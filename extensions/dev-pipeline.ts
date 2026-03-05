@@ -3723,7 +3723,13 @@ export default function (pi: ExtensionAPI) {
 				{ id: "mw.orchestrator", label: "Orchestrator", description: "Reviews pedantic deductions, overrides scores", key: "orchestrator" },
 			];
 
-			let tuiInvalidate: (() => void) | null = null;
+			let tuiRef: any = null;
+			let invalidating = false;
+			function safeInvalidate() {
+				if (invalidating || !tuiRef) return;
+				invalidating = true;
+				setTimeout(() => { invalidating = false; tuiRef?.invalidate(); }, 0);
+			}
 
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
 				const listTheme: SelectListTheme = {
@@ -3830,7 +3836,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const wrapper: any = {
-					invalidate() { if (tuiInvalidate) tuiInvalidate(); },
+					invalidate() { safeInvalidate(); },
 					render: normalRender,
 					handleInput: normalInput,
 				};
@@ -3960,7 +3966,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-				tuiInvalidate = () => tui.invalidate();
+				tuiRef = tui;
 				const settingsTheme: SettingsListTheme = {
 					label: (text: string, selected: boolean) => selected ? theme.fg("accent", theme.bold(text)) : text,
 					value: (text: string, selected: boolean) => selected ? theme.fg("success", text) : theme.fg("dim", text),
@@ -4001,8 +4007,8 @@ export default function (pi: ExtensionAPI) {
 				const origHandleInput = settingsList.handleInput.bind(settingsList);
 
 				const component = {
-					dispose() { tuiInvalidate = null; },
-					invalidate() { tui.invalidate(); },
+					dispose() { tuiRef = null; },
+					invalidate() { /* called by TUI during render cycle, no-op to avoid recursion */ },
 					render(width: number): string[] {
 						const border = theme.fg("dim", "─".repeat(width));
 						const lines: string[] = [];
