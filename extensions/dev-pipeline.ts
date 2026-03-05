@@ -2845,7 +2845,15 @@ export default function (pi: ExtensionAPI) {
 
 	// ── UAT Scenario Generation ──────────────────
 
+	function ensureUatLabels() {
+		shellExec(`gh label create uat --color "FBCA04" --description "User Acceptance Testing" --force`, cwd);
+		shellExec(`gh label create uat-pass --color "0E8A16" --description "UAT scenario passed" --force`, cwd);
+		shellExec(`gh label create uat-fail --color "D93F0B" --description "UAT scenario failed" --force`, cwd);
+		shellExec(`gh label create uat-pending --color "FBCA04" --description "UAT scenario pending" --force`, cwd);
+	}
+
 	async function ensureUatEpic(): Promise<number | undefined> {
+		ensureUatLabels();
 		if (uatState.epicIssueNum) return uatState.epicIssueNum;
 
 		// Check if UAT epic already exists
@@ -2881,11 +2889,6 @@ export default function (pi: ExtensionAPI) {
 			if (numMatch) {
 				uatState.epicIssueNum = parseInt(numMatch[1], 10);
 				log(`[UAT] Created UAT epic: #${uatState.epicIssueNum}`);
-				// Ensure uat label exists
-				shellExec(`gh label create uat --color "FBCA04" --description "User Acceptance Testing" --force`, cwd);
-				shellExec(`gh label create uat-pass --color "0E8A16" --description "UAT scenario passed" --force`, cwd);
-				shellExec(`gh label create uat-fail --color "D93F0B" --description "UAT scenario failed" --force`, cwd);
-				shellExec(`gh label create uat-pending --color "FBCA04" --description "UAT scenario pending" --force`, cwd);
 				return uatState.epicIssueNum;
 			}
 		}
@@ -4071,6 +4074,7 @@ export default function (pi: ExtensionAPI) {
 			log(`[RESET] Reopened ${reopened} GitHub issue(s)`);
 
 			// Remove UAT labels from all scenarios
+			ensureUatLabels();
 			for (const scenario of uatState.scenarios) {
 				if (scenario.issueNum) {
 					shellExec(`gh issue edit ${scenario.issueNum} --add-label "uat-pending" --remove-label "uat-pass,uat-fail"`, cwd);
@@ -4658,6 +4662,7 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 
 			// Post rejection notes to failed scenario issues
+			ensureUatLabels();
 			const failedScenarios = uatState.scenarios.filter(s => s.result === "fail");
 			for (const scenario of failedScenarios) {
 				if (scenario.issueNum) {
