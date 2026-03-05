@@ -239,43 +239,7 @@ function shortModelName(fullId: string): string {
 	return parts.length > 1 ? parts[1] : fullId;
 }
 
-const PING_TIMEOUT_MS = 10000;
 
-function pingModel(modelId: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const providerExtDir = join(homedir(), ".pi", "agent", "extensions");
-		const providerExts: string[] = [];
-		if (existsSync(providerExtDir)) {
-			for (const f of readdirSync(providerExtDir)) {
-				if (f.endsWith("-provider.ts")) providerExts.push("-e", join(providerExtDir, f));
-			}
-		}
-		const args = [
-			"--mode", "print",
-			"-p",
-			"--no-extensions",
-			...providerExts,
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-session",
-			"--model", modelId,
-			"--thinking", "off",
-			"--no-tools",
-			"Say OK",
-		];
-		let done = false;
-		const timer = setTimeout(() => {
-			if (!done) { done = true; child.kill(); resolve(false); }
-		}, PING_TIMEOUT_MS);
-		const child = spawn("pi", args, { stdio: ["ignore", "pipe", "ignore"] });
-		child.on("close", (code) => {
-			if (!done) { done = true; clearTimeout(timer); resolve(code === 0); }
-		});
-		child.on("error", () => {
-			if (!done) { done = true; clearTimeout(timer); resolve(false); }
-		});
-	});
-}
 
 // ── Helpers ──────────────────────────────────────
 
@@ -3724,9 +3688,6 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			let tuiRef: any = null;
-			function safeInvalidate() {
-				tuiRef?.requestRender();
-			}
 
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
 				const listTheme: SelectListTheme = {
@@ -3833,57 +3794,13 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const wrapper: any = {
-					invalidate() { safeInvalidate(); },
+					invalidate() {},
 					render: normalRender,
 					handleInput: normalInput,
 				};
 
 				const onSelect = (item: SelectItem) => {
-					const selectedModel = item.value;
-					const pingStart = Date.now();
-					const timeoutSec = Math.ceil(PING_TIMEOUT_MS / 1000);
-					let pingCountdown = timeoutSec;
-
-					wrapper.render = (_width: number): string[] => {
-						const elapsed = Math.ceil((Date.now() - pingStart) / 1000);
-						const remaining = Math.max(0, timeoutSec - elapsed);
-						return [
-							ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")),
-							"",
-							ctx.ui.theme.fg("warning", `  Pinging ${shortModelName(selectedModel)}... (${remaining}s)`),
-						];
-					};
-					wrapper.handleInput = () => {}; // Block input during ping
-					wrapper.invalidate();
-
-					const countdownInterval = setInterval(() => { wrapper.invalidate(); }, 1000);
-
-					pingModel(selectedModel).then((ok) => {
-						clearInterval(countdownInterval);
-						if (ok) {
-							done(selectedModel);
-						} else {
-							wrapper.render = (_width: number): string[] => [
-								ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")),
-								"",
-								ctx.ui.theme.fg("error", `  ${shortModelName(selectedModel)} failed ping test (timed out or error)`),
-								"",
-								ctx.ui.theme.fg("dim", "  Enter: use anyway · Esc/any: go back"),
-							];
-							wrapper.invalidate();
-							wrapper.handleInput = (data: string) => {
-								const kb = getEditorKeybindings();
-								if (kb.matches(data, "selectConfirm")) {
-									done(selectedModel);
-								} else {
-									wrapper.render = normalRender;
-									wrapper.handleInput = normalInput;
-									searchText = "";
-									wrapper.invalidate();
-								}
-							};
-						}
-					});
+					done(item.value);
 				};
 
 				list.onSelect = onSelect;
