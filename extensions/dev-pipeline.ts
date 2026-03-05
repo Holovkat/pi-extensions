@@ -239,8 +239,10 @@ function shortModelName(fullId: string): string {
 	return parts.length > 1 ? parts[1] : fullId;
 }
 
-function pingModel(modelId: string): boolean {
-	try {
+const PING_TIMEOUT_MS = 10000;
+
+function pingModel(modelId: string): Promise<boolean> {
+	return new Promise((resolve) => {
 		const providerExtDir = join(homedir(), ".pi", "agent", "extensions");
 		const providerExts: string[] = [];
 		if (existsSync(providerExtDir)) {
@@ -261,15 +263,18 @@ function pingModel(modelId: string): boolean {
 			"--no-tools",
 			"Say OK",
 		];
-		execSync(`pi ${args.map(a => `'${a}'`).join(" ")}`, {
-			encoding: "utf-8",
-			timeout: 15000,
-			stdio: ["ignore", "pipe", "ignore"],
+		let done = false;
+		const timer = setTimeout(() => {
+			if (!done) { done = true; child.kill(); resolve(false); }
+		}, PING_TIMEOUT_MS);
+		const child = spawn("pi", args, { stdio: ["ignore", "pipe", "ignore"] });
+		child.on("close", (code) => {
+			if (!done) { done = true; clearTimeout(timer); resolve(code === 0); }
 		});
-		return true;
-	} catch {
-		return false;
-	}
+		child.on("error", () => {
+			if (!done) { done = true; clearTimeout(timer); resolve(false); }
+		});
+	});
 }
 
 // ── Helpers ──────────────────────────────────────
@@ -3830,36 +3835,50 @@ export default function (pi: ExtensionAPI) {
 
 				const onSelect = (item: SelectItem) => {
 					const selectedModel = item.value;
+					const pingStart = Date.now();
+					const timeoutSec = Math.ceil(PING_TIMEOUT_MS / 1000);
+					let pingCountdown = timeoutSec;
+
 					wrapper.render = (_width: number): string[] => {
-						const lines: string[] = [];
-						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
-						lines.push("");
-						lines.push(ctx.ui.theme.fg("warning", `  Pinging ${shortModelName(selectedModel)}...`));
-						return lines;
+						const elapsed = Math.ceil((Date.now() - pingStart) / 1000);
+						const remaining = Math.max(0, timeoutSec - elapsed);
+						return [
+							ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")),
+							"",
+							ctx.ui.theme.fg("warning", `  Pinging ${shortModelName(selectedModel)}... (${remaining}s)`),
+						];
 					};
+					wrapper.handleInput = () => {}; // Block input during ping
 					wrapper.invalidate();
 
-					setTimeout(() => {
-						const ok = pingModel(selectedModel);
+					const countdownInterval = setInterval(() => { wrapper.invalidate(); }, 1000);
+
+					pingModel(selectedModel).then((ok) => {
+						clearInterval(countdownInterval);
 						if (ok) {
 							done(selectedModel);
 						} else {
-							wrapper.render = (_width: number): string[] => {
-								const lines: string[] = [];
-								lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
-								lines.push("");
-								lines.push(ctx.ui.theme.fg("error", `  ${shortModelName(selectedModel)} failed ping test`));
-								lines.push(ctx.ui.theme.fg("dim", "  Press any key to go back"));
-								return lines;
-							};
+							wrapper.render = (_width: number): string[] => [
+								ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")),
+								"",
+								ctx.ui.theme.fg("error", `  ${shortModelName(selectedModel)} failed ping test (timed out or error)`),
+								"",
+								ctx.ui.theme.fg("dim", "  Enter: use anyway · Esc/any: go back"),
+							];
 							wrapper.invalidate();
-							wrapper.handleInput = (_data: string) => {
-								wrapper.render = normalRender;
-								wrapper.handleInput = normalInput;
-								wrapper.invalidate();
+							wrapper.handleInput = (data: string) => {
+								const kb = getEditorKeybindings();
+								if (kb.matches(data, "selectConfirm")) {
+									done(selectedModel);
+								} else {
+									wrapper.render = normalRender;
+									wrapper.handleInput = normalInput;
+									searchText = "";
+									wrapper.invalidate();
+								}
 							};
 						}
-					}, 50);
+					});
 				};
 
 				list.onSelect = onSelect;
