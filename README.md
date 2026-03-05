@@ -53,30 +53,41 @@ graph TD
 
 ### How Agent Subprocess Execution Works
 
-Both extensions spawn agents as pi CLI subprocesses. This is the core execution pattern:
+Both extensions spawn agents as pi CLI subprocesses using pi's native RPC mode:
 
 ```mermaid
 graph TD
-    EXT[Extension Process] -->|spawn| SUB["pi --mode json -p<br/>--no-extensions --no-skills<br/>--system-prompt '...'"]
+    EXT[Extension Process] -->|spawn| SUB["pi --mode rpc<br/>--no-extensions --no-skills<br/>--system-prompt '...'"]
+    EXT -->|"stdin: {type: 'prompt', message: '...'}"| SUB
     SUB -->|stdout JSON stream| EXT
     EXT -->|parse events| LOG[Write to .log file]
     EXT -->|extract text| RES[Collect response]
-    SUB -->|exit| EXT
+    EXT -.->|"stdin: {type: 'steer', message: '...'}"| SUB
+    SUB -->|agent_end| EXT
+    EXT -->|stdin.end| SUB
+
+    CTL[Control Socket :3142] -.->|forwarded commands| EXT
+    WEB[Steer Web UI] -.->|POST /api/steer| CTL
 
     style EXT fill:#fbbf24,color:#1e1b4b
     style SUB fill:#60a5fa,color:#1e1b4b
+    style CTL fill:#a78bfa,color:#1e1b4b
+    style WEB fill:#86efac,color:#14532d
 ```
 
 Each agent subprocess:
-- Runs `pi` in JSON streaming mode (`--mode json -p`)
-- Loads no extensions, skills, or prompt templates (`--no-extensions --no-skills --no-prompt-templates`)
-- Receives a custom system prompt from its agent definition file (`--system-prompt "..."`)
-- Gets specific tools based on role (e.g. dev gets `write,edit,bash`; compliance gets `read,bash,grep`)
-- Streams JSON events (`message_update`, `tool_execution_start`, `tool_execution_end`)
+- Runs `pi` in RPC mode (`--mode rpc`) with stdin/stdout piped
+- Receives its task via stdin as `{"type": "prompt", "message": "..."}` — not as a positional arg
+- Can be steered mid-execution via `{"type": "steer", "message": "..."}` on stdin
+- Can be aborted via `{"type": "abort"}` on stdin
+- Streams JSON events (`message_update`, `agent_start`, `agent_end`, `tool_execution_start`, etc.)
 - Logs all output to `.pi/pipeline-logs/<session-key>.log`
 - Uses session file reuse (`--session <file> -c`) so agents retain context across calls within a phase
+- Is tracked in the `agentProcesses` map by session key for steering/monitoring
 
 **Session reuse** means a dev agent called for task 1.1 keeps its conversation context when called again for task 1.2, reducing repeated codebase scanning.
+
+**RPC lifecycle:** `prompt` → `agent_start` → `turn_start` → `message_start` → `message_update` (text deltas) → `message_end` → `tool_execution_start/end` (if tools used) → `turn_end` → `agent_end` → `stdin.end()` (or keep alive for follow-up).
 
 ---
 
@@ -251,8 +262,11 @@ graph TD
     BUILD --> EVAL["EVALUATE: Stronger model<br/>scores per-task"]
     EVAL --> FIX{"Score >= 95%?"}
     FIX -->|yes| UAT_GEN["Generate UAT scenarios"]
-    FIX -->|no| SUB["Subtask decomposition<br/>(up to 5 depths)"]
-    SUB --> EVAL
+    FIX -->|no| SUB["Fix with watchdog timer<br/>(10m + 5m/depth)"]
+    SUB --> YIELD{"Agent yielded<br/>(timeout)?"}
+    YIELD -->|no| EVAL
+    YIELD -->|yes| ANALYST["Analyst reviews learnings<br/>decompose / simplify /<br/>deprecate / skip"]
+    ANALYST --> EVAL
     UAT_GEN --> UPDATE2["Update checklist + issues"]
 
     UPDATE1 -->|"auto-chain"| NEXT1["Next epic"]
@@ -286,6 +300,7 @@ sequenceDiagram
     participant BUILD as Builder (Gemini 3 Pro)
     participant EVAL as Evaluator (Opus 4.6)
     participant FIX as Fixer (Qwen 3.5+)
+    participant ANA as Analyst (Opus 4.6)
     participant PW as Playwright
     participant USER as Human
 
@@ -300,10 +315,20 @@ sequenceDiagram
         EXT->>EVAL: Score each task (0-100%)
         EVAL-->>EXT: Per-task scores + issues
 
-        Note over EXT,FIX: Step 3: FIX (if needed)
+        Note over EXT,ANA: Step 3: FIX with watchdog (if needed)
+        EXT->>EXT: Load prior learnings from GitHub issue comments
         loop For each task < 95% (up to 5 depths)
-            EXT->>FIX: Surgical fix with specific issues
-            FIX-->>EXT: Targeted edits
+            Note over EXT,FIX: Watchdog: 10m + 5m/depth timeout
+            EXT->>FIX: Fix with issues + learnings context
+            alt Agent completes in time
+                FIX-->>EXT: Targeted edits
+            else Agent yields (timeout)
+                EXT->>FIX: Steer: "Summarize blockers and yield"
+                FIX-->>EXT: {blockers, attempted, suggestion}
+                EXT->>ANA: Review learnings, decide action
+                ANA-->>EXT: decompose / simplify / deprecate / skip
+                EXT->>EXT: Post learning to GitHub issue comment
+            end
             EXT->>EVAL: Re-score
             EVAL-->>EXT: Updated score
         end
@@ -333,26 +358,69 @@ sequenceDiagram
     end
 ```
 
-##### Subtask Decomposition
+##### Fix with Watchdog Timers & Analyst Escalation
 
-When a task scores below 95%, the fast track doesn't rebuild from scratch. Instead:
+When a task scores below 95%, the fast track doesn't rebuild from scratch. Each fix attempt runs under a watchdog timer — if the agent can't finish in time, it's steered to yield a structured summary, and an analyst agent decides how to proceed.
 
 ```mermaid
 graph TD
-    SCORE["Task 4.2: A* pathfinding<br/>Score: 88%"] --> ISSUES["Issues:<br/>1. Missing tunnel cost<br/>2. Cache not invalidated"]
-    ISSUES --> FIX1["Depth 1: Fix tunnel cost + cache"]
-    FIX1 --> RESCORE1["Re-score: 92%"]
-    RESCORE1 --> FIX2["Depth 2: Fix remaining edge case"]
+    SCORE["Task 4.2: A* pathfinding<br/>Score: 88%"] --> SEED["Load prior learnings<br/>from GitHub issue #58"]
+    SEED --> FIX1["Depth 1: Qwen 3.5+<br/>Timeout: 10 min"]
+    FIX1 --> DONE1{"Completed<br/>in time?"}
+    DONE1 -->|yes| RESCORE1["Re-score: 92%"]
+    DONE1 -->|"no (yielded)"| LEARN1["Learnings:<br/>blockers, attempted, suggestion"]
+    LEARN1 --> ANALYST1["Analyst: DECOMPOSE<br/>Split into 2 sub-tasks"]
+    ANALYST1 --> POST1["Post learning to issue #58"]
+    POST1 --> RESCORE1
+    RESCORE1 --> FIX2["Depth 2: Sonnet 4.6<br/>Timeout: 15 min<br/>(receives learnings)"]
     FIX2 --> RESCORE2["Re-score: 97%"]
     RESCORE2 --> PASS["Task passed"]
 
     style SCORE fill:#fca5a5,color:#7f1d1d
     style PASS fill:#86efac,color:#14532d
+    style ANALYST1 fill:#c4b5fd,color:#1e1b4b
+    style LEARN1 fill:#fbbf24,color:#1e1b4b
 ```
 
-- Existing work is preserved — fixes are surgical, not rewrites
-- Each depth gets the specific issues list from the evaluator
-- Maximum 5 decomposition depths before flagging for attention
+**Watchdog timer progression:**
+| Depth | Timeout | Model |
+|-------|---------|-------|
+| 1 | 10 min | Base fixer |
+| 2 | 15 min | Escalation 1 |
+| 3 | 20 min | Escalation 2 |
+| 4 | 25 min | Escalation 2 (clamped) |
+| 5 | 30 min | Escalation 2 (clamped) |
+
+At **T-30 seconds**, the watchdog steers the agent: "TIMEOUT WARNING: yield NOW and provide a JSON summary of blockers, attempted approaches, and suggestions." At **T**, the agent is aborted and killed.
+
+**Analyst decisions:**
+| Action | Effect |
+|--------|--------|
+| `decompose` | Breaks the task into smaller sub-tasks for the next fix depth |
+| `simplify` | Reduces the task scope — overwrites requirements with a simpler version |
+| `deprecate` | Marks the task as infeasible — stops trying, moves on |
+| `skip` | Skips for now — records conditions under which to retry |
+
+**Learnings flow:**
+- Each fix attempt records an `AgentLearning` (blockers, attempted approaches, suggestion, analyst decision)
+- Learnings are posted as structured comments on the task's GitHub issue
+- Subsequent fix agents receive all prior learnings in their prompt with "DO NOT repeat approaches that have already been tried"
+- On pipeline restart, learnings are seeded from issue comments — they survive crashes
+
+##### GitHub Issue Learning Comments
+
+When a fix agent yields or an analyst makes a decision, a structured comment is posted:
+
+```markdown
+## Agent Learning (depth 2, fix, claude-sonnet-4-6)
+**Yielded:** yes (timeout after 612s)
+**Blockers:** collision detection not triggering at maze boundaries; tile cost array index off-by-one
+**Attempted:** adjusted hitbox calculations; rewrote boundary detection with BFS
+**Suggestion:** try a tile-based grid collision approach instead of pixel-based raycasting
+**Analyst:** decompose — split into boundary detection sub-task + ghost collision sub-task
+```
+
+These comments accumulate on the issue, forming a visible audit trail of what was tried and why.
 
 ##### Stage Widget Bar
 
@@ -391,7 +459,10 @@ UAT Epic #101: "UAT Test Suite"                          [uat]
 |------|-------|---------|
 | Builder | Gemini 3 Pro Preview | Build entire epic in one shot |
 | Evaluator | Claude Opus 4.6 | Per-task scoring + UAT scenario generation |
-| Fixer | Qwen 3.5 Plus (Bailian) | Surgical subtask fixes |
+| Fixer | Qwen 3.5 Plus (Bailian) | Surgical subtask fixes (depth 1) |
+| Fix Escalation 1 | Claude Sonnet 4.6 | Stronger model for depth 2+ |
+| Fix Escalation 2 | Claude Opus 4.6 (xhigh) | Maximum capability for deep escalation |
+| Analyst | Claude Opus 4.6 (xhigh) | Reviews yielded agents, decomposes/deprecates stuck tasks |
 | UAT Tester | Gemini 3 Pro Preview | Playwright browser automation |
 
 ##### Dashboard — Approval State
@@ -496,6 +567,9 @@ Both modes share:
 
 - **Checklist parser** — handles both `### Phase N:` and `## Epic N:` headers, and both `- [ ] #56 - 1.1 Title` and `- [ ] **1.1 — Title** (#N)` task formats
 - **GitHub issue enrichment** — fetches full issue bodies via `gh issue view`
+- **GitHub issue learnings** — agent learnings posted as structured comments on task issues, read back on pipeline restart
+- **RPC agent steering** — all agents run in RPC mode with stdin piped, enabling mid-execution steering
+- **Watchdog timers** — per-depth timeout with steer-for-summary and hard yield
 - **Auto-chaining** — epics chain automatically with branch creation between them
 - **Tmux log panes** — live agent output in tmux splits, auto-closing on completion
 - **Pipeline state file** — `pipeline-state.json` for the standalone dashboard
@@ -524,9 +598,10 @@ Each role shows its model and thinking level (e.g. `gemini-3-pro · high`). Pres
     ↳ Escalation 1            claude-sonnet-4-6 · high
     ↳ Escalation 2            claude-opus-4-6 · xhigh
     ↳ + Add escalation step
+  Analyst                     claude-opus-4-6 · xhigh
   UAT Tester                  gemini-3-pro · medium
 
-  Surgical subtask fixes · Space to cycle thinking · Del to remove
+  Reviews yielded agents · Space to cycle thinking · Del to remove
 
   Enter: change model · Space: cycle thinking · Del: remove escalation · Esc: close
 ──────────────────────────────────────────────────
@@ -612,8 +687,8 @@ Written to `.pi/pipeline-logs/pipeline-state.json` on every state change:
       "total": 6,
       "gate": "wave2-parallel",
       "tasks": [
-        { "id": "4.1", "title": "Ghost entity class", "status": "passed", "complianceScore": 98, "attempts": 1 },
-        { "id": "4.2", "title": "A* pathfinding", "status": "building", "complianceScore": 0, "attempts": 1 }
+        { "id": "4.1", "title": "Ghost entity class", "status": "passed", "complianceScore": 98, "attempts": 1, "yields": 0 },
+        { "id": "4.2", "title": "A* pathfinding", "status": "building", "complianceScore": 0, "attempts": 2, "yields": 1, "lastAnalystAction": "decompose" }
       ]
     }
   ],
@@ -639,6 +714,59 @@ A standalone bash script that reads `pipeline-state.json` every 2 seconds and re
 
 Run standalone: `pi-dash /path/to/project`
 Or from inside pi: `/pipeline-dashboard` (opens in a tmux pane)
+
+#### Pipeline Control Center (Web)
+
+**File:** `bin/pipeline-dashboard-web`
+
+A multi-page web application for monitoring and steering agents from a browser.
+
+**Home** (`http://localhost:3141/`) — navigation cards to Dashboard and Steer pages.
+
+**Dashboard** (`/dashboard`) — live SSE-powered view of pipeline state, same data as the terminal dashboard but rendered in HTML with the Claude/shadcn oklch theme (dark/light toggle).
+
+**Steer** (`/steer`) — interactive agent steering page:
+- Active agent list (auto-refreshes every 3s)
+- Message textarea with Steer / Follow-up / Abort buttons
+- Live steer log via SSE showing command history
+
+**TCP Control Socket** (port 3142) — programmatic interface for agent registration and command forwarding:
+
+```mermaid
+sequenceDiagram
+    participant EXT as dev-pipeline.ts
+    participant CTL as Control Socket :3142
+    participant WEB as Steer Web UI
+
+    Note over EXT,CTL: On agent spawn
+    EXT->>CTL: {"type":"register","agentId":"fast-fix-2.3-d2",...}
+
+    Note over WEB,CTL: User steers from browser
+    WEB->>CTL: POST /api/steer {agentId, type:"steer", message:"..."}
+    CTL->>EXT: {"forward":true,"type":"steer","message":"...","agentId":"..."}
+    EXT->>EXT: Write to agent's proc.stdin
+
+    Note over EXT,CTL: Watchdog steer (automatic)
+    EXT->>EXT: Timeout approaching — steer via stdin directly
+```
+
+The extension auto-connects to the control socket on startup and re-registers agents on reconnect. If the web dashboard isn't running, steering still works via the watchdog timers.
+
+#### Agent Steering via RPC
+
+Pi's native RPC mode enables mid-execution steering of any running agent:
+
+| RPC Command | Effect |
+|-------------|--------|
+| `{"type": "prompt", "message": "..."}` | Send initial task (on spawn) |
+| `{"type": "steer", "message": "..."}` | Interrupt agent, deliver new instructions |
+| `{"type": "follow_up", "message": "..."}` | Continue conversation after `agent_end` (if keepAlive) |
+| `{"type": "abort"}` | Cancel current execution |
+
+Steering sources:
+1. **Watchdog timer** — automatic yield summary request at timeout
+2. **Web UI** — user types a message on the `/steer` page
+3. **Control socket** — programmatic steering from any TCP client
 
 ---
 
@@ -676,6 +804,7 @@ Agent            │ read │ write │ edit │ bash │ grep │ find │ ls �
 ─────────────────┼──────┼───────┼──────┼──────┼──────┼──────┼────┤
 dev              │  ✓   │   ✓   │  ✓   │  ✓   │  ✓   │  ✓   │ ✓  │ ← only agent that writes
 compliance       │  ✓   │       │      │  ✓   │  ✓   │  ✓   │ ✓  │
+analyst          │  ✓   │       │      │      │  ✓   │  ✓   │ ✓  │ ← reviews yielded agents
 reviewer         │  ✓   │       │      │  ✓   │  ✓   │  ✓   │ ✓  │
 lint-build       │  ✓   │       │      │  ✓   │  ✓   │  ✓   │ ✓  │
 tester           │  ✓   │       │      │  ✓   │  ✓   │  ✓   │ ✓  │
@@ -703,6 +832,7 @@ ln -sf ~/workspace/pi-extensions/extensions ~/.pi-init/extensions
 ln -sf ~/workspace/pi-extensions/agents/req-qa/* ~/.pi-init/agents/
 ln -sf ~/workspace/pi-extensions/agents/dev-pipeline/* ~/.pi-init/agents/
 ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard ~/.pi-init/bin/pipeline-dashboard
+ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard-web ~/.pi-init/bin/pipeline-dashboard-web
 
 # 3. Install dependencies
 cd ~/.pi-init && npm install @mariozechner/pi-tui
@@ -733,7 +863,8 @@ brew install glow
 |-------|---------|
 | `pi-req` | Launch requirements discovery session |
 | `pi-dev` | Launch sprint development pipeline |
-| `pi-dash` | Launch standalone pipeline dashboard |
+| `pi-dash` | Launch standalone terminal dashboard |
+| `pi-web` | Launch Pipeline Control Center (web, port 3141) |
 
 ---
 
@@ -778,18 +909,22 @@ brew install glow
 pi-extensions/
 ├── README.md
 ├── extensions/
-│   ├── req-qa.ts            # Requirements discovery extension (~1640 lines)
-│   ├── dev-pipeline.ts      # Sprint development extension (~3630 lines)
-│   ├── themeMap.ts           # Per-extension theme assignments
-│   └── theme-cycler.ts      # Runtime theme switching
+│   ├── req-qa.ts              # Requirements discovery extension (~1640 lines)
+│   ├── dev-pipeline.ts        # Sprint development extension (~5050 lines)
+│   ├── bailian-provider.ts    # Alibaba Cloud Bailian provider
+│   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
+│   ├── glm-provider.ts        # Zhipu GLM provider
+│   ├── ollama-provider.ts     # Ollama local models provider
+│   ├── themeMap.ts             # Per-extension theme assignments
+│   └── theme-cycler.ts        # Runtime theme switching
 ├── agents/
-│   ├── req-qa/              # Requirements discovery agents
+│   ├── req-qa/                # Requirements discovery agents
 │   │   ├── req-analyst.md
 │   │   ├── tech-analyst.md
 │   │   ├── ux-analyst.md
 │   │   ├── scenario-analyst.md
 │   │   └── prd-writer.md
-│   └── dev-pipeline/        # Development pipeline agents
+│   └── dev-pipeline/          # Development pipeline agents
 │       ├── dev.md
 │       ├── compliance.md
 │       ├── reviewer.md
@@ -798,8 +933,10 @@ pi-extensions/
 │       ├── uat-signoff.md
 │       └── sharder.md
 ├── bin/
-│   └── pipeline-dashboard   # Standalone terminal dashboard
+│   ├── pipeline-dashboard     # Standalone terminal dashboard (bash)
+│   └── pipeline-dashboard-web # Pipeline Control Center (Node.js HTTP + SSE + TCP)
 └── docs/
+    ├── walkthrough-fasttrack.md
     └── research-diffusion-llm-code-generation.md
 ```
 
@@ -825,11 +962,12 @@ A 7-task epic with fix attempts typically takes 15-25 minutes.
 |------|----------|-------|
 | Build (entire epic) | ~2-4 min | Single model, all tasks at once |
 | Evaluate (per-task scoring) | ~60-90s | Single pass |
-| Fix depth (per failed task) | ~1-2 min | Surgical edit + re-score |
+| Fix depth (per failed task) | ~1-10 min | Surgical edit + re-score (watchdog: 10m + 5m/depth) |
+| Analyst review (if yielded) | ~1-3 min | Analyzes learnings, decides next action |
 | UAT scenario generation | ~60-90s | Per-epic, runs in parallel with compliance |
 | UAT execution (per scenario) | ~30-60s | Playwright browser automation |
 
-A 7-task epic with 2 fix depths typically takes 5-10 minutes. Full UAT execution across all epics adds 5-15 minutes depending on scenario count.
+A 7-task epic with 2 fix depths typically takes 5-10 minutes. If agents yield and analyst intervention is needed, fix stages can take longer (up to 30 min for deep escalation). Full UAT execution across all epics adds 5-15 minutes depending on scenario count.
 
 ### Comparison
 

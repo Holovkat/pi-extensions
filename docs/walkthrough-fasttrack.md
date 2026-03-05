@@ -59,7 +59,9 @@ Tasks to build (7):
 
 Build: gemini-3-pro-preview (entire epic at once)
 Evaluate: claude-opus-4-6 (per-task scoring)
-Fix: bailian/qwen3.5-plus (surgical subtask fixes, up to 5 depths)
+Fix: qwen3.5-plus (subtask decomposition, up to 5 depths) → escalation: claude-sonnet-4-6:high → claude-opus-4-6:xhigh
+Analyst: claude-opus-4-6:xhigh (reviews yielded agents, decomposes/deprecates)
+Timeouts: 10m base + 5m/depth, yield warning at -30s
 UAT: Scenario generation → Playwright execution → approval gate
 Compliance threshold: 95%
 ```
@@ -113,24 +115,71 @@ Scoring rules are strict but fair — points are only deducted for real, verifia
   + 1.7: 3-layer rendering pipeline 95%
 ```
 
-### Stage 3: FIX (Subtask Decomposition)
+### Stage 3: FIX with Watchdog Timers & Analyst Escalation
 
-Tasks below 95% get surgical fixes. The builder receives the specific issues list from the evaluator and makes targeted edits — not a full rewrite.
+Tasks below 95% get surgical fixes under watchdog supervision. Each fix agent runs with a timeout — if it can't finish in time, it's steered to yield a structured summary, and an analyst agent decides how to proceed.
+
+**Normal case — agent finishes in time:**
 
 ```
-[FAST] 2 task(s) below 95%. Starting subtask decomposition...
-[FAST] Subtask fix depth 1 for 1.2 (88%)...
+[FAST] 2 task(s) below 95%. Starting fix with watchdog timers...
+[FAST] Fix depth 1 for 1.2 (88%) [timeout: 10m]...
 [FAST] 1.2 fixed at depth 1: 97%
-[FAST] Subtask fix depth 1 for 1.6 (92%)...
+[FAST] Fix depth 1 for 1.6 (92%) [timeout: 10m]...
 [FAST] 1.6 fixed at depth 1: 100%
 ```
 
-If a fix doesn't bring the score above 95%, the evaluator identifies the remaining issues, and the builder tries again. This repeats up to 5 depths:
+**Timeout case — agent yields, analyst intervenes:**
 
 ```
-Depth 1: Fix "dt clamp missing" + "no gameTime tracking" → re-score → 92%
-Depth 2: Fix "gameTime not reset on level change" → re-score → 97% ✓
+[FAST] Fix depth 2 for 4.2 (82%) [timeout: 15m] [escalated → claude-sonnet-4-6:high]...
+[WATCHDOG] fast-fix-4.2-d2: timeout approaching (870s), requesting yield summary
+[FAST] 4.2 depth 2: YIELDED after 900s. Blockers: collision detection not triggering at maze boundaries
+[FAST] Invoking analyst for 4.2...
+[ANALYST] 4.2: decompose — split into boundary detection + ghost collision sub-tasks
 ```
+
+When an agent yields, the pipeline:
+1. Steers the agent 30 seconds before timeout: "Summarize your blockers and yield"
+2. Captures the agent's structured response: `{blockers, attempted, suggestion}`
+3. Hard-kills the agent at timeout
+4. Spawns the analyst to review all learnings and decide: **decompose**, **simplify**, **deprecate**, or **skip**
+5. Posts the learning as a comment on the task's GitHub issue
+6. Next fix depth receives all prior learnings in its prompt
+
+**Timeout progression:**
+
+| Depth | Timeout | Model | Thinking |
+|-------|---------|-------|----------|
+| 1 | 10 min | Qwen 3.5+ (base fixer) | high |
+| 2 | 15 min | Claude Sonnet 4.6 (escalation 1) | high |
+| 3 | 20 min | Claude Opus 4.6 (escalation 2) | xhigh |
+| 4 | 25 min | Claude Opus 4.6 (clamped) | xhigh |
+| 5 | 30 min | Claude Opus 4.6 (clamped) | xhigh |
+
+**Learnings on GitHub issues:**
+
+Each fix attempt posts a structured comment to the task's issue:
+
+```markdown
+## Agent Learning (depth 2, fix, claude-sonnet-4-6)
+**Yielded:** yes (timeout after 612s)
+**Blockers:** collision detection not triggering at maze boundaries
+**Attempted:** adjusted hitbox calculations; rewrote boundary detection
+**Suggestion:** try a tile-based collision approach instead of pixel-based
+**Analyst:** decompose — split into boundary detection + ghost collision
+```
+
+These comments accumulate, forming an audit trail. On pipeline restart (e.g., after a crash), learnings are automatically read back from the issue comments — nothing is lost.
+
+**Analyst decisions:**
+
+| Decision | Effect |
+|----------|--------|
+| **decompose** | Breaks the task into smaller sub-tasks — replaces the issues list |
+| **simplify** | Reduces task scope — overwrites requirements with simpler version |
+| **deprecate** | Marks task as infeasible — stops trying, moves on |
+| **skip** | Skips for now — records conditions for retry |
 
 Existing working code is always preserved. Fixes are additive or corrective, never destructive.
 
@@ -351,7 +400,9 @@ Run `/pipeline-next` to trigger a fix cycle. The builder reads the rejection not
 | `/pipeline-config` | Configure model assignments per role (full-screen, Available/All tabs) |
 | `/pipeline-start` | Parse checklist, fetch GitHub issues, show plan, create branch, start building |
 | `/pipeline-reset` | Full reset — checkout main, delete branches, uncheck checklist, reopen issues |
-| *(automatic)* | BUILD → EVALUATE → FIX → UAT scenarios → checklist update → next epic |
+| *(automatic)* | BUILD → EVALUATE → FIX (with watchdog + analyst) → UAT scenarios → checklist update → next epic |
+| *(automatic)* | Watchdog steers stuck agents for yield summary, analyst decides next action |
+| *(automatic)* | Learnings posted as GitHub issue comments, read back on restart |
 | *(automatic)* | After all epics: run UAT via Playwright, post results to GitHub |
 | `/pipeline-approve` | Accept UAT, close GitHub epic |
 | `/pipeline-reject` | Post rejection notes, reset failed scenarios |
@@ -364,10 +415,11 @@ Run `/pipeline-next` to trigger a fix cycle. The builder reads the rejection not
 |-------|----------|-------|
 | Build (per epic) | 2-4 min | Single model, all tasks at once |
 | Evaluate | 1-2 min | Per-task scoring |
-| Fix (per failed task, per depth) | 1-2 min | Surgical edit + re-score |
+| Fix (per failed task, per depth) | 1-10 min | Watchdog: 10m + 5m/depth timeout |
+| Analyst review (if agent yields) | 1-3 min | Reviews learnings, decides action |
 | UAT scenario generation (per epic) | 1-2 min | Runs after compliance |
 | UAT execution (all scenarios) | 5-15 min | Playwright, depends on scenario count |
-| Total for 9 epics + UAT | ~45-90 min | Compared to 2-4 hours in 3-Wave mode |
+| Total for 9 epics + UAT | ~45-120 min | Longer if agents yield and analyst intervenes |
 
 ## Configuring Models
 
@@ -387,7 +439,9 @@ The model selector has its own tabs:
 - **Available** — models with API keys configured and ready to use
 - **All** — every registered model
 
-A ping test runs on model selection to confirm it responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately. The thinking level controls how much reasoning budget each role gets — use `high`/`xhigh` for complex tasks (build, eval, fix) and `medium`/`low` for simpler ones (UAT).
+A ping test runs on model selection to confirm it responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately. The thinking level controls how much reasoning budget each role gets — use `high`/`xhigh` for complex tasks (build, eval, fix, analyst) and `medium`/`low` for simpler ones (UAT).
+
+The **Analyst** role uses the strongest model by default (Opus 4.6 with xhigh thinking) because it needs to deeply understand failure patterns and make architectural decisions about task decomposition.
 
 ### Fix Escalation
 
@@ -413,6 +467,50 @@ If you open a second `pi-dev` terminal while a pipeline is running, it enters **
 
 ---
 
+## Pipeline Control Center (Web)
+
+For browser-based monitoring and steering, start the web dashboard:
+
+```bash
+node ~/.pi-init/bin/pipeline-dashboard-web
+# or: pi-web (if alias configured)
+```
+
+Open `http://localhost:3141/` in your browser. Three pages:
+
+### Home
+Navigation cards linking to Dashboard and Steer pages.
+
+### Dashboard (`/dashboard`)
+Live SSE-powered view of pipeline state — same information as the terminal dashboard but in a browser with the Claude/shadcn oklch theme. Supports dark/light toggle.
+
+### Steer (`/steer`)
+Interactive agent steering. While the pipeline is running:
+
+1. The active agent list shows all spawned agents (auto-refreshes every 3s)
+2. Select an agent from the list
+3. Type a message in the textarea
+4. Click **Steer** (interrupt and redirect), **Follow-up** (continue conversation), or **Abort** (cancel)
+
+Use cases:
+- Tell a stuck builder to "focus only on the collision logic, leave rendering alone"
+- Ask a fixer to "try a completely different approach — use grid-based instead of pixel-based"
+- Abort a runaway agent that's rewriting the entire file
+
+The steer log shows all commands sent to agents in real-time via SSE.
+
+### How Steering Works Under the Hood
+
+1. Your browser POSTs to `/api/steer` with the agent ID and message
+2. The web server forwards the command over the TCP control socket (port 3142) to `dev-pipeline.ts`
+3. The extension writes the command as JSON to the agent's `proc.stdin` (pi RPC mode)
+4. Pi interrupts the agent mid-execution and delivers your message
+5. The agent responds to your steer before continuing its task
+
+The watchdog timers use the same mechanism — they steer the agent automatically when time runs out.
+
+---
+
 ## Tips
 
 - **Use `/pipeline-config`** to swap models before starting — try a faster model for early epics, a stronger one for complex ones
@@ -422,3 +520,6 @@ If you open a second `pi-dev` terminal while a pipeline is running, it enters **
 - **You can switch modes between epics** — use default for early epics, then switch to `--multiwave` for complex ones
 - **UAT scenarios accumulate** — each epic adds its scenarios to the same UAT parent issue, so by the end you have a complete test suite
 - **Open a second terminal** to observe progress without interfering with the running pipeline
+- **Open the web dashboard** (`http://localhost:3141/`) for browser-based monitoring alongside the terminal
+- **Steer stuck agents** from the web UI or let the watchdog handle it automatically
+- **Check GitHub issue comments** on failed tasks to see the full learning history
