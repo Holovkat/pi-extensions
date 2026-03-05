@@ -3728,27 +3728,47 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				let modelTab: "available" | "all" = "available";
+				let searchText = "";
 				let items = buildModelItems(true);
 				let list = new SelectList(items, 20, listTheme);
 				const currentIdx = items.findIndex(m => m.value === currentModelId);
 				if (currentIdx >= 0) list.setSelectedIndex(currentIdx);
 
+				function applyFilter() {
+					if (searchText) list.setFilter(searchText);
+					else {
+						// Reset filter by rebuilding
+						const newItems = buildModelItems(modelTab === "available");
+						items = newItems;
+						list = new SelectList(items, 20, listTheme);
+						const idx = items.findIndex(m => m.value === currentModelId);
+						if (idx >= 0) list.setSelectedIndex(idx);
+						list.onSelect = onSelect;
+						list.onCancel = () => { done(undefined); };
+					}
+				}
+
 				function rebuildList() {
 					items = buildModelItems(modelTab === "available");
 					list = new SelectList(items, 20, listTheme);
-					const idx = items.findIndex(m => m.value === currentModelId);
-					if (idx >= 0) list.setSelectedIndex(idx);
+					if (searchText) list.setFilter(searchText);
+					else {
+						const idx = items.findIndex(m => m.value === currentModelId);
+						if (idx >= 0) list.setSelectedIndex(idx);
+					}
 					list.onSelect = onSelect;
 					list.onCancel = () => { done(undefined); };
 				}
 
 				function renderTabBar(): string {
+					const avCount = buildModelItems(true).length;
+					const allCount = buildModelItems(false).length;
 					const avLabel = modelTab === "available"
-						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[Available (${availableSet.size})]`))
-						: ctx.ui.theme.fg("dim", ` Available (${availableSet.size}) `);
+						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[Available (${avCount})]`))
+						: ctx.ui.theme.fg("dim", ` Available (${avCount}) `);
 					const allLabel = modelTab === "all"
-						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[All (${allModels.length})]`))
-						: ctx.ui.theme.fg("dim", ` All (${allModels.length}) `);
+						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[All (${allCount})]`))
+						: ctx.ui.theme.fg("dim", ` All (${allCount}) `);
 					return `  ${avLabel}  ${allLabel}    ${ctx.ui.theme.fg("dim", "Tab to switch")}`;
 				}
 
@@ -3761,12 +3781,17 @@ export default function (pi: ExtensionAPI) {
 					lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}`));
 					lines.push("");
 					lines.push(renderTabBar());
+					if (searchText) {
+						lines.push(ctx.ui.theme.fg("accent", `  Search: ${searchText}█`));
+					} else {
+						lines.push(ctx.ui.theme.fg("dim", `  Type to search...`));
+					}
 					lines.push("");
 					lines.push(border);
 					lines.push("");
 					lines.push(...list.render(width));
 					lines.push("");
-					lines.push(ctx.ui.theme.fg("dim", "  Enter to select and ping · Esc to cancel"));
+					lines.push(ctx.ui.theme.fg("dim", "  Type to filter · Enter to select · Tab to switch · Esc to cancel"));
 					lines.push(border);
 					return lines;
 				};
@@ -3775,6 +3800,22 @@ export default function (pi: ExtensionAPI) {
 					if (data === "\t") {
 						modelTab = modelTab === "available" ? "all" : "available";
 						rebuildList();
+						wrapper.invalidate();
+						return;
+					}
+					// Backspace: remove last char from search
+					if (data === "\x7f" || data === "\b") {
+						if (searchText.length > 0) {
+							searchText = searchText.slice(0, -1);
+							applyFilter();
+							wrapper.invalidate();
+						}
+						return;
+					}
+					// Printable characters: add to search filter
+					if (data.length === 1 && data >= " " && data <= "~" && data !== "\r" && data !== "\n") {
+						searchText += data;
+						applyFilter();
 						wrapper.invalidate();
 						return;
 					}
