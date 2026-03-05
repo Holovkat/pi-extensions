@@ -353,6 +353,72 @@ function shellExec(cmd: string, cwd?: string): { ok: boolean; stdout: string; st
 	}
 }
 
+// ── GitHub Issue Learnings ───────────────────────
+
+function postLearningToIssue(issueNum: number, learning: AgentLearning, cwd: string): void {
+	if (!issueNum) return;
+	const lines = [
+		`## Agent Learning (depth ${learning.depth}, ${learning.agentRole}, ${shortModelName(learning.model)})`,
+		`**Yielded:** ${learning.yielded ? `yes (timeout after ${Math.round(learning.elapsedMs / 1000)}s)` : `no (${Math.round(learning.elapsedMs / 1000)}s)`}`,
+	];
+	if (learning.blockers.length > 0) lines.push(`**Blockers:** ${learning.blockers.join("; ")}`);
+	if (learning.attempted.length > 0) lines.push(`**Attempted:** ${learning.attempted.join("; ")}`);
+	if (learning.suggestion) lines.push(`**Suggestion:** ${learning.suggestion}`);
+	if (learning.analystAction) {
+		lines.push(`**Analyst:** ${learning.analystAction}${learning.analystNotes ? ` — ${learning.analystNotes}` : ""}`);
+	}
+	const body = lines.join("\n");
+	try {
+		execSync(`gh issue comment ${issueNum} --body ${JSON.stringify(body)}`, {
+			cwd, encoding: "utf-8", timeout: 15000, stdio: ["ignore", "pipe", "ignore"],
+		});
+	} catch {}
+}
+
+function readLearningsFromIssue(issueNum: number, cwd: string): AgentLearning[] {
+	if (!issueNum) return [];
+	try {
+		const raw = execSync(
+			`gh issue view ${issueNum} --json comments -q '.comments[].body'`,
+			{ cwd, encoding: "utf-8", timeout: 15000, stdio: ["ignore", "pipe", "ignore"] },
+		).trim();
+		if (!raw) return [];
+		const learnings: AgentLearning[] = [];
+		// Each comment is separated by newline in the jq output
+		// Split on the "## Agent Learning" header to find learning comments
+		const comments = raw.split(/(?=## Agent Learning)/);
+		for (const comment of comments) {
+			if (!comment.startsWith("## Agent Learning")) continue;
+			const headerMatch = comment.match(/## Agent Learning \(depth (\d+), (\w+), (.+?)\)/);
+			if (!headerMatch) continue;
+			const depth = parseInt(headerMatch[1], 10);
+			const agentRole = headerMatch[2];
+			const model = headerMatch[3];
+			const yielded = /\*\*Yielded:\*\* yes/.test(comment);
+			const elapsedMatch = comment.match(/\((?:timeout after )?(\d+)s\)/);
+			const elapsedMs = elapsedMatch ? parseInt(elapsedMatch[1], 10) * 1000 : 0;
+			const blockersMatch = comment.match(/\*\*Blockers:\*\* (.+)/);
+			const attemptedMatch = comment.match(/\*\*Attempted:\*\* (.+)/);
+			const suggestionMatch = comment.match(/\*\*Suggestion:\*\* (.+)/);
+			const analystMatch = comment.match(/\*\*Analyst:\*\* (\w+)(?:\s*—\s*(.+))?/);
+			learnings.push({
+				timestamp: 0,
+				agentRole,
+				model,
+				depth,
+				elapsedMs,
+				yielded,
+				blockers: blockersMatch ? blockersMatch[1].split("; ") : [],
+				attempted: attemptedMatch ? attemptedMatch[1].split("; ") : [],
+				suggestion: suggestionMatch ? suggestionMatch[1] : "",
+				analystAction: analystMatch ? analystMatch[1] as any : undefined,
+				analystNotes: analystMatch?.[2] || undefined,
+			});
+		}
+		return learnings;
+	} catch { return []; }
+}
+
 // ── Checklist Parser ─────────────────────────────
 
 interface ParsedPhase {
@@ -2507,6 +2573,14 @@ export default function (pi: ExtensionAPI) {
 				let currentScore = failedTask.complianceScore;
 				const issues = taskScores.get(failedTask.id)?.issues || [];
 
+				// Seed learnings from GitHub issue comments (picks up from prior runs)
+				if (failedTask.issueNum && failedTask.learnings.length === 0) {
+					failedTask.learnings = readLearningsFromIssue(failedTask.issueNum, cwd);
+					if (failedTask.learnings.length > 0) {
+						log(`[FAST] ${failedTask.id}: loaded ${failedTask.learnings.length} prior learnings from issue #${failedTask.issueNum}`);
+					}
+				}
+
 				while (currentScore < COMPLIANCE_THRESHOLD && depth < MAX_SUBTASK_DEPTH) {
 					depth++;
 
@@ -2668,6 +2742,11 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
+					// Post learning to GitHub issue (after analyst has had chance to enrich it)
+					if (failedTask.issueNum) {
+						postLearningToIssue(failedTask.issueNum, learning, cwd);
+					}
+
 					// Commit whatever the agent managed to do (even if yielded)
 					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth}${fixResult.yielded ? " — yielded" : ""})"`, cwd);
 
@@ -2714,12 +2793,7 @@ export default function (pi: ExtensionAPI) {
 					const yieldCount = failedTask.learnings.filter(l => l.yielded).length;
 					log(`[FAST] ${failedTask.id} could not reach ${COMPLIANCE_THRESHOLD}% after ${MAX_SUBTASK_DEPTH} depths (final: ${currentScore}%, ${totalLearnings} attempts, ${yieldCount} yields)`);
 
-					// Persist learnings to a file for post-mortem analysis
-					try {
-						const learningsFile = join(logDir, `learnings-${failedTask.id}.json`);
-						writeFileSync(learningsFile, JSON.stringify(failedTask.learnings, null, 2));
-						log(`[FAST] Learnings saved to ${learningsFile}`);
-					} catch {}
+					// Learnings are persisted as GitHub issue comments (posted inline above)
 				}
 				updateWidget();
 			}
