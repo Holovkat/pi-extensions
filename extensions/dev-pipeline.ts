@@ -3724,11 +3724,8 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			let tuiRef: any = null;
-			let invalidating = false;
 			function safeInvalidate() {
-				if (invalidating || !tuiRef) return;
-				invalidating = true;
-				setTimeout(() => { invalidating = false; tuiRef?.invalidate(); }, 0);
+				tuiRef?.requestRender();
 			}
 
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
