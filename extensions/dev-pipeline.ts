@@ -4882,21 +4882,15 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!pipelineProcessAlive) {
-				// Stale state -- ask user
+				// Stale state — auto-clear since no pipeline process is alive
 				const staleAge = Date.now() - (existingState.ts || 0);
 				const staleMin = Math.round(staleAge / 60000);
-				const answer = await ctx.ui.select(
-					`Pipeline state shows "running" but no active pipeline process found (last updated ${staleMin}m ago). Likely a crashed session.`,
-					["Clear stale state and start fresh", "Enter observer mode anyway"],
+				existingState.running = false;
+				writeStateFile();
+				ctx.ui.notify(
+					`Stale pipeline state detected (last updated ${staleMin}m ago, no active process).\nAuto-cleared. You can run commands normally.`,
+					"warning",
 				);
-				if (answer === "Clear stale state and start fresh") {
-					existingState.running = false;
-					writeStateFile();
-					ctx.ui.notify("Stale pipeline state cleared. You can now run commands normally.", "success");
-					// Fall through to normal startup below
-				} else {
-					// Fall through to observer mode
-				}
 			}
 
 			if (existingState.running) {
