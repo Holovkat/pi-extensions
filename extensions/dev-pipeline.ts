@@ -44,7 +44,7 @@ import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth, SettingsList, SelectList, getEditorKeybindings } from "@mariozechner/pi-tui";
 import type { SettingItem, SettingsListTheme, SelectItem, SelectListTheme } from "@mariozechner/pi-tui";
 import { spawn, type ChildProcess } from "child_process";
-import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, createWriteStream } from "fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { homedir, tmpdir } from "os";
@@ -623,7 +623,8 @@ export default function (pi: ExtensionAPI) {
 		writeStateFile();
 	}
 
-	function logFile(key: string): string { return join(logDir, `${key}.log`); }
+	function logFile(key: string): string { return join(logDir, `${key}.jsonl`); }
+	function metaFile(key: string): string { return join(logDir, `${key}.meta.json`); }
 	function writeLog(key: string, text: string) {
 		if (!logDir) return;
 		try { appendFileSync(logFile(key), text); } catch {}
@@ -885,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (opts.ephemeral) {
-			args.push("--no-session");
+			args.push("--session", logFile(sessionKey));
 		} else if (opts.reuse) {
 			let sessionFile = agentSessions.get(agentDef.name);
 			if (!sessionFile) {
@@ -903,15 +904,11 @@ export default function (pi: ExtensionAPI) {
 		// Task is sent via RPC prompt command, not as a positional arg
 
 		const startTime = Date.now();
-		const currentLogFile = logFile(sessionKey);
-		activeLogFile = currentLogFile;
+		const sessionLogFile = logFile(sessionKey);
+		activeLogFile = sessionLogFile;
 		activeAgent = { name: agentDef.name, model: model.split("/").pop() || model, hint: task.slice(0, 120) };
-		activeAgents.set(sessionKey, { name: agentDef.name, model: model.split("/").pop() || model, hint: task.slice(0, 120), logFile: currentLogFile });
+		activeAgents.set(sessionKey, { name: agentDef.name, model: model.split("/").pop() || model, hint: task.slice(0, 120), logFile: sessionLogFile });
 		writeStateFile();
-
-		try {
-			writeFileSync(currentLogFile, `── ${agentDef.name} | ${sessionKey} | ${new Date().toISOString()} ──\n\n`);
-		} catch {}
 
 		const agentCwd = opts.worktreeCwd || cwd || undefined;
 
@@ -934,14 +931,14 @@ export default function (pi: ExtensionAPI) {
 
 			// Open a tail pane that filters JSON → readable text, auto-closes when done
 			const filterScript = join(logDir, "json-filter.py");
-			const tailCmd = `echo '── ${label.replace(/'/g, "\\'")} ──' && tail -f '${currentLogFile}' | '${filterScript}' &` +
+			const tailCmd = `echo '── ${label.replace(/'/g, "\\'")} ──' && tail -f '${sessionLogFile}' | '${filterScript}' &` +
 				` TAIL_PID=$! && while [ ! -f '${sentinelFile}' ]; do sleep 1; done && kill $TAIL_PID 2>/dev/null; sleep 2`;
 			const paneId = allocateTmuxPane(tailCmd, label);
 			if (paneId) agentPanes.set(sessionKey, paneId);
 
 			// Run agent headless, write sentinel on completion
 			return new Promise((resolve) => {
-				const headlessPromise = runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
+				const headlessPromise = runAgentHeadless(args, task, sessionKey, sessionLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
 				headlessPromise.then((result) => {
 					// Write sentinel to signal tail pane to close
 					try { writeFileSync(sentinelFile, String(result.exitCode)); } catch {}
@@ -962,14 +959,14 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ── Headless mode (no tmux or tmux disabled) ──
-		return runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
+		return runAgentHeadless(args, task, sessionKey, sessionLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
 	}
 
 	function runAgentHeadless(
 		args: string[],
 		task: string,
 		sessionKey: string,
-		currentLogFile: string,
+		sessionLogFile: string,
 		agentCwd: string | undefined,
 		startTime: number,
 		opts: { timeoutMs?: number; keepAlive?: boolean } = {},
@@ -999,7 +996,7 @@ export default function (pi: ExtensionAPI) {
 			const yieldResponseParts: string[] = [];
 			let warningTimer: ReturnType<typeof setTimeout> | null = null;
 			let hardTimer: ReturnType<typeof setTimeout> | null = null;
-			const logStream = existsSync(logDir) ? createWriteStream(currentLogFile, { flags: "a" }) : null;
+			const watchdogEvents: { ts: number; event: string }[] = [];
 
 			function cleanup() {
 				if (warningTimer) { clearTimeout(warningTimer); warningTimer = null; }
@@ -1020,7 +1017,7 @@ export default function (pi: ExtensionAPI) {
 					if (agentDone || yieldSteerSent) return;
 					yieldSteerSent = true;
 					collectingYieldResponse = true;
-					logStream?.write(`\n── WATCHDOG: ${Math.round(warnAt / 1000)}s elapsed, steering for yield summary ──\n`);
+					watchdogEvents.push({ ts: Date.now(), event: `yield-warning at ${Math.round(warnAt / 1000)}s` });
 					log(`[WATCHDOG] ${sessionKey}: timeout approaching (${Math.round(warnAt / 1000)}s), requesting yield summary`);
 					try {
 						proc.stdin!.write(JSON.stringify({
@@ -1045,7 +1042,7 @@ export default function (pi: ExtensionAPI) {
 				hardTimer = setTimeout(() => {
 					if (agentDone) return;
 					yielded = true;
-					logStream?.write(`\n── WATCHDOG: hard yield at ${Math.round(opts.timeoutMs! / 1000)}s ──\n`);
+					watchdogEvents.push({ ts: Date.now(), event: `hard-yield at ${Math.round(opts.timeoutMs! / 1000)}s` });
 					log(`[WATCHDOG] ${sessionKey}: hard yield at ${Math.round(opts.timeoutMs! / 1000)}s`);
 					try { proc.stdin!.write(JSON.stringify({ type: "abort" }) + "\n"); } catch {}
 					// Give 5s for graceful shutdown, then force kill
@@ -1058,7 +1055,6 @@ export default function (pi: ExtensionAPI) {
 
 			proc.stdout!.setEncoding("utf-8");
 			proc.stdout!.on("data", (chunk: string) => {
-				logStream?.write(chunk);
 				lineBuf += chunk;
 				const lines = lineBuf.split("\n");
 				lineBuf = lines.pop() || "";
@@ -1087,9 +1083,7 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", (chunk: string) => {
-				logStream?.write(chunk);
-			});
+			proc.stderr!.on("data", () => {});
 
 			proc.on("close", (code) => {
 				const elapsed = Date.now() - startTime;
@@ -1102,8 +1096,14 @@ export default function (pi: ExtensionAPI) {
 						}
 					} catch {}
 				}
-				logStream?.write(`\n── exit ${code} | ${Math.round(elapsed / 1000)}s${yielded ? " | YIELDED" : ""} ──\n`);
-				logStream?.end();
+				// Write metadata sidecar (watchdog events, exit info)
+				try {
+					writeFileSync(metaFile(sessionKey), JSON.stringify({
+						sessionKey, exitCode: code, elapsed, yielded,
+						yieldSummary: yieldSummary || undefined,
+						watchdog: watchdogEvents.length > 0 ? watchdogEvents : undefined,
+					}));
+				} catch {}
 				cleanup();
 
 				const output = textParts.join("") || `(no text output, exit code ${code})`;
@@ -1112,7 +1112,6 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			proc.on("error", (err) => {
-				logStream?.end();
 				cleanup();
 				resolve({
 					output: `Error: ${err.message}`,
@@ -3533,7 +3532,7 @@ export default function (pi: ExtensionAPI) {
 	function findLatestLog(agentName: string): string | null {
 		if (!logDir || !existsSync(logDir)) return null;
 		const logs = readdirSync(logDir)
-			.filter(f => f.includes(agentName) && f.endsWith(".log"))
+			.filter(f => f.includes(agentName) && (f.endsWith(".jsonl") || f.endsWith(".log")))
 			.sort();
 		return logs.length > 0 ? logs[logs.length - 1] : null;
 	}
@@ -3945,7 +3944,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const label = target.split("/").pop()?.replace(".log", "") || "agent";
+			const label = target.split("/").pop()?.replace(/\.(jsonl|log)$/, "") || "agent";
 			if (openTmuxTail(target, label, ctx)) {
 				ctx.ui.notify(`Watching: ${label}`, "success");
 			}
@@ -4901,7 +4900,7 @@ export default function (pi: ExtensionAPI) {
 			// Clean up pipeline logs and sessions
 			if (existsSync(logDir)) {
 				for (const f of readdirSync(logDir)) {
-					if (f.endsWith(".log")) {
+					if (f.endsWith(".jsonl") || f.endsWith(".meta.json") || f.endsWith(".log")) {
 						try { unlinkSync(join(logDir, f)); } catch {}
 					}
 				}

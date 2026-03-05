@@ -6,6 +6,7 @@ import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
+import { execSync as execSyncImport } from "node:child_process";
 
 const args = process.argv.slice(2);
 let projectDir = process.cwd();
@@ -248,37 +249,56 @@ const server = http.createServer((req, res) => {
 		req.on("close", () => steerLogClients.delete(res));
 		return;
 	}
-	// Sessions API — list log files
+	// Sessions API — list session files (.jsonl pi sessions + legacy .log)
 	if (req.url === "/api/sessions") {
 		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
 		const logDir = path.join(projectDir, ".pi", "pipeline-logs");
 		try {
-			const files = fs.readdirSync(logDir).filter(f => f.endsWith(".log")).sort();
-			const sessions = files.map(f => {
+			const files = fs.readdirSync(logDir).filter(f => f.endsWith(".jsonl") || f.endsWith(".log")).sort();
+			// Deduplicate: if both .jsonl and .log exist for same name, prefer .jsonl
+			const seen = new Set();
+			const deduped = [];
+			for (const f of files) {
+				const name = f.replace(/\.(jsonl|log)$/, "");
+				if (seen.has(name)) continue;
+				seen.add(name);
+				deduped.push(f);
+			}
+			const sessions = deduped.map(f => {
 				const stat = fs.statSync(path.join(logDir, f));
-				const name = f.replace(/\.log$/, "");
+				const name = f.replace(/\.(jsonl|log)$/, "");
+				const format = f.endsWith(".jsonl") ? "pi-session" : "legacy";
 				let model = "", startTs = "";
-				// Read first few lines for metadata
+				// Read metadata from first lines
 				try {
 					const fd = fs.openSync(path.join(logDir, f), "r");
 					const buf = Buffer.alloc(4096);
 					const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
 					fs.closeSync(fd);
 					const head = buf.slice(0, bytesRead).toString("utf-8");
-					const lines = head.split("\n");
-					for (const line of lines) {
+					for (const line of head.split("\n")) {
 						if (!line.startsWith("{")) continue;
 						try {
 							const j = JSON.parse(line);
 							if (j.type === "session") startTs = j.timestamp || "";
+							if (j.type === "model_change") model = j.modelId || "";
+							// Legacy RPC format
 							if (j.type === "message_start" && j.message?.role === "assistant") {
-								model = j.message.model || j.message.provider || "";
-								break;
+								model = model || j.message.model || "";
 							}
+							// Pi session format
+							if (j.type === "message" && j.message?.role === "assistant") {
+								model = model || j.message.model || "";
+							}
+							if (model && startTs) break;
 						} catch {}
 					}
 				} catch {}
-				return { name, file: f, size: stat.size, mtime: stat.mtimeMs, model, startTs };
+				// Check for meta sidecar
+				let meta = null;
+				const metaPath = path.join(logDir, name + ".meta.json");
+				try { if (fs.existsSync(metaPath)) meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")); } catch {}
+				return { name, file: f, format, size: stat.size, mtime: stat.mtimeMs, model, startTs, meta };
 			});
 			res.end(JSON.stringify({ sessions }));
 		} catch (e) {
@@ -286,29 +306,123 @@ const server = http.createServer((req, res) => {
 		}
 		return;
 	}
-	// Session detail API — parse log into chat events
+	// Export session as HTML via pi --export
+	if (req.url.startsWith("/api/export/")) {
+		const name = decodeURIComponent(req.url.slice("/api/export/".length));
+		const logDir = path.join(projectDir, ".pi", "pipeline-logs");
+		// Find the session file (.jsonl preferred)
+		let sessionPath = path.join(logDir, name + ".jsonl");
+		if (!fs.existsSync(sessionPath)) sessionPath = path.join(logDir, name + ".log");
+		if (!fs.existsSync(sessionPath)) {
+			res.writeHead(404, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: "not found" }));
+			return;
+		}
+		const tmpHtml = path.join(logDir, name + ".export.html");
+		try {
+			execSyncImport(`pi --export "${sessionPath}" "${tmpHtml}"`, { timeout: 15000, stdio: "ignore" });
+			const html = fs.readFileSync(tmpHtml, "utf-8");
+			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+			res.end(html);
+			try { fs.unlinkSync(tmpHtml); } catch {}
+		} catch (e) {
+			res.writeHead(500, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: "export failed: " + e.message }));
+		}
+		return;
+	}
+	// Session detail API — parse session into chat events
 	if (req.url.startsWith("/api/session/")) {
 		const name = decodeURIComponent(req.url.slice("/api/session/".length));
-		const logFile = path.join(projectDir, ".pi", "pipeline-logs", name + ".log");
+		const logDir = path.join(projectDir, ".pi", "pipeline-logs");
+		// Find session file (.jsonl preferred, fallback to .log)
+		let logFile = path.join(logDir, name + ".jsonl");
+		if (!fs.existsSync(logFile)) logFile = path.join(logDir, name + ".log");
 		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
 		if (!fs.existsSync(logFile)) { res.end(JSON.stringify({ error: "not found" })); return; }
+		// Load meta sidecar if exists
+		let meta = null;
+		try { const mp = path.join(logDir, name + ".meta.json"); if (fs.existsSync(mp)) meta = JSON.parse(fs.readFileSync(mp, "utf-8")); } catch {}
 		try {
 			const raw = fs.readFileSync(logFile, "utf-8");
 			const lines = raw.split("\n");
 
-			// Detect format: JSON-RPC (lines start with {) vs plain text
-			let isJsonRpc = false;
+			// Detect format: pi-session (.jsonl), legacy RPC, or plain text
+			let format = "plaintext"; // default
 			for (const line of lines) {
 				const trimmed = line.trim();
 				if (!trimmed || trimmed.startsWith("──")) continue;
-				if (trimmed.startsWith("{")) { isJsonRpc = true; }
+				if (trimmed.startsWith("{")) {
+					try {
+						const j = JSON.parse(trimmed);
+						// Pi session format has type:"session" then type:"message"
+						// RPC format has type:"session" then type:"agent_start" / type:"message_start"
+						if (j.type === "session") {
+							format = "detect-next"; continue;
+						}
+						if (j.type === "model_change" || j.type === "thinking_level_change") { format = "pi-session"; break; }
+						if (j.type === "message" && j.message) { format = "pi-session"; break; }
+						if (j.type === "agent_start" || j.type === "message_start") { format = "rpc"; break; }
+						format = "rpc"; // fallback for json
+					} catch { format = "rpc"; }
+				}
 				break;
 			}
+			if (format === "detect-next") format = "pi-session"; // session line only, assume pi format
 
 			const events = [];
 			let sessionMeta = null;
 
-			if (!isJsonRpc) {
+			if (format === "pi-session") {
+				// ── Pi native session format (.jsonl) ──
+				for (const line of lines) {
+					if (!line.trim() || !line.startsWith("{")) continue;
+					let j;
+					try { j = JSON.parse(line); } catch { continue; }
+
+					if (j.type === "session") {
+						sessionMeta = { id: j.id, cwd: j.cwd, timestamp: j.timestamp, version: j.version };
+						continue;
+					}
+					if (j.type === "model_change") {
+						// Track model for context
+						continue;
+					}
+					if (j.type === "message" && j.message) {
+						const msg = j.message;
+						if (msg.role === "user") {
+							let text = "";
+							for (const c of (msg.content || [])) {
+								if (c.type === "text") text += c.text;
+							}
+							if (text) events.push({ type: "user", text, timestamp: msg.timestamp || j.timestamp });
+						} else if (msg.role === "assistant") {
+							// Extract thinking + text + tool calls
+							for (const c of (msg.content || [])) {
+								if (c.type === "thinking" && c.thinking) {
+									events.push({ type: "thinking", text: c.thinking, model: msg.model });
+								}
+								if (c.type === "text" && c.text) {
+									events.push({ type: "assistant", text: c.text, model: msg.model, provider: msg.provider });
+								}
+								if (c.type === "toolCall") {
+									events.push({ type: "tool_start", toolName: c.name, toolCallId: c.id, args: typeof c.arguments === "string" ? JSON.parse(c.arguments || "{}") : (c.arguments || {}) });
+								}
+							}
+							if (msg.usage) {
+								events.push({ type: "usage", usage: msg.usage, model: msg.model, timestamp: msg.timestamp || j.timestamp });
+							}
+						} else if (msg.role === "toolResult") {
+							let resultText = "";
+							for (const c of (msg.content || [])) {
+								if (c.type === "text") resultText += c.text;
+							}
+							events.push({ type: "tool_end", toolName: msg.toolName, toolCallId: msg.toolCallId, result: resultText, isError: msg.isError });
+						}
+						continue;
+					}
+				}
+			} else if (format === "plaintext") {
 				// ── Plain text log parser ──
 				let headerParsed = false;
 				let currentText = "";
@@ -458,7 +572,7 @@ const server = http.createServer((req, res) => {
 				}
 				if (agentEndData) events.push(agentEndData);
 			}
-			res.end(JSON.stringify({ session: sessionMeta, events }));
+			res.end(JSON.stringify({ session: sessionMeta, events, meta, format, exportUrl: "/api/export/" + encodeURIComponent(name) }));
 		} catch (e) {
 			res.end(JSON.stringify({ error: e.message }));
 		}
@@ -1012,6 +1126,8 @@ var active=currentSession===s.name?' active':'';
 html+='<div class="session-item'+active+'" onclick="loadSession(\\''+esc(s.name)+'\\')"><div class="name">'+esc(s.name)+'</div><div class="meta">';
 html+='<span style="color:'+roleBadgeColor(role)+'">'+role+'</span>';
 if(s.model)html+='<span class="model-tag">'+esc(s.model)+'</span>';
+if(s.meta&&s.meta.elapsed)html+='<span>'+Math.round(s.meta.elapsed/1000)+'s</span>';
+if(s.meta&&s.meta.yielded)html+='<span style="color:var(--yellow)">Y</span>';
 html+='<span class="size-tag">'+formatSize(s.size)+'</span>';
 if(s.mtime)html+='<span>'+formatDate(s.mtime)+'</span>';
 html+='</div></div>';
@@ -1110,8 +1226,25 @@ var role=roleFromName(name);
 var html='<div class="chat-container">';
 html+='<div class="chat-header"><span class="session-title">'+esc(name)+'</span>';
 html+='<span class="badge" style="border-color:'+roleBadgeColor(role)+';color:'+roleBadgeColor(role)+'">'+role+'</span>';
+if(data.format)html+='<span class="badge">'+esc(data.format)+'</span>';
 if(data.session&&data.session.timestamp)html+='<span class="badge">'+formatDate(data.session.timestamp)+'</span>';
+if(data.meta){
+var m=data.meta;
+if(m.elapsed)html+='<span class="badge">'+Math.round(m.elapsed/1000)+'s</span>';
+if(m.yielded)html+='<span class="badge" style="border-color:var(--yellow);color:var(--yellow)">YIELDED</span>';
+if(m.exitCode!==undefined&&m.exitCode!==0)html+='<span class="badge" style="border-color:var(--destructive);color:var(--destructive)">exit '+m.exitCode+'</span>';
+}
+if(data.exportUrl)html+='<a href="'+esc(data.exportUrl)+'" target="_blank" class="badge" style="border-color:var(--primary);color:var(--primary);cursor:pointer;text-decoration:none">Export HTML</a>';
 html+='</div>';
+if(data.meta&&data.meta.watchdog&&data.meta.watchdog.length>0){
+html+='<div style="padding:8px 12px;margin-bottom:12px;background:var(--muted);border:1px solid var(--border);border-radius:var(--radius);font-size:.72rem">';
+html+='<strong style="color:var(--yellow)">Watchdog Events:</strong> ';
+for(var w=0;w<data.meta.watchdog.length;w++){
+html+=esc(data.meta.watchdog[w].event);
+if(w<data.meta.watchdog.length-1)html+=', ';
+}
+html+='</div>';
+}
 
 for(var i=0;i<events.length;i++){
 var ev=events[i];
