@@ -2,7 +2,7 @@
 // Pipeline Dashboard — Web Server with WebSocket live updates
 // Usage: pipeline-dashboard-web [project-dir] [--port PORT]
 
-import http from "node:http";
+import net from "node:net";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -88,45 +88,89 @@ setInterval(() => {
 	} catch {}
 }, 500);
 
-// ── HTTP Server ──
-const server = http.createServer((req, res) => {
-	if (req.url === "/api/state") {
-		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-		const state = readState();
-		res.end(state ? JSON.stringify(state) : "null");
-		return;
-	}
-	if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === "websocket") return;
-	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-	res.end(HTML);
-});
+// ── HTTP / WebSocket Server ──
+// Use a raw net.Server so upgrade requests never touch Node's HTTP
+// response machinery (which can leak headers and corrupt the handshake).
+const server = net.createServer();
 
-server.on("upgrade", (req, socket) => {
-	if (req.url !== "/ws") { socket.destroy(); return; }
-	const key = req.headers["sec-websocket-key"];
-	const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-5AB9CF11F85B").digest("base64");
-	socket.write(
-		"HTTP/1.1 101 Switching Protocols\r\n" +
-		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
-		`Sec-WebSocket-Accept: ${accept}\r\n\r\n`
-	);
-	wsClients.add(socket);
-	// Send initial state
-	const state = readState();
-	if (state) wsSend(socket, JSON.stringify(state));
+server.on("connection", (socket) => {
+	let headBuf = Buffer.alloc(0);
+	let upgraded = false;
 
-	socket.on("data", (buf) => {
-		const frame = wsParseFrame(buf);
-		if (!frame) return;
-		if (frame.opcode === 0x08) { wsClients.delete(socket); socket.end(); }
-		if (frame.opcode === 0x09) { // ping
-			const pong = Buffer.alloc(2); pong[0] = 0x8a; pong[1] = 0;
-			socket.write(pong);
+	const onData = (chunk) => {
+		if (upgraded) return;
+		headBuf = Buffer.concat([headBuf, chunk]);
+		const headStr = headBuf.toString();
+		const endIdx = headStr.indexOf("\r\n\r\n");
+		if (endIdx === -1) return; // headers not complete yet
+
+		socket.removeListener("data", onData);
+		const headerBlock = headStr.substring(0, endIdx);
+		const lines = headerBlock.split("\r\n");
+		const requestLine = lines[0]; // e.g. "GET /ws HTTP/1.1"
+		const headers = {};
+		for (let i = 1; i < lines.length; i++) {
+			const col = lines[i].indexOf(":");
+			if (col > 0) headers[lines[i].substring(0, col).toLowerCase().trim()] = lines[i].substring(col + 1).trim();
 		}
-	});
-	socket.on("close", () => wsClients.delete(socket));
-	socket.on("error", () => wsClients.delete(socket));
+		const [method, url] = requestLine.split(" ");
+		const body = headBuf.slice(endIdx + 4); // leftover after headers
+
+		// ── WebSocket upgrade ──
+		if (headers["upgrade"] && headers["upgrade"].toLowerCase() === "websocket" && url === "/ws") {
+			upgraded = true;
+			const key = headers["sec-websocket-key"];
+			const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-5AB9CF11F85B").digest("base64");
+			socket.write(
+				"HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
+			);
+			wsClients.add(socket);
+			const st = readState();
+			if (st) wsSend(socket, JSON.stringify(st));
+
+			socket.on("data", (buf) => {
+				const frame = wsParseFrame(buf);
+				if (!frame) return;
+				if (frame.opcode === 0x08) { wsClients.delete(socket); socket.end(); }
+				if (frame.opcode === 0x09) {
+					const pong = Buffer.alloc(2); pong[0] = 0x8a; pong[1] = 0;
+					socket.write(pong);
+				}
+			});
+			socket.on("close", () => wsClients.delete(socket));
+			socket.on("error", () => wsClients.delete(socket));
+			return;
+		}
+
+		// ── Normal HTTP ──
+		if (url === "/api/state") {
+			const st = readState();
+			const json = st ? JSON.stringify(st) : "null";
+			socket.end(
+				"HTTP/1.1 200 OK\r\n" +
+				"Content-Type: application/json\r\n" +
+				"Access-Control-Allow-Origin: *\r\n" +
+				"Content-Length: " + Buffer.byteLength(json) + "\r\n" +
+				"Connection: close\r\n\r\n" + json
+			);
+			return;
+		}
+
+		// Serve dashboard HTML
+		const htmlBuf = Buffer.from(HTML);
+		socket.end(
+			"HTTP/1.1 200 OK\r\n" +
+			"Content-Type: text/html; charset=utf-8\r\n" +
+			"Content-Length: " + htmlBuf.length + "\r\n" +
+			"Connection: close\r\n\r\n" + HTML
+		);
+	};
+
+	socket.on("data", onData);
+	socket.on("error", () => {});
 });
 
 server.listen(port, () => {
