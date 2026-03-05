@@ -3723,6 +3723,8 @@ export default function (pi: ExtensionAPI) {
 				{ id: "mw.orchestrator", label: "Orchestrator", description: "Reviews pedantic deductions, overrides scores", key: "orchestrator" },
 			];
 
+			let tuiInvalidate: (() => void) | null = null;
+
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
 				const listTheme: SelectListTheme = {
 					selectedPrefix: (t: string) => ctx.ui.theme.fg("accent", t),
@@ -3828,7 +3830,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const wrapper: any = {
-					invalidate() { list.invalidate(); },
+					invalidate() { if (tuiInvalidate) tuiInvalidate(); },
 					render: normalRender,
 					handleInput: normalInput,
 				};
@@ -3958,6 +3960,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+				tuiInvalidate = () => tui.invalidate();
 				const settingsTheme: SettingsListTheme = {
 					label: (text: string, selected: boolean) => selected ? theme.fg("accent", theme.bold(text)) : text,
 					value: (text: string, selected: boolean) => selected ? theme.fg("success", text) : theme.fg("dim", text),
@@ -3998,8 +4001,8 @@ export default function (pi: ExtensionAPI) {
 				const origHandleInput = settingsList.handleInput.bind(settingsList);
 
 				const component = {
-					dispose() {},
-					invalidate() { settingsList.invalidate(); },
+					dispose() { tuiInvalidate = null; },
+					invalidate() { tui.invalidate(); },
 					render(width: number): string[] {
 						const border = theme.fg("dim", "─".repeat(width));
 						const lines: string[] = [];
