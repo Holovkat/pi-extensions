@@ -2517,7 +2517,9 @@ export default function (pi: ExtensionAPI) {
 
 		if (evalJson?.tasks) {
 			for (const t of evalJson.tasks) {
-				taskScores.set(t.id, { score: t.score || 0, issues: t.issues || [], summary: t.summary || "" });
+				const rawIssues: any[] = t.issues || [];
+				const strIssues = rawIssues.map((iss: any) => typeof iss === "string" ? iss : (iss.text || iss.description || iss.issue || JSON.stringify(iss)));
+				taskScores.set(t.id, { score: t.score || 0, issues: strIssues, summary: t.summary || "" });
 			}
 		}
 
@@ -2642,6 +2644,23 @@ export default function (pi: ExtensionAPI) {
 						ephemeral: true, model: fixModelForDepth, thinking: fixThinkingForDepth,
 						timeoutMs,
 					});
+
+					// Detect API errors (rate limit, auth failure) — don't count as a real attempt
+					const noRealWork = fixResult.elapsed < 30000 && (
+						fixResult.output.includes("usage limit") ||
+						fixResult.output.includes("rate limit") ||
+						fixResult.output.includes("Rate limit") ||
+						fixResult.output.includes("No API key") ||
+						fixResult.output.startsWith("(no text output") ||
+						fixResult.output.startsWith("Error:")
+					);
+					if (noRealWork) {
+						depth--; // Don't waste this depth slot
+						const waitSec = fixResult.output.includes("usage limit") || fixResult.output.includes("rate limit") ? 120 : 30;
+						log(`[FAST] ${failedTask.id} depth ${depth + 1}: API error, waiting ${waitSec}s before retry (${fixResult.output.slice(0, 100).replace(/\n/g, " ").trim()})`);
+						await new Promise(r => setTimeout(r, waitSec * 1000));
+						continue;
+					}
 
 					// Record learning from this attempt
 					const learning: AgentLearning = {
@@ -2775,7 +2794,10 @@ export default function (pi: ExtensionAPI) {
 					if (reEvalJson) {
 						currentScore = reEvalJson.score || currentScore;
 						failedTask.complianceScore = currentScore;
-						if (reEvalJson.issues) issues.length = 0, issues.push(...reEvalJson.issues);
+						if (reEvalJson.issues) {
+							issues.length = 0;
+							issues.push(...reEvalJson.issues.map((iss: any) => typeof iss === "string" ? iss : (iss.text || iss.description || iss.issue || JSON.stringify(iss))));
+						}
 					}
 
 					failedTask.attempts = depth + 1;
