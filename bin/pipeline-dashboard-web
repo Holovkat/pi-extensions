@@ -248,6 +248,161 @@ const server = http.createServer((req, res) => {
 		req.on("close", () => steerLogClients.delete(res));
 		return;
 	}
+	// Sessions API — list log files
+	if (req.url === "/api/sessions") {
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+		const logDir = path.join(projectDir, ".pi", "pipeline-logs");
+		try {
+			const files = fs.readdirSync(logDir).filter(f => f.endsWith(".log")).sort();
+			const sessions = files.map(f => {
+				const stat = fs.statSync(path.join(logDir, f));
+				const name = f.replace(/\.log$/, "");
+				let model = "", startTs = "";
+				// Read first few lines for metadata
+				try {
+					const fd = fs.openSync(path.join(logDir, f), "r");
+					const buf = Buffer.alloc(4096);
+					const bytesRead = fs.readSync(fd, buf, 0, 4096, 0);
+					fs.closeSync(fd);
+					const head = buf.slice(0, bytesRead).toString("utf-8");
+					const lines = head.split("\n");
+					for (const line of lines) {
+						if (!line.startsWith("{")) continue;
+						try {
+							const j = JSON.parse(line);
+							if (j.type === "session") startTs = j.timestamp || "";
+							if (j.type === "message_start" && j.message?.role === "assistant") {
+								model = j.message.model || j.message.provider || "";
+								break;
+							}
+						} catch {}
+					}
+				} catch {}
+				return { name, file: f, size: stat.size, mtime: stat.mtimeMs, model, startTs };
+			});
+			res.end(JSON.stringify({ sessions }));
+		} catch (e) {
+			res.end(JSON.stringify({ sessions: [], error: e.message }));
+		}
+		return;
+	}
+	// Session detail API — parse log into chat events
+	if (req.url.startsWith("/api/session/")) {
+		const name = decodeURIComponent(req.url.slice("/api/session/".length));
+		const logFile = path.join(projectDir, ".pi", "pipeline-logs", name + ".log");
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+		if (!fs.existsSync(logFile)) { res.end(JSON.stringify({ error: "not found" })); return; }
+		try {
+			const raw = fs.readFileSync(logFile, "utf-8");
+			const lines = raw.split("\n");
+			const events = [];
+			let sessionMeta = null;
+			let currentThinking = "";
+			let currentText = "";
+			let currentModel = "";
+			let currentProvider = "";
+			let turnMessages = [];
+			let agentEndData = null;
+
+			for (const line of lines) {
+				if (!line.startsWith("{")) {
+					// Header line (e.g. "── dev | fast-fix-1.5-d1 | 2026-03-05T06:12:10.249Z ──")
+					if (line.includes("|")) {
+						const parts = line.replace(/[─ ]/g, " ").trim().split("|").map(s => s.trim());
+						if (parts.length >= 3) {
+							events.push({ type: "header", role: parts[0], session: parts[1], timestamp: parts[2] });
+						}
+					}
+					continue;
+				}
+				let j;
+				try { j = JSON.parse(line); } catch { continue; }
+
+				if (j.type === "session") {
+					sessionMeta = { id: j.id, cwd: j.cwd, timestamp: j.timestamp, version: j.version };
+					continue;
+				}
+				if (j.type === "message_start") {
+					const msg = j.message;
+					if (msg?.role === "user" && msg.content?.[0]?.text) {
+						events.push({ type: "user", text: msg.content[0].text, timestamp: msg.timestamp });
+					}
+					if (msg?.role === "assistant") {
+						currentModel = msg.model || "";
+						currentProvider = msg.provider || "";
+						currentThinking = "";
+						currentText = "";
+					}
+					continue;
+				}
+				if (j.type === "message_update") {
+					const ev = j.assistantMessageEvent;
+					if (!ev) continue;
+					if (ev.type === "thinking_delta") {
+						currentThinking += ev.delta || "";
+					} else if (ev.type === "text_delta") {
+						currentText += ev.delta || "";
+					} else if (ev.type === "thinking_end") {
+						if (currentThinking) {
+							events.push({ type: "thinking", text: currentThinking, model: currentModel });
+							currentThinking = "";
+						}
+					} else if (ev.type === "text_end") {
+						if (currentText) {
+							events.push({ type: "assistant", text: currentText, model: currentModel, provider: currentProvider });
+							currentText = "";
+						}
+					} else if (ev.type === "toolcall_start") {
+						// Will be followed by tool_execution_start
+					}
+					continue;
+				}
+				if (j.type === "tool_execution_start") {
+					events.push({ type: "tool_start", toolName: j.toolName, toolCallId: j.toolCallId, args: j.args });
+					continue;
+				}
+				if (j.type === "tool_execution_end") {
+					let resultText = "";
+					if (j.result?.content?.[0]?.text) resultText = j.result.content[0].text;
+					events.push({ type: "tool_end", toolName: j.toolName, toolCallId: j.toolCallId, result: resultText, isError: j.isError });
+					continue;
+				}
+				if (j.type === "message_end") {
+					// Flush any remaining text
+					if (currentThinking) {
+						events.push({ type: "thinking", text: currentThinking, model: currentModel });
+						currentThinking = "";
+					}
+					if (currentText) {
+						events.push({ type: "assistant", text: currentText, model: currentModel, provider: currentProvider });
+						currentText = "";
+					}
+					// Extract usage from message_end
+					const msg = j.message;
+					if (msg?.role === "assistant" && msg.usage) {
+						events.push({ type: "usage", usage: msg.usage, model: msg.model, timestamp: msg.timestamp });
+					}
+					continue;
+				}
+				if (j.type === "agent_end") {
+					const lastMsg = j.messages?.[j.messages.length - 1];
+					agentEndData = {
+						type: "agent_end",
+						usage: lastMsg?.usage,
+						model: lastMsg?.model,
+						stopReason: lastMsg?.stopReason,
+						timestamp: lastMsg?.timestamp,
+					};
+					continue;
+				}
+			}
+			if (agentEndData) events.push(agentEndData);
+			res.end(JSON.stringify({ session: sessionMeta, events }));
+		} catch (e) {
+			res.end(JSON.stringify({ error: e.message }));
+		}
+		return;
+	}
 	// Pages
 	if (req.url === "/dashboard") {
 		res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -259,6 +414,11 @@ const server = http.createServer((req, res) => {
 		res.end(STEER_HTML);
 		return;
 	}
+	if (req.url === "/sessions" || req.url.startsWith("/sessions?")) {
+		res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+		res.end(SESSIONS_HTML);
+		return;
+	}
 	// Home
 	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 	res.end(HOME_HTML);
@@ -268,6 +428,7 @@ server.listen(port, () => {
 	console.log(`Pipeline Control Center: http://localhost:${port}`);
 	console.log(`  Dashboard: http://localhost:${port}/dashboard`);
 	console.log(`  Steer:     http://localhost:${port}/steer`);
+	console.log(`  Sessions:  http://localhost:${port}/sessions`);
 	console.log(`  Control:   tcp://localhost:${controlPort}`);
 	console.log(`  Watching:  ${stateFile}`);
 	console.log(`  Press Ctrl+C to stop\n`);
@@ -360,6 +521,7 @@ const HOME_HTML = `<!DOCTYPE html><html lang="en"><head>
 <a href="/" class="nav-link active">Home</a>
 <a href="/dashboard" class="nav-link">Dashboard</a>
 <a href="/steer" class="nav-link">Steer</a>
+<a href="/sessions" class="nav-link">Sessions</a>
 </div>
 <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
 </nav>
@@ -373,6 +535,11 @@ const HOME_HTML = `<!DOCTYPE html><html lang="en"><head>
 <div class="card-icon">&#9654;</div>
 <h2>Agent Steering</h2>
 <p>Send steer, follow-up, or abort commands to running agents. Inject instructions mid-execution via the control socket.</p>
+</a>
+<a href="/sessions" class="home-card">
+<div class="card-icon">&#9776;</div>
+<h2>Sessions</h2>
+<p>Browse completed agent sessions. Chat-style log viewer with syntax-highlighted code blocks, tool calls, thinking, and timestamps.</p>
 </a>
 </div>
 <div class="home-status" id="status">Loading...</div>
@@ -441,6 +608,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html><html lang="en"><head>
 <a href="/" class="nav-link">Home</a>
 <a href="/dashboard" class="nav-link active">Dashboard</a>
 <a href="/steer" class="nav-link">Steer</a>
+<a href="/sessions" class="nav-link">Sessions</a>
 </div>
 <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
 </nav>
@@ -522,6 +690,7 @@ const STEER_HTML = `<!DOCTYPE html><html lang="en"><head>
 <a href="/" class="nav-link">Home</a>
 <a href="/dashboard" class="nav-link">Dashboard</a>
 <a href="/steer" class="nav-link active">Steer</a>
+<a href="/sessions" class="nav-link">Sessions</a>
 </div>
 <button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
 </nav>
@@ -598,4 +767,367 @@ function esc(s){if(!s)return '';var d=document.createElement('div');d.textConten
 refreshAgents();
 setInterval(refreshAgents,3000);
 document.getElementById('steer-msg').addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();sendCmd('steer')}});
+</script></body></html>`;
+
+// ── SESSIONS PAGE ──
+const SESSIONS_HTML = `<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sessions - Pipeline</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/javascript.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/typescript.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/bash.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/json.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/xml.min.js"><\/script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/css.min.js"><\/script>
+<style>${THEME_CSS}
+
+/* Sessions layout */
+.sessions-layout{display:grid;grid-template-columns:320px 1fr;gap:0;margin-top:0;height:calc(100vh - 70px)}
+@media(max-width:900px){.sessions-layout{grid-template-columns:1fr;height:auto}}
+.session-sidebar{border-right:1px solid var(--border);overflow-y:auto;padding:12px 0}
+.session-main{overflow-y:auto;padding:0}
+
+/* Session list */
+.session-filter{padding:8px 12px;position:sticky;top:0;background:var(--background);z-index:1;border-bottom:1px solid var(--border)}
+.session-filter input{width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius);background:var(--card);color:var(--foreground);font-size:.78rem;font-family:inherit}
+.session-filter input:focus{outline:none;border-color:var(--ring)}
+.session-item{padding:10px 14px;cursor:pointer;border-bottom:1px solid var(--border);transition:background .15s;font-size:.78rem}
+.session-item:hover{background:var(--accent)}
+.session-item.active{background:var(--accent);border-left:3px solid var(--primary)}
+.session-item .name{font-weight:600;color:var(--primary);margin-bottom:2px}
+.session-item .meta{color:var(--muted-foreground);font-size:.68rem;display:flex;gap:8px;flex-wrap:wrap}
+.session-item .meta .model-tag{background:var(--muted);padding:1px 5px;border-radius:3px}
+.session-item .meta .size-tag{color:var(--muted-foreground)}
+
+/* Chat view */
+.chat-container{max-width:900px;margin:0 auto;padding:20px 24px}
+.chat-header{padding:14px 0;border-bottom:1px solid var(--border);margin-bottom:16px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.chat-header .session-title{font-size:1rem;font-weight:700;color:var(--primary)}
+.chat-header .badge{font-size:.68rem}
+.chat-empty{text-align:center;padding:80px 20px;color:var(--muted-foreground);font-size:.9rem}
+
+/* Chat bubbles */
+.chat-msg{margin-bottom:16px;display:flex;gap:10px}
+.chat-msg.user-msg{flex-direction:row}
+.chat-msg.assistant-msg{flex-direction:row}
+
+.chat-avatar{width:28px;height:28px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.7rem;font-weight:700;margin-top:4px}
+.chat-msg.user-msg .chat-avatar{background:var(--primary);color:var(--primary-foreground)}
+.chat-msg.assistant-msg .chat-avatar{background:var(--accent);color:var(--accent-foreground);border:1px solid var(--border)}
+
+.chat-bubble{flex:1;min-width:0}
+.chat-bubble .sender{font-size:.68rem;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:6px}
+.chat-msg.user-msg .sender{color:var(--primary)}
+.chat-msg.assistant-msg .sender{color:var(--accent-foreground)}
+.chat-bubble .timestamp{font-size:.62rem;color:var(--muted-foreground);font-weight:400}
+.chat-bubble .content{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px 14px;font-size:.82rem;line-height:1.65;overflow-x:auto}
+.chat-msg.user-msg .content{border-left:3px solid var(--primary)}
+.chat-msg.assistant-msg .content{border-left:3px solid var(--accent-foreground)}
+
+/* Markdown inside chat */
+.content h1,.content h2,.content h3{margin:12px 0 6px;color:var(--primary);font-weight:700}
+.content h1{font-size:1.05rem}.content h2{font-size:.95rem}.content h3{font-size:.88rem}
+.content p{margin:6px 0}
+.content ul,.content ol{margin:6px 0;padding-left:20px}
+.content li{margin:3px 0}
+.content code:not(pre code){background:var(--muted);padding:1px 5px;border-radius:3px;font-size:.78rem;font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace}
+.content pre{margin:8px 0;border-radius:var(--radius);overflow-x:auto;background:oklch(0.18 0.003 106) !important;border:1px solid var(--border)}
+.content pre code{display:block;padding:12px 14px;font-size:.76rem;line-height:1.5;font-family:ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace;background:transparent !important}
+.content strong{font-weight:700;color:var(--foreground)}
+.content em{font-style:italic}
+.content hr{border:none;border-top:1px solid var(--border);margin:12px 0}
+.content blockquote{border-left:3px solid var(--primary);padding-left:12px;margin:8px 0;color:var(--muted-foreground);font-style:italic}
+.content a{color:var(--primary)}
+.content table{border-collapse:collapse;margin:8px 0;width:100%}
+.content th,.content td{border:1px solid var(--border);padding:5px 8px;font-size:.76rem;text-align:left}
+.content th{background:var(--muted);font-weight:600}
+
+/* Thinking block */
+.thinking-block{margin:8px 0}
+.thinking-toggle{display:flex;align-items:center;gap:6px;cursor:pointer;padding:6px 10px;background:var(--muted);border-radius:var(--radius);font-size:.72rem;color:var(--muted-foreground);border:1px solid var(--border);font-family:inherit;width:100%;text-align:left;transition:background .15s}
+.thinking-toggle:hover{background:var(--accent)}
+.thinking-toggle .arrow{transition:transform .2s;display:inline-block}
+.thinking-toggle.open .arrow{transform:rotate(90deg)}
+.thinking-content{display:none;padding:10px 12px;background:oklch(0.18 0.003 106);border:1px solid var(--border);border-top:none;border-radius:0 0 var(--radius) var(--radius);font-size:.74rem;line-height:1.5;color:var(--muted-foreground);font-family:ui-monospace,monospace;white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto}
+.thinking-content.open{display:block}
+
+/* Tool call block */
+.tool-block{margin:8px 0;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.tool-header{display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--muted);cursor:pointer;font-size:.72rem;font-family:inherit;width:100%;text-align:left;border:none;color:var(--foreground);transition:background .15s}
+.tool-header:hover{background:var(--accent)}
+.tool-header .arrow{transition:transform .2s;display:inline-block}
+.tool-header.open .arrow{transform:rotate(90deg)}
+.tool-header .tool-name{font-weight:700;color:var(--cyan)}
+.tool-header .tool-args{color:var(--muted-foreground);font-family:ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:500px}
+.tool-header .tool-status{margin-left:auto;flex-shrink:0}
+.tool-header .tool-status.ok{color:var(--green)}
+.tool-header .tool-status.err{color:var(--destructive)}
+.tool-body{display:none;border-top:1px solid var(--border)}
+.tool-body.open{display:block}
+.tool-body pre{margin:0;border:none;border-radius:0}
+.tool-body pre code{font-size:.72rem;max-height:350px;overflow-y:auto}
+
+/* Agent end / usage */
+.agent-end-block{margin:16px 0;padding:12px 14px;background:var(--muted);border:1px solid var(--border);border-radius:var(--radius);font-size:.74rem;color:var(--muted-foreground);display:flex;gap:16px;flex-wrap:wrap;align-items:center}
+.agent-end-block .label{font-weight:600;color:var(--foreground)}
+.agent-end-block .stat{display:flex;gap:4px;align-items:center}
+
+/* Usage inline */
+.usage-block{font-size:.66rem;color:var(--muted-foreground);padding:4px 0;text-align:right}
+
+</style></head>
+<body class="dark"><div class="container" style="padding:0 0 0 0;max-width:100%">
+<nav class="nav" style="padding:16px 20px">
+<span class="nav-brand">PIPELINE CONTROL CENTER</span>
+<div class="nav-links">
+<a href="/" class="nav-link">Home</a>
+<a href="/dashboard" class="nav-link">Dashboard</a>
+<a href="/steer" class="nav-link">Steer</a>
+<a href="/sessions" class="nav-link active">Sessions</a>
+</div>
+<button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
+</nav>
+<div class="sessions-layout">
+<div class="session-sidebar">
+<div class="session-filter"><input type="text" id="filter" placeholder="Filter sessions..." oninput="filterSessions()"></div>
+<div id="session-list"></div>
+</div>
+<div class="session-main" id="session-main">
+<div class="chat-empty">Select a session from the sidebar to view the conversation</div>
+</div>
+</div>
+</div>
+<script>${THEME_JS}
+var allSessions=[];
+var currentSession=null;
+
+function formatSize(b){if(b<1024)return b+'B';if(b<1048576)return (b/1024).toFixed(1)+'KB';return (b/1048576).toFixed(1)+'MB'}
+function formatTime(ts){if(!ts)return '';try{var d=new Date(ts);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}catch(e){return ''}}
+function formatDate(ts){if(!ts)return '';try{var d=new Date(ts);return d.toLocaleDateString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}catch(e){return ''}}
+
+function roleFromName(n){
+if(n.startsWith('fast-build'))return 'build';
+if(n.startsWith('fast-eval'))return 'eval';
+if(n.startsWith('fast-fix'))return 'fix';
+if(n.startsWith('fast-reeval'))return 'reeval';
+if(n.startsWith('fast-analyst'))return 'analyst';
+if(n.startsWith('fast-uat'))return 'uat';
+return 'agent';
+}
+function roleBadgeColor(r){
+switch(r){case 'build':return 'var(--primary)';case 'eval':return 'var(--cyan)';case 'fix':return 'var(--yellow)';case 'reeval':return 'var(--cyan)';case 'analyst':return 'oklch(0.7 0.15 310)';case 'uat':return 'var(--green)';default:return 'var(--muted-foreground)'}
+}
+
+function loadSessions(){
+fetch('/api/sessions').then(function(r){return r.json()}).then(function(d){
+allSessions=d.sessions||[];
+allSessions.reverse();
+renderSessionList(allSessions);
+// Auto-select from URL hash
+var hash=window.location.hash.slice(1);
+if(hash){
+var found=allSessions.find(function(s){return s.name===hash});
+if(found)loadSession(found.name);
+}
+})}
+
+function filterSessions(){
+var q=document.getElementById('filter').value.toLowerCase();
+var filtered=allSessions.filter(function(s){return s.name.toLowerCase().includes(q)||s.model.toLowerCase().includes(q)});
+renderSessionList(filtered);
+}
+
+function renderSessionList(sessions){
+var el=document.getElementById('session-list');
+if(sessions.length===0){el.innerHTML='<div style="padding:20px;text-align:center;color:var(--muted-foreground);font-size:.8rem">No sessions found</div>';return}
+var html='';
+for(var i=0;i<sessions.length;i++){
+var s=sessions[i];
+var role=roleFromName(s.name);
+var active=currentSession===s.name?' active':'';
+html+='<div class="session-item'+active+'" onclick="loadSession(\\''+esc(s.name)+'\\')"><div class="name">'+esc(s.name)+'</div><div class="meta">';
+html+='<span style="color:'+roleBadgeColor(role)+'">'+role+'</span>';
+if(s.model)html+='<span class="model-tag">'+esc(s.model)+'</span>';
+html+='<span class="size-tag">'+formatSize(s.size)+'</span>';
+if(s.mtime)html+='<span>'+formatDate(s.mtime)+'</span>';
+html+='</div></div>';
+}
+el.innerHTML=html;
+}
+
+function loadSession(name){
+currentSession=name;
+window.location.hash=name;
+renderSessionList(allSessions.filter(function(s){
+var q=document.getElementById('filter').value.toLowerCase();
+return !q||s.name.toLowerCase().includes(q)||s.model.toLowerCase().includes(q);
+}));
+var main=document.getElementById('session-main');
+main.innerHTML='<div class="chat-empty">Loading '+esc(name)+'...</div>';
+fetch('/api/session/'+encodeURIComponent(name)).then(function(r){return r.json()}).then(function(d){
+if(d.error){main.innerHTML='<div class="chat-empty">Error: '+esc(d.error)+'</div>';return}
+renderChat(d,name);
+}).catch(function(e){main.innerHTML='<div class="chat-empty">Error: '+esc(e.message)+'</div>'});
+}
+
+function renderMarkdown(text){
+if(!text)return '';
+var s=esc(text);
+// Code blocks with language
+s=s.replace(/\`\`\`(\\w*)?\\n([\\s\\S]*?)\`\`\`/g,function(m,lang,code){
+var id='cb'+Math.random().toString(36).slice(2,8);
+return '<pre><code id="'+id+'" class="language-'+(lang||'plaintext')+'">'+code.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')+'</code></pre>';
+});
+// Inline code
+s=s.replace(/\`([^\`]+)\`/g,'<code>$1</code>');
+// Headers
+s=s.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+s=s.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+s=s.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+// Bold
+s=s.replace(/\\*\\*(.+?)\\*\\*/g,'<strong>$1</strong>');
+// Italic
+s=s.replace(/\\*(.+?)\\*/g,'<em>$1</em>');
+// Horizontal rule
+s=s.replace(/^---$/gm,'<hr>');
+// Blockquote
+s=s.replace(/^&gt; (.+)$/gm,'<blockquote>$1</blockquote>');
+// Unordered list items
+s=s.replace(/^[\\-\\*] (.+)$/gm,'<li>$1</li>');
+// Ordered list items
+s=s.replace(/^\\d+\\. (.+)$/gm,'<li>$1</li>');
+// Wrap consecutive <li> in <ul>
+s=s.replace(/(<li>.*?<\\/li>\\n?)+/g,'<ul>$&</ul>');
+// Line breaks for remaining lines (but not inside pre/code)
+s=s.replace(/\\n/g,'<br>');
+// Clean up extra <br> after block elements
+s=s.replace(/<\\/(h[123]|pre|ul|ol|blockquote|hr)><br>/g,'</$1>');
+s=s.replace(/<br><(h[123]|pre|ul|ol|blockquote)/g,'<$1');
+return s;
+}
+
+var toggleCounter=0;
+function renderChat(data,name){
+var main=document.getElementById('session-main');
+var events=data.events||[];
+var role=roleFromName(name);
+var html='<div class="chat-container">';
+html+='<div class="chat-header"><span class="session-title">'+esc(name)+'</span>';
+html+='<span class="badge" style="border-color:'+roleBadgeColor(role)+';color:'+roleBadgeColor(role)+'">'+role+'</span>';
+if(data.session&&data.session.timestamp)html+='<span class="badge">'+formatDate(data.session.timestamp)+'</span>';
+html+='</div>';
+
+for(var i=0;i<events.length;i++){
+var ev=events[i];
+
+if(ev.type==='header'){
+html+='<div style="padding:8px 0;font-size:.72rem;color:var(--muted-foreground);font-family:monospace">'+esc(ev.role)+' | '+esc(ev.session)+' | '+esc(ev.timestamp)+'</div>';
+continue;
+}
+
+if(ev.type==='user'){
+html+='<div class="chat-msg user-msg"><div class="chat-avatar">U</div><div class="chat-bubble"><div class="sender">User Prompt <span class="timestamp">'+formatTime(ev.timestamp)+'</span></div><div class="content">'+renderMarkdown(ev.text)+'</div></div></div>';
+continue;
+}
+
+if(ev.type==='thinking'){
+var tid='think'+toggleCounter++;
+html+='<div class="thinking-block"><button class="thinking-toggle" onclick="toggleBlock(\\''+tid+'\\')" id="btn-'+tid+'"><span class="arrow">&#9654;</span> Thinking'+(ev.model?' <span style="color:var(--muted-foreground);font-weight:400">('+esc(ev.model)+')</span>':'')+'</button><div class="thinking-content" id="'+tid+'">'+esc(ev.text)+'</div></div>';
+continue;
+}
+
+if(ev.type==='assistant'){
+html+='<div class="chat-msg assistant-msg"><div class="chat-avatar">A</div><div class="chat-bubble"><div class="sender">Agent'+(ev.model?' <span class="timestamp">'+esc(ev.model)+'</span>':'')+(ev.provider?' <span class="timestamp">via '+esc(ev.provider)+'</span>':'')+'</div><div class="content">'+renderMarkdown(ev.text)+'</div></div></div>';
+continue;
+}
+
+if(ev.type==='tool_start'){
+var toolId='tool'+toggleCounter++;
+// Find matching tool_end
+var endEv=null;
+for(var j=i+1;j<events.length;j++){if(events[j].type==='tool_end'&&events[j].toolCallId===ev.toolCallId){endEv=events[j];events[j]={type:'_consumed'};break}}
+var argSummary='';
+if(ev.args){
+if(ev.toolName==='read'||ev.toolName==='write'||ev.toolName==='edit')argSummary=ev.args.path||ev.args.file_path||'';
+else if(ev.toolName==='bash'||ev.toolName==='shell')argSummary=(ev.args.command||'').slice(0,80);
+else{var ak=Object.keys(ev.args);argSummary=ak.slice(0,2).map(function(k){return k+':'+JSON.stringify(ev.args[k]).slice(0,30)}).join(', ')}
+}
+var statusCls=endEv?(endEv.isError?'err':'ok'):'';
+var statusIcon=endEv?(endEv.isError?'&#10007;':'&#10003;'):'...';
+html+='<div class="tool-block" id="wrap-'+toolId+'"><button class="tool-header" onclick="toggleTool(\\''+toolId+'\\')"><span class="arrow">&#9654;</span><span class="tool-name">'+esc(ev.toolName)+'</span><span class="tool-args">'+esc(argSummary)+'</span><span class="tool-status '+statusCls+'">'+statusIcon+'</span></button><div class="tool-body" id="'+toolId+'">';
+html+='<div style="padding:8px 12px;font-size:.68rem;color:var(--muted-foreground);border-bottom:1px solid var(--border)"><strong>Arguments:</strong></div>';
+html+='<pre><code class="language-json">'+esc(JSON.stringify(ev.args,null,2))+'</code></pre>';
+if(endEv){
+var resultText=endEv.result||'(empty)';
+if(resultText.length>5000)resultText=resultText.slice(0,5000)+'\\n... (truncated)';
+html+='<div style="padding:8px 12px;font-size:.68rem;color:var(--muted-foreground);border-bottom:1px solid var(--border)"><strong>Result:</strong></div>';
+html+='<pre><code class="language-plaintext">'+esc(resultText)+'</code></pre>';
+}
+html+='</div></div>';
+continue;
+}
+if(ev.type==='tool_end'||ev.type==='_consumed'){continue;}
+
+if(ev.type==='usage'){
+if(ev.usage){
+var u=ev.usage;
+html+='<div class="usage-block">';
+if(u.input)html+='in:'+u.input+' ';
+if(u.output)html+='out:'+u.output+' ';
+if(u.cacheRead)html+='cache:'+u.cacheRead+' ';
+if(u.cost&&u.cost.total)html+='$'+u.cost.total.toFixed(4)+' ';
+html+='</div>';
+}
+continue;
+}
+
+if(ev.type==='agent_end'){
+html+='<div class="agent-end-block"><span class="label">Session Complete</span>';
+if(ev.model)html+='<span class="stat">Model: '+esc(ev.model)+'</span>';
+if(ev.stopReason)html+='<span class="stat">Stop: '+esc(ev.stopReason)+'</span>';
+if(ev.usage){
+var u=ev.usage;
+if(u.input)html+='<span class="stat">In: '+u.input.toLocaleString()+'</span>';
+if(u.output)html+='<span class="stat">Out: '+u.output.toLocaleString()+'</span>';
+if(u.cost&&u.cost.total>0)html+='<span class="stat">Cost: $'+u.cost.total.toFixed(4)+'</span>';
+}
+if(ev.timestamp)html+='<span class="stat">'+formatTime(ev.timestamp)+'</span>';
+html+='</div>';
+continue;
+}
+}
+
+html+='</div>';
+main.innerHTML=html;
+
+// Run highlight.js on all code blocks
+setTimeout(function(){
+main.querySelectorAll('pre code').forEach(function(block){try{hljs.highlightElement(block)}catch(e){}});
+},50);
+main.scrollTop=0;
+}
+
+function toggleBlock(id){
+var el=document.getElementById(id);
+var btn=document.getElementById('btn-'+id);
+if(el.classList.contains('open')){el.classList.remove('open');btn.classList.remove('open')}
+else{el.classList.add('open');btn.classList.add('open')}
+}
+function toggleTool(id){
+var el=document.getElementById(id);
+var wrap=document.getElementById('wrap-'+id);
+var btn=wrap.querySelector('.tool-header');
+if(el.classList.contains('open')){el.classList.remove('open');btn.classList.remove('open')}
+else{el.classList.add('open');btn.classList.add('open');
+// Highlight any code blocks inside
+el.querySelectorAll('pre code').forEach(function(b){try{hljs.highlightElement(b)}catch(e){}});
+}
+}
+
+function esc(s){if(!s)return '';var d=document.createElement('div');d.textContent=String(s);return d.innerHTML}
+
+loadSessions();
 </script></body></html>`;
