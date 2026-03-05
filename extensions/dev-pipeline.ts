@@ -4418,36 +4418,73 @@ export default function (pi: ExtensionAPI) {
 		// Detect if another pipeline instance is already running
 		const existingState = readStateFile();
 		if (existingState?.running) {
-			observerMode = true;
-			// Load checklist for widget context but don't write state
-			const checklistPath = join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
-			if (existsSync(checklistPath)) {
-				parsedPhases = parseChecklist(checklistPath);
+			// Check if a pi process is actually running a pipeline (not just stale state)
+			let pipelineProcessAlive = false;
+			try {
+				const psOutput = execSync(`ps aux | grep -E 'pi.*(-e|--extension)' | grep -v grep`, { encoding: "utf-8", timeout: 3000 }).trim();
+				// Count pi processes (excluding this one)
+				const myPid = process.pid;
+				const lines = psOutput.split("\n").filter(l => l.trim());
+				const otherPiProcesses = lines.filter(l => {
+					const parts = l.trim().split(/\s+/);
+					const pid = parseInt(parts[1], 10);
+					return pid !== myPid;
+				});
+				pipelineProcessAlive = otherPiProcesses.length > 0;
+			} catch {
+				pipelineProcessAlive = false;
 			}
-			agents = scanAgents(ctx.cwd);
-			updateWidget();
-			startObserverPolling();
-			ctx.ui.notify(
-				"Observer mode: another pipeline instance is running.\n" +
-				"This session is read-only — the widget shows live progress from the active pipeline.\n" +
-				"Pipeline commands (start, next, reset, etc.) are disabled.\n\n" +
-				"Available: /pipeline-status, /pipeline-config, /pipeline-logs, /pipeline-watch, /pipeline-dashboard",
-				"warning",
-			);
 
-			ctx.ui.setFooter((_tui, theme, _footerData) => ({
-				dispose: () => {},
-				invalidate() {},
-				render(width: number): string[] {
-					const left = theme.fg("dim", ` observer`) +
-						theme.fg("muted", " · ") +
-						theme.fg("warning", "read-only");
-					const right = theme.fg("dim", `pipeline running elsewhere `);
-					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-					return [truncateToWidth(left + pad + right, width)];
-				},
-			}));
-			return;
+			if (!pipelineProcessAlive) {
+				// Stale state -- ask user
+				const staleAge = Date.now() - (existingState.ts || 0);
+				const staleMin = Math.round(staleAge / 60000);
+				const answer = await ctx.ui.select(
+					`Pipeline state shows "running" but no active pipeline process found (last updated ${staleMin}m ago). Likely a crashed session.`,
+					["Clear stale state and start fresh", "Enter observer mode anyway"],
+				);
+				if (answer === "Clear stale state and start fresh") {
+					existingState.running = false;
+					writeStateFile();
+					ctx.ui.notify("Stale pipeline state cleared. You can now run commands normally.", "success");
+					// Fall through to normal startup below
+				} else {
+					// Fall through to observer mode
+				}
+			}
+
+			if (existingState.running) {
+				observerMode = true;
+				// Load checklist for widget context but don't write state
+				const checklistPath = join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
+				if (existsSync(checklistPath)) {
+					parsedPhases = parseChecklist(checklistPath);
+				}
+				agents = scanAgents(ctx.cwd);
+				updateWidget();
+				startObserverPolling();
+				ctx.ui.notify(
+					"Observer mode: another pipeline instance is running.\n" +
+					"This session is read-only — the widget shows live progress from the active pipeline.\n" +
+					"Pipeline commands (start, next, reset, etc.) are disabled.\n\n" +
+					"Available: /pipeline-status, /pipeline-config, /pipeline-logs, /pipeline-watch, /pipeline-dashboard",
+					"warning",
+				);
+
+				ctx.ui.setFooter((_tui, theme, _footerData) => ({
+					dispose: () => {},
+					invalidate() {},
+					render(width: number): string[] {
+						const left = theme.fg("dim", ` observer`) +
+							theme.fg("muted", " · ") +
+							theme.fg("warning", "read-only");
+						const right = theme.fg("dim", `pipeline running elsewhere `);
+						const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+						return [truncateToWidth(left + pad + right, width)];
+					},
+				}));
+				return;
+			}
 		}
 
 		observerMode = false;
