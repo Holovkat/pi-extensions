@@ -3769,7 +3769,7 @@ export default function (pi: ExtensionAPI) {
 
 			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
 				const settingsTheme: SettingsListTheme = {
-					label: (text: string, selected: boolean) => selected ? theme.fg("accent", theme.bold(text)) : theme.fg("fg", text),
+					label: (text: string, selected: boolean) => selected ? theme.fg("accent", theme.bold(text)) : text,
 					value: (text: string, selected: boolean) => selected ? theme.fg("success", text) : theme.fg("dim", text),
 					description: (text: string) => theme.fg("dim", text),
 					cursor: theme.fg("accent", "→ "),
