@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Pipeline Dashboard — Web Server with WebSocket live updates
+// Pipeline Dashboard — Web Server with SSE live updates
 // Usage: pipeline-dashboard-web [project-dir] [--port PORT]
 
-import net from "node:net";
+import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -23,57 +23,16 @@ function readState() {
 	catch { return null; }
 }
 
-// ── WebSocket ──
-const wsClients = new Set();
+// ── SSE Clients ──
+const sseClients = new Set();
 
 function broadcastState() {
 	const state = readState();
 	if (!state) return;
-	const msg = JSON.stringify(state);
-	for (const ws of wsClients) {
-		try { wsSend(ws, msg); } catch { wsClients.delete(ws); }
+	const msg = `data: ${JSON.stringify(state)}\n\n`;
+	for (const res of sseClients) {
+		try { res.write(msg); } catch { sseClients.delete(res); }
 	}
-}
-
-function wsSend(socket, data) {
-	const buf = Buffer.from(data);
-	let frame;
-	if (buf.length < 126) {
-		frame = Buffer.alloc(2 + buf.length);
-		frame[0] = 0x81;
-		frame[1] = buf.length;
-		buf.copy(frame, 2);
-	} else if (buf.length < 65536) {
-		frame = Buffer.alloc(4 + buf.length);
-		frame[0] = 0x81;
-		frame[1] = 126;
-		frame.writeUInt16BE(buf.length, 2);
-		buf.copy(frame, 4);
-	} else {
-		frame = Buffer.alloc(10 + buf.length);
-		frame[0] = 0x81;
-		frame[1] = 127;
-		frame.writeBigUInt64BE(BigInt(buf.length), 2);
-		buf.copy(frame, 10);
-	}
-	socket.write(frame);
-}
-
-function wsParseFrame(buf) {
-	if (buf.length < 2) return null;
-	const masked = (buf[1] & 0x80) !== 0;
-	let len = buf[1] & 0x7f;
-	let offset = 2;
-	if (len === 126) { len = buf.readUInt16BE(2); offset = 4; }
-	else if (len === 127) { len = Number(buf.readBigUInt64BE(2)); offset = 10; }
-	if (masked) {
-		const mask = buf.slice(offset, offset + 4);
-		offset += 4;
-		const payload = buf.slice(offset, offset + len);
-		for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
-		return { opcode: buf[0] & 0x0f, payload };
-	}
-	return { opcode: buf[0] & 0x0f, payload: buf.slice(offset, offset + len) };
 }
 
 // ── File Watcher ──
@@ -88,89 +47,32 @@ setInterval(() => {
 	} catch {}
 }, 500);
 
-// ── HTTP / WebSocket Server ──
-// Use a raw net.Server so upgrade requests never touch Node's HTTP
-// response machinery (which can leak headers and corrupt the handshake).
-const server = net.createServer();
+// ── HTTP Server ──
+const server = http.createServer((req, res) => {
+	if (req.url === "/api/state") {
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+		const state = readState();
+		res.end(state ? JSON.stringify(state) : "null");
+		return;
+	}
 
-server.on("connection", (socket) => {
-	let headBuf = Buffer.alloc(0);
-	let upgraded = false;
+	if (req.url === "/events") {
+		res.writeHead(200, {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache",
+			"Connection": "keep-alive",
+			"Access-Control-Allow-Origin": "*",
+		});
+		res.write("\n");
+		sseClients.add(res);
+		const state = readState();
+		if (state) res.write(`data: ${JSON.stringify(state)}\n\n`);
+		req.on("close", () => sseClients.delete(res));
+		return;
+	}
 
-	const onData = (chunk) => {
-		if (upgraded) return;
-		headBuf = Buffer.concat([headBuf, chunk]);
-		const headStr = headBuf.toString();
-		const endIdx = headStr.indexOf("\r\n\r\n");
-		if (endIdx === -1) return; // headers not complete yet
-
-		socket.removeListener("data", onData);
-		const headerBlock = headStr.substring(0, endIdx);
-		const lines = headerBlock.split("\r\n");
-		const requestLine = lines[0]; // e.g. "GET /ws HTTP/1.1"
-		const headers = {};
-		for (let i = 1; i < lines.length; i++) {
-			const col = lines[i].indexOf(":");
-			if (col > 0) headers[lines[i].substring(0, col).toLowerCase().trim()] = lines[i].substring(col + 1).trim();
-		}
-		const [method, url] = requestLine.split(" ");
-		const body = headBuf.slice(endIdx + 4); // leftover after headers
-
-		// ── WebSocket upgrade ──
-		if (headers["upgrade"] && headers["upgrade"].toLowerCase() === "websocket" && url === "/ws") {
-			upgraded = true;
-			const key = headers["sec-websocket-key"];
-			const accept = crypto.createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-5AB9CF11F85B").digest("base64");
-			socket.write(
-				"HTTP/1.1 101 Switching Protocols\r\n" +
-				"Upgrade: websocket\r\n" +
-				"Connection: Upgrade\r\n" +
-				"Sec-WebSocket-Accept: " + accept + "\r\n\r\n"
-			);
-			wsClients.add(socket);
-			const st = readState();
-			if (st) wsSend(socket, JSON.stringify(st));
-
-			socket.on("data", (buf) => {
-				const frame = wsParseFrame(buf);
-				if (!frame) return;
-				if (frame.opcode === 0x08) { wsClients.delete(socket); socket.end(); }
-				if (frame.opcode === 0x09) {
-					const pong = Buffer.alloc(2); pong[0] = 0x8a; pong[1] = 0;
-					socket.write(pong);
-				}
-			});
-			socket.on("close", () => wsClients.delete(socket));
-			socket.on("error", () => wsClients.delete(socket));
-			return;
-		}
-
-		// ── Normal HTTP ──
-		if (url === "/api/state") {
-			const st = readState();
-			const json = st ? JSON.stringify(st) : "null";
-			socket.end(
-				"HTTP/1.1 200 OK\r\n" +
-				"Content-Type: application/json\r\n" +
-				"Access-Control-Allow-Origin: *\r\n" +
-				"Content-Length: " + Buffer.byteLength(json) + "\r\n" +
-				"Connection: close\r\n\r\n" + json
-			);
-			return;
-		}
-
-		// Serve dashboard HTML
-		const htmlBuf = Buffer.from(HTML);
-		socket.end(
-			"HTTP/1.1 200 OK\r\n" +
-			"Content-Type: text/html; charset=utf-8\r\n" +
-			"Content-Length: " + htmlBuf.length + "\r\n" +
-			"Connection: close\r\n\r\n" + HTML
-		);
-	};
-
-	socket.on("data", onData);
-	socket.on("error", () => {});
+	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+	res.end(HTML);
 });
 
 server.listen(port, () => {
@@ -216,7 +118,6 @@ const HTML = `<!DOCTYPE html>
   --chart-4: oklch(0.8822 0.0403 298.1792);
   --chart-5: oklch(0.5608 0.1348 42.0584);
   --radius: 0.5rem;
-  /* Semantic aliases */
   --bg: var(--background);
   --surface: var(--card);
   --text: var(--foreground);
@@ -263,13 +164,11 @@ const HTML = `<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);min-height:100vh;padding:0;transition:background .3s,color .3s}
 .container{max-width:1200px;margin:0 auto;padding:16px 20px}
 
-/* ── Header ── */
 header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 16px;border-bottom:1px solid var(--border)}
 header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primary)}
 .theme-toggle{background:var(--accent);border:1px solid var(--border);border-radius:var(--radius);padding:6px 12px;cursor:pointer;color:var(--accent-foreground);font-size:.75rem;font-weight:500;transition:all .2s}
 .theme-toggle:hover{opacity:.8}
 
-/* ── Status ── */
 .status-bar{display:flex;align-items:center;gap:16px;padding:14px 0;flex-wrap:wrap}
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .status-dot.running{background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.5s infinite}
@@ -277,12 +176,9 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .badge{padding:3px 10px;border-radius:calc(var(--radius) - 2px);font-size:.75rem;font-weight:500;background:var(--secondary);color:var(--secondary-foreground);border:1px solid var(--border)}
 
-/* ── Progress ── */
 .progress-bar{height:6px;background:var(--muted);border-radius:var(--radius);margin-top:6px;overflow:hidden}
 .progress-fill{height:100%;background:var(--primary);border-radius:var(--radius);transition:width .4s ease}
-.progress-label{font-size:.72rem;color:var(--dim);margin-top:6px}
 
-/* ── Phases ── */
 .phases{margin-top:20px;display:flex;flex-direction:column;gap:8px}
 .phase{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:box-shadow .2s}
 .phase:hover{box-shadow:0 2px 8px oklch(0 0 0 / .08)}
@@ -294,7 +190,6 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .phase.done .phase-header{border-left:3px solid var(--green)}
 .phase.done .phase-name{color:var(--green)}
 
-/* ── Tasks ── */
 .tasks{padding:0 16px 14px 46px;display:flex;flex-direction:column;gap:2px}
 .task{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.8rem}
 .task-icon{width:16px;text-align:center;flex-shrink:0}
@@ -306,7 +201,6 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .task-score.low{color:var(--red)}
 .task-attempts{color:var(--dim);font-size:.7rem;min-width:24px}
 
-/* ── Sections ── */
 .log-section,.agents-section{margin-top:16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
 .log-section h2,.agents-section h2{font-size:.82rem;color:var(--primary);margin-bottom:12px;font-weight:600}
 .log-entry{font-size:.72rem;padding:3px 0;color:var(--dim);word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5}
@@ -314,14 +208,12 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .log-entry.fail{color:var(--red)}
 .log-entry.phase-start{color:var(--primary);font-weight:600}
 
-/* ── Agents ── */
 .agent{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:.8rem}
 .agent-spinner{display:inline-block;animation:spin 1s linear infinite;color:var(--primary)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .agent-name{font-weight:600;min-width:120px;text-transform:uppercase;color:var(--primary)}
 .agent-model{color:var(--dim);font-size:.75rem}
 
-/* ── Gate badges ── */
 .gate-badge{font-size:.65rem;padding:2px 7px;border-radius:calc(var(--radius) - 2px);font-weight:600}
 .gate-badge.build{background:oklch(0.35 0.06 85 / .3);color:var(--yellow);border:1px solid var(--yellow)}
 .gate-badge.fix{background:oklch(0.35 0.06 85 / .3);color:var(--yellow);border:1px solid var(--yellow)}
@@ -344,32 +236,30 @@ header{flex-direction:column;gap:12px;text-align:center}
 <body class="dark">
 <div class="container">
 <header>
-<h1>⬡ PIPELINE DASHBOARD</h1>
-<button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">☀ Light</button>
+<h1>PIPELINE DASHBOARD</h1>
+<button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
 </header>
 <div id="app"><div class="no-data">Connecting...</div></div>
 <div class="updated" id="updated"></div>
 </div>
 <script>
 let state = null;
-let ws;
+let evtSource;
 
 function connect() {
-const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-ws = new WebSocket(proto + '//' + location.host + '/ws');
-ws.onmessage = (e) => { state = JSON.parse(e.data); render(); };
-ws.onclose = () => setTimeout(connect, 2000);
-ws.onerror = () => ws.close();
+evtSource = new EventSource('/events');
+evtSource.onmessage = function(e) { state = JSON.parse(e.data); render(); };
+evtSource.onerror = function() { evtSource.close(); setTimeout(connect, 2000); };
 }
 connect();
 
 function statusIcon(s) {
 switch(s) {
-case 'passed': return '<span style="color:var(--green)">✓</span>';
-case 'building': return '<span style="color:var(--blue)" class="agent-spinner">◐</span>';
-case 'scoring': return '<span style="color:var(--cyan)" class="agent-spinner">◐</span>';
-case 'failed': return '<span style="color:var(--red)">✗</span>';
-default: return '<span style="color:var(--dim)">○</span>';
+case 'passed': return '<span style="color:var(--green)">&#10003;</span>';
+case 'building': return '<span style="color:var(--blue)" class="agent-spinner">&#9684;</span>';
+case 'scoring': return '<span style="color:var(--cyan)" class="agent-spinner">&#9684;</span>';
+case 'failed': return '<span style="color:var(--red)">&#10007;</span>';
+default: return '<span style="color:var(--dim)">&#9675;</span>';
 }
 }
 
@@ -383,7 +273,7 @@ return 'build';
 
 function elapsed(ms) {
 if (!ms) return '';
-const s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60);
+var s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60);
 if (h > 0) return h+'h '+m%60+'m '+s%60+'s';
 if (m > 0) return m+'m '+s%60+'s';
 return s+'s';
@@ -400,28 +290,27 @@ return '';
 
 function render() {
 if (!state) { document.getElementById('app').innerHTML = '<div class="no-data">Waiting for pipeline state...</div>'; return; }
-const d = state;
-const age = Math.round((Date.now() - d.ts) / 1000);
+var d = state;
+var age = Math.round((Date.now() - d.ts) / 1000);
 
-let html = '<div class="status-bar">';
+var html = '<div class="status-bar">';
 html += '<span class="status-dot '+(d.running?'running':'idle')+'"></span>';
 html += '<strong>'+(d.running?'RUNNING':'IDLE')+'</strong>';
 if (d.branch) html += '<span class="badge">'+esc(d.branch)+'</span>';
 html += '</div>';
 
-// Progress bar
-const total = d.phases.reduce((a,p) => a+p.total, 0);
-const done = d.phases.reduce((a,p) => a+p.tasks.filter(t=>t.status==='passed').length, 0);
-const pct = total ? Math.round(done/total*100) : 0;
+var total = d.phases.reduce(function(a,p){return a+p.total},0);
+var done = d.phases.reduce(function(a,p){return a+p.tasks.filter(function(t){return t.status==='passed'}).length},0);
+var pct = total ? Math.round(done/total*100) : 0;
 html += '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div>';
 html += '<div style="font-size:.7rem;color:var(--dim);margin-top:4px">'+done+'/'+total+' tasks ('+pct+'%)</div>';
 
-// Phases
 html += '<div class="phases">';
-for (const p of d.phases) {
-const cls = p.allDone ? 'done' : p.isCurrent ? 'current' : '';
-const icon = p.allDone ? '<span style="color:var(--green)">✓</span>' : p.isCurrent && d.running ? '<span class="agent-spinner" style="color:var(--blue)">◐</span>' : '<span style="color:var(--dim)">○</span>';
-const passedCount = p.tasks.filter(t=>t.status==='passed').length;
+for (var i = 0; i < d.phases.length; i++) {
+var p = d.phases[i];
+var cls = p.allDone ? 'done' : p.isCurrent ? 'current' : '';
+var icon = p.allDone ? '<span style="color:var(--green)">&#10003;</span>' : p.isCurrent && d.running ? '<span class="agent-spinner" style="color:var(--blue)">&#9684;</span>' : '<span style="color:var(--dim)">&#9675;</span>';
+var passedCount = p.tasks.filter(function(t){return t.status==='passed'}).length;
 
 html += '<div class="phase '+cls+'">';
 html += '<div class="phase-header">';
@@ -435,7 +324,8 @@ html += '</span></div>';
 
 if (p.isCurrent || p.allDone) {
 html += '<div class="tasks">';
-for (const t of p.tasks) {
+for (var j = 0; j < p.tasks.length; j++) {
+var t = p.tasks[j];
 html += '<div class="task">';
 html += '<span class="task-icon">'+statusIcon(t.status)+'</span>';
 html += '<span class="task-id">'+esc(t.id)+'</span>';
@@ -450,13 +340,13 @@ html += '</div>';
 }
 html += '</div>';
 
-// Active agents
-const agents = d.activeAgents || (d.activeAgent ? [d.activeAgent] : []);
+var agents = d.activeAgents || (d.activeAgent ? [d.activeAgent] : []);
 if (agents.length > 0) {
 html += '<div class="agents-section"><h2>Active Agents</h2>';
-for (const a of agents) {
+for (var k = 0; k < agents.length; k++) {
+var a = agents[k];
 html += '<div class="agent">';
-html += '<span class="agent-spinner" style="color:var(--blue)">◐</span>';
+html += '<span class="agent-spinner" style="color:var(--blue)">&#9684;</span>';
 html += '<span class="agent-name">'+esc(a.name)+'</span>';
 html += '<span class="agent-model">'+esc(a.model)+'</span>';
 html += '</div>';
@@ -464,12 +354,11 @@ html += '</div>';
 html += '</div>';
 }
 
-// Log
 if (d.log && d.log.length > 0) {
-const show = d.log.slice(-15);
+var show = d.log.slice(-15);
 html += '<div class="log-section"><h2>Recent Activity</h2>';
-for (const entry of show) {
-html += '<div class="log-entry '+logClass(entry)+'">'+esc(entry)+'</div>';
+for (var m = 0; m < show.length; m++) {
+html += '<div class="log-entry '+logClass(show[m])+'">'+esc(show[m])+'</div>';
 }
 html += '</div>';
 }
@@ -478,21 +367,20 @@ document.getElementById('app').innerHTML = html;
 document.getElementById('updated').textContent = age < 5 ? 'live' : 'updated '+age+'s ago';
 }
 
-function esc(s) { if (!s) return ''; const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { if (!s) return ''; var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 function toggleTheme() {
 document.body.classList.toggle('dark');
-const isDark = document.body.classList.contains('dark');
-document.getElementById('theme-btn').textContent = isDark ? '☀ Light' : '🌙 Dark';
+var isDark = document.body.classList.contains('dark');
+document.getElementById('theme-btn').textContent = isDark ? 'Light' : 'Dark';
 localStorage.setItem('pi-dash-theme', isDark ? 'dark' : 'light');
 }
-// Restore saved theme
 (function(){
-const saved = localStorage.getItem('pi-dash-theme');
-if (saved === 'light') { document.body.classList.remove('dark'); document.getElementById('theme-btn').textContent = '🌙 Dark'; }
+var saved = localStorage.getItem('pi-dash-theme');
+if (saved === 'light') { document.body.classList.remove('dark'); document.getElementById('theme-btn').textContent = 'Dark'; }
 })();
 
-setInterval(() => { if (state) render(); }, 1000);
+setInterval(function(){ if (state) render(); }, 1000);
 </script>
 </body>
 </html>`;
