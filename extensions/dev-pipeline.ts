@@ -3245,7 +3245,8 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 						lines.push("", theme.fg("dim", "Refreshing every 3s. Pipeline commands are disabled."));
-						text.setText(lines.join("\n"));
+						const truncatedObs = lines.map(l => truncateToWidth(l, width));
+						text.setText(truncatedObs.join("\n"));
 						return text.render(width);
 					}
 
@@ -3372,7 +3373,9 @@ export default function (pi: ExtensionAPI) {
 					// Mode indicator
 					lines.push("", theme.fg("dim", `Mode: ${pipelineMode === "fast" ? "Fast Track" : "3-Wave"}`));
 
-					text.setText(lines.join("\n"));
+					// Truncate all lines to terminal width to prevent TUI crash
+					const truncated = lines.map(l => truncateToWidth(l, width));
+					text.setText(truncated.join("\n"));
 					return text.render(width);
 				},
 				invalidate() { text.invalidate(); },
