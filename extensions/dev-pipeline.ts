@@ -3628,11 +3628,21 @@ export default function (pi: ExtensionAPI) {
 
 			const config = loadPipelineConfig();
 			const allModels = ctx.modelRegistry.getAll();
-			const modelItems: SelectItem[] = allModels.map(m => ({
-				value: `${m.provider}/${m.id}`,
-				label: `${m.provider}/${m.id}`,
-				description: m.name,
-			}));
+			const availableModels = new Set(ctx.modelRegistry.getAvailable().map(m => `${m.provider}/${m.id}`));
+			const modelItems: SelectItem[] = allModels.map(m => {
+				const fullId = `${m.provider}/${m.id}`;
+				const hasAuth = availableModels.has(fullId);
+				return {
+					value: fullId,
+					label: hasAuth ? `  ${fullId}` : `  ${fullId}  [no key]`,
+					description: hasAuth ? m.name : `${m.name} (no API key configured)`,
+				};
+			}).sort((a, b) => {
+				const aOk = !a.label.includes("[no key]");
+				const bOk = !b.label.includes("[no key]");
+				if (aOk !== bOk) return aOk ? -1 : 1;
+				return a.value.localeCompare(b.value);
+			});
 
 			type ConfigTab = "fast" | "multiwave";
 			let activeTab: ConfigTab = pipelineMode === "fast" ? "fast" : "multiwave";
@@ -3665,20 +3675,28 @@ export default function (pi: ExtensionAPI) {
 					noMatch: (t: string) => ctx.ui.theme.fg("warning", t),
 				};
 
-				const list = new SelectList(modelItems, 15, theme);
+				const list = new SelectList(modelItems, 20, theme);
 				const currentIdx = modelItems.findIndex(m => m.value === currentModelId);
 				if (currentIdx >= 0) list.setSelectedIndex(currentIdx);
 
 				const wrapper: any = {
 					invalidate() { list.invalidate(); },
 					render(width: number): string[] {
+						const border = ctx.ui.theme.fg("dim", "─".repeat(width));
+						const configuredCount = availableModels.size;
+						const totalCount = allModels.length;
 						const lines: string[] = [];
+						lines.push(border);
+						lines.push("");
 						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
-						lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}`));
+						lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}    (${configuredCount}/${totalCount} configured)`));
+						lines.push("");
+						lines.push(border);
 						lines.push("");
 						lines.push(...list.render(width));
 						lines.push("");
 						lines.push(ctx.ui.theme.fg("dim", "  Enter to select and ping · Esc to cancel"));
+						lines.push(border);
 						return lines;
 					},
 					handleInput(data: string) {
