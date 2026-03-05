@@ -3806,11 +3806,18 @@ export default function (pi: ExtensionAPI) {
 					dispose() {},
 					invalidate() { settingsList.invalidate(); },
 					render(width: number): string[] {
+						const border = theme.fg("dim", "─".repeat(width));
 						const lines: string[] = [];
+						lines.push(border);
+						lines.push("");
 						lines.push(theme.fg("accent", theme.bold("  Pipeline Configuration")));
 						lines.push(theme.fg("dim", "  Model assignments for each pipeline role"));
 						lines.push("");
+						lines.push(border);
+						lines.push("");
 						lines.push(...settingsList.render(width));
+						lines.push("");
+						lines.push(border);
 						return lines;
 					},
 					handleInput(data: string) {
@@ -3831,9 +3838,6 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				return component;
-			}, {
-				overlay: true,
-				overlayOptions: { width: "70%", maxHeight: "80%", anchor: "center" },
 			});
 
 			updateWidget();
