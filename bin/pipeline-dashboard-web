@@ -295,108 +295,169 @@ const server = http.createServer((req, res) => {
 		try {
 			const raw = fs.readFileSync(logFile, "utf-8");
 			const lines = raw.split("\n");
+
+			// Detect format: JSON-RPC (lines start with {) vs plain text
+			let isJsonRpc = false;
+			for (const line of lines) {
+				const trimmed = line.trim();
+				if (!trimmed || trimmed.startsWith("──")) continue;
+				if (trimmed.startsWith("{")) { isJsonRpc = true; }
+				break;
+			}
+
 			const events = [];
 			let sessionMeta = null;
-			let currentThinking = "";
-			let currentText = "";
-			let currentModel = "";
-			let currentProvider = "";
-			let turnMessages = [];
-			let agentEndData = null;
 
-			for (const line of lines) {
-				if (!line.startsWith("{")) {
-					// Header line (e.g. "── dev | fast-fix-1.5-d1 | 2026-03-05T06:12:10.249Z ──")
-					if (line.includes("|")) {
-						const parts = line.replace(/[─ ]/g, " ").trim().split("|").map(s => s.trim());
+			if (!isJsonRpc) {
+				// ── Plain text log parser ──
+				let headerParsed = false;
+				let currentText = "";
+				let inTool = false;
+				let toolName = "";
+				let toolContent = "";
+
+				for (const line of lines) {
+					// Header line
+					if (!headerParsed && line.includes("──") && line.includes("|")) {
+						const parts = line.replace(/[─]/g, "").trim().split("|").map(s => s.trim());
 						if (parts.length >= 3) {
 							events.push({ type: "header", role: parts[0], session: parts[1], timestamp: parts[2] });
+							sessionMeta = { timestamp: parts[2] };
 						}
+						headerParsed = true;
+						continue;
 					}
-					continue;
+					// Tool blocks: [TOOL] name ... [/TOOL]
+					if (line.trim().startsWith("[TOOL]")) {
+						// Flush current text
+						if (currentText.trim()) {
+							events.push({ type: "assistant", text: currentText.trim() });
+							currentText = "";
+						}
+						toolName = line.trim().replace(/^\[TOOL\]\s*/, "").trim();
+						inTool = true;
+						toolContent = "";
+						continue;
+					}
+					if (line.trim() === "[/TOOL]") {
+						events.push({ type: "tool_start", toolName: toolName || "tool", toolCallId: "pt-" + events.length, args: {} });
+						if (toolContent.trim()) {
+							events.push({ type: "tool_end", toolName: toolName || "tool", toolCallId: "pt-" + (events.length - 1), result: toolContent.trim(), isError: false });
+						} else {
+							events.push({ type: "tool_end", toolName: toolName || "tool", toolCallId: "pt-" + (events.length - 1), result: "(output omitted)", isError: false });
+						}
+						inTool = false;
+						toolName = "";
+						toolContent = "";
+						continue;
+					}
+					if (inTool) {
+						toolContent += line + "\n";
+						continue;
+					}
+					currentText += line + "\n";
 				}
-				let j;
-				try { j = JSON.parse(line); } catch { continue; }
+				// Flush remaining
+				if (currentText.trim()) {
+					events.push({ type: "assistant", text: currentText.trim() });
+				}
+			} else {
+				// ── JSON-RPC log parser ──
+				let currentThinking = "";
+				let currentText = "";
+				let currentModel = "";
+				let currentProvider = "";
+				let agentEndData = null;
 
-				if (j.type === "session") {
-					sessionMeta = { id: j.id, cwd: j.cwd, timestamp: j.timestamp, version: j.version };
-					continue;
-				}
-				if (j.type === "message_start") {
-					const msg = j.message;
-					if (msg?.role === "user" && msg.content?.[0]?.text) {
-						events.push({ type: "user", text: msg.content[0].text, timestamp: msg.timestamp });
+				for (const line of lines) {
+					if (!line.startsWith("{")) {
+						if (line.includes("──") && line.includes("|")) {
+							const parts = line.replace(/[─]/g, "").trim().split("|").map(s => s.trim());
+							if (parts.length >= 3) {
+								events.push({ type: "header", role: parts[0], session: parts[1], timestamp: parts[2] });
+							}
+						}
+						continue;
 					}
-					if (msg?.role === "assistant") {
-						currentModel = msg.model || "";
-						currentProvider = msg.provider || "";
-						currentThinking = "";
-						currentText = "";
+					let j;
+					try { j = JSON.parse(line); } catch { continue; }
+
+					if (j.type === "session") {
+						sessionMeta = { id: j.id, cwd: j.cwd, timestamp: j.timestamp, version: j.version };
+						continue;
 					}
-					continue;
-				}
-				if (j.type === "message_update") {
-					const ev = j.assistantMessageEvent;
-					if (!ev) continue;
-					if (ev.type === "thinking_delta") {
-						currentThinking += ev.delta || "";
-					} else if (ev.type === "text_delta") {
-						currentText += ev.delta || "";
-					} else if (ev.type === "thinking_end") {
+					if (j.type === "message_start") {
+						const msg = j.message;
+						if (msg?.role === "user" && msg.content?.[0]?.text) {
+							events.push({ type: "user", text: msg.content[0].text, timestamp: msg.timestamp });
+						}
+						if (msg?.role === "assistant") {
+							currentModel = msg.model || "";
+							currentProvider = msg.provider || "";
+							currentThinking = "";
+							currentText = "";
+						}
+						continue;
+					}
+					if (j.type === "message_update") {
+						const ev = j.assistantMessageEvent;
+						if (!ev) continue;
+						if (ev.type === "thinking_delta") {
+							currentThinking += ev.delta || "";
+						} else if (ev.type === "text_delta") {
+							currentText += ev.delta || "";
+						} else if (ev.type === "thinking_end") {
+							if (currentThinking) {
+								events.push({ type: "thinking", text: currentThinking, model: currentModel });
+								currentThinking = "";
+							}
+						} else if (ev.type === "text_end") {
+							if (currentText) {
+								events.push({ type: "assistant", text: currentText, model: currentModel, provider: currentProvider });
+								currentText = "";
+							}
+						}
+						continue;
+					}
+					if (j.type === "tool_execution_start") {
+						events.push({ type: "tool_start", toolName: j.toolName, toolCallId: j.toolCallId, args: j.args });
+						continue;
+					}
+					if (j.type === "tool_execution_end") {
+						let resultText = "";
+						if (j.result?.content?.[0]?.text) resultText = j.result.content[0].text;
+						events.push({ type: "tool_end", toolName: j.toolName, toolCallId: j.toolCallId, result: resultText, isError: j.isError });
+						continue;
+					}
+					if (j.type === "message_end") {
 						if (currentThinking) {
 							events.push({ type: "thinking", text: currentThinking, model: currentModel });
 							currentThinking = "";
 						}
-					} else if (ev.type === "text_end") {
 						if (currentText) {
 							events.push({ type: "assistant", text: currentText, model: currentModel, provider: currentProvider });
 							currentText = "";
 						}
-					} else if (ev.type === "toolcall_start") {
-						// Will be followed by tool_execution_start
+						const msg = j.message;
+						if (msg?.role === "assistant" && msg.usage) {
+							events.push({ type: "usage", usage: msg.usage, model: msg.model, timestamp: msg.timestamp });
+						}
+						continue;
 					}
-					continue;
-				}
-				if (j.type === "tool_execution_start") {
-					events.push({ type: "tool_start", toolName: j.toolName, toolCallId: j.toolCallId, args: j.args });
-					continue;
-				}
-				if (j.type === "tool_execution_end") {
-					let resultText = "";
-					if (j.result?.content?.[0]?.text) resultText = j.result.content[0].text;
-					events.push({ type: "tool_end", toolName: j.toolName, toolCallId: j.toolCallId, result: resultText, isError: j.isError });
-					continue;
-				}
-				if (j.type === "message_end") {
-					// Flush any remaining text
-					if (currentThinking) {
-						events.push({ type: "thinking", text: currentThinking, model: currentModel });
-						currentThinking = "";
+					if (j.type === "agent_end") {
+						const lastMsg = j.messages?.[j.messages.length - 1];
+						agentEndData = {
+							type: "agent_end",
+							usage: lastMsg?.usage,
+							model: lastMsg?.model,
+							stopReason: lastMsg?.stopReason,
+							timestamp: lastMsg?.timestamp,
+						};
+						continue;
 					}
-					if (currentText) {
-						events.push({ type: "assistant", text: currentText, model: currentModel, provider: currentProvider });
-						currentText = "";
-					}
-					// Extract usage from message_end
-					const msg = j.message;
-					if (msg?.role === "assistant" && msg.usage) {
-						events.push({ type: "usage", usage: msg.usage, model: msg.model, timestamp: msg.timestamp });
-					}
-					continue;
 				}
-				if (j.type === "agent_end") {
-					const lastMsg = j.messages?.[j.messages.length - 1];
-					agentEndData = {
-						type: "agent_end",
-						usage: lastMsg?.usage,
-						model: lastMsg?.model,
-						stopReason: lastMsg?.stopReason,
-						timestamp: lastMsg?.timestamp,
-					};
-					continue;
-				}
+				if (agentEndData) events.push(agentEndData);
 			}
-			if (agentEndData) events.push(agentEndData);
 			res.end(JSON.stringify({ session: sessionMeta, events }));
 		} catch (e) {
 			res.end(JSON.stringify({ error: e.message }));
