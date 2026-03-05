@@ -71,7 +71,7 @@ interface Checkpoint {
 	branch: string;
 	completedGate: PhaseGate;
 	foundationsSpec: string;
-	tasks: { id: string; title: string; body: string; epic: string; status: TaskStatus; complianceScore: number; attempts: number; issueNum?: number }[];
+	tasks: { id: string; title: string; body: string; epic: string; status: TaskStatus; complianceScore: number; attempts: number; issueNum?: number; learnings?: AgentLearning[] }[];
 	timestamp: number;
 }
 
@@ -84,6 +84,7 @@ interface TaskState {
 	complianceScore: number;
 	attempts: number;
 	issueNum?: number;
+	learnings: AgentLearning[];
 }
 
 interface PhaseState {
@@ -103,9 +104,29 @@ interface PipelineState {
 	running: boolean;
 }
 
+// ── Agent Learnings ──
+// When an agent yields (timeout or stuck), it provides structured feedback.
+// Subsequent agents receive these learnings to avoid repeating failed approaches.
+interface AgentLearning {
+	timestamp: number;
+	agentRole: string;
+	model: string;
+	depth: number;
+	elapsedMs: number;
+	yielded: boolean;           // true if agent was timed out / forced to yield
+	blockers: string[];         // what prevented progress
+	attempted: string[];        // approaches already tried
+	suggestion: string;         // agent's recommendation for next steps
+	analystAction?: "decompose" | "deprecate" | "simplify" | "skip";
+	analystNotes?: string;
+}
+
 const COMPLIANCE_THRESHOLD = 95;
 const MAX_LOOPS = 5; // More attempts before giving up
 const MAX_SUBTASK_DEPTH = 5; // Max decomposition levels for fast track
+const AGENT_TIMEOUT_BASE_MS = 10 * 60 * 1000; // 10 minutes base timeout
+const AGENT_TIMEOUT_ESCALATION_MS = 5 * 60 * 1000; // +5 minutes per escalation depth
+const AGENT_YIELD_WARNING_MS = 30 * 1000; // Steer 30s before hard yield
 
 type PipelineMode = "3wave" | "fast";
 
@@ -145,6 +166,7 @@ interface PipelineModelConfig {
 		eval: RoleConfig;
 		fix: RoleConfig;
 		fixEscalation: RoleConfig[];
+		analyst: RoleConfig;
 		uat: RoleConfig;
 	};
 	multiwave: {
@@ -169,6 +191,7 @@ const DEFAULT_CONFIG: PipelineModelConfig = {
 			{ model: "anthropic/claude-sonnet-4-6", thinking: "high" },
 			{ model: "anthropic/claude-opus-4-6", thinking: "xhigh" },
 		],
+		analyst: { model: "anthropic/claude-opus-4-6", thinking: "xhigh" },
 		uat: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
 	},
 	multiwave: {
@@ -209,6 +232,7 @@ function loadPipelineConfig(): PipelineModelConfig {
 				fixEscalation: Array.isArray(fast.fixEscalation)
 					? fast.fixEscalation.map((e: any, i: number) => migrateRole(e, DEFAULT_CONFIG.fast.fixEscalation[i] || DEFAULT_CONFIG.fast.fix))
 					: JSON.parse(JSON.stringify(DEFAULT_CONFIG.fast.fixEscalation)),
+				analyst: migrateRole(fast.analyst, DEFAULT_CONFIG.fast.analyst),
 				uat: migrateRole(fast.uat, DEFAULT_CONFIG.fast.uat),
 			},
 			multiwave: {
@@ -594,6 +618,8 @@ export default function (pi: ExtensionAPI) {
 						status: t.status,
 						complianceScore: t.complianceScore,
 						attempts: t.attempts,
+						yields: t.learnings?.filter(l => l.yielded).length || 0,
+						lastAnalystAction: t.learnings?.slice(-1)[0]?.analystAction,
 					})) || phase.tasks.map(t => ({
 						id: t.id,
 						title: t.title,
@@ -630,7 +656,7 @@ export default function (pi: ExtensionAPI) {
 				branch: pipeline.branch,
 				completedGate,
 				foundationsSpec,
-				tasks: ps.tasks.map(t => ({ id: t.id, title: t.title, body: t.body, epic: t.epic, status: t.status, complianceScore: t.complianceScore, attempts: t.attempts, issueNum: t.issueNum })),
+				tasks: ps.tasks.map(t => ({ id: t.id, title: t.title, body: t.body, epic: t.epic, status: t.status, complianceScore: t.complianceScore, attempts: t.attempts, issueNum: t.issueNum, learnings: t.learnings || [] })),
 				timestamp: Date.now(),
 			};
 			writeFileSync(checkpointPath(), JSON.stringify(cp, null, 2));
@@ -662,6 +688,16 @@ export default function (pi: ExtensionAPI) {
 		model?: string;
 		thinking?: string;
 		worktreeCwd?: string;
+		timeoutMs?: number;   // Watchdog timeout — steer for summary then hard yield
+		keepAlive?: boolean;  // Don't close stdin on agent_end (allow follow_up from review)
+	}
+
+	interface AgentResult {
+		output: string;
+		exitCode: number;
+		elapsed: number;
+		yielded: boolean;       // true if agent was timed out
+		yieldSummary?: string;  // structured summary extracted after steer-for-summary
 	}
 
 	// ── Worktree helpers ──
@@ -746,7 +782,7 @@ export default function (pi: ExtensionAPI) {
 		sessionKey: string,
 		ctx: ExtensionContext,
 		opts: RunAgentOpts = {},
-	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+	): Promise<AgentResult> {
 		const isDev = agentDef.name === "dev" || agentDef.name === "foundations-builder";
 		const model = opts.model || agentDef.model || (isDev ? DEV_MODEL : FAST_MODEL);
 
@@ -832,7 +868,7 @@ export default function (pi: ExtensionAPI) {
 
 			// Run agent headless, write sentinel on completion
 			return new Promise((resolve) => {
-				const headlessPromise = runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime);
+				const headlessPromise = runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
 				headlessPromise.then((result) => {
 					// Write sentinel to signal tail pane to close
 					try { writeFileSync(sentinelFile, String(result.exitCode)); } catch {}
@@ -853,7 +889,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ── Headless mode (no tmux or tmux disabled) ──
-		return runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime);
+		return runAgentHeadless(args, task, sessionKey, currentLogFile, agentCwd, startTime, { timeoutMs: opts.timeoutMs, keepAlive: opts.keepAlive });
 	}
 
 	function runAgentHeadless(
@@ -863,7 +899,8 @@ export default function (pi: ExtensionAPI) {
 		currentLogFile: string,
 		agentCwd: string | undefined,
 		startTime: number,
-	): Promise<{ output: string; exitCode: number; elapsed: number }> {
+		opts: { timeoutMs?: number; keepAlive?: boolean } = {},
+	): Promise<AgentResult> {
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
 				stdio: ["pipe", "pipe", "pipe"],
@@ -873,7 +910,6 @@ export default function (pi: ExtensionAPI) {
 
 			// Track process for steering
 			agentProcesses.set(sessionKey, proc);
-			// Register on control socket
 			const agentInfo = activeAgents.get(sessionKey);
 			if (agentInfo) registerAgentOnControl(sessionKey, agentInfo);
 
@@ -883,7 +919,68 @@ export default function (pi: ExtensionAPI) {
 			const textParts: string[] = [];
 			let lineBuf = "";
 			let agentDone = false;
+			let yielded = false;
+			let yieldSummary = "";
+			let yieldSteerSent = false;
+			let collectingYieldResponse = false;
+			const yieldResponseParts: string[] = [];
+			let warningTimer: ReturnType<typeof setTimeout> | null = null;
+			let hardTimer: ReturnType<typeof setTimeout> | null = null;
 			const logStream = existsSync(logDir) ? createWriteStream(currentLogFile, { flags: "a" }) : null;
+
+			function cleanup() {
+				if (warningTimer) { clearTimeout(warningTimer); warningTimer = null; }
+				if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
+				agentProcesses.delete(sessionKey);
+				activeAgents.delete(sessionKey);
+				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
+				writeStateFile();
+			}
+
+			// ── Watchdog timers ──
+			if (opts.timeoutMs && opts.timeoutMs > 0) {
+				const warnAt = Math.max(opts.timeoutMs - AGENT_YIELD_WARNING_MS, opts.timeoutMs * 0.8);
+
+				// Warning steer: ask agent to summarize blockers
+				warningTimer = setTimeout(() => {
+					if (agentDone || yieldSteerSent) return;
+					yieldSteerSent = true;
+					collectingYieldResponse = true;
+					logStream?.write(`\n── WATCHDOG: ${Math.round(warnAt / 1000)}s elapsed, steering for yield summary ──\n`);
+					log(`[WATCHDOG] ${sessionKey}: timeout approaching (${Math.round(warnAt / 1000)}s), requesting yield summary`);
+					try {
+						proc.stdin!.write(JSON.stringify({
+							type: "steer",
+							message: [
+								"TIMEOUT WARNING: You are running out of time. You must yield NOW.",
+								"Stop all current work immediately and respond with a JSON summary:",
+								"```json",
+								'{',
+								'  "blockers": ["list of things preventing progress"],',
+								'  "attempted": ["approaches you already tried"],',
+								'  "suggestion": "your recommendation for what should be tried next"',
+								'}',
+								"```",
+								"This is mandatory. Provide the summary and stop working.",
+							].join("\n"),
+						}) + "\n");
+					} catch {}
+				}, warnAt);
+
+				// Hard yield: kill the process
+				hardTimer = setTimeout(() => {
+					if (agentDone) return;
+					yielded = true;
+					logStream?.write(`\n── WATCHDOG: hard yield at ${Math.round(opts.timeoutMs! / 1000)}s ──\n`);
+					log(`[WATCHDOG] ${sessionKey}: hard yield at ${Math.round(opts.timeoutMs! / 1000)}s`);
+					try { proc.stdin!.write(JSON.stringify({ type: "abort" }) + "\n"); } catch {}
+					// Give 5s for graceful shutdown, then force kill
+					setTimeout(() => {
+						try { proc.kill("SIGTERM"); } catch {}
+						setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2000);
+					}, 5000);
+				}, opts.timeoutMs);
+			}
 
 			proc.stdout!.setEncoding("utf-8");
 			proc.stdout!.on("data", (chunk: string) => {
@@ -895,14 +992,21 @@ export default function (pi: ExtensionAPI) {
 					if (!line) continue;
 					try {
 						const e = JSON.parse(line);
-						// RPC event: extract text deltas (same as json mode)
 						if (e.type === "message_update" && e.assistantMessageEvent?.type === "text_delta") {
-							textParts.push(e.assistantMessageEvent.delta);
+							const delta = e.assistantMessageEvent.delta;
+							textParts.push(delta);
+							// Collect yield response separately after steer
+							if (collectingYieldResponse) yieldResponseParts.push(delta);
 						}
-						// Agent finished - close stdin to let the process exit
 						if (e.type === "agent_end" && !agentDone) {
 							agentDone = true;
-							try { proc.stdin!.end(); } catch {}
+							// Extract yield summary from response if we steered
+							if (yieldSteerSent) {
+								yieldSummary = yieldResponseParts.join("");
+							}
+							if (!opts.keepAlive) {
+								try { proc.stdin!.end(); } catch {}
+							}
 						}
 					} catch {}
 				}
@@ -920,33 +1024,51 @@ export default function (pi: ExtensionAPI) {
 						const e = JSON.parse(lineBuf);
 						if (e.type === "message_update" && e.assistantMessageEvent?.type === "text_delta") {
 							textParts.push(e.assistantMessageEvent.delta);
+							if (collectingYieldResponse) yieldResponseParts.push(e.assistantMessageEvent.delta);
 						}
 					} catch {}
 				}
-				logStream?.write(`\n── exit ${code} | ${Math.round(elapsed / 1000)}s ──\n`);
+				logStream?.write(`\n── exit ${code} | ${Math.round(elapsed / 1000)}s${yielded ? " | YIELDED" : ""} ──\n`);
 				logStream?.end();
-				agentProcesses.delete(sessionKey);
-				activeAgents.delete(sessionKey);
-				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
-				writeStateFile();
+				cleanup();
 
 				const output = textParts.join("") || `(no text output, exit code ${code})`;
-				resolve({ output, exitCode: code ?? 1, elapsed });
+				if (yieldSteerSent && !yieldSummary) yieldSummary = yieldResponseParts.join("");
+				resolve({ output, exitCode: code ?? 1, elapsed, yielded, yieldSummary: yieldSummary || undefined });
 			});
 
 			proc.on("error", (err) => {
 				logStream?.end();
-				agentProcesses.delete(sessionKey);
-				activeAgents.delete(sessionKey);
-				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
-				writeStateFile();
+				cleanup();
 				resolve({
 					output: `Error: ${err.message}`,
 					exitCode: 1,
 					elapsed: Date.now() - startTime,
+					yielded: false,
 				});
 			});
 		});
+	}
+
+	// Extract yield summary JSON from agent's steer response
+	function parseYieldSummary(raw: string): { blockers: string[]; attempted: string[]; suggestion: string } | null {
+		const jsonMatch = raw.match(/```json\s*([\s\S]*?)\s*```/);
+		const text = jsonMatch ? jsonMatch[1] : raw;
+		try {
+			const parsed = JSON.parse(text.trim());
+			if (parsed.blockers || parsed.attempted || parsed.suggestion) {
+				return {
+					blockers: Array.isArray(parsed.blockers) ? parsed.blockers : [],
+					attempted: Array.isArray(parsed.attempted) ? parsed.attempted : [],
+					suggestion: typeof parsed.suggestion === "string" ? parsed.suggestion : "",
+				};
+			}
+		} catch {}
+		// Fallback: treat the entire text as a single blocker
+		if (raw.trim().length > 10) {
+			return { blockers: [raw.trim().slice(0, 500)], attempted: [], suggestion: "" };
+		}
+		return null;
 	}
 
 	function extractJson(text: string): any | null {
@@ -1025,6 +1147,7 @@ export default function (pi: ExtensionAPI) {
 					complianceScore: 0,
 					attempts: 0,
 					issueNum: t.issueNum,
+					learnings: [],
 				})),
 				gate: "wave1-council",
 				gateAttempts: 0,
@@ -2194,7 +2317,7 @@ export default function (pi: ExtensionAPI) {
 			name: phase.name,
 			tasks: pendingTasks.map(t => ({
 				id: t.id, title: t.title, body: t.body, epic: t.epic,
-				status: "pending" as TaskStatus, complianceScore: 0, attempts: 0, issueNum: t.issueNum,
+				status: "pending" as TaskStatus, complianceScore: 0, attempts: 0, issueNum: t.issueNum, learnings: [],
 			})),
 			gate: "wave2-parallel",
 			gateAttempts: 0,
@@ -2353,10 +2476,30 @@ export default function (pi: ExtensionAPI) {
 			log(`  ${t.status === "passed" ? "+" : "-"} ${t.id}: ${t.complianceScore}% — ${scoreInfo?.summary || ""}`);
 		}
 
-		// ── STEP 3: SUBTASK DECOMPOSITION for failed tasks ──
+		// ── STEP 3: FIX with watchdog timeouts, learnings, and analyst escalation ──
 		if (failedTasks.length > 0) {
 			fastStage = "fix";
-			log(`[FAST] ${failedTasks.length} task(s) below ${COMPLIANCE_THRESHOLD}%. Starting subtask decomposition...`);
+			log(`[FAST] ${failedTasks.length} task(s) below ${COMPLIANCE_THRESHOLD}%. Starting fix with watchdog timers...`);
+
+			// Analyst agent definition
+			const analystAgent: AgentDef = {
+				name: "analyst",
+				description: "Task analyst — breaks down or deprecates stuck tasks",
+				tools: "read,grep,find,ls",
+				systemPrompt: [
+					"You are a senior technical analyst. When an agent gets stuck on a task, you analyze the learnings",
+					"(blockers, attempted approaches, suggestions) and decide the best path forward.",
+					"Your options are:",
+					"1. DECOMPOSE: Break the task into smaller, more achievable sub-tasks",
+					"2. SIMPLIFY: Reduce the scope of the task to something achievable",
+					"3. DEPRECATE: Mark the task as not feasible with current approach (explain why)",
+					"4. SKIP: Skip this task for now and move on (explain conditions for retry)",
+					"",
+					"Always provide actionable, specific guidance. If decomposing, provide concrete sub-tasks.",
+					"If simplifying, describe exactly what to keep and what to drop.",
+				].join("\n"),
+				model: pipelineConfig.fast.analyst.model,
+			};
 
 			for (const failedTask of failedTasks) {
 				fastStageTask = `${failedTask.id}: ${failedTask.title}`;
@@ -2376,10 +2519,30 @@ export default function (pi: ExtensionAPI) {
 					const fixThinkingForDepth = fixRole.thinking;
 					const escalated = depth > 1 && esc.length > 0;
 
-					ctx.ui.setStatus("pipeline", `[FAST] Fixing ${failedTask.id} (depth ${depth}/${MAX_SUBTASK_DEPTH}, ${currentScore}%${escalated ? ` · ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}` : ""})...`);
-					log(`[FAST] Subtask fix depth ${depth} for ${failedTask.id} (${currentScore}%)${escalated ? ` [escalated → ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}]` : ""}...`);
+					// Timeout: 10min base + 5min per escalation depth
+					const timeoutMs = AGENT_TIMEOUT_BASE_MS + (depth - 1) * AGENT_TIMEOUT_ESCALATION_MS;
+					const timeoutMin = Math.round(timeoutMs / 60000);
+
+					ctx.ui.setStatus("pipeline", `[FAST] Fixing ${failedTask.id} (depth ${depth}/${MAX_SUBTASK_DEPTH}, ${currentScore}%, ${timeoutMin}m timeout${escalated ? ` · ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}` : ""})...`);
+					log(`[FAST] Fix depth ${depth} for ${failedTask.id} (${currentScore}%) [timeout: ${timeoutMin}m]${escalated ? ` [escalated → ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}]` : ""}...`);
 					failedTask.status = "building";
 					updateWidget();
+
+					// Build learnings context from previous attempts
+					const learningsContext = failedTask.learnings.length > 0 ? [
+						``,
+						`## Previous attempt learnings`,
+						`The following agents have already attempted this task and yielded:`,
+						...failedTask.learnings.map((l, i) => [
+							`### Attempt ${i + 1} (${l.agentRole}, ${shortModelName(l.model)}, depth ${l.depth}, ${Math.round(l.elapsedMs / 1000)}s${l.yielded ? " — TIMED OUT" : ""})`,
+							l.blockers.length > 0 ? `Blockers: ${l.blockers.join("; ")}` : "",
+							l.attempted.length > 0 ? `Already tried: ${l.attempted.join("; ")}` : "",
+							l.suggestion ? `Suggestion: ${l.suggestion}` : "",
+							l.analystAction ? `Analyst decision: ${l.analystAction}${l.analystNotes ? ` — ${l.analystNotes}` : ""}` : "",
+						].filter(Boolean).join("\n")),
+						``,
+						`DO NOT repeat approaches that have already been tried. Use the learnings above to inform a DIFFERENT strategy.`,
+					].join("\n") : "";
 
 					const fixPrompt = [
 						`# Fix Task ${failedTask.id}: ${failedTask.title}`,
@@ -2390,6 +2553,7 @@ export default function (pi: ExtensionAPI) {
 						``,
 						`## Task requirements`,
 						failedTask.body,
+						learningsContext,
 						``,
 						`## Instructions`,
 						`Fix the issues listed above. Do NOT rewrite the entire file.`,
@@ -2400,8 +2564,112 @@ export default function (pi: ExtensionAPI) {
 						...(escalated ? [``, `This is an ESCALATED attempt (depth ${depth}). Previous fixes were insufficient. Apply maximum care and deeper reasoning.`] : []),
 					].join("\n");
 
-					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: fixModelForDepth, thinking: fixThinkingForDepth });
-					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth})"`, cwd);
+					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, {
+						ephemeral: true, model: fixModelForDepth, thinking: fixThinkingForDepth,
+						timeoutMs,
+					});
+
+					// Record learning from this attempt
+					const learning: AgentLearning = {
+						timestamp: Date.now(),
+						agentRole: "fix",
+						model: fixModelForDepth,
+						depth,
+						elapsedMs: fixResult.elapsed,
+						yielded: fixResult.yielded,
+						blockers: [],
+						attempted: [],
+						suggestion: "",
+					};
+
+					if (fixResult.yielded && fixResult.yieldSummary) {
+						const parsed = parseYieldSummary(fixResult.yieldSummary);
+						if (parsed) {
+							learning.blockers = parsed.blockers;
+							learning.attempted = parsed.attempted;
+							learning.suggestion = parsed.suggestion;
+						}
+						log(`[FAST] ${failedTask.id} depth ${depth}: YIELDED after ${Math.round(fixResult.elapsed / 1000)}s. Blockers: ${learning.blockers.join("; ") || "unknown"}`);
+					}
+
+					failedTask.learnings.push(learning);
+
+					// If agent yielded, invoke analyst before re-evaluation
+					if (fixResult.yielded) {
+						ctx.ui.setStatus("pipeline", `[FAST] Analyst reviewing ${failedTask.id} (yielded at depth ${depth})...`);
+						log(`[FAST] Invoking analyst for ${failedTask.id}...`);
+
+						const analystPrompt = [
+							`# Analyst Review — Task ${failedTask.id}: ${failedTask.title}`,
+							``,
+							`## Task requirements`,
+							failedTask.body,
+							``,
+							`## Current score: ${currentScore}%`,
+							`## Current issues: ${issues.join("; ")}`,
+							``,
+							`## Agent learnings from all attempts:`,
+							...failedTask.learnings.map((l, i) => [
+								`### Attempt ${i + 1}: ${l.agentRole} (${shortModelName(l.model)}) — depth ${l.depth}, ${Math.round(l.elapsedMs / 1000)}s${l.yielded ? " TIMED OUT" : ""}`,
+								l.blockers.length > 0 ? `Blockers: ${l.blockers.join("; ")}` : "",
+								l.attempted.length > 0 ? `Tried: ${l.attempted.join("; ")}` : "",
+								l.suggestion ? `Suggestion: ${l.suggestion}` : "",
+							].filter(Boolean).join("\n")),
+							``,
+							`## Read the current codebase (index.html) to understand the implementation state.`,
+							``,
+							`## Your decision — respond with JSON:`,
+							'```json',
+							`{`,
+							`  "action": "decompose" | "simplify" | "deprecate" | "skip",`,
+							`  "reasoning": "why you chose this action",`,
+							`  "subtasks": ["specific sub-task 1", "specific sub-task 2"],`,
+							`  "simplifiedRequirements": "reduced scope description (if simplify)",`,
+							`  "retryConditions": "conditions for retry (if skip)"`,
+							`}`,
+							'```',
+						].join("\n");
+
+						const analystResult = await runAgent(analystAgent, analystPrompt, `fast-analyst-${failedTask.id}-d${depth}`, ctx, {
+							ephemeral: true,
+							model: pipelineConfig.fast.analyst.model,
+							thinking: pipelineConfig.fast.analyst.thinking,
+							timeoutMs: 5 * 60 * 1000, // 5min for analyst
+						});
+
+						const analystJson = extractJson(analystResult.output);
+						const lastLearning = failedTask.learnings[failedTask.learnings.length - 1];
+
+						if (analystJson) {
+							const action = analystJson.action as "decompose" | "simplify" | "deprecate" | "skip";
+							lastLearning.analystAction = action;
+							lastLearning.analystNotes = analystJson.reasoning || "";
+							log(`[ANALYST] ${failedTask.id}: ${action} — ${analystJson.reasoning || "(no reasoning)"}`);
+
+							if (action === "deprecate" || action === "skip") {
+								failedTask.status = "failed";
+								log(`[ANALYST] ${failedTask.id}: ${action === "deprecate" ? "DEPRECATED" : "SKIPPED"} — moving on`);
+								break;
+							}
+
+							if (action === "simplify" && analystJson.simplifiedRequirements) {
+								failedTask.body = analystJson.simplifiedRequirements;
+								log(`[ANALYST] ${failedTask.id}: requirements simplified`);
+							}
+
+							if (action === "decompose" && Array.isArray(analystJson.subtasks) && analystJson.subtasks.length > 0) {
+								// Replace issues with analyst's subtask decomposition
+								issues.length = 0;
+								issues.push(...analystJson.subtasks);
+								log(`[ANALYST] ${failedTask.id}: decomposed into ${analystJson.subtasks.length} subtasks`);
+							}
+						} else {
+							log(`[ANALYST] ${failedTask.id}: could not parse analyst response, continuing with next depth`);
+						}
+					}
+
+					// Commit whatever the agent managed to do (even if yielded)
+					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth}${fixResult.yielded ? " — yielded" : ""})"`, cwd);
 
 					// Re-evaluate this specific task
 					failedTask.status = "scoring";
@@ -2442,7 +2710,16 @@ export default function (pi: ExtensionAPI) {
 
 				if (currentScore < COMPLIANCE_THRESHOLD) {
 					failedTask.status = "failed";
-					log(`[FAST] ${failedTask.id} could not reach ${COMPLIANCE_THRESHOLD}% after ${MAX_SUBTASK_DEPTH} depths (final: ${currentScore}%)`);
+					const totalLearnings = failedTask.learnings.length;
+					const yieldCount = failedTask.learnings.filter(l => l.yielded).length;
+					log(`[FAST] ${failedTask.id} could not reach ${COMPLIANCE_THRESHOLD}% after ${MAX_SUBTASK_DEPTH} depths (final: ${currentScore}%, ${totalLearnings} attempts, ${yieldCount} yields)`);
+
+					// Persist learnings to a file for post-mortem analysis
+					try {
+						const learningsFile = join(logDir, `learnings-${failedTask.id}.json`);
+						writeFileSync(learningsFile, JSON.stringify(failedTask.learnings, null, 2));
+						log(`[FAST] Learnings saved to ${learningsFile}`);
+					} catch {}
 				}
 				updateWidget();
 			}
@@ -3217,6 +3494,8 @@ export default function (pi: ExtensionAPI) {
 					`Build: ${shortModelName(pipelineConfig.fast.build.model)} (entire epic at once)`,
 					`Evaluate: ${shortModelName(pipelineConfig.fast.eval.model)} (per-task scoring)`,
 					`Fix: ${shortModelName(pipelineConfig.fast.fix.model)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)${pipelineConfig.fast.fixEscalation.length > 0 ? ` → escalation: ${pipelineConfig.fast.fixEscalation.map(e => `${shortModelName(e.model)}:${e.thinking}`).join(" → ")}` : ""}`,
+					`Analyst: ${shortModelName(pipelineConfig.fast.analyst.model)}:${pipelineConfig.fast.analyst.thinking} (reviews yielded agents, decomposes/deprecates)`,
+					`Timeouts: ${AGENT_TIMEOUT_BASE_MS / 60000}m base + ${AGENT_TIMEOUT_ESCALATION_MS / 60000}m/depth, yield warning at -${AGENT_YIELD_WARNING_MS / 1000}s`,
 					`UAT: Scenario generation → Playwright execution → approval gate`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				]),
@@ -3803,6 +4082,7 @@ export default function (pi: ExtensionAPI) {
 				{ id: "fast.build", label: "Builder", description: "Builds the entire epic in one shot", key: "build" },
 				{ id: "fast.eval", label: "Evaluator", description: "Scores each task against acceptance criteria", key: "eval" },
 				{ id: "fast.fix", label: "Fixer", description: "Surgical subtask fixes for failed tasks", key: "fix" },
+				{ id: "fast.analyst", label: "Analyst", description: "Reviews yielded agents, decomposes or deprecates stuck tasks", key: "analyst" },
 				{ id: "fast.uat", label: "UAT Tester", description: "Runs Playwright browser automation for UAT scenarios", key: "uat" },
 			];
 
