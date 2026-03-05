@@ -371,18 +371,23 @@ Run `/pipeline-next` to trigger a fix cycle. The builder reads the rejection not
 
 ## Configuring Models
 
-Before starting the pipeline, you can assign which model handles each role:
+Before starting the pipeline, you can assign which model and reasoning level handles each role:
 
 ```
 /pipeline-config
 ```
 
-This opens a full-screen config view with two mode tabs (Fast Track / 3-Wave). Select a role, press Enter, and pick from available models. The model selector has its own tabs:
+This opens a full-screen config view with two mode tabs (Fast Track / 3-Wave). Each role shows its model and thinking level (e.g. `gemini-3-pro · high`).
+
+- **Enter** — open model selector to change the model
+- **Space** — cycle thinking level: `off → minimal → low → medium → high → xhigh`
+
+The model selector has its own tabs:
 
 - **Available** — models with API keys configured and ready to use
 - **All** — every registered model
 
-A ping test runs on selection to confirm the model responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately.
+A ping test runs on model selection to confirm it responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately. The thinking level controls how much reasoning budget each role gets — use `high`/`xhigh` for complex tasks (build, eval, fix) and `medium`/`low` for simpler ones (UAT).
 
 ---
 

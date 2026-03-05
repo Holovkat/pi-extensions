@@ -130,43 +130,51 @@ interface UatState {
 
 // ── Pipeline Config ──────────────────────────────
 
+type ThinkingLevelOption = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+const THINKING_LEVELS: ThinkingLevelOption[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+interface RoleConfig {
+	model: string;
+	thinking: ThinkingLevelOption;
+}
+
 interface PipelineModelConfig {
 	fast: {
-		build: string;
-		eval: string;
-		fix: string;
-		uat: string;
+		build: RoleConfig;
+		eval: RoleConfig;
+		fix: RoleConfig;
+		uat: RoleConfig;
 	};
 	multiwave: {
-		council1: string;
-		council2: string;
-		council3: string;
-		proto1: string;
-		proto2: string;
-		proto3: string;
-		dev: string;
-		compliance: string;
-		orchestrator: string;
+		council1: RoleConfig;
+		council2: RoleConfig;
+		council3: RoleConfig;
+		proto1: RoleConfig;
+		proto2: RoleConfig;
+		proto3: RoleConfig;
+		dev: RoleConfig;
+		compliance: RoleConfig;
+		orchestrator: RoleConfig;
 	};
 }
 
 const DEFAULT_CONFIG: PipelineModelConfig = {
 	fast: {
-		build: "google-gemini-cli/gemini-3-pro-preview",
-		eval: "anthropic/claude-opus-4-6",
-		fix: "bailian/qwen3.5-plus",
-		uat: "google-gemini-cli/gemini-3-pro-preview",
+		build: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "high" },
+		eval: { model: "anthropic/claude-opus-4-6", thinking: "high" },
+		fix: { model: "bailian/qwen3.5-plus", thinking: "high" },
+		uat: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
 	},
 	multiwave: {
-		council1: "anthropic/claude-opus-4-6",
-		council2: "bailian/qwen3.5-plus",
-		council3: "google-gemini-cli/gemini-3-pro-preview",
-		proto1: "google-gemini-cli/gemini-3-pro-preview",
-		proto2: "anthropic/claude-haiku-4-5",
-		proto3: "bailian/qwen3.5-plus",
-		dev: "anthropic/claude-haiku-4-5",
-		compliance: "bailian/qwen3.5-plus",
-		orchestrator: "anthropic/claude-opus-4-6",
+		council1: { model: "anthropic/claude-opus-4-6", thinking: "medium" },
+		council2: { model: "bailian/qwen3.5-plus", thinking: "medium" },
+		council3: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
+		proto1: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
+		proto2: { model: "anthropic/claude-haiku-4-5", thinking: "medium" },
+		proto3: { model: "bailian/qwen3.5-plus", thinking: "medium" },
+		dev: { model: "anthropic/claude-haiku-4-5", thinking: "medium" },
+		compliance: { model: "bailian/qwen3.5-plus", thinking: "medium" },
+		orchestrator: { model: "anthropic/claude-opus-4-6", thinking: "medium" },
 	},
 };
 
@@ -174,14 +182,37 @@ function getConfigPath(): string {
 	return join(homedir(), ".pi", "agent", "pipeline-config.json");
 }
 
+function migrateRole(saved: any, fallback: RoleConfig): RoleConfig {
+	if (!saved) return { ...fallback };
+	if (typeof saved === "string") return { model: saved, thinking: fallback.thinking };
+	return { model: saved.model || fallback.model, thinking: saved.thinking || fallback.thinking };
+}
+
 function loadPipelineConfig(): PipelineModelConfig {
 	const configPath = getConfigPath();
 	if (!existsSync(configPath)) return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 	try {
 		const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+		const fast = raw.fast || {};
+		const mw = raw.multiwave || {};
 		return {
-			fast: { ...DEFAULT_CONFIG.fast, ...raw.fast },
-			multiwave: { ...DEFAULT_CONFIG.multiwave, ...raw.multiwave },
+			fast: {
+				build: migrateRole(fast.build, DEFAULT_CONFIG.fast.build),
+				eval: migrateRole(fast.eval, DEFAULT_CONFIG.fast.eval),
+				fix: migrateRole(fast.fix, DEFAULT_CONFIG.fast.fix),
+				uat: migrateRole(fast.uat, DEFAULT_CONFIG.fast.uat),
+			},
+			multiwave: {
+				council1: migrateRole(mw.council1, DEFAULT_CONFIG.multiwave.council1),
+				council2: migrateRole(mw.council2, DEFAULT_CONFIG.multiwave.council2),
+				council3: migrateRole(mw.council3, DEFAULT_CONFIG.multiwave.council3),
+				proto1: migrateRole(mw.proto1, DEFAULT_CONFIG.multiwave.proto1),
+				proto2: migrateRole(mw.proto2, DEFAULT_CONFIG.multiwave.proto2),
+				proto3: migrateRole(mw.proto3, DEFAULT_CONFIG.multiwave.proto3),
+				dev: migrateRole(mw.dev, DEFAULT_CONFIG.multiwave.dev),
+				compliance: migrateRole(mw.compliance, DEFAULT_CONFIG.multiwave.compliance),
+				orchestrator: migrateRole(mw.orchestrator, DEFAULT_CONFIG.multiwave.orchestrator),
+			},
 		};
 	} catch {
 		return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
@@ -603,17 +634,22 @@ export default function (pi: ExtensionAPI) {
 
 	// Model tiers (loaded from config, mutable)
 	let pipelineConfig = loadPipelineConfig();
-	const getDevModel = () => pipelineConfig.multiwave.dev;
-	const getFastModel = () => pipelineConfig.multiwave.compliance;
-	const getFinalDevModel = () => pipelineConfig.multiwave.orchestrator;
-	const getProtoModels = (): string[] => [pipelineConfig.multiwave.proto1, pipelineConfig.multiwave.proto2, pipelineConfig.multiwave.proto3];
-	const getCouncilModels = (): string[] => [pipelineConfig.multiwave.council1, pipelineConfig.multiwave.council2, pipelineConfig.multiwave.council3];
+	const getDevModel = () => pipelineConfig.multiwave.dev.model;
+	const getDevThinking = () => pipelineConfig.multiwave.dev.thinking;
+	const getFastModel = () => pipelineConfig.multiwave.compliance.model;
+	const getFastThinking = () => pipelineConfig.multiwave.compliance.thinking;
+	const getFinalDevModel = () => pipelineConfig.multiwave.orchestrator.model;
+	const getFinalDevThinking = () => pipelineConfig.multiwave.orchestrator.thinking;
+	const getProtoModels = (): string[] => [pipelineConfig.multiwave.proto1.model, pipelineConfig.multiwave.proto2.model, pipelineConfig.multiwave.proto3.model];
+	const getProtoThinking = (i: number): string => [pipelineConfig.multiwave.proto1.thinking, pipelineConfig.multiwave.proto2.thinking, pipelineConfig.multiwave.proto3.thinking][i] || "medium";
+	const getCouncilModels = (): string[] => [pipelineConfig.multiwave.council1.model, pipelineConfig.multiwave.council2.model, pipelineConfig.multiwave.council3.model];
+	const getCouncilThinking = (i: number): string => [pipelineConfig.multiwave.council1.thinking, pipelineConfig.multiwave.council2.thinking, pipelineConfig.multiwave.council3.thinking][i] || "medium";
 
 	// Backward-compat aliases
-	const DEV_MODEL = pipelineConfig.multiwave.dev;
-	const FAST_MODEL = pipelineConfig.multiwave.compliance;
-	const BUILDER_MODEL = pipelineConfig.multiwave.compliance;
-	const FINAL_DEV_MODEL = pipelineConfig.multiwave.orchestrator;
+	const DEV_MODEL = pipelineConfig.multiwave.dev.model;
+	const FAST_MODEL = pipelineConfig.multiwave.compliance.model;
+	const BUILDER_MODEL = pipelineConfig.multiwave.compliance.model;
+	const FINAL_DEV_MODEL = pipelineConfig.multiwave.orchestrator.model;
 	const PROTO_MODELS = getProtoModels();
 	const FOUNDATIONS_COUNCIL_MODELS = getCouncilModels();
 
@@ -986,7 +1022,7 @@ export default function (pi: ExtensionAPI) {
 					architectPrompt,
 					`architect-${phaseIdx}-${idx}-${model.split("/")[1]}`,
 					ctx,
-					{ model, ephemeral: true, thinking: "medium", worktreeCwd: wtPath },
+					{ model, ephemeral: true, thinking: getCouncilThinking(idx), worktreeCwd: wtPath },
 				);
 			})
 		);
@@ -1062,7 +1098,7 @@ export default function (pi: ExtensionAPI) {
 			JSON.stringify(consolidatedSpec, null, 2),
 			`consolidate-${phaseIdx}`,
 			ctx,
-			{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: "medium" },
+			{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: getCouncilThinking(0) },
 		);
 
 		foundationsSpec = consolidationResult.output;
@@ -1136,7 +1172,7 @@ export default function (pi: ExtensionAPI) {
 			wave0BuildPrompt(1, "Full Prototype Build"),
 			`wave0-step1-${phaseIdx}`,
 			ctx,
-			{ model: PROTO_MODELS[0], ephemeral: true, thinking: "medium" },
+			{ model: PROTO_MODELS[0], ephemeral: true, thinking: getProtoThinking(0) },
 		);
 
 		shellExec(`git add -A && git commit -m "Wave 0 step 1: prototype build (${PROTO_MODELS[0].split("/").pop()})" --allow-empty`, cwd);
@@ -1158,7 +1194,7 @@ export default function (pi: ExtensionAPI) {
 			wave0BuildPrompt(2, "Enhancement Pass"),
 			`wave0-step2-${phaseIdx}`,
 			ctx,
-			{ model: PROTO_MODELS[1], ephemeral: true, thinking: "medium" },
+			{ model: PROTO_MODELS[1], ephemeral: true, thinking: getProtoThinking(1) },
 		);
 
 		shellExec(`git add -A && git commit -m "Wave 0 step 2: enhance (${PROTO_MODELS[1].split("/").pop()})" --allow-empty`, cwd);
@@ -1180,7 +1216,7 @@ export default function (pi: ExtensionAPI) {
 			wave0BuildPrompt(3, "Fine-Tuning & Refinement Pass"),
 			`wave0-step3-${phaseIdx}`,
 			ctx,
-			{ model: PROTO_MODELS[2], ephemeral: true, thinking: "medium" },
+			{ model: PROTO_MODELS[2], ephemeral: true, thinking: getProtoThinking(2) },
 		);
 
 		shellExec(`git add -A && git commit -m "Wave 0 step 3: refine (${PROTO_MODELS[2].split("/").pop()})" --allow-empty`, cwd);
@@ -1240,7 +1276,7 @@ export default function (pi: ExtensionAPI) {
 			].join("\n"),
 			`wave1-review-${phaseIdx}`,
 			ctx,
-			{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: "medium" },
+			{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: getCouncilThinking(0) },
 		);
 
 		shellExec(`git add -A && git commit -m "Wave 1: review and TODO placement" --allow-empty`, cwd);
@@ -1314,7 +1350,7 @@ export default function (pi: ExtensionAPI) {
 				devPrompt,
 				`dev-${task.id}-1`,
 				ctx,
-				{ model: DEV_MODEL, ephemeral: true, thinking: "medium" },
+				{ model: DEV_MODEL, ephemeral: true, thinking: getDevThinking() },
 			);
 
 			// Commit after each task so the next task sees this task's output
@@ -1376,7 +1412,7 @@ export default function (pi: ExtensionAPI) {
 					].join("\n"),
 					`compliance-${task.id}-${compRound}`,
 					ctx,
-					{ ephemeral: true, thinking: "medium" },
+					{ ephemeral: true, thinking: getFastThinking() },
 				);
 
 				const compData = extractJson(compResult.output);
@@ -1423,7 +1459,7 @@ export default function (pi: ExtensionAPI) {
 						].join("\n"),
 						`override-${task.id}-${compRound}`,
 						ctx,
-						{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: "medium" },
+						{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: getCouncilThinking(0) },
 					);
 
 					const overrideData = extractJson(overrideResult.output);
@@ -1552,7 +1588,7 @@ export default function (pi: ExtensionAPI) {
 				].join("\n"),
 				`triage-${phaseIdx}-${fixRound}`,
 				ctx,
-				{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: "medium" },
+				{ model: FOUNDATIONS_COUNCIL_MODELS[0], ephemeral: true, thinking: getCouncilThinking(0) },
 			);
 
 			// Parse triage results and update task bodies / create subtasks
@@ -1652,7 +1688,7 @@ export default function (pi: ExtensionAPI) {
 					].join("\n"),
 					`dev-${task.id}-${fixRound}`,
 					ctx,
-					{ model, ephemeral: true, thinking: "medium" },
+					{ model, ephemeral: true, thinking: getDevThinking() },
 				);
 
 				shellExec(`git add -A && git commit -m "Fix ${task.id} round ${fixRound}" --allow-empty`, cwd);
@@ -1690,7 +1726,7 @@ export default function (pi: ExtensionAPI) {
 				].join("\n"),
 				`blocked-check-${phaseIdx}`,
 				ctx,
-				{ ephemeral: true, thinking: "medium" },
+				{ ephemeral: true, thinking: getFinalDevThinking() },
 			);
 
 			const blockedData = extractJson(blockedCheckResult.output);
@@ -1745,7 +1781,7 @@ export default function (pi: ExtensionAPI) {
 						].join("\n"),
 						`blocked-fix-${taskId}`,
 						ctx,
-						{ model: DEV_MODEL, ephemeral: true, thinking: "medium" },
+						{ model: DEV_MODEL, ephemeral: true, thinking: getDevThinking() },
 					);
 
 					shellExec(`git add -A && git commit -m "Resolve blocked TODOs for ${taskId}" --allow-empty`, cwd);
@@ -2011,15 +2047,15 @@ export default function (pi: ExtensionAPI) {
 	// FAST TRACK PIPELINE
 	// ══════════════════════════════════════════════
 
-	const getFastBuildModel = () => pipelineConfig.fast.build;
-	const getFastEvalModel = () => pipelineConfig.fast.eval;
-	const getFastFixModel = () => pipelineConfig.fast.fix;
-	const getFastUatModel = () => pipelineConfig.fast.uat;
+	const getFastBuildModel = () => pipelineConfig.fast.build.model;
+	const getFastEvalModel = () => pipelineConfig.fast.eval.model;
+	const getFastFixModel = () => pipelineConfig.fast.fix.model;
+	const getFastUatModel = () => pipelineConfig.fast.uat.model;
 
 	// Backward-compat aliases (used in string templates, re-evaluated on access)
-	let FAST_BUILD_MODEL = pipelineConfig.fast.build;
-	let FAST_EVAL_MODEL = pipelineConfig.fast.eval;
-	let FAST_FIX_MODEL = pipelineConfig.fast.fix;
+	let FAST_BUILD_MODEL = pipelineConfig.fast.build.model;
+	let FAST_EVAL_MODEL = pipelineConfig.fast.eval.model;
+	let FAST_FIX_MODEL = pipelineConfig.fast.fix.model;
 
 	function updateChecklistForTask(taskId: string, taskIssueNum?: number) {
 		const checklistPath = join(cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
@@ -2115,7 +2151,7 @@ export default function (pi: ExtensionAPI) {
 			model: FAST_BUILD_MODEL,
 		};
 
-		const buildResult = await runAgent(builderAgent, buildPrompt, `fast-build-${phaseIdx}`, ctx, { ephemeral: true, model: FAST_BUILD_MODEL, thinking: "high" });
+		const buildResult = await runAgent(builderAgent, buildPrompt, `fast-build-${phaseIdx}`, ctx, { ephemeral: true, model: FAST_BUILD_MODEL, thinking: pipelineConfig.fast.build.thinking });
 
 		shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: build ${phase.name}"`, cwd);
 		log(`[FAST] BUILD complete (${Math.round(buildResult.elapsed / 1000)}s)`);
@@ -2177,7 +2213,7 @@ export default function (pi: ExtensionAPI) {
 			model: FAST_EVAL_MODEL,
 		};
 
-		const evalResult = await runAgent(evalAgent, evalPrompt, `fast-eval-${phaseIdx}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: "high" });
+		const evalResult = await runAgent(evalAgent, evalPrompt, `fast-eval-${phaseIdx}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: pipelineConfig.fast.eval.thinking });
 
 		const evalJson = extractJson(evalResult.output);
 		const taskScores = new Map<string, { score: number; issues: string[]; summary: string }>();
@@ -2245,7 +2281,7 @@ export default function (pi: ExtensionAPI) {
 						`Focus only on what's broken or missing for task ${failedTask.id}.`,
 					].join("\n");
 
-					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: FAST_FIX_MODEL, thinking: "high" });
+					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: FAST_FIX_MODEL, thinking: pipelineConfig.fast.fix.thinking });
 					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth})"`, cwd);
 
 					// Re-evaluate this specific task
@@ -2267,7 +2303,7 @@ export default function (pi: ExtensionAPI) {
 						'```',
 					].join("\n");
 
-					const reEvalResult = await runAgent(evalAgent, reEvalPrompt, `fast-reeval-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: "medium" });
+					const reEvalResult = await runAgent(evalAgent, reEvalPrompt, `fast-reeval-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: pipelineConfig.fast.eval.thinking });
 					const reEvalJson = extractJson(reEvalResult.output);
 
 					if (reEvalJson) {
@@ -2433,7 +2469,7 @@ export default function (pi: ExtensionAPI) {
 			systemPrompt: "You are a QA engineer. Generate thorough, automatable test scenarios for user acceptance testing.",
 		};
 
-		const result = await runAgent(scenarioAgent, scenarioPrompt, `fast-uat-scenarios-${epicNum}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: "medium" });
+		const result = await runAgent(scenarioAgent, scenarioPrompt, `fast-uat-scenarios-${epicNum}`, ctx, { ephemeral: true, model: FAST_EVAL_MODEL, thinking: pipelineConfig.fast.uat.thinking });
 		const scenarioJson = extractJson(result.output);
 
 		if (!scenarioJson?.scenarios) {
@@ -2550,10 +2586,10 @@ export default function (pi: ExtensionAPI) {
 				description: "UAT browser tester",
 				tools: "read,bash,browser_navigate,browser_snapshot,browser_take_screenshot,browser_click,browser_type,browser_press_key,browser_wait_for,browser_evaluate",
 				systemPrompt: "You are a QA tester. Execute test scenarios using Playwright browser tools. Be thorough and report pass/fail with evidence.",
-				model: pipelineConfig.fast.uat,
+				model: pipelineConfig.fast.uat.model,
 			};
 
-			const uatResult = await runAgent(uatAgent, playwrightPrompt, `fast-uat-exec-${scenario.id}`, ctx, { ephemeral: true });
+			const uatResult = await runAgent(uatAgent, playwrightPrompt, `fast-uat-exec-${scenario.id}`, ctx, { ephemeral: true, thinking: pipelineConfig.fast.uat.thinking });
 			const resultJson = extractJson(uatResult.output);
 
 			const scenarioResult = resultJson?.overallResult === "pass" ? "pass" : "fail";
@@ -2754,10 +2790,10 @@ export default function (pi: ExtensionAPI) {
 					if (pipelineMode === "fast" && pipeline.running) {
 						const sn = (id: string) => shortModelName(id).slice(0, 10);
 						const stages: { label: string; model: string; stage: FastStage; taskLine: string }[] = [
-							{ label: "Build", model: sn(pipelineConfig.fast.build), stage: "build", taskLine: "" },
-							{ label: "Eval", model: sn(pipelineConfig.fast.eval), stage: "eval", taskLine: "" },
-							{ label: "Fix", model: sn(pipelineConfig.fast.fix), stage: "fix", taskLine: fastStageTask },
-							{ label: "UAT Auto", model: sn(pipelineConfig.fast.uat), stage: "uat-exec", taskLine: "" },
+							{ label: "Build", model: sn(pipelineConfig.fast.build.model), stage: "build", taskLine: "" },
+							{ label: "Eval", model: sn(pipelineConfig.fast.eval.model), stage: "eval", taskLine: "" },
+							{ label: "Fix", model: sn(pipelineConfig.fast.fix.model), stage: "fix", taskLine: fastStageTask },
+							{ label: "UAT Auto", model: sn(pipelineConfig.fast.uat.model), stage: "uat-exec", taskLine: "" },
 							{ label: "UAT", model: "User", stage: "uat-approval", taskLine: "" },
 						];
 
@@ -2796,7 +2832,7 @@ export default function (pi: ExtensionAPI) {
 						const allDone = fastStage === "uat-approval" && uatState.approved;
 						const sn2 = (id: string) => shortModelName(id).slice(0, 10);
 						const stageLabels = ["Build", "Eval", "Fix", "UAT Auto", "UAT"];
-						const models = [sn2(pipelineConfig.fast.build), sn2(pipelineConfig.fast.eval), sn2(pipelineConfig.fast.fix), sn2(pipelineConfig.fast.uat), "User"];
+						const models = [sn2(pipelineConfig.fast.build.model), sn2(pipelineConfig.fast.eval.model), sn2(pipelineConfig.fast.fix.model), sn2(pipelineConfig.fast.uat.model), "User"];
 						const boxParts: string[] = [];
 						for (let s = 0; s < stageLabels.length; s++) {
 							const icon = allDone ? "✓" : (s <= 4 ? "✓" : "○");
@@ -3053,15 +3089,15 @@ export default function (pi: ExtensionAPI) {
 				``,
 				...(isMultiwave ? [
 					`Council: 3 architects → consolidate spec`,
-					`Wave 0: Prototype POC (${shortModelName(pipelineConfig.multiwave.proto1)} → ${shortModelName(pipelineConfig.multiwave.proto2)} → ${shortModelName(pipelineConfig.multiwave.proto3)}) → working prototype`,
+					`Wave 0: Prototype POC (${shortModelName(pipelineConfig.multiwave.proto1.model)} → ${shortModelName(pipelineConfig.multiwave.proto2.model)} → ${shortModelName(pipelineConfig.multiwave.proto3.model)}) → working prototype`,
 					`Wave 1: Review prototype → place TODOs for gaps → compliance`,
 					`Wave 2: Parallel dev sprint → compliance → targeted fixes`,
 					`Gates: review → build/lint → test (max ${MAX_LOOPS} retries each)`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				] : [
-					`Build: ${shortModelName(pipelineConfig.fast.build)} (entire epic at once)`,
-					`Evaluate: ${shortModelName(pipelineConfig.fast.eval)} (per-task scoring)`,
-					`Fix: ${shortModelName(pipelineConfig.fast.fix)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)`,
+					`Build: ${shortModelName(pipelineConfig.fast.build.model)} (entire epic at once)`,
+					`Evaluate: ${shortModelName(pipelineConfig.fast.eval.model)} (per-task scoring)`,
+					`Fix: ${shortModelName(pipelineConfig.fast.fix.model)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)`,
 					`UAT: Scenario generation → Playwright execution → approval gate`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				]),
@@ -3772,6 +3808,15 @@ export default function (pi: ExtensionAPI) {
 				return wrapper;
 			}
 
+			function formatRoleValue(role: RoleConfig): string {
+				return `${shortModelName(role.model)} · ${role.thinking}`;
+			}
+
+			function cycleThinking(role: RoleConfig): void {
+				const idx = THINKING_LEVELS.indexOf(role.thinking);
+				role.thinking = THINKING_LEVELS[(idx + 1) % THINKING_LEVELS.length];
+			}
+
 			function getSettingItems(): SettingItem[] {
 				const tabHeader: SettingItem = {
 					id: "__tab",
@@ -3786,10 +3831,10 @@ export default function (pi: ExtensionAPI) {
 						...fastRoles.map(r => ({
 							id: r.id,
 							label: r.label,
-							currentValue: shortModelName(config.fast[r.key]),
-							description: r.description,
+							currentValue: formatRoleValue(config.fast[r.key]),
+							description: `${r.description} · Space to cycle thinking`,
 							submenu: (currentValue: string, done: (selectedValue?: string) => void) => {
-								const fullId = config.fast[r.key];
+								const fullId = config.fast[r.key].model;
 								return buildModelSubmenu(fullId, done);
 							},
 						})),
@@ -3800,10 +3845,10 @@ export default function (pi: ExtensionAPI) {
 						...multiwaveRoles.map(r => ({
 							id: r.id,
 							label: r.label,
-							currentValue: shortModelName(config.multiwave[r.key]),
-							description: r.description,
+							currentValue: formatRoleValue(config.multiwave[r.key]),
+							description: `${r.description} · Space to cycle thinking`,
 							submenu: (currentValue: string, done: (selectedValue?: string) => void) => {
-								const fullId = config.multiwave[r.key];
+								const fullId = config.multiwave[r.key].model;
 								return buildModelSubmenu(fullId, done);
 							},
 						})),
@@ -3820,26 +3865,28 @@ export default function (pi: ExtensionAPI) {
 					hint: (text: string) => theme.fg("dim", text),
 				};
 
+			function saveAndReload() {
+					savePipelineConfig(config);
+					pipelineConfig = config;
+					FAST_BUILD_MODEL = config.fast.build.model;
+					FAST_EVAL_MODEL = config.fast.eval.model;
+					FAST_FIX_MODEL = config.fast.fix.model;
+				}
+
 				let items = getSettingItems();
 				const settingsList = new SettingsList(
 					items,
 					16,
 					settingsTheme,
 					(id: string, newValue: string) => {
-						// Save on every change
 						if (id.startsWith("fast.")) {
 							const key = id.slice(5) as keyof PipelineModelConfig["fast"];
-							config.fast[key] = newValue;
+							config.fast[key].model = newValue;
 						} else if (id.startsWith("mw.")) {
 							const key = id.slice(3) as keyof PipelineModelConfig["multiwave"];
-							config.multiwave[key] = newValue;
+							config.multiwave[key].model = newValue;
 						}
-						savePipelineConfig(config);
-						// Reload into runtime
-						pipelineConfig = config;
-						FAST_BUILD_MODEL = config.fast.build;
-						FAST_EVAL_MODEL = config.fast.eval;
-						FAST_FIX_MODEL = config.fast.fix;
+						saveAndReload();
 					},
 					() => { done(); }, // Esc exits
 				);
@@ -3861,19 +3908,38 @@ export default function (pi: ExtensionAPI) {
 						lines.push("");
 						lines.push(...settingsList.render(width));
 						lines.push("");
+						lines.push(theme.fg("dim", "  Enter: change model · Space: cycle thinking · Esc: close"));
 						lines.push(border);
 						return lines;
 					},
 					handleInput(data: string) {
-						// Intercept Tab and arrow keys on the tab header to switch tabs
 						const kb = getEditorKeybindings();
 						const selected = items[(settingsList as any).selectedIndex];
+						// Tab header: switch pipeline mode tabs
 						if (selected?.id === "__tab" && (data === "\t" || kb.matches(data, "selectConfirm") || data === " ")) {
 							activeTab = activeTab === "fast" ? "multiwave" : "fast";
 							items = getSettingItems();
 							(settingsList as any).items = items;
 							(settingsList as any).filteredItems = items;
 							(settingsList as any).selectedIndex = 0;
+							settingsList.invalidate();
+							return;
+						}
+						// Space on a role item: cycle thinking level
+						if (selected && selected.id !== "__tab" && data === " ") {
+							if (selected.id.startsWith("fast.")) {
+								const key = selected.id.slice(5) as keyof PipelineModelConfig["fast"];
+								cycleThinking(config.fast[key]);
+							} else if (selected.id.startsWith("mw.")) {
+								const key = selected.id.slice(3) as keyof PipelineModelConfig["multiwave"];
+								cycleThinking(config.multiwave[key]);
+							}
+							saveAndReload();
+							items = getSettingItems();
+							const idx = (settingsList as any).selectedIndex;
+							(settingsList as any).items = items;
+							(settingsList as any).filteredItems = items;
+							(settingsList as any).selectedIndex = idx;
 							settingsList.invalidate();
 							return;
 						}
@@ -4224,9 +4290,9 @@ export default function (pi: ExtensionAPI) {
 
 		// Reload pipeline config on session start
 		pipelineConfig = loadPipelineConfig();
-		FAST_BUILD_MODEL = pipelineConfig.fast.build;
-		FAST_EVAL_MODEL = pipelineConfig.fast.eval;
-		FAST_FIX_MODEL = pipelineConfig.fast.fix;
+		FAST_BUILD_MODEL = pipelineConfig.fast.build.model;
+		FAST_EVAL_MODEL = pipelineConfig.fast.eval.model;
+		FAST_FIX_MODEL = pipelineConfig.fast.fix.model;
 
 		sessionDir = join(ctx.cwd, ".pi", "agent-sessions");
 		logDir = join(ctx.cwd, ".pi", "pipeline-logs");

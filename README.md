@@ -505,7 +505,9 @@ Both modes share:
 
 #### Model Configuration (`/pipeline-config`)
 
-Opens a full-screen configuration view with two mode tabs (Fast Track and 3-Wave) listing every pipeline role and its assigned model. Takes over the entire viewport for clarity.
+Opens a full-screen configuration view with two mode tabs (Fast Track and 3-Wave) listing every pipeline role, its assigned model, and reasoning level. Takes over the entire viewport for clarity.
+
+Each role shows its model and thinking level (e.g. `gemini-3-pro · high`). Press **Enter** to change the model, or **Space** to cycle the thinking level (`off → minimal → low → medium → high → xhigh`).
 
 ```
 ──────────────────────────────────────────────────
@@ -516,14 +518,14 @@ Opens a full-screen configuration view with two mode tabs (Fast Track and 3-Wave
 ──────────────────────────────────────────────────
 
 → [Fast Track]  3-Wave        Tab/← → to switch
-  Builder                     gemini-3-pro-preview
-  Evaluator                   claude-opus-4-6
-  Fixer                       qwen3.5-plus
-  UAT Tester                  gemini-3-pro-preview
+  Builder                     gemini-3-pro · high
+  Evaluator                   claude-opus-4-6 · high
+  Fixer                       qwen3.5-plus · high
+  UAT Tester                  gemini-3-pro · medium
 
-  Builds the entire epic in one shot
+  Builds the entire epic in one shot · Space to cycle thinking
 
-  Enter/Space to change · Esc to cancel
+  Enter: change model · Space: cycle thinking · Esc: close
 ──────────────────────────────────────────────────
 ```
 
