@@ -2366,7 +2366,14 @@ export default function (pi: ExtensionAPI) {
 		if (!existsSync(checklistPath)) return;
 		let checklist = readFileSync(checklistPath, "utf-8");
 		const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-		// Format A: - [ ] **1.1 — Title**
+		// Format A: - [ ] **1.1 — Title** or - [x] **1.1 — Title**
+		if (taskIssueNum) {
+			// Add issue number: **Title** → **Title** (#N)
+			checklist = checklist.replace(
+				new RegExp(`(- \\[[ x]\\] \\*\\*${escaped}\\s*[—–-]+\\s*.+?)\\*\\*(?!.*\\(#\\d+\\))`),
+				`$1** (#${taskIssueNum})`,
+			);
+		}
 		checklist = checklist.replace(
 			new RegExp(`- \\[ \\] (\\*\\*${escaped}\\s*[—–-]+)`),
 			`- [x] $1`,
@@ -2582,6 +2589,35 @@ export default function (pi: ExtensionAPI) {
 				let currentScore = failedTask.complianceScore;
 				const issues = taskScores.get(failedTask.id)?.issues || [];
 
+				// Create GitHub issue for this task if it doesn't have one
+				if (!failedTask.issueNum) {
+					const issueBody = [
+						`## Task ${failedTask.id}: ${failedTask.title}`,
+						``,
+						`**Epic:** ${failedTask.epic}`,
+						`**Initial score:** ${currentScore}%`,
+						`**Issues:** ${issues.length > 0 ? issues.join("; ") : "pending evaluation"}`,
+						``,
+						`### Requirements`,
+						failedTask.body.slice(0, 4000),
+						``,
+						`---`,
+						`*Created by pipeline fix loop. Agent learnings will be posted as comments.*`,
+					].join("\n");
+					const createResult = shellExec(
+						`gh issue create --title "${failedTask.id}: ${failedTask.title}" --body ${JSON.stringify(issueBody)} --label "pipeline-fix"`,
+						cwd,
+					);
+					if (createResult.ok) {
+						const numMatch = createResult.stdout.match(/(\d+)/);
+						if (numMatch) {
+							failedTask.issueNum = parseInt(numMatch[1], 10);
+							log(`[FAST] Created issue #${failedTask.issueNum} for ${failedTask.id}`);
+							updateChecklistForTask(failedTask.id, failedTask.issueNum);
+						}
+					}
+				}
+
 				// Seed learnings from GitHub issue comments (picks up from prior runs)
 				if (failedTask.issueNum && failedTask.learnings.length === 0) {
 					failedTask.learnings = readLearningsFromIssue(failedTask.issueNum, cwd);
@@ -2669,7 +2705,7 @@ export default function (pi: ExtensionAPI) {
 						continue;
 					}
 
-					// Record learning from this attempt
+					// Record learning from this attempt — ALWAYS, not just on yield
 					const learning: AgentLearning = {
 						timestamp: Date.now(),
 						agentRole: "fix",
@@ -2677,16 +2713,24 @@ export default function (pi: ExtensionAPI) {
 						depth,
 						elapsedMs: fixResult.elapsed,
 						yielded: fixResult.yielded,
-						blockers: [],
+						blockers: [...issues], // Current issues ARE the blockers
 						attempted: [],
 						suggestion: "",
 					};
 
+					// Extract what the agent actually did from its output
+					const agentOutput = fixResult.output || "";
+					if (agentOutput.length > 10) {
+						// Truncate to first ~500 chars as a summary of approach
+						const summary = agentOutput.slice(0, 500).replace(/\n{2,}/g, "\n").trim();
+						learning.attempted = [summary];
+					}
+
 					if (fixResult.yielded && fixResult.yieldSummary) {
 						const parsed = parseYieldSummary(fixResult.yieldSummary);
 						if (parsed) {
-							learning.blockers = parsed.blockers;
-							learning.attempted = parsed.attempted;
+							learning.blockers = parsed.blockers.length > 0 ? parsed.blockers : learning.blockers;
+							learning.attempted = parsed.attempted.length > 0 ? parsed.attempted : learning.attempted;
 							learning.suggestion = parsed.suggestion;
 						}
 						log(`[FAST] ${failedTask.id} depth ${depth}: YIELDED after ${Math.round(fixResult.elapsed / 1000)}s. Blockers: ${learning.blockers.join("; ") || "unknown"}`);
@@ -2768,11 +2812,6 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					// Post learning to GitHub issue (after analyst has had chance to enrich it)
-					if (failedTask.issueNum) {
-						postLearningToIssue(failedTask.issueNum, learning, cwd);
-					}
-
 					// Commit whatever the agent managed to do (even if yielded)
 					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth}${fixResult.yielded ? " — yielded" : ""})"`, cwd);
 
@@ -2807,7 +2846,22 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
+					// Enrich learning with re-eval results (what changed, what's still broken)
+					const lastLearning = failedTask.learnings[failedTask.learnings.length - 1];
+					if (lastLearning) {
+						lastLearning.blockers = [...issues]; // Update to post-reeval issues
+						lastLearning.suggestion = currentScore >= COMPLIANCE_THRESHOLD
+							? `Fixed — score now ${currentScore}%`
+							: `Score improved to ${currentScore}% but still failing. Remaining: ${issues.join("; ")}`;
+					}
+
+					// Post learning to GitHub issue (with full context from this depth)
+					if (failedTask.issueNum && lastLearning) {
+						postLearningToIssue(failedTask.issueNum, lastLearning, cwd);
+					}
+
 					failedTask.attempts = depth + 1;
+					writeStateFile();
 
 					if (currentScore >= COMPLIANCE_THRESHOLD) {
 						failedTask.status = "passed";
