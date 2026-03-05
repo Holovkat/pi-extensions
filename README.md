@@ -501,6 +501,28 @@ Both modes share:
 - **Pipeline state file** — `pipeline-state.json` for the standalone dashboard
 - **Branch management** — each epic gets its own branch chained from the previous
 - **Checkpoint system** — save/resume for long-running pipelines
+- **Configurable models** — `/pipeline-config` to assign models to each pipeline role
+
+#### Model Configuration (`/pipeline-config`)
+
+Opens an interactive overlay with two tabs (Fast Track and 3-Wave) listing every pipeline role. Tab between modes, select a role, and pick from all available models with a live ping test before persisting.
+
+```
+  Pipeline Configuration
+  Model assignments for each pipeline role
+
+→ [Fast Track]  3-Wave        Tab/← → to switch
+  Builder                     gemini-3-pro-preview
+  Evaluator                   claude-opus-4-6
+  Fixer                       qwen3.5-plus
+  UAT Tester                  gemini-3-pro-preview
+
+  Builds the entire epic in one shot
+
+  Enter/Space to change · Esc to cancel
+```
+
+On Enter, a model selector overlay appears listing all configured models. Selecting one triggers a quick ping test to confirm the model responds. On success, the assignment is saved to `~/.pi/agent/pipeline-config.json` and takes effect immediately.
 
 #### Pipeline State File
 
@@ -680,6 +702,7 @@ brew install glow
 | `/pipeline-reject` | Reject UAT with notes, loop back (Fast Track) |
 | `/pipeline-reset` | Full reset — checkout main, delete branches, uncheck checklist, reopen issues |
 | `/pipeline-end` | UAT sign-off, squash merge to main, push, clean up |
+| `/pipeline-config` | Configure model assignments for each pipeline role |
 | `/pipeline-status` | Show current pipeline progress |
 | `/pipeline-dashboard` | Open live dashboard in tmux pane |
 | `/pipeline-logs` | Open all agent logs in tmux panes |

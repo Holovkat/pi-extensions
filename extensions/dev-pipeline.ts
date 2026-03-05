@@ -41,7 +41,8 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Text, truncateToWidth, visibleWidth, SettingsList, SelectList, getEditorKeybindings } from "@mariozechner/pi-tui";
+import type { SettingItem, SettingsListTheme, SelectItem, SelectListTheme } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, createWriteStream } from "fs";
 import { join, resolve } from "path";
@@ -125,6 +126,111 @@ interface UatState {
 	awaitingApproval: boolean;
 	approved: boolean;
 	rejectionNotes?: string;
+}
+
+// ── Pipeline Config ──────────────────────────────
+
+interface PipelineModelConfig {
+	fast: {
+		build: string;
+		eval: string;
+		fix: string;
+		uat: string;
+	};
+	multiwave: {
+		council1: string;
+		council2: string;
+		council3: string;
+		proto1: string;
+		proto2: string;
+		proto3: string;
+		dev: string;
+		compliance: string;
+		orchestrator: string;
+	};
+}
+
+const DEFAULT_CONFIG: PipelineModelConfig = {
+	fast: {
+		build: "google-gemini-cli/gemini-3-pro-preview",
+		eval: "anthropic/claude-opus-4-6",
+		fix: "bailian/qwen3.5-plus",
+		uat: "google-gemini-cli/gemini-3-pro-preview",
+	},
+	multiwave: {
+		council1: "anthropic/claude-opus-4-6",
+		council2: "bailian/qwen3.5-plus",
+		council3: "google-gemini-cli/gemini-3-pro-preview",
+		proto1: "google-gemini-cli/gemini-3-pro-preview",
+		proto2: "anthropic/claude-haiku-4-5",
+		proto3: "bailian/qwen3.5-plus",
+		dev: "anthropic/claude-haiku-4-5",
+		compliance: "bailian/qwen3.5-plus",
+		orchestrator: "anthropic/claude-opus-4-6",
+	},
+};
+
+function getConfigPath(): string {
+	return join(homedir(), ".pi", "agent", "pipeline-config.json");
+}
+
+function loadPipelineConfig(): PipelineModelConfig {
+	const configPath = getConfigPath();
+	if (!existsSync(configPath)) return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+	try {
+		const raw = JSON.parse(readFileSync(configPath, "utf-8"));
+		return {
+			fast: { ...DEFAULT_CONFIG.fast, ...raw.fast },
+			multiwave: { ...DEFAULT_CONFIG.multiwave, ...raw.multiwave },
+		};
+	} catch {
+		return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+	}
+}
+
+function savePipelineConfig(config: PipelineModelConfig): void {
+	const configPath = getConfigPath();
+	const dir = join(homedir(), ".pi", "agent");
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+}
+
+function shortModelName(fullId: string): string {
+	const parts = fullId.split("/");
+	return parts.length > 1 ? parts[1] : fullId;
+}
+
+function pingModel(modelId: string): boolean {
+	try {
+		const providerExtDir = join(homedir(), ".pi", "agent", "extensions");
+		const providerExts: string[] = [];
+		if (existsSync(providerExtDir)) {
+			for (const f of readdirSync(providerExtDir)) {
+				if (f.endsWith("-provider.ts")) providerExts.push("-e", join(providerExtDir, f));
+			}
+		}
+		const args = [
+			"--mode", "print",
+			"-p",
+			"--no-extensions",
+			...providerExts,
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-session",
+			"--model", modelId,
+			"--thinking", "off",
+			"--no-tools",
+			"Say OK",
+		];
+		execSync(`pi ${args.map(a => `'${a}'`).join(" ")}`, {
+			encoding: "utf-8",
+			timeout: 15000,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 // ── Helpers ──────────────────────────────────────
@@ -457,21 +563,21 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	// Model tiers
-	const DEV_MODEL = "anthropic/claude-haiku-4-5";
-	const FAST_MODEL = "bailian/qwen3.5-plus";
-	const BUILDER_MODEL = "bailian/qwen3.5-plus";
-	const FINAL_DEV_MODEL = "anthropic/claude-opus-4-6";
-	const PROTO_MODELS = [
-		"google-gemini-cli/gemini-3-pro-preview",  // Step 1: one-shot full build
-		"anthropic/claude-haiku-4-5",               // Step 2: enhance & polish
-		"bailian/qwen3.5-plus",                     // Step 3: fine-tune & refine
-	];
-	const FOUNDATIONS_COUNCIL_MODELS = [
-		"anthropic/claude-opus-4-6",
-		"bailian/qwen3.5-plus",
-		"google-gemini-cli/gemini-3-pro-preview",
-	];
+	// Model tiers (loaded from config, mutable)
+	let pipelineConfig = loadPipelineConfig();
+	const getDevModel = () => pipelineConfig.multiwave.dev;
+	const getFastModel = () => pipelineConfig.multiwave.compliance;
+	const getFinalDevModel = () => pipelineConfig.multiwave.orchestrator;
+	const getProtoModels = (): string[] => [pipelineConfig.multiwave.proto1, pipelineConfig.multiwave.proto2, pipelineConfig.multiwave.proto3];
+	const getCouncilModels = (): string[] => [pipelineConfig.multiwave.council1, pipelineConfig.multiwave.council2, pipelineConfig.multiwave.council3];
+
+	// Backward-compat aliases
+	const DEV_MODEL = pipelineConfig.multiwave.dev;
+	const FAST_MODEL = pipelineConfig.multiwave.compliance;
+	const BUILDER_MODEL = pipelineConfig.multiwave.compliance;
+	const FINAL_DEV_MODEL = pipelineConfig.multiwave.orchestrator;
+	const PROTO_MODELS = getProtoModels();
+	const FOUNDATIONS_COUNCIL_MODELS = getCouncilModels();
 
 	function runAgent(
 		agentDef: AgentDef,
@@ -1867,9 +1973,15 @@ export default function (pi: ExtensionAPI) {
 	// FAST TRACK PIPELINE
 	// ══════════════════════════════════════════════
 
-	const FAST_BUILD_MODEL = "google-gemini-cli/gemini-3-pro-preview";
-	const FAST_EVAL_MODEL = "anthropic/claude-opus-4-6";
-	const FAST_FIX_MODEL = "bailian/qwen3.5-plus";
+	const getFastBuildModel = () => pipelineConfig.fast.build;
+	const getFastEvalModel = () => pipelineConfig.fast.eval;
+	const getFastFixModel = () => pipelineConfig.fast.fix;
+	const getFastUatModel = () => pipelineConfig.fast.uat;
+
+	// Backward-compat aliases (used in string templates, re-evaluated on access)
+	let FAST_BUILD_MODEL = pipelineConfig.fast.build;
+	let FAST_EVAL_MODEL = pipelineConfig.fast.eval;
+	let FAST_FIX_MODEL = pipelineConfig.fast.fix;
 
 	function updateChecklistForTask(taskId: string, taskIssueNum?: number) {
 		const checklistPath = join(cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
@@ -2400,7 +2512,7 @@ export default function (pi: ExtensionAPI) {
 				description: "UAT browser tester",
 				tools: "read,bash,browser_navigate,browser_snapshot,browser_take_screenshot,browser_click,browser_type,browser_press_key,browser_wait_for,browser_evaluate",
 				systemPrompt: "You are a QA tester. Execute test scenarios using Playwright browser tools. Be thorough and report pass/fail with evidence.",
-				model: FAST_BUILD_MODEL,
+				model: pipelineConfig.fast.uat,
 			};
 
 			const uatResult = await runAgent(uatAgent, playwrightPrompt, `fast-uat-exec-${scenario.id}`, ctx, { ephemeral: true });
@@ -2559,11 +2671,12 @@ export default function (pi: ExtensionAPI) {
 
 					// ── Fast Track pipeline stage bar ──
 					if (pipelineMode === "fast" && pipeline.running) {
+						const sn = (id: string) => shortModelName(id).slice(0, 10);
 						const stages: { label: string; model: string; stage: FastStage; taskLine: string }[] = [
-							{ label: "Build", model: "Gemini", stage: "build", taskLine: "" },
-							{ label: "Eval", model: "Opus", stage: "eval", taskLine: "" },
-							{ label: "Fix", model: "Qwen", stage: "fix", taskLine: fastStageTask },
-							{ label: "UAT Auto", model: "Gemini", stage: "uat-exec", taskLine: "" },
+							{ label: "Build", model: sn(pipelineConfig.fast.build), stage: "build", taskLine: "" },
+							{ label: "Eval", model: sn(pipelineConfig.fast.eval), stage: "eval", taskLine: "" },
+							{ label: "Fix", model: sn(pipelineConfig.fast.fix), stage: "fix", taskLine: fastStageTask },
+							{ label: "UAT Auto", model: sn(pipelineConfig.fast.uat), stage: "uat-exec", taskLine: "" },
 							{ label: "UAT", model: "User", stage: "uat-approval", taskLine: "" },
 						];
 
@@ -2600,8 +2713,9 @@ export default function (pi: ExtensionAPI) {
 					} else if (pipelineMode === "fast" && !pipeline.running && fastStage !== "idle") {
 						// Show completed state
 						const allDone = fastStage === "uat-approval" && uatState.approved;
+						const sn2 = (id: string) => shortModelName(id).slice(0, 10);
 						const stageLabels = ["Build", "Eval", "Fix", "UAT Auto", "UAT"];
-						const models = ["Gemini", "Opus", "Qwen", "Gemini", "User"];
+						const models = [sn2(pipelineConfig.fast.build), sn2(pipelineConfig.fast.eval), sn2(pipelineConfig.fast.fix), sn2(pipelineConfig.fast.uat), "User"];
 						const boxParts: string[] = [];
 						for (let s = 0; s < stageLabels.length; s++) {
 							const icon = allDone ? "✓" : (s <= 4 ? "✓" : "○");
@@ -2857,15 +2971,15 @@ export default function (pi: ExtensionAPI) {
 				``,
 				...(isMultiwave ? [
 					`Council: 3 architects → consolidate spec`,
-					`Wave 0: Prototype POC (Gemini → Haiku → Qwen) → working prototype`,
+					`Wave 0: Prototype POC (${shortModelName(pipelineConfig.multiwave.proto1)} → ${shortModelName(pipelineConfig.multiwave.proto2)} → ${shortModelName(pipelineConfig.multiwave.proto3)}) → working prototype`,
 					`Wave 1: Review prototype → place TODOs for gaps → compliance`,
 					`Wave 2: Parallel dev sprint → compliance → targeted fixes`,
 					`Gates: review → build/lint → test (max ${MAX_LOOPS} retries each)`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				] : [
-					`Build: ${FAST_BUILD_MODEL} (entire epic at once)`,
-					`Evaluate: ${FAST_EVAL_MODEL} (per-task scoring)`,
-					`Fix: Subtask decomposition (up to ${MAX_SUBTASK_DEPTH} depths)`,
+					`Build: ${shortModelName(pipelineConfig.fast.build)} (entire epic at once)`,
+					`Evaluate: ${shortModelName(pipelineConfig.fast.eval)} (per-task scoring)`,
+					`Fix: ${shortModelName(pipelineConfig.fast.fix)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)`,
 					`UAT: Scenario generation → Playwright execution → approval gate`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				]),
@@ -3418,6 +3532,230 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ── Pipeline Config Command ──────────────────
+
+	pi.registerCommand("pipeline-config", {
+		description: "Configure model assignments for Fast Track and 3-Wave pipeline modes",
+		handler: async (_args, ctx) => {
+			if (pipeline.running) {
+				ctx.ui.notify("Pipeline is running. Stop it first before changing config.", "warning");
+				return;
+			}
+
+			const config = loadPipelineConfig();
+			const allModels = ctx.modelRegistry.getAll();
+			const modelItems: SelectItem[] = allModels.map(m => ({
+				value: `${m.provider}/${m.id}`,
+				label: `${m.provider}/${m.id}`,
+				description: m.name,
+			}));
+
+			type ConfigTab = "fast" | "multiwave";
+			let activeTab: ConfigTab = pipelineMode === "fast" ? "fast" : "multiwave";
+
+			const fastRoles: { id: string; label: string; description: string; key: keyof PipelineModelConfig["fast"] }[] = [
+				{ id: "fast.build", label: "Builder", description: "Builds the entire epic in one shot", key: "build" },
+				{ id: "fast.eval", label: "Evaluator", description: "Scores each task against acceptance criteria", key: "eval" },
+				{ id: "fast.fix", label: "Fixer", description: "Surgical subtask fixes for failed tasks", key: "fix" },
+				{ id: "fast.uat", label: "UAT Tester", description: "Runs Playwright browser automation for UAT scenarios", key: "uat" },
+			];
+
+			const multiwaveRoles: { id: string; label: string; description: string; key: keyof PipelineModelConfig["multiwave"] }[] = [
+				{ id: "mw.council1", label: "Council Architect 1", description: "First independent design brief", key: "council1" },
+				{ id: "mw.council2", label: "Council Architect 2", description: "Second independent design brief", key: "council2" },
+				{ id: "mw.council3", label: "Council Architect 3", description: "Third independent design brief", key: "council3" },
+				{ id: "mw.proto1", label: "Prototype Step 1", description: "Full one-shot build from spec", key: "proto1" },
+				{ id: "mw.proto2", label: "Prototype Step 2", description: "Enhancement pass", key: "proto2" },
+				{ id: "mw.proto3", label: "Prototype Step 3", description: "Fine-tuning pass", key: "proto3" },
+				{ id: "mw.dev", label: "Dev Agent", description: "Task implementation in Wave 2 sprint", key: "dev" },
+				{ id: "mw.compliance", label: "Compliance", description: "Per-task compliance scoring", key: "compliance" },
+				{ id: "mw.orchestrator", label: "Orchestrator", description: "Reviews pedantic deductions, overrides scores", key: "orchestrator" },
+			];
+
+			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
+				const theme: SelectListTheme = {
+					selectedPrefix: (t: string) => ctx.ui.theme.fg("accent", t),
+					selectedText: (t: string) => ctx.ui.theme.fg("accent", ctx.ui.theme.bold(t)),
+					description: (t: string) => ctx.ui.theme.fg("dim", t),
+					scrollInfo: (t: string) => ctx.ui.theme.fg("dim", t),
+					noMatch: (t: string) => ctx.ui.theme.fg("warning", t),
+				};
+
+				const list = new SelectList(modelItems, 15, theme);
+				const currentIdx = modelItems.findIndex(m => m.value === currentModelId);
+				if (currentIdx >= 0) list.setSelectedIndex(currentIdx);
+
+				const wrapper: any = {
+					invalidate() { list.invalidate(); },
+					render(width: number): string[] {
+						const lines: string[] = [];
+						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
+						lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}`));
+						lines.push("");
+						lines.push(...list.render(width));
+						lines.push("");
+						lines.push(ctx.ui.theme.fg("dim", "  Enter to select and ping · Esc to cancel"));
+						return lines;
+					},
+					handleInput(data: string) {
+						list.handleInput(data);
+					},
+				};
+
+				list.onSelect = (item: SelectItem) => {
+					const selectedModel = item.value;
+					// Show pinging state
+					const origRender = wrapper.render;
+					wrapper.render = (width: number): string[] => {
+						const lines: string[] = [];
+						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
+						lines.push("");
+						lines.push(ctx.ui.theme.fg("warning", `  Pinging ${shortModelName(selectedModel)}...`));
+						return lines;
+					};
+					wrapper.invalidate();
+
+					setTimeout(() => {
+						const ok = pingModel(selectedModel);
+						if (ok) {
+							done(selectedModel);
+						} else {
+							wrapper.render = (width: number): string[] => {
+								const lines: string[] = [];
+								lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
+								lines.push("");
+								lines.push(ctx.ui.theme.fg("error", `  ${shortModelName(selectedModel)} failed ping test`));
+								lines.push(ctx.ui.theme.fg("dim", "  Press any key to go back"));
+								return lines;
+							};
+							wrapper.invalidate();
+							const origInput = wrapper.handleInput;
+							wrapper.handleInput = (_data: string) => {
+								wrapper.render = origRender;
+								wrapper.handleInput = origInput;
+								wrapper.invalidate();
+							};
+						}
+					}, 50);
+				};
+
+				list.onCancel = () => { done(undefined); };
+
+				return wrapper;
+			}
+
+			function getSettingItems(): SettingItem[] {
+				const tabHeader: SettingItem = {
+					id: "__tab",
+					label: activeTab === "fast" ? "[Fast Track]  3-Wave" : " Fast Track  [3-Wave]",
+					currentValue: "Tab/← → to switch",
+					description: "Switch between pipeline mode configurations",
+				};
+
+				if (activeTab === "fast") {
+					return [
+						tabHeader,
+						...fastRoles.map(r => ({
+							id: r.id,
+							label: r.label,
+							currentValue: shortModelName(config.fast[r.key]),
+							description: r.description,
+							submenu: (currentValue: string, done: (selectedValue?: string) => void) => {
+								const fullId = config.fast[r.key];
+								return buildModelSubmenu(fullId, done);
+							},
+						})),
+					];
+				} else {
+					return [
+						tabHeader,
+						...multiwaveRoles.map(r => ({
+							id: r.id,
+							label: r.label,
+							currentValue: shortModelName(config.multiwave[r.key]),
+							description: r.description,
+							submenu: (currentValue: string, done: (selectedValue?: string) => void) => {
+								const fullId = config.multiwave[r.key];
+								return buildModelSubmenu(fullId, done);
+							},
+						})),
+					];
+				}
+			}
+
+			await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+				const settingsTheme: SettingsListTheme = {
+					label: (text: string, selected: boolean) => selected ? theme.fg("accent", theme.bold(text)) : theme.fg("fg", text),
+					value: (text: string, selected: boolean) => selected ? theme.fg("success", text) : theme.fg("dim", text),
+					description: (text: string) => theme.fg("dim", text),
+					cursor: theme.fg("accent", "→ "),
+					hint: (text: string) => theme.fg("dim", text),
+				};
+
+				let items = getSettingItems();
+				const settingsList = new SettingsList(
+					items,
+					16,
+					settingsTheme,
+					(id: string, newValue: string) => {
+						// Save on every change
+						if (id.startsWith("fast.")) {
+							const key = id.slice(5) as keyof PipelineModelConfig["fast"];
+							config.fast[key] = newValue;
+						} else if (id.startsWith("mw.")) {
+							const key = id.slice(3) as keyof PipelineModelConfig["multiwave"];
+							config.multiwave[key] = newValue;
+						}
+						savePipelineConfig(config);
+						// Reload into runtime
+						pipelineConfig = config;
+						FAST_BUILD_MODEL = config.fast.build;
+						FAST_EVAL_MODEL = config.fast.eval;
+						FAST_FIX_MODEL = config.fast.fix;
+					},
+					() => { done(); }, // Esc exits
+				);
+
+				const origHandleInput = settingsList.handleInput.bind(settingsList);
+
+				const component = {
+					dispose() {},
+					invalidate() { settingsList.invalidate(); },
+					render(width: number): string[] {
+						const lines: string[] = [];
+						lines.push(theme.fg("accent", theme.bold("  Pipeline Configuration")));
+						lines.push(theme.fg("dim", "  Model assignments for each pipeline role"));
+						lines.push("");
+						lines.push(...settingsList.render(width));
+						return lines;
+					},
+					handleInput(data: string) {
+						// Intercept Tab and arrow keys on the tab header to switch tabs
+						const kb = getEditorKeybindings();
+						const selected = items[(settingsList as any).selectedIndex];
+						if (selected?.id === "__tab" && (data === "\t" || kb.matches(data, "selectConfirm") || data === " ")) {
+							activeTab = activeTab === "fast" ? "multiwave" : "fast";
+							items = getSettingItems();
+							(settingsList as any).items = items;
+							(settingsList as any).filteredItems = items;
+							(settingsList as any).selectedIndex = 0;
+							settingsList.invalidate();
+							return;
+						}
+						origHandleInput(data);
+					},
+				};
+
+				return component;
+			}, {
+				overlay: true,
+				overlayOptions: { width: "70%", maxHeight: "80%", anchor: "center" },
+			});
+
+			updateWidget();
+		},
+	});
+
 	// ── UAT Approval Commands ────────────────────
 
 	pi.registerCommand("pipeline-approve", {
@@ -3748,6 +4086,12 @@ export default function (pi: ExtensionAPI) {
 		applyExtensionDefaults(import.meta.url, ctx);
 		widgetCtx = ctx;
 		cwd = ctx.cwd;
+
+		// Reload pipeline config on session start
+		pipelineConfig = loadPipelineConfig();
+		FAST_BUILD_MODEL = pipelineConfig.fast.build;
+		FAST_EVAL_MODEL = pipelineConfig.fast.eval;
+		FAST_FIX_MODEL = pipelineConfig.fast.fix;
 
 		sessionDir = join(ctx.cwd, ".pi", "agent-sessions");
 		logDir = join(ctx.cwd, ".pi", "pipeline-logs");
