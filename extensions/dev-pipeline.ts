@@ -43,11 +43,12 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth, SettingsList, SelectList, getEditorKeybindings } from "@mariozechner/pi-tui";
 import type { SettingItem, SettingsListTheme, SelectItem, SelectListTheme } from "@mariozechner/pi-tui";
-import { spawn } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, createWriteStream } from "fs";
 import { join, resolve } from "path";
 import { execSync } from "child_process";
 import { homedir, tmpdir } from "os";
+import { createConnection, type Socket } from "net";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 // ── Types ────────────────────────────────────────
@@ -418,6 +419,86 @@ export default function (pi: ExtensionAPI) {
 	let activeLogFile = "";
 	let activeAgent: { name: string; model: string; hint: string } | null = null;
 	const activeAgents = new Map<string, { name: string; model: string; hint: string; logFile: string }>();
+	const agentProcesses = new Map<string, ChildProcess>(); // sessionKey -> spawned pi process (RPC mode)
+
+	// ── Control Socket Client ──
+	// Connects to the pipeline-dashboard-web control socket to register agents
+	// and receive forwarded steer/follow_up/abort commands.
+	let controlSocket: Socket | null = null;
+	let controlConnected = false;
+	const CONTROL_PORT = 3142;
+
+	function connectControlSocket() {
+		if (controlSocket) return;
+		try {
+			controlSocket = createConnection(CONTROL_PORT, "127.0.0.1");
+			controlSocket.setEncoding("utf-8");
+			let buf = "";
+			controlSocket.on("data", (chunk: string) => {
+				buf += chunk;
+				let nl;
+				while ((nl = buf.indexOf("\n")) !== -1) {
+					const line = buf.slice(0, nl).trim();
+					buf = buf.slice(nl + 1);
+					if (!line) continue;
+					try {
+						const msg = JSON.parse(line);
+						if (msg.forward) handleForwardedCommand(msg);
+					} catch {}
+				}
+			});
+			controlSocket.on("connect", () => {
+				controlConnected = true;
+				// Re-register all active agents
+				for (const [key, info] of activeAgents) {
+					registerAgentOnControl(key, info);
+				}
+			});
+			controlSocket.on("error", () => { controlSocket = null; controlConnected = false; });
+			controlSocket.on("close", () => { controlSocket = null; controlConnected = false; });
+		} catch { controlSocket = null; controlConnected = false; }
+	}
+
+	function registerAgentOnControl(sessionKey: string, info: { name: string; model: string; hint: string }) {
+		if (!controlSocket || !controlConnected) return;
+		try {
+			controlSocket.write(JSON.stringify({
+				type: "register",
+				agentId: sessionKey,
+				sessionKey,
+				info: { name: info.name, model: info.model, hint: info.hint },
+			}) + "\n");
+		} catch {}
+	}
+
+	function handleForwardedCommand(msg: any) {
+		// msg has: { forward: true, type: "steer"|"follow_up"|"abort", message?: string }
+		// Route to the appropriate agent's stdin
+		// Find the agent - forwarded commands come with implicit routing to the first active agent
+		// unless the control server adds an agentId
+		const agentId = msg.agentId;
+		let proc: ChildProcess | undefined;
+		if (agentId && agentProcesses.has(agentId)) {
+			proc = agentProcesses.get(agentId);
+		} else if (agentProcesses.size === 1) {
+			proc = agentProcesses.values().next().value;
+		}
+		if (!proc || !proc.stdin) return;
+
+		const rpcCmd = msg.type === "abort"
+			? { type: "abort" }
+			: msg.type === "follow_up"
+				? { type: "follow_up", message: msg.message || "" }
+				: { type: "steer", message: msg.message || "" };
+		try {
+			proc.stdin.write(JSON.stringify(rpcCmd) + "\n");
+		} catch {}
+	}
+
+	// Try connecting on startup; reconnect periodically
+	setTimeout(connectControlSocket, 2000);
+	setInterval(() => { if (!controlConnected) connectControlSocket(); }, 10000);
+
 	let widgetCtx: ExtensionContext | null = null;
 	let cwd = "";
 	let pipelineMode: PipelineMode = "fast";
@@ -678,8 +759,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const args = [
-			"--mode", "json",
-			"-p",
+			"--mode", "rpc",
 			"--no-extensions",
 			...providerExts,
 			"--no-skills",
@@ -711,7 +791,7 @@ export default function (pi: ExtensionAPI) {
 			if (existsSync(agentSessionFile)) args.push("-c");
 		}
 
-		args.push(task);
+		// Task is sent via RPC prompt command, not as a positional arg
 
 		const startTime = Date.now();
 		const currentLogFile = logFile(sessionKey);
@@ -786,13 +866,23 @@ export default function (pi: ExtensionAPI) {
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
 		return new Promise((resolve) => {
 			const proc = spawn("pi", args, {
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 				env: process.env,
 				cwd: agentCwd || cwd || undefined,
 			});
 
+			// Track process for steering
+			agentProcesses.set(sessionKey, proc);
+			// Register on control socket
+			const agentInfo = activeAgents.get(sessionKey);
+			if (agentInfo) registerAgentOnControl(sessionKey, agentInfo);
+
+			// Send prompt via RPC stdin
+			proc.stdin!.write(JSON.stringify({ type: "prompt", message: task }) + "\n");
+
 			const textParts: string[] = [];
 			let lineBuf = "";
+			let agentDone = false;
 			const logStream = existsSync(logDir) ? createWriteStream(currentLogFile, { flags: "a" }) : null;
 
 			proc.stdout!.setEncoding("utf-8");
@@ -802,10 +892,18 @@ export default function (pi: ExtensionAPI) {
 				const lines = lineBuf.split("\n");
 				lineBuf = lines.pop() || "";
 				for (const line of lines) {
-					if (!line.includes("text_delta")) continue;
+					if (!line) continue;
 					try {
 						const e = JSON.parse(line);
-						if (e.assistantMessageEvent?.delta) textParts.push(e.assistantMessageEvent.delta);
+						// RPC event: extract text deltas (same as json mode)
+						if (e.type === "message_update" && e.assistantMessageEvent?.type === "text_delta") {
+							textParts.push(e.assistantMessageEvent.delta);
+						}
+						// Agent finished - close stdin to let the process exit
+						if (e.type === "agent_end" && !agentDone) {
+							agentDone = true;
+							try { proc.stdin!.end(); } catch {}
+						}
 					} catch {}
 				}
 			});
@@ -817,14 +915,17 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("close", (code) => {
 				const elapsed = Date.now() - startTime;
-				if (lineBuf && lineBuf.includes("text_delta")) {
+				if (lineBuf) {
 					try {
 						const e = JSON.parse(lineBuf);
-						if (e.assistantMessageEvent?.delta) textParts.push(e.assistantMessageEvent.delta);
+						if (e.type === "message_update" && e.assistantMessageEvent?.type === "text_delta") {
+							textParts.push(e.assistantMessageEvent.delta);
+						}
 					} catch {}
 				}
 				logStream?.write(`\n── exit ${code} | ${Math.round(elapsed / 1000)}s ──\n`);
 				logStream?.end();
+				agentProcesses.delete(sessionKey);
 				activeAgents.delete(sessionKey);
 				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
 				writeStateFile();
@@ -835,6 +936,7 @@ export default function (pi: ExtensionAPI) {
 
 			proc.on("error", (err) => {
 				logStream?.end();
+				agentProcesses.delete(sessionKey);
 				activeAgents.delete(sessionKey);
 				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
 				writeStateFile();
