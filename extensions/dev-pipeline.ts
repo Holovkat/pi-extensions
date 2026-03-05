@@ -385,6 +385,7 @@ export default function (pi: ExtensionAPI) {
 	let cwd = "";
 	let pipelineMode: PipelineMode = "fast";
 	let uatState: UatState = { scenarios: [], awaitingApproval: false, approved: false };
+	let observerMode = false; // true when another pipeline instance is already running
 
 	// Fast track stage tracking for widget
 	type FastStage = "idle" | "build" | "eval" | "fix" | "uat-gen" | "uat-exec" | "uat-approval";
@@ -414,8 +415,45 @@ export default function (pi: ExtensionAPI) {
 	}
 	function isInTmux(): boolean { return !!process.env.TMUX; }
 
+	function isObserverBlocked(ctx: ExtensionContext): boolean {
+		if (!observerMode) return false;
+		ctx.ui.notify("Observer mode: another pipeline instance is running.\nThis session is read-only. Use /pipeline-status to view progress.", "warning");
+		return true;
+	}
+
+	function readStateFile(): any | null {
+		if (!logDir) return null;
+		try {
+			const stateFile = join(logDir, "pipeline-state.json");
+			if (!existsSync(stateFile)) return null;
+			return JSON.parse(readFileSync(stateFile, "utf-8"));
+		} catch { return null; }
+	}
+
+	let observerPollInterval: ReturnType<typeof setInterval> | null = null;
+
+	function startObserverPolling() {
+		if (observerPollInterval) return;
+		observerPollInterval = setInterval(() => {
+			const state = readStateFile();
+			if (!state) return;
+			// If the other instance stopped, exit observer mode
+			if (!state.running) {
+				observerMode = false;
+				if (observerPollInterval) { clearInterval(observerPollInterval); observerPollInterval = null; }
+				updateWidget();
+				return;
+			}
+			updateWidget();
+		}, 3000);
+	}
+
+	function stopObserverPolling() {
+		if (observerPollInterval) { clearInterval(observerPollInterval); observerPollInterval = null; }
+	}
+
 	function writeStateFile() {
-		if (!logDir) return;
+		if (!logDir || observerMode) return;
 		try {
 			const stateFile = join(logDir, "pipeline-state.json");
 			const phaseArr: any[] = [];
@@ -2662,6 +2700,49 @@ export default function (pi: ExtensionAPI) {
 
 			return {
 				render(width: number): string[] {
+					// Observer mode: render from state file
+					if (observerMode) {
+						const state = readStateFile();
+						if (!state) {
+							text.setText(theme.fg("dim", "Observer mode — no state file found."));
+							return text.render(width);
+						}
+						const lines: string[] = [];
+						lines.push(theme.fg("warning", theme.bold("OBSERVER MODE")) + theme.fg("dim", " — another pipeline instance is running"));
+						lines.push("");
+						if (state.phases) {
+							for (const phase of state.phases) {
+								const icon = phase.allDone ? "✓" : phase.isCurrent ? "●" : "○";
+								const color = phase.allDone ? "success" : phase.isCurrent ? "accent" : "dim";
+								const pending = phase.pending > 0 ? ` (${phase.pending} remaining)` : "";
+								const gate = phase.gate && phase.gate !== "idle" && phase.gate !== "done" ? ` [${phase.gate}]` : "";
+								lines.push(
+									phase.isCurrent
+										? theme.fg(color, theme.bold(`${icon} ${phase.name}${pending}${gate}`))
+										: theme.fg(color, `${icon} ${phase.name}${pending}${gate}`)
+								);
+								if (phase.isCurrent && phase.tasks) {
+									for (const t of phase.tasks) {
+										const tIcon = t.status === "passed" ? "✓" : t.status === "building" ? "●" : t.status === "scoring" ? "◉" : t.status === "failed" ? "✗" : "○";
+										const tColor = t.status === "passed" ? "success" : t.status === "building" || t.status === "scoring" ? "accent" : t.status === "failed" ? "error" : "dim";
+										const score = t.complianceScore > 0 ? ` ${t.complianceScore}%` : "";
+										lines.push(theme.fg(tColor, `  ${tIcon} ${t.id}: ${t.title}${score}`));
+									}
+								}
+							}
+						}
+						if (state.log && state.log.length > 0) {
+							lines.push("");
+							const recentLogs = state.log.slice(-5);
+							for (const entry of recentLogs) {
+								lines.push(theme.fg("dim", `  ${entry}`));
+							}
+						}
+						lines.push("", theme.fg("dim", "Refreshing every 3s. Pipeline commands are disabled."));
+						text.setText(lines.join("\n"));
+						return text.render(width);
+					}
+
 					if (parsedPhases.length === 0) {
 						text.setText(theme.fg("dim", "No checklist loaded. Run /pipeline-start to start."));
 						return text.render(width);
@@ -2920,6 +3001,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-start", {
 		description: "Initialize pipeline: read checklist, show plan, create branch. Use --multiwave for 3-Wave mode.",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			// Detect --multiwave flag (fast track is default)
 			const rawArgs = typeof _args === "string" ? _args : (_args?.join?.(" ") || "");
 			const isMultiwave = rawArgs.includes("--multiwave");
@@ -3208,6 +3290,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-next", {
 		description: "Run the next phase: dev loop + quality gates",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			if (pipelineMode === "fast") {
 				await runNextPhaseFast(ctx);
 			} else {
@@ -3376,6 +3459,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-reset", {
 		description: "Full reset: checkout main, delete feature branches, uncheck checklist, reopen GitHub issues",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			if (pipeline.running) {
 				ctx.ui.notify("Pipeline is running. Wait for it to finish first.", "warning");
 				return;
@@ -3761,6 +3845,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-approve", {
 		description: "Approve UAT results, close UAT epic, proceed to merge",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			if (!uatState.awaitingApproval) {
 				ctx.ui.notify("No UAT awaiting approval. Run the pipeline first.", "warning");
 				return;
@@ -3804,6 +3889,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-reject", {
 		description: "Reject UAT results with notes, loop back for fixes",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			if (!uatState.awaitingApproval) {
 				ctx.ui.notify("No UAT awaiting approval.", "warning");
 				return;
@@ -3852,6 +3938,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("pipeline-end", {
 		description: "End session: confirm UAT, check off completed items, squash merge to main, push, clean up",
 		handler: async (_args, ctx) => {
+			if (isObserverBlocked(ctx)) return;
 			if (pipeline.running) {
 				ctx.ui.notify("Pipeline is still running. Wait for it to finish.", "warning");
 				return;
@@ -4098,6 +4185,44 @@ export default function (pi: ExtensionAPI) {
 		if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 		if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
 
+		// Detect if another pipeline instance is already running
+		const existingState = readStateFile();
+		if (existingState?.running) {
+			observerMode = true;
+			// Load checklist for widget context but don't write state
+			const checklistPath = join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
+			if (existsSync(checklistPath)) {
+				parsedPhases = parseChecklist(checklistPath);
+			}
+			agents = scanAgents(ctx.cwd);
+			updateWidget();
+			startObserverPolling();
+			ctx.ui.notify(
+				"Observer mode: another pipeline instance is running.\n" +
+				"This session is read-only — the widget shows live progress from the active pipeline.\n" +
+				"Pipeline commands (start, next, reset, etc.) are disabled.\n\n" +
+				"Available: /pipeline-status, /pipeline-config, /pipeline-logs, /pipeline-watch, /pipeline-dashboard",
+				"warning",
+			);
+
+			ctx.ui.setFooter((_tui, theme, _footerData) => ({
+				dispose: () => {},
+				invalidate() {},
+				render(width: number): string[] {
+					const left = theme.fg("dim", ` observer`) +
+						theme.fg("muted", " · ") +
+						theme.fg("warning", "read-only");
+					const right = theme.fg("dim", `pipeline running elsewhere `);
+					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+					return [truncateToWidth(left + pad + right, width)];
+				},
+			}));
+			return;
+		}
+
+		observerMode = false;
+		stopObserverPolling();
+
 		// Write JSON→text filter script once, reuse in all tmux panes
 		const filterScript = join(logDir, "json-filter.py");
 		writeFileSync(filterScript, [
@@ -4203,5 +4328,9 @@ export default function (pi: ExtensionAPI) {
 				return [truncateToWidth(left + pad + right, width)];
 			},
 		}));
+	});
+
+	pi.on("session_shutdown", async () => {
+		stopObserverPolling();
 	});
 }
