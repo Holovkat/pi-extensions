@@ -348,6 +348,7 @@ Run `/pipeline-next` to trigger a fix cycle. The builder reads the rejection not
 
 | Command | What it does |
 |---------|-------------|
+| `/pipeline-config` | Configure model assignments per role (full-screen, Available/All tabs) |
 | `/pipeline-start` | Parse checklist, fetch GitHub issues, show plan, create branch, start building |
 | `/pipeline-reset` | Full reset — checkout main, delete branches, uncheck checklist, reopen issues |
 | *(automatic)* | BUILD → EVALUATE → FIX → UAT scenarios → checklist update → next epic |
@@ -368,10 +369,40 @@ Run `/pipeline-next` to trigger a fix cycle. The builder reads the rejection not
 | UAT execution (all scenarios) | 5-15 min | Playwright, depends on scenario count |
 | Total for 9 epics + UAT | ~45-90 min | Compared to 2-4 hours in 3-Wave mode |
 
+## Configuring Models
+
+Before starting the pipeline, you can assign which model handles each role:
+
+```
+/pipeline-config
+```
+
+This opens a full-screen config view with two mode tabs (Fast Track / 3-Wave). Select a role, press Enter, and pick from available models. The model selector has its own tabs:
+
+- **Available** — models with API keys configured and ready to use
+- **All** — every registered model
+
+A ping test runs on selection to confirm the model responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately.
+
+---
+
+## Observer Mode
+
+If you open a second `pi-dev` terminal while a pipeline is running, it enters **observer mode** automatically:
+
+- Widget shows live progress from the running pipeline (polled every 3s)
+- Mutating commands are blocked (`/pipeline-start`, `/pipeline-next`, `/pipeline-reset`, etc.)
+- Read-only commands work: `/pipeline-status`, `/pipeline-config`, `/pipeline-logs`
+- Exits observer mode automatically when the other pipeline finishes
+
+---
+
 ## Tips
 
+- **Use `/pipeline-config`** to swap models before starting — try a faster model for early epics, a stronger one for complex ones
 - **Use `/pipeline-logs` or `/pipeline-watch dev`** to see what the builder is doing in real time
 - **The dashboard widget** updates live — no need to run `/pipeline-status`
 - **If the pipeline halts on an epic**, check the logs (`/pipeline-watch fast-build-N`) to see what went wrong
 - **You can switch modes between epics** — use default for early epics, then switch to `--multiwave` for complex ones
 - **UAT scenarios accumulate** — each epic adds its scenarios to the same UAT parent issue, so by the end you have a complete test suite
+- **Open a second terminal** to observe progress without interfering with the running pipeline

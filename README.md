@@ -505,11 +505,15 @@ Both modes share:
 
 #### Model Configuration (`/pipeline-config`)
 
-Opens an interactive overlay with two tabs (Fast Track and 3-Wave) listing every pipeline role. Tab between modes, select a role, and pick from all available models with a live ping test before persisting.
+Opens a full-screen configuration view with two mode tabs (Fast Track and 3-Wave) listing every pipeline role and its assigned model. Takes over the entire viewport for clarity.
 
 ```
+──────────────────────────────────────────────────
+
   Pipeline Configuration
   Model assignments for each pipeline role
+
+──────────────────────────────────────────────────
 
 → [Fast Track]  3-Wave        Tab/← → to switch
   Builder                     gemini-3-pro-preview
@@ -520,9 +524,59 @@ Opens an interactive overlay with two tabs (Fast Track and 3-Wave) listing every
   Builds the entire epic in one shot
 
   Enter/Space to change · Esc to cancel
+──────────────────────────────────────────────────
 ```
 
-On Enter, a model selector overlay appears listing all configured models. Selecting one triggers a quick ping test to confirm the model responds. On success, the assignment is saved to `~/.pi/agent/pipeline-config.json` and takes effect immediately.
+On Enter, a model selector opens with two tabs:
+
+- **Available** — only models with configured API keys (ready to use)
+- **All** — every registered model (including unconfigured ones)
+
+Press Tab to switch between Available and All. The header shows the count for each.
+
+```
+──────────────────────────────────────────────────
+
+  Select Model
+  Current: gemini-3-pro-preview
+
+  [Available (12)]  All (45)    Tab to switch
+
+──────────────────────────────────────────────────
+
+→ anthropic/claude-opus-4-6       Claude Opus 4.6
+  anthropic/claude-sonnet-4-6     Claude Sonnet 4.6
+  bailian/qwen3.5-plus            Qwen 3.5 Plus
+  google-gemini-cli/gemini-3-pro  Gemini 3 Pro Preview
+  ...
+
+  Enter to select and ping · Esc to cancel
+──────────────────────────────────────────────────
+```
+
+Selecting a model triggers a quick ping test to confirm it responds. On success, the assignment is saved to `~/.pi/agent/pipeline-config.json` and takes effect immediately — no restart needed.
+
+##### Observer Mode
+
+When a second `pi-dev` terminal is opened while a pipeline is already running, the extension enters **observer mode**:
+
+- The widget polls `pipeline-state.json` every 3 seconds and shows live progress
+- All mutating commands (`/pipeline-start`, `/pipeline-next`, `/pipeline-reset`, `/pipeline-approve`, `/pipeline-reject`, `/pipeline-end`) are blocked
+- Read-only commands still work: `/pipeline-status`, `/pipeline-config`, `/pipeline-logs`, `/pipeline-watch`, `/pipeline-dashboard`
+- Automatically exits observer mode when the running pipeline finishes
+
+```
+OBSERVER MODE — another pipeline instance is running
+
+✓ Epic 1: Foundation & Core Architecture
+● Epic 2: Procedural Maze Generation (6 remaining) [wave2-compliance]
+  ✓ 2.1: Mulberry32 PRNG implementation 95%
+  ● 2.3: Horizontal symmetry mirror  building
+  ○ 2.4: Ghost house stamp
+○ Epic 3: Player Mechanics (4 remaining)
+
+Refreshing every 3s. Pipeline commands are disabled.
+```
 
 #### Pipeline State File
 
