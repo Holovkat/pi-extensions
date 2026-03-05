@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Pipeline Dashboard — standalone progress viewer
+# Usage: pipeline-dashboard [project-dir]
+#   Run in a separate tmux pane to monitor pipeline progress.
+
+set -euo pipefail
+
+PROJECT_DIR="${1:-$(pwd)}"
+STATE_FILE="$PROJECT_DIR/.pi/pipeline-logs/pipeline-state.json"
+REFRESH=0.5
+
+# ── Colors ──
+RST="\033[0m"
+BOLD="\033[1m"
+DIM="\033[2m"
+RED="\033[31m"
+GRN="\033[32m"
+YEL="\033[33m"
+BLU="\033[34m"
+CYN="\033[36m"
+WHT="\033[37m"
+
+# Spinner frames
+SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+SPIN_IDX=0
+
+home_cursor() { printf "\033[H"; }
+clear_to_end() { printf "\033[J"; }
+FIRST_RENDER=true
+PREV_LINES=0
+
+format_elapsed() {
+    local ms=$1
+    local secs=$((ms / 1000))
+    local mins=$((secs / 60))
+    local hrs=$((mins / 60))
+    secs=$((secs % 60))
+    mins=$((mins % 60))
+    if [ "$hrs" -gt 0 ]; then
+        printf "%dh %dm %ds" "$hrs" "$mins" "$secs"
+    elif [ "$mins" -gt 0 ]; then
+        printf "%dm %ds" "$mins" "$secs"
+    else
+        printf "%ds" "$secs"
+    fi
+}
+
+status_icon() {
+    case "$1" in
+        passed)   printf "${GRN}✓${RST}" ;;
+        building) printf "${BLU}${SPIN[$SPIN_IDX]}${RST}" ;;
+        scoring)  printf "${CYN}${SPIN[$SPIN_IDX]}${RST}" ;;
+        failed)   printf "${RED}✗${RST}" ;;
+        pending)  printf "${DIM}○${RST}" ;;
+        *)        printf "${DIM}○${RST}" ;;
+    esac
+}
+
+gate_label() {
+    case "$1" in
+        dev-loop)   printf "${BLU}dev-loop${RST}" ;;
+        review)     printf "${CYN}review${RST}" ;;
+        build-lint) printf "${YEL}build/lint${RST}" ;;
+        test)       printf "${YEL}test${RST}" ;;
+        done)       printf "${GRN}done${RST}" ;;
+        error)      printf "${RED}error${RST}" ;;
+        *)          printf "${DIM}$1${RST}" ;;
+    esac
+}
+
+render() {
+    if [ ! -f "$STATE_FILE" ]; then
+        printf "${DIM}Waiting for pipeline state...${RST}\n${DIM}Watching: ${STATE_FILE}${RST}\n"
+        return
+    fi
+
+    local json
+    json=$(cat "$STATE_FILE" 2>/dev/null) || return
+
+    local running branch currentPhase ts
+    running=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('running',False))" 2>/dev/null)
+    branch=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('branch',''))" 2>/dev/null)
+    currentPhase=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('currentPhase',-1))" 2>/dev/null)
+    ts=$(echo "$json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('ts',0))" 2>/dev/null)
+
+    local now_ms
+    now_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+    local age_s=$(( (now_ms - ts) / 1000 ))
+
+    # All output below goes to stdout, captured by main loop
+
+    # Header
+    local cols
+    cols=$(tput cols 2>/dev/null || echo 80)
+    printf "${BOLD}${CYN}╔"
+    printf '═%.0s' $(seq 1 $((cols - 2)))
+    printf "╗${RST}\n"
+
+    local title=" PIPELINE DASHBOARD "
+    local pad=$(( (cols - ${#title} - 2) / 2 ))
+    printf "${BOLD}${CYN}║${RST}"
+    printf "%*s" "$pad" ""
+    printf "${BOLD}${WHT}${title}${RST}"
+    printf "%*s" "$((cols - pad - ${#title} - 2))" ""
+    printf "${BOLD}${CYN}║${RST}\n"
+
+    printf "${BOLD}${CYN}╚"
+    printf '═%.0s' $(seq 1 $((cols - 2)))
+    printf "╝${RST}\n"
+
+    # Status line
+    local status_str
+    if [ "$running" = "True" ]; then
+        status_str="${GRN}${BOLD}● RUNNING${RST}"
+    else
+        status_str="${DIM}○ IDLE${RST}"
+    fi
+    printf "\n  Status: %b" "$status_str"
+    if [ -n "$branch" ]; then
+        printf "    Branch: ${CYN}%s${RST}" "$branch"
+    fi
+    if [ "$age_s" -gt 10 ]; then
+        printf "    ${DIM}(updated %ds ago)${RST}" "$age_s"
+    fi
+    printf "\n\n"
+
+    # Separator
+    printf "  ${DIM}"
+    printf '─%.0s' $(seq 1 $((cols - 4)))
+    printf "${RST}\n\n"
+
+    # Phases
+    local phase_count
+    phase_count=$(echo "$json" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('phases',[])))" 2>/dev/null)
+
+    for i in $(seq 0 $((phase_count - 1))); do
+        local pdata
+        pdata=$(echo "$json" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)['phases'][$i]
+print(d['name'])
+print(d['isCurrent'])
+print(d['allDone'])
+print(d['pending'])
+print(d['total'])
+print(d['gate'])
+print(d['gateAttempts'])
+print(d['elapsed'])
+print(len(d.get('tasks',[])))
+" 2>/dev/null)
+
+        local name is_current all_done pending total gate gate_attempts elapsed task_count
+        IFS=$'\n' read -d '' -r name is_current all_done pending total gate gate_attempts elapsed task_count <<< "$pdata" || true
+
+        local icon color
+        if [ "$all_done" = "True" ]; then
+            icon="${GRN}✓${RST}"
+        elif [ "$gate" = "error" ]; then
+            icon="${RED}✗${RST}"
+        elif [ "$is_current" = "True" ] && [ "$running" = "True" ]; then
+            icon="${BLU}${SPIN[$SPIN_IDX]}${RST}"
+        else
+            icon="${DIM}○${RST}"
+        fi
+
+        local detail=""
+        if [ "$all_done" != "True" ]; then
+            detail=" ${DIM}(${pending}/${total} remaining)${RST}"
+        fi
+
+        local gate_str=""
+        if [ "$gate" != "idle" ] && [ "$gate" != "done" ]; then
+            gate_str=" [$(gate_label "$gate")"
+            if [ "$gate_attempts" -gt 0 ]; then
+                gate_str+=" x${gate_attempts}"
+            fi
+            gate_str+="]"
+        fi
+
+        local time_str=""
+        if [ "$elapsed" -gt 0 ] && [ "$elapsed" != "0" ]; then
+            time_str=" ${DIM}$(format_elapsed "$elapsed")${RST}"
+        fi
+
+        if [ "$is_current" = "True" ]; then
+            printf "  %b ${BOLD}${WHT}%s${RST}%b%b%b\n" "$icon" "$name" "$detail" "$gate_str" "$time_str"
+        elif [ "$all_done" = "True" ]; then
+            printf "  %b ${GRN}%s${RST}%b\n" "$icon" "$name" "$time_str"
+        else
+            printf "  %b ${DIM}%s${RST}%b\n" "$icon" "$name" "$detail"
+        fi
+
+        # Task details for current phase
+        if [ "$is_current" = "True" ] && [ "$task_count" -gt 0 ]; then
+            for j in $(seq 0 $((task_count - 1))); do
+                local tdata
+                tdata=$(echo "$json" | python3 -c "
+import sys,json
+t=json.load(sys.stdin)['phases'][$i]['tasks'][$j]
+print(t['id'])
+print(t['title'])
+print(t['status'])
+print(t['complianceScore'])
+print(t['attempts'])
+" 2>/dev/null)
+
+                local tid ttitle tstatus tscore tattempts
+                IFS=$'\n' read -d '' -r tid ttitle tstatus tscore tattempts <<< "$tdata" || true
+
+                local ticon
+                ticon=$(status_icon "$tstatus")
+
+                local score_str=""
+                if [ "$tscore" -gt 0 ] 2>/dev/null; then
+                    if [ "$tscore" -ge 95 ]; then
+                        score_str=" ${GRN}${tscore}%${RST}"
+                    elif [ "$tscore" -ge 80 ]; then
+                        score_str=" ${YEL}${tscore}%${RST}"
+                    else
+                        score_str=" ${RED}${tscore}%${RST}"
+                    fi
+                fi
+
+                local att_str=""
+                if [ "$tattempts" -gt 1 ] 2>/dev/null; then
+                    att_str=" ${DIM}x${tattempts}${RST}"
+                fi
+
+                printf "    %b %s: %s%b%b\n" "$ticon" "$tid" "$ttitle" "$score_str" "$att_str"
+            done
+        fi
+    done
+
+    # Log tail
+    local log_count
+    log_count=$(echo "$json" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('log',[])))" 2>/dev/null)
+
+    if [ "$log_count" -gt 0 ]; then
+        printf "\n  ${DIM}"
+        printf '─%.0s' $(seq 1 $((cols - 4)))
+        printf "${RST}\n"
+        printf "  ${BOLD}Recent Activity${RST}\n\n"
+
+        local show=$((log_count > 12 ? 12 : log_count))
+        local start=$((log_count - show))
+
+        for k in $(seq "$start" $((log_count - 1))); do
+            local entry
+            entry=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin)['log'][$k])" 2>/dev/null)
+
+            # Color code log entries
+            if echo "$entry" | grep -q "PASSED"; then
+                printf "  ${GRN}%s${RST}\n" "$entry"
+            elif echo "$entry" | grep -q "FAILED"; then
+                printf "  ${RED}%s${RST}\n" "$entry"
+            elif echo "$entry" | grep -q "Score:"; then
+                printf "  ${CYN}%s${RST}\n" "$entry"
+            elif echo "$entry" | grep -q "==="; then
+                printf "  ${BOLD}%s${RST}\n" "$entry"
+            else
+                printf "  ${DIM}%s${RST}\n" "$entry"
+            fi
+        done
+    fi
+
+    # Active log file
+    local active_log
+    active_log=$(echo "$json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('activeLogFile',''))" 2>/dev/null)
+    if [ -n "$active_log" ] && [ -f "$active_log" ]; then
+        printf "\n  ${DIM}"
+        printf '─%.0s' $(seq 1 $((cols - 4)))
+        printf "${RST}\n"
+        printf "  ${BOLD}Live Output${RST} ${DIM}(%s)${RST}\n\n" "$(basename "$active_log")"
+        tail -5 "$active_log" 2>/dev/null | while IFS= read -r line; do
+            printf "  ${DIM}│${RST} %.${cols}s\n" "$line"
+        done
+    fi
+}
+
+# ── Main Loop ──
+trap 'printf "\033[?25h\033[J"; exit 0' INT TERM
+printf "\033[?25l"  # hide cursor
+printf "\033[2J"    # clear screen once on start
+
+while true; do
+    # Capture render output into variable
+    FRAME=$(render 2>/dev/null)
+    # Move cursor to home position, print frame, clear any leftover lines below
+    printf "\033[H%s\033[J" "$FRAME"
+    SPIN_IDX=$(( (SPIN_IDX + 1) % ${#SPIN[@]} ))
+    sleep "$REFRESH"
+done
