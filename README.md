@@ -521,13 +521,18 @@ Each role shows its model and thinking level (e.g. `gemini-3-pro · high`). Pres
   Builder                     gemini-3-pro · high
   Evaluator                   claude-opus-4-6 · high
   Fixer                       qwen3.5-plus · high
+    ↳ Escalation 1            claude-sonnet-4-6 · high
+    ↳ Escalation 2            claude-opus-4-6 · xhigh
+    ↳ + Add escalation step
   UAT Tester                  gemini-3-pro · medium
 
-  Builds the entire epic in one shot · Space to cycle thinking
+  Surgical subtask fixes · Space to cycle thinking · Del to remove
 
-  Enter: change model · Space: cycle thinking · Esc: close
+  Enter: change model · Space: cycle thinking · Del: remove escalation · Esc: close
 ──────────────────────────────────────────────────
 ```
+
+**Fix Escalation** — when a task fails at depth 1, the pipeline escalates to the next configured model/thinking pair. Depth 1 uses the base Fixer, depth 2 uses Escalation 1, depth 3 uses Escalation 2, etc. You can add as many escalation steps as you want (Enter on "+ Add escalation step") or remove them (Del/Backspace on any escalation row). If depths exceed the configured escalation steps, the last step is reused.
 
 On Enter, a model selector opens with two tabs:
 

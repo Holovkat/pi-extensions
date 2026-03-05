@@ -143,6 +143,7 @@ interface PipelineModelConfig {
 		build: RoleConfig;
 		eval: RoleConfig;
 		fix: RoleConfig;
+		fixEscalation: RoleConfig[];
 		uat: RoleConfig;
 	};
 	multiwave: {
@@ -163,6 +164,10 @@ const DEFAULT_CONFIG: PipelineModelConfig = {
 		build: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "high" },
 		eval: { model: "anthropic/claude-opus-4-6", thinking: "high" },
 		fix: { model: "bailian/qwen3.5-plus", thinking: "high" },
+		fixEscalation: [
+			{ model: "anthropic/claude-sonnet-4-6", thinking: "high" },
+			{ model: "anthropic/claude-opus-4-6", thinking: "xhigh" },
+		],
 		uat: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
 	},
 	multiwave: {
@@ -200,6 +205,9 @@ function loadPipelineConfig(): PipelineModelConfig {
 				build: migrateRole(fast.build, DEFAULT_CONFIG.fast.build),
 				eval: migrateRole(fast.eval, DEFAULT_CONFIG.fast.eval),
 				fix: migrateRole(fast.fix, DEFAULT_CONFIG.fast.fix),
+				fixEscalation: Array.isArray(fast.fixEscalation)
+					? fast.fixEscalation.map((e: any, i: number) => migrateRole(e, DEFAULT_CONFIG.fast.fixEscalation[i] || DEFAULT_CONFIG.fast.fix))
+					: JSON.parse(JSON.stringify(DEFAULT_CONFIG.fast.fixEscalation)),
 				uat: migrateRole(fast.uat, DEFAULT_CONFIG.fast.uat),
 			},
 			multiwave: {
@@ -2258,8 +2266,18 @@ export default function (pi: ExtensionAPI) {
 
 				while (currentScore < COMPLIANCE_THRESHOLD && depth < MAX_SUBTASK_DEPTH) {
 					depth++;
-					ctx.ui.setStatus("pipeline", `[FAST] Fixing ${failedTask.id} (depth ${depth}/${MAX_SUBTASK_DEPTH}, current: ${currentScore}%)...`);
-					log(`[FAST] Subtask fix depth ${depth} for ${failedTask.id} (${currentScore}%)...`);
+
+					// Escalation: depth 1 = fix, depth 2+ = fixEscalation[depth-2] (clamped to last entry)
+					const esc = pipelineConfig.fast.fixEscalation;
+					const fixRole = depth === 1 ? pipelineConfig.fast.fix
+						: esc.length > 0 ? esc[Math.min(depth - 2, esc.length - 1)]
+						: pipelineConfig.fast.fix;
+					const fixModelForDepth = fixRole.model;
+					const fixThinkingForDepth = fixRole.thinking;
+					const escalated = depth > 1 && esc.length > 0;
+
+					ctx.ui.setStatus("pipeline", `[FAST] Fixing ${failedTask.id} (depth ${depth}/${MAX_SUBTASK_DEPTH}, ${currentScore}%${escalated ? ` · ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}` : ""})...`);
+					log(`[FAST] Subtask fix depth ${depth} for ${failedTask.id} (${currentScore}%)${escalated ? ` [escalated → ${shortModelName(fixModelForDepth)}:${fixThinkingForDepth}]` : ""}...`);
 					failedTask.status = "building";
 					updateWidget();
 
@@ -2279,9 +2297,10 @@ export default function (pi: ExtensionAPI) {
 						`Preserve all existing working code from this and previous epics.`,
 						``,
 						`Focus only on what's broken or missing for task ${failedTask.id}.`,
+						...(escalated ? [``, `This is an ESCALATED attempt (depth ${depth}). Previous fixes were insufficient. Apply maximum care and deeper reasoning.`] : []),
 					].join("\n");
 
-					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: FAST_FIX_MODEL, thinking: pipelineConfig.fast.fix.thinking });
+					const fixResult = await runAgent(builderAgent, fixPrompt, `fast-fix-${failedTask.id}-d${depth}`, ctx, { ephemeral: true, model: fixModelForDepth, thinking: fixThinkingForDepth });
 					shellExec(`git -C '${cwd}' add -A && git -C '${cwd}' commit -m "Fast track: fix ${failedTask.id} (depth ${depth})"`, cwd);
 
 					// Re-evaluate this specific task
@@ -3097,7 +3116,7 @@ export default function (pi: ExtensionAPI) {
 				] : [
 					`Build: ${shortModelName(pipelineConfig.fast.build.model)} (entire epic at once)`,
 					`Evaluate: ${shortModelName(pipelineConfig.fast.eval.model)} (per-task scoring)`,
-					`Fix: ${shortModelName(pipelineConfig.fast.fix.model)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)`,
+					`Fix: ${shortModelName(pipelineConfig.fast.fix.model)} (subtask decomposition, up to ${MAX_SUBTASK_DEPTH} depths)${pipelineConfig.fast.fixEscalation.length > 0 ? ` → escalation: ${pipelineConfig.fast.fixEscalation.map(e => `${shortModelName(e.model)}:${e.thinking}`).join(" → ")}` : ""}`,
 					`UAT: Scenario generation → Playwright execution → approval gate`,
 					`Compliance threshold: ${COMPLIANCE_THRESHOLD}%`,
 				]),
@@ -3826,9 +3845,9 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				if (activeTab === "fast") {
-					return [
-						tabHeader,
-						...fastRoles.map(r => ({
+					const items: SettingItem[] = [tabHeader];
+					for (const r of fastRoles) {
+						items.push({
 							id: r.id,
 							label: r.label,
 							currentValue: formatRoleValue(config.fast[r.key]),
@@ -3837,8 +3856,30 @@ export default function (pi: ExtensionAPI) {
 								const fullId = config.fast[r.key].model;
 								return buildModelSubmenu(fullId, done);
 							},
-						})),
-					];
+						});
+						// After "fix", insert escalation entries
+						if (r.key === "fix") {
+							for (let i = 0; i < config.fast.fixEscalation.length; i++) {
+								const esc = config.fast.fixEscalation[i];
+								items.push({
+									id: `fast.esc.${i}`,
+									label: `  ↳ Escalation ${i + 1}`,
+									currentValue: formatRoleValue(esc),
+									description: `Depth ${i + 2} fix · Space to cycle thinking · Del to remove`,
+									submenu: (_currentValue: string, done: (selectedValue?: string) => void) => {
+										return buildModelSubmenu(esc.model, done);
+									},
+								});
+							}
+							items.push({
+								id: "__add_esc",
+								label: "  ↳ + Add escalation step",
+								currentValue: "",
+								description: "Add another escalation depth with a stronger model",
+							});
+						}
+					}
+					return items;
 				} else {
 					return [
 						tabHeader,
@@ -3879,9 +3920,12 @@ export default function (pi: ExtensionAPI) {
 					16,
 					settingsTheme,
 					(id: string, newValue: string) => {
-						if (id.startsWith("fast.")) {
+						if (id.startsWith("fast.esc.")) {
+							const escIdx = parseInt(id.slice(9), 10);
+							if (config.fast.fixEscalation[escIdx]) config.fast.fixEscalation[escIdx].model = newValue;
+						} else if (id.startsWith("fast.")) {
 							const key = id.slice(5) as keyof PipelineModelConfig["fast"];
-							config.fast[key].model = newValue;
+							if (key !== "fixEscalation") (config.fast[key] as RoleConfig).model = newValue;
 						} else if (id.startsWith("mw.")) {
 							const key = id.slice(3) as keyof PipelineModelConfig["multiwave"];
 							config.multiwave[key].model = newValue;
@@ -3908,7 +3952,7 @@ export default function (pi: ExtensionAPI) {
 						lines.push("");
 						lines.push(...settingsList.render(width));
 						lines.push("");
-						lines.push(theme.fg("dim", "  Enter: change model · Space: cycle thinking · Esc: close"));
+						lines.push(theme.fg("dim", "  Enter: change model · Space: cycle thinking · Del: remove escalation · Esc: close"));
 						lines.push(border);
 						return lines;
 					},
@@ -3925,11 +3969,42 @@ export default function (pi: ExtensionAPI) {
 							settingsList.invalidate();
 							return;
 						}
+						// Enter on __add_esc: add a new escalation step
+						if (selected?.id === "__add_esc" && kb.matches(data, "selectConfirm")) {
+							const lastEsc = config.fast.fixEscalation.length > 0
+								? config.fast.fixEscalation[config.fast.fixEscalation.length - 1]
+								: config.fast.fix;
+							config.fast.fixEscalation.push({ model: lastEsc.model, thinking: lastEsc.thinking });
+							saveAndReload();
+							const idx = (settingsList as any).selectedIndex;
+							items = getSettingItems();
+							(settingsList as any).items = items;
+							(settingsList as any).filteredItems = items;
+							(settingsList as any).selectedIndex = idx;
+							settingsList.invalidate();
+							return;
+						}
+						// Delete/Backspace on fast.esc.N: remove that escalation step
+						if (selected?.id.startsWith("fast.esc.") && (data === "\x7f" || data === "\b" || data === "\x1b[3~")) {
+							const escIdx = parseInt(selected.id.slice(9), 10);
+							config.fast.fixEscalation.splice(escIdx, 1);
+							saveAndReload();
+							const idx = Math.min((settingsList as any).selectedIndex, 0);
+							items = getSettingItems();
+							(settingsList as any).items = items;
+							(settingsList as any).filteredItems = items;
+							(settingsList as any).selectedIndex = Math.min(idx, items.length - 1);
+							settingsList.invalidate();
+							return;
+						}
 						// Space on a role item: cycle thinking level
-						if (selected && selected.id !== "__tab" && data === " ") {
-							if (selected.id.startsWith("fast.")) {
+						if (selected && selected.id !== "__tab" && selected.id !== "__add_esc" && data === " ") {
+							if (selected.id.startsWith("fast.esc.")) {
+								const escIdx = parseInt(selected.id.slice(9), 10);
+								if (config.fast.fixEscalation[escIdx]) cycleThinking(config.fast.fixEscalation[escIdx]);
+							} else if (selected.id.startsWith("fast.")) {
 								const key = selected.id.slice(5) as keyof PipelineModelConfig["fast"];
-								cycleThinking(config.fast[key]);
+								if (key !== "fixEscalation") cycleThinking(config.fast[key] as RoleConfig);
 							} else if (selected.id.startsWith("mw.")) {
 								const key = selected.id.slice(3) as keyof PipelineModelConfig["multiwave"];
 								cycleThinking(config.multiwave[key]);

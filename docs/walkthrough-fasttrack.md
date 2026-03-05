@@ -389,6 +389,17 @@ The model selector has its own tabs:
 
 A ping test runs on model selection to confirm it responds. Config saves to `~/.pi/agent/pipeline-config.json` and takes effect immediately. The thinking level controls how much reasoning budget each role gets — use `high`/`xhigh` for complex tasks (build, eval, fix) and `medium`/`low` for simpler ones (UAT).
 
+### Fix Escalation
+
+When a task fails to reach the compliance threshold, the pipeline retries at increasing depth. You can configure different models and thinking levels for each escalation depth:
+
+- **Depth 1** uses the base Fixer model
+- **Depth 2** uses Escalation 1 (e.g. a stronger model)
+- **Depth 3** uses Escalation 2 (e.g. even stronger with xhigh thinking)
+- And so on — add as many escalation steps as needed
+
+In the config UI, escalation rows appear indented under the Fixer. Use Enter to change the model, Space to cycle thinking, and Del/Backspace to remove a step. Select "+ Add escalation step" to add more.
+
 ---
 
 ## Observer Mode
