@@ -118,15 +118,9 @@ const HTML = `<!DOCTYPE html>
   --chart-4: oklch(0.8822 0.0403 298.1792);
   --chart-5: oklch(0.5608 0.1348 42.0584);
   --radius: 0.5rem;
-  --bg: var(--background);
-  --surface: var(--card);
-  --text: var(--foreground);
-  --dim: var(--muted-foreground);
   --green: oklch(0.62 0.17 145);
-  --red: var(--destructive);
   --yellow: oklch(0.75 0.15 85);
   --cyan: oklch(0.72 0.12 195);
-  --blue: var(--primary);
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
 }
 
@@ -155,13 +149,12 @@ const HTML = `<!DOCTYPE html>
   --chart-3: oklch(0.2130 0.0078 95.4245);
   --chart-4: oklch(0.3074 0.0516 289.3230);
   --chart-5: oklch(0.5608 0.1348 42.0584);
-  --surface: oklch(0.3085 0.0035 106.6039);
   --green: oklch(0.72 0.17 145);
   --yellow: oklch(0.80 0.14 85);
   --cyan: oklch(0.78 0.10 195);
 }
 
-body{background:var(--bg);color:var(--text);min-height:100vh;padding:0;transition:background .3s,color .3s}
+body{background:var(--background);color:var(--foreground);min-height:100vh;padding:0;transition:background .3s,color .3s}
 .container{max-width:1200px;margin:0 auto;padding:16px 20px}
 
 header{display:flex;align-items:center;justify-content:space-between;padding:20px 0 16px;border-bottom:1px solid var(--border)}
@@ -172,7 +165,7 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .status-bar{display:flex;align-items:center;gap:16px;padding:14px 0;flex-wrap:wrap}
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .status-dot.running{background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.5s infinite}
-.status-dot.idle{background:var(--dim)}
+.status-dot.idle{background:var(--muted-foreground)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 .badge{padding:3px 10px;border-radius:calc(var(--radius) - 2px);font-size:.75rem;font-weight:500;background:var(--secondary);color:var(--secondary-foreground);border:1px solid var(--border)}
 
@@ -180,12 +173,12 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .progress-fill{height:100%;background:var(--primary);border-radius:var(--radius);transition:width .4s ease}
 
 .phases{margin-top:20px;display:flex;flex-direction:column;gap:8px}
-.phase{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:box-shadow .2s}
+.phase{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:box-shadow .2s}
 .phase:hover{box-shadow:0 2px 8px oklch(0 0 0 / .08)}
 .phase-header{padding:14px 16px;display:flex;align-items:center;gap:12px}
 .phase-icon{font-size:1rem;width:20px;text-align:center;flex-shrink:0}
 .phase-name{flex:1;font-weight:600;font-size:.88rem}
-.phase-meta{font-size:.72rem;color:var(--dim);display:flex;gap:8px;align-items:center;flex-shrink:0}
+.phase-meta{font-size:.72rem;color:var(--muted-foreground);display:flex;gap:8px;align-items:center;flex-shrink:0}
 .phase.current .phase-header{border-left:3px solid var(--primary)}
 .phase.done .phase-header{border-left:3px solid var(--green)}
 .phase.done .phase-name{color:var(--green)}
@@ -193,36 +186,36 @@ header h1{font-size:1.3rem;font-weight:700;letter-spacing:1px;color:var(--primar
 .tasks{padding:0 16px 14px 46px;display:flex;flex-direction:column;gap:2px}
 .task{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.8rem}
 .task-icon{width:16px;text-align:center;flex-shrink:0}
-.task-id{color:var(--dim);min-width:32px;font-weight:500;font-size:.75rem}
+.task-id{color:var(--muted-foreground);min-width:32px;font-weight:500;font-size:.75rem}
 .task-title{flex:1}
 .task-score{font-weight:600;min-width:40px;text-align:right}
 .task-score.high{color:var(--green)}
 .task-score.med{color:var(--yellow)}
-.task-score.low{color:var(--red)}
-.task-attempts{color:var(--dim);font-size:.7rem;min-width:24px}
+.task-score.low{color:var(--destructive)}
+.task-attempts{color:var(--muted-foreground);font-size:.7rem;min-width:24px}
 
-.log-section,.agents-section{margin-top:16px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
+.log-section,.agents-section{margin-top:16px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
 .log-section h2,.agents-section h2{font-size:.82rem;color:var(--primary);margin-bottom:12px;font-weight:600}
-.log-entry{font-size:.72rem;padding:3px 0;color:var(--dim);word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5}
+.log-entry{font-size:.72rem;padding:3px 0;color:var(--muted-foreground);word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;line-height:1.5}
 .log-entry.pass{color:var(--green)}
-.log-entry.fail{color:var(--red)}
+.log-entry.fail{color:var(--destructive)}
 .log-entry.phase-start{color:var(--primary);font-weight:600}
 
 .agent{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:.8rem}
 .agent-spinner{display:inline-block;animation:spin 1s linear infinite;color:var(--primary)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .agent-name{font-weight:600;min-width:120px;text-transform:uppercase;color:var(--primary)}
-.agent-model{color:var(--dim);font-size:.75rem}
+.agent-model{color:var(--muted-foreground);font-size:.75rem}
 
 .gate-badge{font-size:.65rem;padding:2px 7px;border-radius:calc(var(--radius) - 2px);font-weight:600}
 .gate-badge.build{background:oklch(0.35 0.06 85 / .3);color:var(--yellow);border:1px solid var(--yellow)}
 .gate-badge.fix{background:oklch(0.35 0.06 85 / .3);color:var(--yellow);border:1px solid var(--yellow)}
 .gate-badge.compliance{background:oklch(0.35 0.05 195 / .3);color:var(--cyan);border:1px solid var(--cyan)}
 .gate-badge.done{background:oklch(0.35 0.06 145 / .3);color:var(--green);border:1px solid var(--green)}
-.gate-badge.error{background:oklch(0.35 0.08 25 / .3);color:var(--red);border:1px solid var(--red)}
+.gate-badge.error{background:oklch(0.35 0.08 25 / .3);color:var(--destructive);border:1px solid var(--destructive)}
 
-.no-data{text-align:center;padding:48px;color:var(--dim);font-size:.9rem}
-.updated{font-size:.7rem;color:var(--dim);text-align:right;padding:8px 0}
+.no-data{text-align:center;padding:48px;color:var(--muted-foreground);font-size:.9rem}
+.updated{font-size:.7rem;color:var(--muted-foreground);text-align:right;padding:8px 0}
 
 @media(max-width:600px){
 .container{padding:10px}
@@ -256,10 +249,10 @@ connect();
 function statusIcon(s) {
 switch(s) {
 case 'passed': return '<span style="color:var(--green)">&#10003;</span>';
-case 'building': return '<span style="color:var(--blue)" class="agent-spinner">&#9684;</span>';
+case 'building': return '<span style="color:var(--primary)" class="agent-spinner">&#9684;</span>';
 case 'scoring': return '<span style="color:var(--cyan)" class="agent-spinner">&#9684;</span>';
-case 'failed': return '<span style="color:var(--red)">&#10007;</span>';
-default: return '<span style="color:var(--dim)">&#9675;</span>';
+case 'failed': return '<span style="color:var(--destructive)">&#10007;</span>';
+default: return '<span style="color:var(--muted-foreground)">&#9675;</span>';
 }
 }
 
@@ -303,13 +296,13 @@ var total = d.phases.reduce(function(a,p){return a+p.total},0);
 var done = d.phases.reduce(function(a,p){return a+p.tasks.filter(function(t){return t.status==='passed'}).length},0);
 var pct = total ? Math.round(done/total*100) : 0;
 html += '<div class="progress-bar"><div class="progress-fill" style="width:'+pct+'%"></div></div>';
-html += '<div style="font-size:.7rem;color:var(--dim);margin-top:4px">'+done+'/'+total+' tasks ('+pct+'%)</div>';
+html += '<div style="font-size:.7rem;color:var(--muted-foreground);margin-top:4px">'+done+'/'+total+' tasks ('+pct+'%)</div>';
 
 html += '<div class="phases">';
 for (var i = 0; i < d.phases.length; i++) {
 var p = d.phases[i];
 var cls = p.allDone ? 'done' : p.isCurrent ? 'current' : '';
-var icon = p.allDone ? '<span style="color:var(--green)">&#10003;</span>' : p.isCurrent && d.running ? '<span class="agent-spinner" style="color:var(--blue)">&#9684;</span>' : '<span style="color:var(--dim)">&#9675;</span>';
+var icon = p.allDone ? '<span style="color:var(--green)">&#10003;</span>' : p.isCurrent && d.running ? '<span class="agent-spinner" style="color:var(--primary)">&#9684;</span>' : '<span style="color:var(--muted-foreground)">&#9675;</span>';
 var passedCount = p.tasks.filter(function(t){return t.status==='passed'}).length;
 
 html += '<div class="phase '+cls+'">';
@@ -346,7 +339,7 @@ html += '<div class="agents-section"><h2>Active Agents</h2>';
 for (var k = 0; k < agents.length; k++) {
 var a = agents[k];
 html += '<div class="agent">';
-html += '<span class="agent-spinner" style="color:var(--blue)">&#9684;</span>';
+html += '<span class="agent-spinner" style="color:var(--primary)">&#9684;</span>';
 html += '<span class="agent-name">'+esc(a.name)+'</span>';
 html += '<span class="agent-model">'+esc(a.model)+'</span>';
 html += '</div>';
