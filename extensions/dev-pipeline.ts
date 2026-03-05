@@ -240,6 +240,35 @@ function shortModelName(fullId: string): string {
 }
 
 
+function pingModel(modelId: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		const providerExtDir = join(homedir(), ".pi", "agent", "extensions");
+		const providerExts: string[] = [];
+		if (existsSync(providerExtDir)) {
+			for (const f of readdirSync(providerExtDir)) {
+				if (f.endsWith("-provider.ts")) providerExts.push("-e", join(providerExtDir, f));
+			}
+		}
+		const args = [
+			"--mode", "print", "-p",
+			"--no-extensions", ...providerExts,
+			"--no-skills", "--no-prompt-templates", "--no-session",
+			"--model", modelId, "--thinking", "off", "--no-tools",
+			"Say OK",
+		];
+		let finished = false;
+		const timer = setTimeout(() => {
+			if (!finished) { finished = true; child.kill(); resolve(false); }
+		}, 10000);
+		const child = spawn("pi", args, { stdio: ["ignore", "pipe", "ignore"] });
+		child.on("close", (code) => {
+			if (!finished) { finished = true; clearTimeout(timer); resolve(code === 0); }
+		});
+		child.on("error", () => {
+			if (!finished) { finished = true; clearTimeout(timer); resolve(false); }
+		});
+	});
+}
 
 // ── Helpers ──────────────────────────────────────
 
@@ -3688,8 +3717,10 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			let tuiRef: any = null;
+			let pingStatus = ""; // shown below list during/after ping
 
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
+				pingStatus = "";
 				const listTheme: SelectListTheme = {
 					selectedPrefix: (t: string) => ctx.ui.theme.fg("accent", t),
 					selectedText: (t: string) => ctx.ui.theme.fg("accent", ctx.ui.theme.bold(t)),
@@ -3761,13 +3792,30 @@ export default function (pi: ExtensionAPI) {
 					lines.push(border);
 					lines.push("");
 					lines.push(...list.render(width));
+					if (pingStatus) lines.push(pingStatus);
 					lines.push("");
-					lines.push(ctx.ui.theme.fg("dim", "  Type to filter · Enter to select · Tab to switch · Esc to cancel"));
+					lines.push(ctx.ui.theme.fg("dim", "  Type to filter · Enter to select · Ctrl+P to ping · Tab to switch · Esc to cancel"));
 					lines.push(border);
 					return lines;
 				};
 
 				const normalInput = (data: string) => {
+					// Ctrl+P: ping highlighted model
+					if (data === "\x10") {
+						const selected = list.getSelectedItem();
+						if (selected) {
+							const modelId = selected.value;
+							pingStatus = ctx.ui.theme.fg("warning", `  Pinging ${shortModelName(modelId)}...`);
+							tuiRef?.requestRender();
+							pingModel(modelId).then((ok) => {
+								pingStatus = ok
+									? ctx.ui.theme.fg("success", `  ✓ ${shortModelName(modelId)} responded OK`)
+									: ctx.ui.theme.fg("error", `  ✗ ${shortModelName(modelId)} failed (timeout or error)`);
+								tuiRef?.requestRender();
+							});
+						}
+						return;
+					}
 					if (data === "\t") {
 						modelTab = modelTab === "available" ? "all" : "available";
 						rebuildList();
