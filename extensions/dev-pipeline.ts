@@ -4190,6 +4190,8 @@ export default function (pi: ExtensionAPI) {
 
 				let modelTab: "available" | "all" = "available";
 				let searchText = "";
+				let customMode = false;
+				let customInput = "";
 				let items = buildModelItems(true);
 				let list = new SelectList(items, 20, listTheme);
 				const currentIdx = items.findIndex(m => m.value === currentModelId);
@@ -4241,6 +4243,18 @@ export default function (pi: ExtensionAPI) {
 					lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
 					lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}`));
 					lines.push("");
+
+					if (customMode) {
+						lines.push(ctx.ui.theme.fg("accent", "  Custom Model ID (format: provider/model-id)"));
+						lines.push("");
+						lines.push(ctx.ui.theme.fg("accent", `  > ${customInput}█`));
+						if (pingStatus) lines.push(pingStatus);
+						lines.push("");
+						lines.push(ctx.ui.theme.fg("dim", "  Enter to confirm · Ctrl+P to ping · Esc to go back"));
+						lines.push(border);
+						return lines.map(l => truncateToWidth(l, width));
+					}
+
 					lines.push(renderTabBar());
 					if (searchText) {
 						lines.push(ctx.ui.theme.fg("accent", `  Search: ${searchText}█`));
@@ -4253,12 +4267,62 @@ export default function (pi: ExtensionAPI) {
 					lines.push(...list.render(width));
 					if (pingStatus) lines.push(pingStatus);
 					lines.push("");
-					lines.push(ctx.ui.theme.fg("dim", "  Type to filter · Enter to select · Ctrl+P to ping · Tab to switch · Esc to cancel"));
+					lines.push(ctx.ui.theme.fg("dim", "  Type to filter · Enter to select · / for custom ID · Ctrl+P to ping · Tab to switch · Esc to cancel"));
 					lines.push(border);
-					return lines;
+					return lines.map(l => truncateToWidth(l, width));
 				};
 
 				const normalInput = (data: string) => {
+					// Custom mode input handling
+					if (customMode) {
+						// Escape: back to list mode
+						if (data === "\x1b" || data === "\x1b[") {
+							customMode = false;
+							customInput = "";
+							pingStatus = "";
+							wrapper.invalidate();
+							return;
+						}
+						// Enter: confirm custom model ID
+						if (data === "\r" || data === "\n") {
+							const id = customInput.trim();
+							if (id && id.includes("/")) {
+								done(id);
+							}
+							return;
+						}
+						// Ctrl+P: ping custom model
+						if (data === "\x10") {
+							const id = customInput.trim();
+							if (id) {
+								pingStatus = ctx.ui.theme.fg("warning", `  Pinging ${id}...`);
+								tuiRef?.requestRender();
+								pingModel(id).then((ok) => {
+									pingStatus = ok
+										? ctx.ui.theme.fg("success", `  ✓ ${id} responded OK`)
+										: ctx.ui.theme.fg("error", `  ✗ ${id} failed (timeout or error)`);
+									tuiRef?.requestRender();
+								});
+							}
+							return;
+						}
+						// Backspace
+						if (data === "\x7f" || data === "\b") {
+							if (customInput.length > 0) {
+								customInput = customInput.slice(0, -1);
+								wrapper.invalidate();
+							}
+							return;
+						}
+						// Printable characters
+						if (data.length === 1 && data >= " " && data <= "~") {
+							customInput += data;
+							wrapper.invalidate();
+							return;
+						}
+						return;
+					}
+
 					// Ctrl+P: ping highlighted model
 					if (data === "\x10") {
 						const selected = list.getSelectedItem();
@@ -4273,6 +4337,14 @@ export default function (pi: ExtensionAPI) {
 								tuiRef?.requestRender();
 							});
 						}
+						return;
+					}
+					// / key: enter custom model mode (only when search is empty to avoid conflict)
+					if (data === "/" && searchText === "") {
+						customMode = true;
+						customInput = "";
+						pingStatus = "";
+						wrapper.invalidate();
 						return;
 					}
 					if (data === "\t") {
