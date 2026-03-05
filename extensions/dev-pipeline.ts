@@ -3628,21 +3628,18 @@ export default function (pi: ExtensionAPI) {
 
 			const config = loadPipelineConfig();
 			const allModels = ctx.modelRegistry.getAll();
-			const availableModels = new Set(ctx.modelRegistry.getAvailable().map(m => `${m.provider}/${m.id}`));
-			const modelItems: SelectItem[] = allModels.map(m => {
-				const fullId = `${m.provider}/${m.id}`;
-				const hasAuth = availableModels.has(fullId);
-				return {
-					value: fullId,
-					label: hasAuth ? `  ${fullId}` : `  ${fullId}  [no key]`,
-					description: hasAuth ? m.name : `${m.name} (no API key configured)`,
-				};
-			}).sort((a, b) => {
-				const aOk = !a.label.includes("[no key]");
-				const bOk = !b.label.includes("[no key]");
-				if (aOk !== bOk) return aOk ? -1 : 1;
-				return a.value.localeCompare(b.value);
-			});
+			const availableSet = new Set(ctx.modelRegistry.getAvailable().map(m => `${m.provider}/${m.id}`));
+
+			function buildModelItems(onlyAvailable: boolean): SelectItem[] {
+				return allModels
+					.filter(m => !onlyAvailable || availableSet.has(`${m.provider}/${m.id}`))
+					.map(m => ({
+						value: `${m.provider}/${m.id}`,
+						label: `  ${m.provider}/${m.id}`,
+						description: m.name,
+					}))
+					.sort((a, b) => a.value.localeCompare(b.value));
+			}
 
 			type ConfigTab = "fast" | "multiwave";
 			let activeTab: ConfigTab = pipelineMode === "fast" ? "fast" : "multiwave";
@@ -3667,7 +3664,7 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			function buildModelSubmenu(currentModelId: string, done: (selectedValue?: string) => void) {
-				const theme: SelectListTheme = {
+				const listTheme: SelectListTheme = {
 					selectedPrefix: (t: string) => ctx.ui.theme.fg("accent", t),
 					selectedText: (t: string) => ctx.ui.theme.fg("accent", ctx.ui.theme.bold(t)),
 					description: (t: string) => ctx.ui.theme.fg("dim", t),
@@ -3675,40 +3672,69 @@ export default function (pi: ExtensionAPI) {
 					noMatch: (t: string) => ctx.ui.theme.fg("warning", t),
 				};
 
-				const list = new SelectList(modelItems, 20, theme);
-				const currentIdx = modelItems.findIndex(m => m.value === currentModelId);
+				let modelTab: "available" | "all" = "available";
+				let items = buildModelItems(true);
+				let list = new SelectList(items, 20, listTheme);
+				const currentIdx = items.findIndex(m => m.value === currentModelId);
 				if (currentIdx >= 0) list.setSelectedIndex(currentIdx);
+
+				function rebuildList() {
+					items = buildModelItems(modelTab === "available");
+					list = new SelectList(items, 20, listTheme);
+					const idx = items.findIndex(m => m.value === currentModelId);
+					if (idx >= 0) list.setSelectedIndex(idx);
+					list.onSelect = onSelect;
+					list.onCancel = () => { done(undefined); };
+				}
+
+				function renderTabBar(): string {
+					const avLabel = modelTab === "available"
+						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[Available (${availableSet.size})]`))
+						: ctx.ui.theme.fg("dim", ` Available (${availableSet.size}) `);
+					const allLabel = modelTab === "all"
+						? ctx.ui.theme.fg("accent", ctx.ui.theme.bold(`[All (${allModels.length})]`))
+						: ctx.ui.theme.fg("dim", ` All (${allModels.length}) `);
+					return `  ${avLabel}  ${allLabel}    ${ctx.ui.theme.fg("dim", "Tab to switch")}`;
+				}
+
+				const normalRender = (width: number): string[] => {
+					const border = ctx.ui.theme.fg("dim", "─".repeat(width));
+					const lines: string[] = [];
+					lines.push(border);
+					lines.push("");
+					lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
+					lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}`));
+					lines.push("");
+					lines.push(renderTabBar());
+					lines.push("");
+					lines.push(border);
+					lines.push("");
+					lines.push(...list.render(width));
+					lines.push("");
+					lines.push(ctx.ui.theme.fg("dim", "  Enter to select and ping · Esc to cancel"));
+					lines.push(border);
+					return lines;
+				};
+
+				const normalInput = (data: string) => {
+					if (data === "\t") {
+						modelTab = modelTab === "available" ? "all" : "available";
+						rebuildList();
+						wrapper.invalidate();
+						return;
+					}
+					list.handleInput(data);
+				};
 
 				const wrapper: any = {
 					invalidate() { list.invalidate(); },
-					render(width: number): string[] {
-						const border = ctx.ui.theme.fg("dim", "─".repeat(width));
-						const configuredCount = availableModels.size;
-						const totalCount = allModels.length;
-						const lines: string[] = [];
-						lines.push(border);
-						lines.push("");
-						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
-						lines.push(ctx.ui.theme.fg("dim", `  Current: ${shortModelName(currentModelId)}    (${configuredCount}/${totalCount} configured)`));
-						lines.push("");
-						lines.push(border);
-						lines.push("");
-						lines.push(...list.render(width));
-						lines.push("");
-						lines.push(ctx.ui.theme.fg("dim", "  Enter to select and ping · Esc to cancel"));
-						lines.push(border);
-						return lines;
-					},
-					handleInput(data: string) {
-						list.handleInput(data);
-					},
+					render: normalRender,
+					handleInput: normalInput,
 				};
 
-				list.onSelect = (item: SelectItem) => {
+				const onSelect = (item: SelectItem) => {
 					const selectedModel = item.value;
-					// Show pinging state
-					const origRender = wrapper.render;
-					wrapper.render = (width: number): string[] => {
+					wrapper.render = (_width: number): string[] => {
 						const lines: string[] = [];
 						lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
 						lines.push("");
@@ -3722,7 +3748,7 @@ export default function (pi: ExtensionAPI) {
 						if (ok) {
 							done(selectedModel);
 						} else {
-							wrapper.render = (width: number): string[] => {
+							wrapper.render = (_width: number): string[] => {
 								const lines: string[] = [];
 								lines.push(ctx.ui.theme.fg("accent", ctx.ui.theme.bold("  Select Model")));
 								lines.push("");
@@ -3731,16 +3757,16 @@ export default function (pi: ExtensionAPI) {
 								return lines;
 							};
 							wrapper.invalidate();
-							const origInput = wrapper.handleInput;
 							wrapper.handleInput = (_data: string) => {
-								wrapper.render = origRender;
-								wrapper.handleInput = origInput;
+								wrapper.render = normalRender;
+								wrapper.handleInput = normalInput;
 								wrapper.invalidate();
 							};
 						}
 					}, 50);
 				};
 
+				list.onSelect = onSelect;
 				list.onCancel = () => { done(undefined); };
 
 				return wrapper;
