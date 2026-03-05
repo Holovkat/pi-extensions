@@ -561,6 +561,13 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	}
 
+	function unregisterAgentOnControl(sessionKey: string) {
+		if (!controlSocket || !controlConnected) return;
+		try {
+			controlSocket.write(JSON.stringify({ type: "unregister", agentId: sessionKey }) + "\n");
+		} catch {}
+	}
+
 	function handleForwardedCommand(msg: any) {
 		// msg has: { forward: true, type: "steer"|"follow_up"|"abort", message?: string }
 		// Route to the appropriate agent's stdin
@@ -999,6 +1006,7 @@ export default function (pi: ExtensionAPI) {
 				if (hardTimer) { clearTimeout(hardTimer); hardTimer = null; }
 				agentProcesses.delete(sessionKey);
 				activeAgents.delete(sessionKey);
+				unregisterAgentOnControl(sessionKey);
 				if (activeAgents.size === 0) { activeLogFile = ""; activeAgent = null; }
 				writeStateFile();
 			}

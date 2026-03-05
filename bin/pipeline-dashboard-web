@@ -128,6 +128,15 @@ function handleControlCommand(cmd, socket) {
 			}
 			break;
 		}
+		case "unregister": {
+			const id = cmd.agentId;
+			if (registeredAgents.has(id)) {
+				registeredAgents.delete(id);
+				logSteer({ type: "unregister", agentId: id, reason: cmd.reason || "completed" });
+			}
+			socket.write(JSON.stringify({ success: true, command: "unregister" }) + "\n");
+			break;
+		}
 		case "list_agents": {
 			const agents = [];
 			for (const [id, agent] of registeredAgents) {
