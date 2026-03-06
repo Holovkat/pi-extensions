@@ -776,6 +776,40 @@ document.getElementById('status').textContent=(d.running?'RUNNING':'IDLE')+' | '
 </script></body></html>`;
 
 // ── DASHBOARD PAGE ── (same as before but with nav)
+// Issue detail JS — plain string, no template literals, no regex literals
+// Uses new RegExp() with properly escaped strings to avoid all escaping issues
+// Build the renderMd function as a string at startup (avoids escaping hell)
+const ISSUE_DETAIL_JS = (function() {
+	// These will be emitted literally into the browser <script>
+	function renderMd(s) {
+		if (!s) return "";
+		var bt = String.fromCharCode(96);
+		var bt3 = new RegExp(bt+bt+bt+"[\\s\\S]*?"+bt+bt+bt, "g");
+		s = s.replace(bt3, function(m) {
+			var code = m.slice(3);
+			if (code.slice(-3) === bt+bt+bt) code = code.slice(0, -3);
+			return "<pre><code>" + esc(code.trim()) + "</code></pre>";
+		});
+		var bt1 = new RegExp(bt + "([^" + bt + "]+)" + bt, "g");
+		s = s.replace(bt1, function(_, c) { return "<code>" + esc(c) + "</code>"; });
+		s = s.replace(/^### (.+)$/gm, "<h3>$1</h3>");
+		s = s.replace(/^## (.+)$/gm, "<h2>$1</h2>");
+		s = s.replace(/^# (.+)$/gm, "<h1>$1</h1>");
+		s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+		s = s.replace(/\*(.+?)\*/g, "<em>$1</em>");
+		s = s.replace(/^> (.+)$/gm, "<blockquote>$1</blockquote>");
+		s = s.replace(/^[-*] (.+)$/gm, "<li>$1</li>");
+		s = s.replace(/#(\d+)/g, function(_, n) {
+			return '<a class="issue-sub-ref" onclick="drillIssue(' + n + ',event)">#' + n + '</a>';
+		});
+		return s;
+	}
+	// Extract function body as string
+	var src = renderMd.toString();
+	// Wrap it so it defines the function in browser scope
+	return src;
+})();
+
 const DASHBOARD_HTML = `<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dashboard - Pipeline</title>
@@ -907,21 +941,7 @@ if(data.error){el.innerHTML='<div class="issue-loading">'+esc(data.error)+'</div
 issueCache[issueNum]=data;renderIssueDetail(el,data);
 }).catch(function(e){el.innerHTML='<div class="issue-loading">Error: '+esc(e.message)+'</div>'})
 }
-function renderMd(s){
-if(!s)return '';
-var bt3=/\x60\x60\x60[\\s\\S]*?\x60\x60\x60/g;s=s.replace(bt3,function(m){var code=m.slice(3);var nl=code.indexOf('\\n');var lang=nl>0?code.slice(0,nl).trim():'';code=nl>0?code.slice(nl+1):code;if(code.slice(-3)===String.fromCharCode(96,96,96))code=code.slice(0,-3);return '<pre><code>'+esc(code.trim())+'</code></pre>'});
-var bt1=/\x60([^\x60]+)\x60/g;s=s.replace(bt1,function(_,c){return '<code>'+esc(c)+'</code>'});
-s=s.replace(/^### (.+)$/gm,'<h3>$1</h3>');
-s=s.replace(/^## (.+)$/gm,'<h2>$1</h2>');
-s=s.replace(/^# (.+)$/gm,'<h1>$1</h1>');
-s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
-s=s.replace(/\*(.+?)\*/g,'<em>$1</em>');
-s=s.replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>');
-s=s.replace(/^[-*] (.+)$/gm,'<li>$1</li>');
-s=s.replace(/(<li>[\s\S]*<\/li>)/g,function(m){return '<ul>'+m+'</ul>'});
-s=s.replace(/#(\d+)/g,function(_,n){return '<a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+'</a>'});
-return s;
-}
+${ISSUE_DETAIL_JS}
 function renderIssueDetail(el,data){
 var html='';
 html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
