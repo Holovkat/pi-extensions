@@ -431,9 +431,11 @@ function parseChecklist(checklistPath: string): ParsedPhase[] {
 	const phases: ParsedPhase[] = [];
 	let currentEpic = "";
 	let currentPhase: ParsedPhase | null = null;
+	const allLines = raw.split("\n");
 
 	// Parse "Phase N" or "Epic N" sections
-	for (const line of raw.split("\n")) {
+	for (let lineIdx = 0; lineIdx < allLines.length; lineIdx++) {
+		const line = allLines[lineIdx];
 		const epicMatch = line.match(/^##+ (?:Epic|Phase) (\d+):\s*(.+)/);
 		if (epicMatch) {
 			currentEpic = `Epic ${epicMatch[1]}`;
@@ -442,10 +444,9 @@ function parseChecklist(checklistPath: string): ParsedPhase[] {
 			continue;
 		}
 
-		if (!currentPhase) continue;
-
 		// Format A: - [ ] **1.1 — Title** (#N)
 		// Format B: - [ ] #56 - 1.1 Title
+		// Format C: - [ ] **TR-0: Title** (#N)  (flat checklist, any prefix + number)
 		let taskMatch = line.match(/^- \[([ x])\] \*\*(\d+\.\d+)\s*[—–-]+\s*(.+?)\*\*(?:\s*\(#(\d+)\))?/);
 		if (!taskMatch) {
 			taskMatch = line.match(/^- \[([ x])\] #(\d+)\s*-\s*(\d+\.\d+)\s+(.+)/);
@@ -454,7 +455,23 @@ function parseChecklist(checklistPath: string): ParsedPhase[] {
 				taskMatch = [taskMatch[0], taskMatch[1], taskMatch[3], taskMatch[4], taskMatch[2]];
 			}
 		}
+		if (!taskMatch) {
+			// Format C: - [ ] **PREFIX-N: Title** (#N) — flat checklist with arbitrary task IDs
+			taskMatch = line.match(/^- \[([ x])\] \*\*([A-Za-z][\w-]*\d+)[\s:—–-]+\s*(.+?)\*\*(?:\s*\(#(\d+)\))?/);
+		}
+		if (!taskMatch) {
+			// Format D: - [ ] **PREFIX-N: Title** (#N) — with hyphenated ID like TR-0
+			taskMatch = line.match(/^- \[([ x])\] \*\*([A-Za-z]+-\d+)[\s:—–-]+\s*(.+?)\*\*(?:\s*\(#(\d+)\))?/);
+		}
+
 		if (taskMatch) {
+			// If no epic/phase header seen yet, create a default phase
+			if (!currentPhase) {
+				currentEpic = "Tasks";
+				currentPhase = { name: "Tasks", tasks: [] };
+				phases.push(currentPhase);
+			}
+
 			const done = taskMatch[1] === "x";
 			const id = taskMatch[2];
 			const title = taskMatch[3].trim();
@@ -462,9 +479,7 @@ function parseChecklist(checklistPath: string): ParsedPhase[] {
 
 			// Collect body (indented lines after task)
 			const bodyLines: string[] = [];
-			const startIdx = raw.split("\n").indexOf(line);
-			const allLines = raw.split("\n");
-			for (let i = startIdx + 1; i < allLines.length; i++) {
+			for (let i = lineIdx + 1; i < allLines.length; i++) {
 				if (allLines[i].match(/^- \[/) || allLines[i].match(/^## /)) break;
 				if (allLines[i].startsWith("  ")) bodyLines.push(allLines[i]);
 			}
