@@ -813,7 +813,13 @@ const ISSUE_DETAIL_JS = (function() {
 		s = s.replace(bt3, function(m) {
 			var code = m.slice(3);
 			if (code.slice(-3) === bt+bt+bt) code = code.slice(0, -3);
-			return "<pre><code>" + esc(code.trim()) + "</code></pre>";
+			var nl = code.indexOf("\n");
+			var lang = nl > 0 ? code.slice(0, nl).trim().toLowerCase() : "";
+			var body = nl > 0 ? code.slice(nl + 1) : code;
+			if (lang === "mermaid") {
+				return '<pre class="mermaid">' + body.trim() + '</pre>';
+			}
+			return "<pre><code>" + esc(body.trim()) + "</code></pre>";
 		});
 		var bt1 = new RegExp(bt + "([^" + bt + "]+)" + bt, "g");
 		s = s.replace(bt1, function(_, c) { return "<code>" + esc(c) + "</code>"; });
@@ -839,7 +845,10 @@ const ISSUE_DETAIL_JS = (function() {
 const DASHBOARD_HTML = `<!DOCTYPE html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Dashboard - Pipeline</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({startOnLoad:false,theme:'dark'})</script>
 <style>${THEME_CSS}
+.mermaid{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:12px;margin:8px 0;overflow-x:auto}
 .status-bar{display:flex;align-items:center;gap:16px;padding:14px 0;flex-wrap:wrap}
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
 .status-dot.running{background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.5s infinite}
@@ -992,6 +1001,7 @@ html+='</div>';
 var toFetch=data.subIssueRefs.filter(function(n){return !issueCache[n]});
 if(toFetch.length>0){var parentEl=el;toFetch.forEach(function(n){fetch('/api/issue/'+n).then(function(r){return r.json()}).then(function(d){if(!d.error){issueCache[n]=d;renderIssueDetail(parentEl,data)}}).catch(function(){})})}}
 el.innerHTML=html;
+if(typeof mermaid!=='undefined'){try{mermaid.run({nodes:el.querySelectorAll('.mermaid')})}catch(e){}}
 }
 function drillIssue(num,evt){
 if(evt)evt.stopPropagation();
