@@ -948,7 +948,10 @@ export default function (pi: ExtensionAPI) {
 
 			// Open a tail pane that filters JSON → readable text, auto-closes when done
 			const filterScript = join(logDir, "json-filter.py");
-			const tailCmd = `echo '── ${label.replace(/'/g, "\\'")} ──' && tail -f '${sessionLogFile}' | '${filterScript}' &` +
+			const tailCmd = `echo '── ${label.replace(/'/g, "\\'")} ──' && ` +
+				`echo 'Waiting for agent to start...' && ` +
+				`while [ ! -f '${sessionLogFile}' ]; do sleep 0.5; done && ` +
+				`tail -f '${sessionLogFile}' | '${filterScript}' &` +
 				` TAIL_PID=$! && while [ ! -f '${sentinelFile}' ]; do sleep 1; done && kill $TAIL_PID 2>/dev/null; sleep 2`;
 			const paneId = allocateTmuxPane(tailCmd, label);
 			if (paneId) agentPanes.set(sessionKey, paneId);
@@ -3614,7 +3617,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const filterScript = join(logDir, "json-filter.py");
-			const shellCmd = `echo '── ${label} ──' && tail -f '${logPath}' | '${filterScript}'`;
+			const shellCmd = `echo '── ${label} ──' && ` +
+				`while [ ! -f '${logPath}' ]; do echo 'Waiting for agent to start...'; sleep 0.5; done && ` +
+				`tail -f '${logPath}' | '${filterScript}'`;
 			const paneId = allocateTmuxPane(shellCmd, label);
 			if (!paneId) return false;
 			if (role) agentPanes.set(role, paneId);
