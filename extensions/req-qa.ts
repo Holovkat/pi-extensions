@@ -1383,7 +1383,18 @@ export default function (pi: ExtensionAPI) {
 			const prdPath = join(cwd, "docs", "PRD.md");
 
 			if (!existsSync(checklistPath)) {
-				ctx.ui.notify("No checklist at features/00-IMPLEMENTATION-CHECKLIST.md. Run generate_artifacts first.", "error");
+				const generate = await ctx.ui.confirm(
+					"No Checklist Found",
+					"No checklist at features/00-IMPLEMENTATION-CHECKLIST.md.\nGenerate artifacts (PRD + checklist) first?",
+				);
+				if (!generate) return;
+
+				// Queue a message to the agent to call generate_artifacts
+				ctx.ui.notify(
+					"Tell the agent what you want to build, or if you've already discussed requirements,\n" +
+					"ask it to: \"Please generate the artifacts now.\"",
+					"info",
+				);
 				return;
 			}
 
