@@ -3343,8 +3343,10 @@ export default function (pi: ExtensionAPI) {
 
 					const lines: string[] = [];
 
-					// ── Fast Track pipeline stage bar ──
-					if (pipelineMode === "fast" && pipeline.running) {
+					// ── Fast Track pipeline stage cards ──
+					if ((pipelineMode === "fast" && pipeline.running) ||
+						(pipelineMode === "fast" && !pipeline.running && fastStage !== "idle")) {
+
 						const sn = (id: string) => shortModelName(id).slice(0, 10);
 						const stages: { label: string; model: string; stage: FastStage; taskLine: string }[] = [
 							{ label: "Build", model: sn(pipelineConfig.fast.build.model), stage: "build", taskLine: "" },
@@ -3354,49 +3356,71 @@ export default function (pi: ExtensionAPI) {
 							{ label: "UAT", model: "User", stage: "uat-approval", taskLine: "" },
 						];
 
-						// Map uat-gen to between fix and uat-exec visually
 						const stageOrder: FastStage[] = ["build", "eval", "fix", "uat-exec", "uat-approval"];
-						const activeIdx = stageOrder.indexOf(fastStage === "uat-gen" ? "uat-exec" : fastStage);
+						const activeIdx = pipeline.running
+							? stageOrder.indexOf(fastStage === "uat-gen" ? "uat-exec" : fastStage)
+							: stages.length; // all done when not running
 
-						const boxParts: string[] = [];
-						for (let s = 0; s < stages.length; s++) {
-							const st = stages[s];
-							const isActive = s === activeIdx;
-							const isDone = s < activeIdx;
-							const isWaiting = s > activeIdx;
+						const cols = stages.length;
+						const gap = 1;
+						const colWidth = Math.max(14, Math.floor((width - gap * (cols - 1)) / cols));
+						const w = colWidth - 2;
+						const trunc = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + "..." : s;
+
+						const renderStageCard = (idx: number): string[] => {
+							const st = stages[idx];
+							const isActive = idx === activeIdx;
+							const isDone = idx < activeIdx;
 
 							const icon = isDone ? "✓" : isActive ? "●" : "○";
-							const statusText = isDone ? "Done" : isActive ? (fastStage === "uat-gen" ? "Generating..." : "Running...") : "Waiting...";
-							const taskInfo = isActive && st.taskLine ? st.taskLine.slice(0, 14) : statusText;
+							const statusColor = isDone ? "success" : isActive ? "accent" : "dim";
+							const statusText = isDone ? "Done" : isActive
+								? (fastStage === "uat-gen" ? "Generating..." : "Running...")
+								: "Waiting...";
+							const taskInfo = isActive && st.taskLine ? trunc(st.taskLine, w - 1) : "";
 
-							const inner = ` ${st.label.padEnd(9)} ${st.model.padEnd(6)} [${icon}] ${taskInfo} `;
-							const boxWidth = Math.max(inner.length, 20);
-							const padded = inner.padEnd(boxWidth);
+							const nameStr = isActive
+								? theme.fg(statusColor, theme.bold(trunc(st.label, w)))
+								: theme.fg(statusColor, trunc(st.label, w));
+							const nameVisible = Math.min(st.label.length, w);
 
-							if (isDone) {
-								boxParts.push(theme.fg("success", `|${padded}|`));
-							} else if (isActive) {
-								boxParts.push(theme.fg("accent", theme.bold(`|${padded}|`)));
-							} else {
-								boxParts.push(theme.fg("dim", `|${padded}|`));
+							const statusLine = theme.fg(statusColor, `${icon} ${statusText}`);
+							const statusVisible = icon.length + 1 + statusText.length;
+
+							const modelStr = theme.fg("muted", trunc(st.model, w - 1));
+							const modelVisible = Math.min(st.model.length, w - 1);
+
+							const workStr = taskInfo
+								? theme.fg("dim", trunc(taskInfo, w - 1))
+								: theme.fg("dim", "—");
+							const workVisible = taskInfo ? Math.min(taskInfo.length, w - 1) : 1;
+
+							const top = "┌" + "─".repeat(w) + "┐";
+							const bot = "└" + "─".repeat(w) + "┘";
+							const border = (content: string, visLen: number) =>
+								theme.fg(statusColor, "│") + content + " ".repeat(Math.max(0, w - visLen)) + theme.fg(statusColor, "│");
+
+							return [
+								theme.fg(statusColor, top),
+								border(" " + nameStr, 1 + nameVisible),
+								border(" " + modelStr, 1 + modelVisible),
+								border(" " + statusLine, 1 + statusVisible),
+								border(" " + workStr, 1 + workVisible),
+								theme.fg(statusColor, bot),
+							];
+						};
+
+						const cards = stages.map((_, i) => renderStageCard(i));
+						const cardHeight = cards[0].length;
+
+						for (let line = 0; line < cardHeight; line++) {
+							let row = cards[0][line];
+							for (let c = 1; c < cols; c++) {
+								row += " ".repeat(gap);
+								row += cards[c][line];
 							}
+							lines.push(row);
 						}
-
-						lines.push(boxParts.join(" "));
-						lines.push("");
-					} else if (pipelineMode === "fast" && !pipeline.running && fastStage !== "idle") {
-						// Show completed state
-						const allDone = fastStage === "uat-approval" && uatState.approved;
-						const sn2 = (id: string) => shortModelName(id).slice(0, 10);
-						const stageLabels = ["Build", "Eval", "Fix", "UAT Auto", "UAT"];
-						const models = [sn2(pipelineConfig.fast.build.model), sn2(pipelineConfig.fast.eval.model), sn2(pipelineConfig.fast.fix.model), sn2(pipelineConfig.fast.uat.model), "User"];
-						const boxParts: string[] = [];
-						for (let s = 0; s < stageLabels.length; s++) {
-							const icon = allDone ? "✓" : (s <= 4 ? "✓" : "○");
-							const inner = ` ${stageLabels[s].padEnd(9)} ${models[s].padEnd(6)} [${icon}] `;
-							boxParts.push(theme.fg(allDone ? "success" : "dim", `|${inner}|`));
-						}
-						lines.push(boxParts.join(" "));
 						lines.push("");
 					}
 					for (let i = 0; i < parsedPhases.length; i++) {
