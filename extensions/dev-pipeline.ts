@@ -692,6 +692,7 @@ export default function (pi: ExtensionAPI) {
 						status: t.status,
 						complianceScore: t.complianceScore,
 						attempts: t.attempts,
+						issueNum: t.issueNum || null,
 						yields: t.learnings?.filter(l => l.yielded).length || 0,
 						lastAnalystAction: t.learnings?.slice(-1)[0]?.analystAction,
 					})) || phase.tasks.map(t => ({
@@ -700,6 +701,7 @@ export default function (pi: ExtensionAPI) {
 						status: t.done ? "passed" : "pending",
 						complianceScore: t.done ? 100 : 0,
 						attempts: 0,
+						issueNum: t.issueNum || null,
 					})),
 				});
 			}

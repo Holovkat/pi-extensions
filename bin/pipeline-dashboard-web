@@ -249,6 +249,53 @@ const server = http.createServer((req, res) => {
 		req.on("close", () => steerLogClients.delete(res));
 		return;
 	}
+	// GitHub Issue API — fetch issue details via gh CLI
+	const issueMatch = req.url.match(/^\/api\/issue\/(\d+)$/);
+	if (issueMatch) {
+		const issueNum = issueMatch[1];
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+		try {
+			const issueJson = execSyncImport(
+				`gh issue view ${issueNum} --json number,title,body,state,labels,comments,assignees`,
+				{ encoding: "utf-8", cwd: projectDir, timeout: 15000 },
+			).trim();
+			const issue = JSON.parse(issueJson);
+			// Extract sub-issue references from body (e.g., #123, Part of #45)
+			const subIssueRefs = [];
+			const bodyText = issue.body || "";
+			const refMatches = bodyText.matchAll(/#(\d+)/g);
+			for (const m of refMatches) {
+				const num = parseInt(m[1], 10);
+				if (num !== parseInt(issueNum, 10) && !subIssueRefs.includes(num)) subIssueRefs.push(num);
+			}
+			// Also scan comments for issue refs
+			for (const c of (issue.comments || [])) {
+				const cMatches = (c.body || "").matchAll(/#(\d+)/g);
+				for (const m of cMatches) {
+					const num = parseInt(m[1], 10);
+					if (num !== parseInt(issueNum, 10) && !subIssueRefs.includes(num)) subIssueRefs.push(num);
+				}
+			}
+			res.end(JSON.stringify({
+				number: issue.number,
+				title: issue.title,
+				body: issue.body || "",
+				state: issue.state,
+				labels: (issue.labels || []).map(l => l.name || l),
+				assignees: (issue.assignees || []).map(a => a.login || a),
+				comments: (issue.comments || []).map(c => ({
+					author: c.author?.login || c.author || "",
+					body: c.body || "",
+					createdAt: c.createdAt || "",
+				})),
+				subIssueRefs,
+			}));
+		} catch (e) {
+			res.end(JSON.stringify({ error: "Failed to fetch issue: " + e.message }));
+		}
+		return;
+	}
+
 	// Sessions API — list session files (.jsonl pi sessions + legacy .log)
 	if (req.url === "/api/sessions") {
 		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -751,13 +798,42 @@ const DASHBOARD_HTML = `<!DOCTYPE html><html lang="en"><head>
 .phase.done .phase-header{border-left:3px solid var(--green)}
 .phase.done .phase-name{color:var(--green)}
 .tasks{padding:0 16px 14px 46px;display:flex;flex-direction:column;gap:2px}
-.task{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.8rem}
+.task{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.8rem;flex-wrap:wrap}
+.task-row{display:flex;align-items:center;gap:8px;width:100%;cursor:pointer}
+.task-row:hover{opacity:.85}
 .task-icon{width:16px;text-align:center;flex-shrink:0}
 .task-id{color:var(--muted-foreground);min-width:32px;font-weight:500;font-size:.75rem}
 .task-title{flex:1}
 .task-score{font-weight:600;min-width:40px;text-align:right}
 .task-score.high{color:var(--green)}.task-score.med{color:var(--yellow)}.task-score.low{color:var(--destructive)}
 .task-attempts{color:var(--muted-foreground);font-size:.7rem;min-width:24px}
+.task-chevron{width:16px;text-align:center;flex-shrink:0;color:var(--muted-foreground);transition:transform .2s;font-size:.7rem;cursor:pointer}
+.task-chevron.open{transform:rotate(90deg)}
+.task-issue-num{font-size:.68rem;color:var(--primary);text-decoration:none;min-width:30px}
+.task-issue-num:hover{text-decoration:underline}
+.issue-detail{width:100%;margin:6px 0 10px 28px;padding:12px 16px;background:var(--background);border:1px solid var(--border);border-radius:var(--radius);font-size:.78rem;line-height:1.6;display:none;max-height:600px;overflow-y:auto}
+.issue-detail.open{display:block}
+.issue-detail .issue-body{white-space:pre-wrap;word-break:break-word;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.issue-detail .issue-body h1,.issue-detail .issue-body h2,.issue-detail .issue-body h3{font-size:.85rem;font-weight:700;color:var(--foreground);margin:10px 0 4px}
+.issue-detail .issue-body code{background:var(--muted);padding:1px 5px;border-radius:3px;font-size:.75rem}
+.issue-detail .issue-body pre{background:var(--muted);padding:10px;border-radius:var(--radius);overflow-x:auto;margin:8px 0}
+.issue-detail .issue-body pre code{background:none;padding:0}
+.issue-detail .issue-body ul,.issue-detail .issue-body ol{padding-left:20px;margin:4px 0}
+.issue-detail .issue-body blockquote{border-left:3px solid var(--primary);padding-left:10px;color:var(--muted-foreground);margin:6px 0}
+.issue-comments{margin-top:8px}
+.issue-comment{padding:8px 12px;margin:6px 0;background:var(--card);border:1px solid var(--border);border-radius:var(--radius)}
+.issue-comment-header{font-size:.7rem;color:var(--muted-foreground);margin-bottom:4px;display:flex;gap:8px;align-items:center}
+.issue-comment-author{font-weight:600;color:var(--primary)}
+.issue-comment-body{white-space:pre-wrap;word-break:break-word;font-size:.75rem}
+.issue-sub-refs{margin-top:8px;padding-top:8px;border-top:1px solid var(--border)}
+.issue-sub-ref{display:inline-block;padding:2px 8px;margin:2px 4px 2px 0;background:var(--muted);border:1px solid var(--border);border-radius:var(--radius);font-size:.72rem;cursor:pointer;color:var(--primary);text-decoration:none}
+.issue-sub-ref:hover{background:var(--border);text-decoration:underline}
+.issue-labels{display:flex;gap:4px;margin-bottom:8px;flex-wrap:wrap}
+.issue-label{font-size:.65rem;padding:1px 6px;border-radius:10px;background:var(--muted);color:var(--foreground);border:1px solid var(--border)}
+.issue-loading{color:var(--muted-foreground);font-style:italic;padding:8px 0}
+.issue-state{font-size:.68rem;padding:1px 6px;border-radius:calc(var(--radius) - 2px);font-weight:600}
+.issue-state.open{background:oklch(0.35 0.06 145/.3);color:var(--green);border:1px solid var(--green)}
+.issue-state.closed{background:oklch(0.35 0.05 280/.3);color:var(--purple,#a78bfa);border:1px solid var(--purple,#a78bfa)}
 .log-section,.agents-section{margin-top:16px;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px}
 .log-section h2,.agents-section h2{font-size:.82rem;color:var(--primary);margin-bottom:12px;font-weight:600}
 .log-entry{font-size:.72rem;padding:3px 0;color:var(--muted-foreground);word-break:break-all;font-family:ui-monospace,monospace;line-height:1.5}
@@ -809,11 +885,77 @@ for(var i=0;i<d.phases.length;i++){var p=d.phases[i],cls=p.allDone?'done':p.isCu
 html+='<div class="phase '+cls+'"><div class="phase-header"><span class="phase-icon">'+icon+'</span><span class="phase-name">'+esc(p.name)+'</span><span class="phase-meta">'+pc+'/'+p.total;
 if(p.gate&&p.gate!=='idle'&&p.gate!=='done')html+=' <span class="gate-badge '+gateClass(p.gate)+'">'+esc(p.gate)+(p.gateAttempts>0?' x'+p.gateAttempts:'')+'</span>';
 if(p.elapsed>0)html+=' '+elapsed(p.elapsed);html+='</span></div>';
-if(p.isCurrent||p.allDone){html+='<div class="tasks">';for(var j=0;j<p.tasks.length;j++){var t=p.tasks[j];html+='<div class="task"><span class="task-icon">'+statusIcon(t.status)+'</span><span class="task-id">'+esc(t.id)+'</span><span class="task-title">'+esc(t.title)+'</span>';if(t.complianceScore>0)html+='<span class="task-score '+scoreClass(t.complianceScore)+'">'+t.complianceScore+'%</span>';if(t.attempts>1)html+='<span class="task-attempts">x'+t.attempts+'</span>';html+='</div>'}html+='</div>'}html+='</div>'}html+='</div>';
+if(p.isCurrent||p.allDone){html+='<div class="tasks">';for(var j=0;j<p.tasks.length;j++){var t=p.tasks[j];var tid=esc(t.id);var hasIssue=t.issueNum&&t.issueNum>0;var detailId='issue-detail-'+tid.replace(/\./g,'-');var chevronId='chevron-'+tid.replace(/\./g,'-');html+='<div class="task">';html+='<div class="task-row" onclick="toggleIssue(\''+detailId+'\',\''+chevronId+'\','+(hasIssue?t.issueNum:'null')+')">';html+='<span class="task-chevron" id="'+chevronId+'">&#9654;</span>';html+='<span class="task-icon">'+statusIcon(t.status)+'</span><span class="task-id">'+tid+'</span><span class="task-title">'+esc(t.title)+'</span>';if(hasIssue)html+='<span class="task-issue-num">#'+t.issueNum+'</span>';if(t.complianceScore>0)html+='<span class="task-score '+scoreClass(t.complianceScore)+'">'+t.complianceScore+'%</span>';if(t.attempts>1)html+='<span class="task-attempts">x'+t.attempts+'</span>';html+='</div>';html+='<div class="issue-detail" id="'+detailId+'"></div>';html+='</div>'}html+='</div>'}html+='</div>'}html+='</div>';
 var agents=d.activeAgents||(d.activeAgent?[d.activeAgent]:[]);if(agents.length>0){html+='<div class="agents-section"><h2>Active Agents</h2>';for(var k=0;k<agents.length;k++){var a=agents[k];html+='<div class="agent"><span class="agent-spinner" style="color:var(--primary)">&#9684;</span><span class="agent-name">'+esc(a.name)+'</span><span class="agent-model">'+esc(a.model)+'</span></div>'}html+='</div>'}
 if(d.log&&d.log.length>0){var show=d.log.slice(-15);html+='<div class="log-section"><h2>Recent Activity</h2>';for(var m=0;m<show.length;m++)html+='<div class="log-entry '+logClass(show[m])+'">'+esc(show[m])+'</div>';html+='</div>'}
-document.getElementById('app').innerHTML=html;document.getElementById('updated').textContent=age<5?'live':'updated '+age+'s ago'}
+document.getElementById('app').innerHTML=html;document.getElementById('updated').textContent=age<5?'live':'updated '+age+'s ago';
+for(var eid in expandedIssues){var eEl=document.getElementById(eid);var cid=eid.replace('issue-detail-','chevron-');var cEl=document.getElementById(cid);if(eEl&&cEl){eEl.classList.add('open');cEl.classList.add('open');var eData=expandedIssues[eid];if(eData.issueNum&&issueCache[eData.issueNum])renderIssueDetail(eEl,issueCache[eData.issueNum]);else if(eData.issueNum)eEl.innerHTML='<div class="issue-loading">Loading...</div>';else eEl.innerHTML='<div class="issue-loading">No GitHub issue linked</div>'}}}
 function esc(s){if(!s)return '';var d=document.createElement('div');d.textContent=s;return d.innerHTML}
+var issueCache={};
+var expandedIssues={};
+function toggleIssue(detailId,chevronId,issueNum){
+var el=document.getElementById(detailId);var ch=document.getElementById(chevronId);
+if(!el||!ch)return;
+if(el.classList.contains('open')){el.classList.remove('open');ch.classList.remove('open');delete expandedIssues[detailId];return}
+el.classList.add('open');ch.classList.add('open');expandedIssues[detailId]={issueNum:issueNum};
+if(!issueNum){el.innerHTML='<div class="issue-loading">No GitHub issue linked to this task</div>';return}
+if(issueCache[issueNum]){renderIssueDetail(el,issueCache[issueNum]);return}
+el.innerHTML='<div class="issue-loading">Loading issue #'+issueNum+'...</div>';
+fetch('/api/issue/'+issueNum).then(function(r){return r.json()}).then(function(data){
+if(data.error){el.innerHTML='<div class="issue-loading">'+esc(data.error)+'</div>';return}
+issueCache[issueNum]=data;renderIssueDetail(el,data);
+}).catch(function(e){el.innerHTML='<div class="issue-loading">Error: '+esc(e.message)+'</div>'})
+}
+function renderMd(s){
+if(!s)return '';
+var bt3=/\x60\x60\x60[\\s\\S]*?\x60\x60\x60/g;s=s.replace(bt3,function(m){var code=m.slice(3);var nl=code.indexOf('\\n');var lang=nl>0?code.slice(0,nl).trim():'';code=nl>0?code.slice(nl+1):code;if(code.slice(-3)===String.fromCharCode(96,96,96))code=code.slice(0,-3);return '<pre><code>'+esc(code.trim())+'</code></pre>'});
+var bt1=/\x60([^\x60]+)\x60/g;s=s.replace(bt1,function(_,c){return '<code>'+esc(c)+'</code>'});
+s=s.replace(/^### (.+)$/gm,'<h3>$1</h3>');
+s=s.replace(/^## (.+)$/gm,'<h2>$1</h2>');
+s=s.replace(/^# (.+)$/gm,'<h1>$1</h1>');
+s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+s=s.replace(/\*(.+?)\*/g,'<em>$1</em>');
+s=s.replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>');
+s=s.replace(/^[-*] (.+)$/gm,'<li>$1</li>');
+s=s.replace(/(<li>.*<\/li>)/gs,function(m){return '<ul>'+m+'</ul>'});
+s=s.replace(/#(\d+)/g,function(_,n){return '<a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+'</a>'});
+return s;
+}
+function renderIssueDetail(el,data){
+var html='';
+html+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
+html+='<strong>#'+data.number+': '+esc(data.title)+'</strong>';
+html+='<span class="issue-state '+(data.state==='OPEN'||data.state==='open'?'open':'closed')+'">'+(data.state||'').toUpperCase()+'</span>';
+html+='</div>';
+if(data.labels&&data.labels.length>0){html+='<div class="issue-labels">';for(var i=0;i<data.labels.length;i++)html+='<span class="issue-label">'+esc(data.labels[i])+'</span>';html+='</div>'}
+html+='<div class="issue-body">'+renderMd(data.body)+'</div>';
+if(data.comments&&data.comments.length>0){
+html+='<div class="issue-comments"><strong style="font-size:.75rem">Comments ('+data.comments.length+')</strong>';
+for(var c=0;c<data.comments.length;c++){var cm=data.comments[c];
+html+='<div class="issue-comment"><div class="issue-comment-header"><span class="issue-comment-author">'+esc(cm.author)+'</span>';
+if(cm.createdAt)html+='<span>'+new Date(cm.createdAt).toLocaleString()+'</span>';
+html+='</div><div class="issue-comment-body">'+renderMd(cm.body)+'</div></div>'}
+html+='</div>'}
+if(data.subIssueRefs&&data.subIssueRefs.length>0){
+html+='<div class="issue-sub-refs"><strong style="font-size:.75rem">Referenced Issues</strong><br>';
+for(var r=0;r<data.subIssueRefs.length;r++){var n=data.subIssueRefs[r];html+='<a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+'</a>'}
+html+='</div>'}
+el.innerHTML=html;
+}
+function drillIssue(num,evt){
+if(evt)evt.stopPropagation();
+var containerId='drill-issue-'+num;
+var existing=document.getElementById(containerId);
+if(existing){existing.remove();return}
+var panel=document.createElement('div');panel.id=containerId;panel.className='issue-detail open';panel.style.marginLeft='12px';panel.style.marginTop='6px';
+panel.innerHTML='<div class="issue-loading">Loading issue #'+num+'...</div>';
+var target=evt?evt.target:null;if(target)target.parentNode.insertBefore(panel,target.nextSibling);else document.body.appendChild(panel);
+if(issueCache[num]){renderIssueDetail(panel,issueCache[num]);return}
+fetch('/api/issue/'+num).then(function(r){return r.json()}).then(function(data){
+if(data.error){panel.innerHTML='<div class="issue-loading">'+esc(data.error)+'</div>';return}
+issueCache[num]=data;renderIssueDetail(panel,data);
+}).catch(function(e){panel.innerHTML='<div class="issue-loading">Error: '+esc(e.message)+'</div>'})
+}
 setInterval(function(){if(state)render()},1000);
 </script></body></html>`;
 
