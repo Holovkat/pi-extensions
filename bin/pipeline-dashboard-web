@@ -825,7 +825,8 @@ const ISSUE_DETAIL_JS = (function() {
 		s = s.replace(/^> (.+)$/gm, "<blockquote>$1</blockquote>");
 		s = s.replace(/^[-*] (.+)$/gm, "<li>$1</li>");
 		s = s.replace(/#(\d+)/g, function(_, n) {
-			return '<a class="issue-sub-ref" onclick="drillIssue(' + n + ',event)">#' + n + '</a>';
+			var t = (typeof issueCache !== 'undefined' && issueCache[n]) ? ' — ' + issueCache[n].title : '';
+			return '<a class="issue-sub-ref" onclick="drillIssue(' + n + ',event)">#' + n + t + '</a>';
 		});
 		return s;
 	}
@@ -985,9 +986,11 @@ if(cm.createdAt)html+='<span>'+new Date(cm.createdAt).toLocaleString()+'</span>'
 html+='</div><div class="issue-comment-body">'+renderMd(cm.body)+'</div></div>'}
 html+='</div>'}
 if(data.subIssueRefs&&data.subIssueRefs.length>0){
-html+='<div class="issue-sub-refs"><strong style="font-size:.75rem">Referenced Issues</strong><br>';
-for(var r=0;r<data.subIssueRefs.length;r++){var n=data.subIssueRefs[r];html+='<a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+'</a>'}
-html+='</div>'}
+html+='<div class="issue-sub-refs"><strong style="font-size:.75rem">Referenced Issues</strong>';
+for(var r=0;r<data.subIssueRefs.length;r++){var n=data.subIssueRefs[r];var refTitle=issueCache[n]?esc(issueCache[n].title):'';html+='<div><a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+(refTitle?' — '+refTitle:'')+'</a></div>'}
+html+='</div>';
+var toFetch=data.subIssueRefs.filter(function(n){return !issueCache[n]});
+if(toFetch.length>0){var parentEl=el;toFetch.forEach(function(n){fetch('/api/issue/'+n).then(function(r){return r.json()}).then(function(d){if(!d.error){issueCache[n]=d;renderIssueDetail(parentEl,data)}}).catch(function(){})})}}
 el.innerHTML=html;
 }
 function drillIssue(num,evt){
