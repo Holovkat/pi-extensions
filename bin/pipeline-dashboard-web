@@ -999,7 +999,7 @@ html+='<div class="issue-sub-refs"><strong style="font-size:.75rem">Referenced I
 for(var r=0;r<data.subIssueRefs.length;r++){var n=data.subIssueRefs[r];var refTitle=issueCache[n]?esc(issueCache[n].title):'';html+='<div><a class="issue-sub-ref" onclick="drillIssue('+n+',event)">#'+n+(refTitle?' — '+refTitle:'')+'</a></div>'}
 html+='</div>';
 var toFetch=data.subIssueRefs.filter(function(n){return !issueCache[n]});
-if(toFetch.length>0){var parentEl=el;toFetch.forEach(function(n){fetch('/api/issue/'+n).then(function(r){return r.json()}).then(function(d){if(!d.error){issueCache[n]=d;renderIssueDetail(parentEl,data)}}).catch(function(){})})}}
+if(toFetch.length>0){toFetch.forEach(function(n){fetch('/api/issue/'+n).then(function(r){return r.json()}).then(function(d){if(!d.error){issueCache[n]=d;var links=el.querySelectorAll('.issue-sub-ref');for(var li=0;li<links.length;li++){if(links[li].textContent.trim()==='#'+n){links[li].textContent='#'+n+' — '+d.title}}}}).catch(function(){})})}}
 el.innerHTML=html;
 if(typeof mermaid!=='undefined'){try{mermaid.run({nodes:el.querySelectorAll('.mermaid')})}catch(e){}}
 }
