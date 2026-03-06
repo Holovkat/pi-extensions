@@ -1004,7 +1004,12 @@ if(data.error){panel.innerHTML='<div class="issue-loading">'+esc(data.error)+'</
 issueCache[num]=data;renderIssueDetail(panel,data);
 }).catch(function(e){panel.innerHTML='<div class="issue-loading">Error: '+esc(e.message)+'</div>'})
 }
-setInterval(function(){if(state)render()},1000);
+setInterval(function(){
+if(!state)return;
+var hasExpanded=Object.keys(expandedIssues).length>0;
+if(hasExpanded)return;
+render()
+},1000);
 </script></body></html>`;
 
 // ── STEER PAGE ──
