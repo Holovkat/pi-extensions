@@ -2471,6 +2471,10 @@ export default function (pi: ExtensionAPI) {
 			`- Code must be production quality, no stubs or TODOs`,
 			`- All new code must integrate with existing classes and systems`,
 			``,
+			`CODE ONLY — do NOT create markdown files, reports, summaries, or documentation.`,
+			`Your only output is code in the files listed in task specs.`,
+			`Do NOT write implementation notes, completion reports, or status files.`,
+			``,
 			`IMPORTANT: Write the COMPLETE updated file. Do not use placeholders like "// ... existing code ..."`,
 		].join("\n");
 
@@ -2698,6 +2702,11 @@ export default function (pi: ExtensionAPI) {
 						`Fix the issues listed above. Do NOT rewrite the entire file.`,
 						`Make TARGETED, SURGICAL edits to address each issue.`,
 						`Preserve all existing working code from this and previous epics.`,
+						``,
+						`CODE ONLY — do NOT create markdown files, reports, summaries, documentation,`,
+						`or any files not listed in the task spec. Your only output is code changes.`,
+						`Do NOT write implementation notes, fix summaries, or completion reports.`,
+						`Learnings and status are tracked separately — just fix the code.`,
 						``,
 						`Focus only on what's broken or missing for task ${failedTask.id}.`,
 						...(escalated ? [``, `This is an ESCALATED attempt (depth ${depth}). Previous fixes were insufficient. Apply maximum care and deeper reasoning.`] : []),
