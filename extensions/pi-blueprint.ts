@@ -75,6 +75,14 @@ interface PendingRevisionPrompt {
 
 type WidgetCheck = "alignment" | "assets";
 
+interface RebuildProgressState {
+	active: boolean;
+	stage: string;
+	detail: string;
+	current: number;
+	total: number;
+}
+
 class BlueprintOverlayUI {
 	private scrollOffset = 0;
 
@@ -158,6 +166,12 @@ interface BlueprintTaskPacket {
 	executionGrain: ExecutionGrain;
 	executionReady: boolean;
 	lane: ExecutionLane;
+	executionWave: number | null;
+	parallelGroup: string | null;
+	workerProfile: string | null;
+	parallelizable: boolean;
+	serialReason: string | null;
+	suggestedMaxConcurrency: number | null;
 	prerequisites: BlueprintPrerequisite[];
 	upstreamDependencies: string[];
 	downstreamDependencies: string[];
@@ -175,13 +189,46 @@ interface ParsedTask {
 	body: string;
 	epic: string;
 	epicNum: string;
+	issueNumber: number | null;
 	dependencies: string[];
 	complexityScore: number | null;
 	prerequisiteState: PrerequisiteStatus | null;
 	ownedAreas: string[];
 	laneHint: ExecutionLane | null;
+	executionWave: number | null;
+	parallelGroup: string | null;
+	workerProfile: string | null;
+	parallelizable: boolean | null;
+	serialReason: string | null;
+	suggestedMaxConcurrency: number | null;
 	validators: string[];
 	regressionSurface: string[];
+}
+
+interface ParsedEpicChecklistEntry {
+	title: string;
+	issueNumber: number | null;
+}
+
+const CHECKLIST_PUBLISH_METADATA_PREFIXES = [
+	"  - **GitHub Issue:**",
+	"  - **Complexity Score:**",
+	"  - **Prerequisite State:**",
+	"  - **Owned Areas:**",
+	"  - **Planning Gate:**",
+	"  - **Gate Reason:**",
+	"  - **Execution Wave:**",
+	"  - **Parallel Group:**",
+	"  - **Worker Profile:**",
+	"  - **Parallelizable:**",
+	"  - **Suggested Max Concurrency:**",
+	"  - **Serial Reason:**",
+];
+
+interface ExistingIssueSummary {
+	number: number;
+	title: string;
+	labels: string[];
 }
 
 interface ParsedEpic {
@@ -306,6 +353,133 @@ function extractOwnedAreas(taskBody: string): string[] {
 	return Array.from(new Set(matches));
 }
 
+function isChecklistMetadataLine(line: string): boolean {
+	return CHECKLIST_PUBLISH_METADATA_PREFIXES.some(prefix => line.startsWith(prefix));
+}
+
+function inferWorkerProfile(packet: Pick<BlueprintTaskPacket, "lane" | "ownedAreas">): string {
+	const joined = packet.ownedAreas.join(" ").toLowerCase();
+	if (joined.includes("ui") || joined.includes("scene")) return "ui-gameplay";
+	if (joined.includes("ghost") || joined.includes("entity") || joined.includes("system")) return "gameplay-systems";
+	if (joined.includes("config") || joined.includes("type") || joined.includes("data")) return "foundation-config";
+	if (joined.includes("test") || joined.includes("docs") || joined.includes("readme")) return "validation-docs";
+	switch (packet.lane) {
+		case "fast-corrective": return "corrective";
+		case "broader-promotion": return "integration-validation";
+		case "blocked-replan": return "replan";
+		default: return "feature-implementation";
+	}
+}
+
+function isGlobalOwnedArea(path: string): boolean {
+	const normalized = path.toLowerCase();
+	return normalized === "package.json" ||
+		normalized === "tsconfig.json" ||
+		normalized === "readme.md" ||
+		normalized === "docs/prd.md" ||
+		normalized === "features/00-implementation-checklist.md" ||
+		normalized === "src/main.ts";
+}
+
+function buildParallelExecutionPlan(tasks: ParsedTask[]): Map<string, {
+	executionWave: number;
+	parallelGroup: string;
+	workerProfile: string;
+	parallelizable: boolean;
+	serialReason: string | null;
+	suggestedMaxConcurrency: number;
+}> {
+	const packets = new Map<string, BlueprintTaskPacket>();
+	for (const task of tasks) packets.set(task.id, buildBlueprintTaskPacket(task));
+	const downstream = new Map<string, string[]>();
+	const indegree = new Map<string, number>();
+	for (const task of tasks) {
+		indegree.set(task.id, task.dependencies.length);
+		for (const dep of task.dependencies) {
+			if (!downstream.has(dep)) downstream.set(dep, []);
+			downstream.get(dep)!.push(task.id);
+		}
+	}
+	for (const task of tasks) {
+		const packet = packets.get(task.id)!;
+		packet.downstreamDependencies = downstream.get(task.id) ?? [];
+	}
+	const plan = new Map<string, {
+		executionWave: number;
+		parallelGroup: string;
+		workerProfile: string;
+		parallelizable: boolean;
+		serialReason: string | null;
+		suggestedMaxConcurrency: number;
+	}>();
+	let ready = tasks.filter(task => (indegree.get(task.id) ?? 0) === 0).map(task => task.id).sort();
+	let wave = 1;
+	const remaining = new Set(tasks.map(task => task.id));
+	while (ready.length > 0) {
+		const waveTasks = ready
+			.map(id => tasks.find(task => task.id === id)!)
+			.filter(Boolean);
+		const groups: string[][] = [];
+		for (const task of waveTasks) {
+			const packet = packets.get(task.id)!;
+			const owned = new Set(packet.ownedAreas.map(area => area.toLowerCase()));
+			const inherentlySerial = packet.lane === "broader-promotion" ||
+				packet.lane === "blocked-replan" ||
+				packet.ownedAreas.some(isGlobalOwnedArea);
+			let placed = false;
+			if (!inherentlySerial) {
+				for (const group of groups) {
+					const conflict = group.some(existingId => {
+						const existing = packets.get(existingId)!;
+						return existing.ownedAreas.some(area => owned.has(area.toLowerCase()));
+					});
+					if (!conflict) {
+						group.push(task.id);
+						placed = true;
+						break;
+					}
+				}
+			}
+			if (!placed) groups.push([task.id]);
+		}
+		const waveConcurrency = Math.min(Math.max(groups.length, 1), 4);
+		groups.forEach((group, index) => {
+			const groupId = `wave-${wave}-group-${index + 1}`;
+			for (const taskId of group) {
+				const packet = packets.get(taskId)!;
+				const serialReason = group.length === 1
+					? packet.ownedAreas.some(isGlobalOwnedArea)
+						? "global foundation surface"
+						: packet.lane === "broader-promotion" || packet.lane === "blocked-replan"
+							? `lane ${packet.lane} is serialized`
+							: waveTasks.length === 1
+								? "dependency-gated wave"
+								: "shared owned area"
+					: null;
+				plan.set(taskId, {
+					executionWave: wave,
+					parallelGroup: groupId,
+					workerProfile: inferWorkerProfile(packet),
+					parallelizable: group.length > 1 || groups.length > 1,
+					serialReason,
+					suggestedMaxConcurrency: waveConcurrency,
+				});
+			}
+		});
+		for (const taskId of ready) {
+			remaining.delete(taskId);
+			for (const child of downstream.get(taskId) ?? []) {
+				indegree.set(child, Math.max(0, (indegree.get(child) ?? 0) - 1));
+			}
+		}
+		ready = Array.from(remaining)
+			.filter(id => (indegree.get(id) ?? 0) === 0)
+			.sort();
+		wave += 1;
+	}
+	return plan;
+}
+
 function buildBlueprintTaskPacket(task: ParsedTask): BlueprintTaskPacket {
 	const hierarchyLevel = deriveHierarchyLevel(task);
 	const executionGrain = inferExecutionGrain(task);
@@ -325,6 +499,12 @@ function buildBlueprintTaskPacket(task: ParsedTask): BlueprintTaskPacket {
 		executionGrain,
 		executionReady,
 		lane,
+		executionWave: task.executionWave,
+		parallelGroup: task.parallelGroup,
+		workerProfile: task.workerProfile ?? inferWorkerProfile({ lane, ownedAreas: task.ownedAreas.length > 0 ? task.ownedAreas : extractOwnedAreas(task.body) }),
+		parallelizable: task.parallelizable ?? false,
+		serialReason: task.serialReason,
+		suggestedMaxConcurrency: task.suggestedMaxConcurrency,
 		prerequisites,
 		upstreamDependencies: task.dependencies,
 		downstreamDependencies: [],
@@ -356,6 +536,12 @@ function renderBlueprintTaskPacket(packet: BlueprintTaskPacket): string {
 		`- **Execution Grain:** ${packet.executionGrain}`,
 		`- **Execution Ready:** ${packet.executionReady ? "yes" : "no"}`,
 		`- **Execution Lane:** ${packet.lane}`,
+		`- **Execution Wave:** ${packet.executionWave ?? "unassigned"}`,
+		`- **Parallel Group:** ${packet.parallelGroup ?? "unassigned"}`,
+		`- **Worker Profile:** ${packet.workerProfile ?? "unassigned"}`,
+		`- **Parallelizable:** ${packet.parallelizable ? "yes" : "no"}`,
+		`- **Suggested Max Concurrency:** ${packet.suggestedMaxConcurrency ?? "n/a"}`,
+		`- **Serial Reason:** ${packet.serialReason ?? "n/a"}`,
 		`- **Owned Areas:** ${ownedAreas}`,
 		`- **Upstream Dependencies:** ${packet.upstreamDependencies.length > 0 ? packet.upstreamDependencies.join(", ") : "none"}`,
 		`- **Downstream Dependencies:** ${packet.downstreamDependencies.length > 0 ? packet.downstreamDependencies.join(", ") : "none declared yet"}`,
@@ -396,6 +582,9 @@ function renderReferenceIndex(task: ParsedTask, packet: BlueprintTaskPacket, epi
 		`- **Task ID:** ${task.id}`,
 		`- **Complexity Score:** ${packet.complexityScore}/10`,
 		`- **Execution Lane:** ${packet.lane}`,
+		`- **Execution Wave:** ${packet.executionWave ?? "unassigned"}`,
+		`- **Parallel Group:** ${packet.parallelGroup ?? "unassigned"}`,
+		`- **Worker Profile:** ${packet.workerProfile ?? "unassigned"}`,
 		`- **Execution Ready:** ${packet.executionReady ? "yes" : "no"}`,
 	];
 	if (task.dependencies.length > 0) lines.push(`- **Depends On:** ${task.dependencies.join(", ")}`);
@@ -686,6 +875,7 @@ export default function (pi: ExtensionAPI) {
 	let activeConsultant = "";
 	let consultStartTime = 0;
 	let sessionStateFile = "";
+	let rebuildProgress: RebuildProgressState | null = null;
 
 	// ── Session Persistence ──────────────────────
 
@@ -889,12 +1079,18 @@ export default function (pi: ExtensionAPI) {
 		const truncate = (s: string, max: number) => s.length > max ? s.slice(0, max - 3) + "..." : s;
 		const spec = SPECIALISTS[name] || { label: displayName(name), color: "dim" };
 
-		const isActive = activeConsultant === name;
+		const pulseOn = Math.floor(Date.now() / 450) % 2 === 0;
+		const isRebuildLane = name === "req-analyst" && rebuildProgress?.active;
+		const isActive = activeConsultant === name || !!isRebuildLane;
 		const hasConsulted = record !== null;
 
-		const statusIcon = isActive ? "●" : hasConsulted ? "✓" : "○";
+		const statusIcon = isRebuildLane
+			? (pulseOn ? "●" : "○")
+			: isActive ? "●" : hasConsulted ? "✓" : "○";
 		const statusColor = isActive ? "accent" : hasConsulted ? "success" : "dim";
-		const statusText = isActive ? "consulting..." : hasConsulted ? `done (iter ${record!.iteration})` : "standby";
+		const statusText = isRebuildLane
+			? `${rebuildProgress!.stage} ${rebuildProgress!.current}/${rebuildProgress!.total}`
+			: activeConsultant === name ? "consulting..." : hasConsulted ? `done (iter ${record!.iteration})` : "standby";
 
 		const nameStr = theme.fg(spec.color, theme.bold(truncate(spec.label, w)));
 		const nameVisible = Math.min(spec.label.length, w);
@@ -902,7 +1098,9 @@ export default function (pi: ExtensionAPI) {
 		const statusLine = theme.fg(statusColor, `${statusIcon} ${statusText}`);
 		const statusVisible = statusIcon.length + 1 + statusText.length;
 
-		const lastQ = record ? truncate(record.question, w - 1) : "—";
+		const lastQ = isRebuildLane
+			? truncate(rebuildProgress!.detail || "Publishing GitHub issues...", w - 1)
+			: record ? truncate(record.question, w - 1) : "—";
 		const workLine = theme.fg("muted", lastQ);
 		const workVisible = lastQ.length;
 
@@ -1451,7 +1649,9 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 
 			return {
 				render(width: number): string[] {
-					const phaseLabel = phase === "idle" ? "Describe what you want to build."
+					const phaseLabel = rebuildProgress?.active
+						? `Rebuilding GitHub issues — ${rebuildProgress.stage} ${rebuildProgress.current}/${rebuildProgress.total}`
+						: phase === "idle" ? "Describe what you want to build."
 						: phase === "interview" ? "Discovery interview in progress..."
 						: phase === "consulting" ? `Consulting ${displayName(activeConsultant)}...`
 						: phase === "review" ? "Reviewing findings — provide feedback or approve."
@@ -1880,6 +2080,11 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 
 			const prdExists = existsSync(prdPath);
 			const checklistExists = existsSync(checklistPath);
+			if (checklistExists) {
+				setRebuildProgress("parallel", 0, 1, "Planning execution waves and parallel groups");
+				await applyParallelExecutionPlanToChecklist(checklistPath, ctx as ExtensionContext);
+				clearRebuildProgress();
+			}
 
 			// Publish to GitHub if repo is ready
 			const cwd = (ctx as ExtensionContext).cwd;
@@ -1887,8 +2092,8 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 			let ghSummary = "";
 
 			if (ghStatus.ready && prdExists && checklistExists) {
-				const pub = await publishToGitHub(cwd, checklistPath, prdPath, ctx as ExtensionContext);
-				if (pub.tasksCreated > 0 || pub.tasksRejected > 0) {
+				const pub = await publishToGitHub(cwd, checklistPath, prdPath, ctx as ExtensionContext, { skipParallelPlanning: true });
+				if (pub.tasksCreated > 0 || pub.tasksUpdated > 0 || pub.epicsUpdated > 0 || pub.tasksRejected > 0) {
 					const epicList = Array.from(pub.epicIssueNumbers.entries())
 						.map(([id, num]) => `  #${num} — ${id}`)
 						.join("\n");
@@ -1901,9 +2106,9 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 					ghSummary = [
 						``,
 						`GitHub Issues:`,
-						`  ✓ ${pub.epicsCreated} epic(s) created`,
+						`  ✓ ${pub.epicsCreated} epic(s) created` + (pub.epicsUpdated > 0 ? `, ${pub.epicsUpdated} updated` : ""),
 						epicList,
-						`  ✓ ${pub.tasksCreated} task(s) created` + (pub.tasksFailed > 0 ? ` (${pub.tasksFailed} failed)` : ""),
+						`  ✓ ${pub.tasksCreated} task(s) created` + (pub.tasksUpdated > 0 ? `, ${pub.tasksUpdated} updated` : "") + (pub.tasksFailed > 0 ? ` (${pub.tasksFailed} failed)` : ""),
 						rejectedSummary,
 						`  ✓ Checklist updated with issue numbers`,
 						pub.repoUrl ? `  View: ${pub.repoUrl}/issues` : "",
@@ -2319,9 +2524,33 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		}
 	}
 
-	function parseChecklist(checklistPath: string): { epics: Map<string, string>; tasks: ParsedTask[] } {
+	function shellExecAsync(cmd: string, cwd?: string): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+		return new Promise((resolveResult) => {
+			const proc = spawn("zsh", ["-lc", cmd], {
+				cwd,
+				stdio: ["ignore", "pipe", "pipe"],
+				env: process.env,
+			});
+			let stdout = "";
+			let stderr = "";
+			proc.stdout.on("data", (chunk) => { stdout += chunk.toString(); });
+			proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+			proc.on("error", (error) => {
+				resolveResult({ ok: false, stdout: stdout.trim(), stderr: error.message || stderr.trim() });
+			});
+			proc.on("close", (code) => {
+				resolveResult({
+					ok: code === 0,
+					stdout: stdout.trim(),
+					stderr: stderr.trim(),
+				});
+			});
+		});
+	}
+
+	function parseChecklist(checklistPath: string): { epics: Map<string, ParsedEpicChecklistEntry>; tasks: ParsedTask[] } {
 		const raw = readFileSync(checklistPath, "utf-8");
-		const epics = new Map<string, string>();
+		const epics = new Map<string, ParsedEpicChecklistEntry>();
 		const tasks: ParsedTask[] = [];
 
 		let currentEpic = "";
@@ -2347,12 +2576,21 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 				currentEpicId = epicMatch[1].trim();
 				currentEpicNum = epicMatch[2].trim();
 				currentEpic = epicMatch[3].trim();
-				epics.set(currentEpicId, currentEpic);
+				epics.set(currentEpicId, { title: currentEpic, issueNumber: null });
+				continue;
+			}
+
+			const epicIssueMatch = line.match(/^\s*-\s+\[[ x]\]\s+\[#(\d+)\s+Epic:/i);
+			if (epicIssueMatch && currentEpicId && !currentTask) {
+				const epicEntry = epics.get(currentEpicId);
+				if (epicEntry && epicEntry.issueNumber == null) {
+					epicEntry.issueNumber = parseInt(epicIssueMatch[1], 10);
+				}
 				continue;
 			}
 
 			// Task line: - [ ] **1.1 — Title**
-			const taskMatch = line.match(/^-\s+\[[ x]\]\s+\*\*(.+?)\s*[—–-]+\s*(.+?)\*\*/);
+			const taskMatch = line.match(/^-\s+\[[ x]\]\s+\*\*(.+?)\s*[—–-]+\s*(.+?)\*\*(?:\s+\(#(\d+)\))?/);
 			if (taskMatch) {
 				flushTask();
 				const id = taskMatch[1].trim();
@@ -2363,11 +2601,18 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 					body: "",
 					epic: currentEpicId || "Tasks",
 					epicNum: currentEpicNum,
+					issueNumber: taskMatch[3] ? parseInt(taskMatch[3], 10) : null,
 					dependencies: [],
 					complexityScore: null,
 					prerequisiteState: null,
 					ownedAreas: [],
 					laneHint: null,
+					executionWave: null,
+					parallelGroup: null,
+					workerProfile: null,
+					parallelizable: null,
+					serialReason: null,
+					suggestedMaxConcurrency: null,
 					validators: [],
 					regressionSurface: [],
 				};
@@ -2397,6 +2642,20 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 				}
 				const laneMatch = line.match(/^\s+[-*]\s+\*\*Execution Lane:\*\*\s*(.+)/i);
 				if (laneMatch) currentTask.laneHint = parseChecklistLane(laneMatch[1]);
+				const waveMatch = line.match(/^\s+[-*]\s+\*\*Execution Wave:\*\*\s*(\d+)/i);
+				if (waveMatch) currentTask.executionWave = parseInt(waveMatch[1], 10);
+				const parallelGroupMatch = line.match(/^\s+[-*]\s+\*\*Parallel Group:\*\*\s*(.+)/i);
+				if (parallelGroupMatch) currentTask.parallelGroup = parallelGroupMatch[1].trim();
+				const workerProfileMatch = line.match(/^\s+[-*]\s+\*\*Worker Profile:\*\*\s*(.+)/i);
+				if (workerProfileMatch) currentTask.workerProfile = workerProfileMatch[1].trim();
+				const parallelizableMatch = line.match(/^\s+[-*]\s+\*\*Parallelizable:\*\*\s*(yes|no)/i);
+				if (parallelizableMatch) currentTask.parallelizable = parallelizableMatch[1].toLowerCase() === "yes";
+				const serialReasonMatch = line.match(/^\s+[-*]\s+\*\*Serial Reason:\*\*\s*(.+)/i);
+				if (serialReasonMatch) currentTask.serialReason = serialReasonMatch[1].trim();
+				const concurrencyMatch = line.match(/^\s+[-*]\s+\*\*Suggested Max Concurrency:\*\*\s*(\d+)/i);
+				if (concurrencyMatch) currentTask.suggestedMaxConcurrency = parseInt(concurrencyMatch[1], 10);
+				const githubIssueMatch = line.match(/^\s+[-*]\s+\*\*GitHub Issue:\*\*\s*#(\d+)/i);
+				if (githubIssueMatch) currentTask.issueNumber = parseInt(githubIssueMatch[1], 10);
 				const validationMatch = line.match(/^\s+[-*]\s+\*\*Validators:\*\*\s*(.+)/i);
 				if (validationMatch) {
 					currentTask.validators = validationMatch[1]
@@ -2411,7 +2670,7 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 						.map(item => item.trim())
 						.filter(Boolean);
 				}
-				bodyLines.push(line);
+				if (!isChecklistMetadataLine(line)) bodyLines.push(line);
 			}
 		}
 		flushTask();
@@ -2477,7 +2736,9 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 	interface PublishResult {
 		success: boolean;
 		epicsCreated: number;
+		epicsUpdated: number;
 		tasksCreated: number;
+		tasksUpdated: number;
 		tasksFailed: number;
 		tasksRejected: number;
 		epicIssueNumbers: Map<string, number>;
@@ -2486,18 +2747,11 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		rejectedTasks: Array<{ taskId: string; title: string; status: PlanningGateStatus; reason: string }>;
 	}
 
-	function upsertChecklistTaskMetadata(checklist: string, taskId: string, metadataLines: string[]): string {
+	function upsertChecklistTaskMetadata(checklist: string, taskId: string, metadataLines: string[], replacePrefixes?: string[]): string {
 		const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 		const lines = checklist.split("\n");
 		const headingRe = new RegExp(`^-\\s+\\[[ x]\\]\\s+\\*\\*${escaped}\\s*[—–-]+\\s*.+?\\*\\*(?:\\s*\\(#\\d+\\))?$`);
-		const metadataPrefixes = [
-			"  - **GitHub Issue:**",
-			"  - **Complexity Score:**",
-			"  - **Prerequisite State:**",
-			"  - **Owned Areas:**",
-			"  - **Planning Gate:**",
-			"  - **Gate Reason:**",
-		];
+		const metadataPrefixes = replacePrefixes ?? CHECKLIST_PUBLISH_METADATA_PREFIXES;
 		for (let index = 0; index < lines.length; index++) {
 			if (!headingRe.test(lines[index])) continue;
 			let insertAt = index + 1;
@@ -2510,179 +2764,320 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		return checklist;
 	}
 
+	async function loadExistingIssues(cwd: string): Promise<ExistingIssueSummary[]> {
+		const result = await shellExecAsync(`cd '${cwd}' && gh issue list --state all --limit 500 --json number,title,labels`);
+		if (!result.ok || !result.stdout) return [];
+		try {
+			const parsed = JSON.parse(result.stdout);
+			if (!Array.isArray(parsed)) return [];
+			return parsed.map((issue: any) => ({
+				number: Number(issue.number),
+				title: String(issue.title || ""),
+				labels: Array.isArray(issue.labels) ? issue.labels.map((label: any) => String(label?.name || "")).filter(Boolean) : [],
+			})).filter((issue: ExistingIssueSummary) => Number.isFinite(issue.number) && issue.title);
+		} catch {
+			return [];
+		}
+	}
+
+	function findExistingIssueNumber(existingIssues: ExistingIssueSummary[], title: string, label: string): number | null {
+		const match = existingIssues.find(issue => issue.title === title && issue.labels.includes(label));
+		return match ? match.number : null;
+	}
+
+	function startUiSpinner(ctx: ExtensionContext, key: string, initialMessage: string) {
+		const frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+		let index = 0;
+		let message = initialMessage;
+		ctx.ui.setStatus(key, `${frames[index]} ${message}`);
+		const timer = setInterval(() => {
+			index = (index + 1) % frames.length;
+			ctx.ui.setStatus(key, `${frames[index]} ${message}`);
+		}, 120);
+		return {
+			update(nextMessage: string) {
+				message = nextMessage;
+				ctx.ui.setStatus(key, `${frames[index]} ${message}`);
+			},
+			stop(finalMessage?: string) {
+				clearInterval(timer);
+				ctx.ui.setStatus(key, finalMessage ? `✓ ${finalMessage}` : "");
+			},
+		};
+	}
+
+	function setRebuildProgress(stage: string, current: number, total: number, detail: string) {
+		rebuildProgress = {
+			active: true,
+			stage,
+			current,
+			total,
+			detail,
+		};
+		updateWidget();
+	}
+
+	function clearRebuildProgress() {
+		rebuildProgress = null;
+		updateWidget();
+	}
+
+	async function applyParallelExecutionPlanToChecklist(checklistPath: string, ctx: ExtensionContext) {
+		const { tasks } = parseChecklist(checklistPath);
+		const plan = buildParallelExecutionPlan(tasks);
+		let checklist = readFileSync(checklistPath, "utf-8");
+		let index = 0;
+		for (const task of tasks) {
+			index++;
+			const item = plan.get(task.id);
+			if (!item) continue;
+			setRebuildProgress("parallel", index, tasks.length, `${task.id} — ${task.title}`);
+			const metadataBlock = [
+				`  - **Execution Wave:** ${item.executionWave}`,
+				`  - **Parallel Group:** ${item.parallelGroup}`,
+				`  - **Worker Profile:** ${item.workerProfile}`,
+				`  - **Parallelizable:** ${item.parallelizable ? "yes" : "no"}`,
+				`  - **Suggested Max Concurrency:** ${item.suggestedMaxConcurrency}`,
+				`  - **Serial Reason:** ${item.serialReason ?? "n/a"}`,
+			];
+			checklist = upsertChecklistTaskMetadata(
+				checklist,
+				task.id,
+				metadataBlock,
+				[
+					"  - **Execution Wave:**",
+					"  - **Parallel Group:**",
+					"  - **Worker Profile:**",
+					"  - **Parallelizable:**",
+					"  - **Suggested Max Concurrency:**",
+					"  - **Serial Reason:**",
+				],
+			);
+			if (index % 10 === 0) {
+				writeFileSync(checklistPath, checklist, "utf-8");
+				await new Promise(resolve => setTimeout(resolve, 0));
+			}
+		}
+		writeFileSync(checklistPath, checklist, "utf-8");
+		ctx.ui.notify("Parallel execution plan applied to checklist.", "info");
+	}
+
 	async function publishToGitHub(
 		cwd: string,
 		checklistPath: string,
 		prdPath: string,
 		ctx: ExtensionContext,
+		options?: { skipParallelPlanning?: boolean },
 	): Promise<PublishResult> {
-		const { epics, tasks } = parseChecklist(checklistPath);
-		const hasPrd = existsSync(prdPath);
-		const prdEpics = hasPrd ? parsePrdEpics(prdPath) : new Map<string, ParsedEpic>();
+		const spinner = startUiSpinner(ctx, "pi-blueprint", "Preparing GitHub rebuild...");
 
-		// Create labels
-		ctx.ui.setStatus("pi-blueprint", "Creating labels...");
-		for (const label of ["epic", "phase", "task", "sub-task"]) {
-			const colors: Record<string, string> = { epic: "7057ff", phase: "0e8a16", task: "1d76db", "sub-task": "c5def5" };
-			shellExec(`cd '${cwd}' && gh label create "${label}" --color "${colors[label]}" --force 2>/dev/null`);
-		}
-
-		// Create epic issues — enriched with PRD content
-		const epicIssueNumbers = new Map<string, number>();
-		let epicIdx = 0;
-		for (const [epicId, epicTitle] of epics) {
-			epicIdx++;
-			ctx.ui.setStatus("pi-blueprint", `Creating epic ${epicIdx}/${epics.size}: ${epicId}...`);
-			const epicTasks = tasks.filter(t => t.epic === epicId);
-			const taskList = epicTasks.map(t => `- [ ] **${t.id}** — ${t.title}`).join("\n");
-
-			const prdEpic = prdEpics.get(epicId);
-			const prdContent = prdEpic ? prdEpic.prdBody : "";
-
-			const body = [
-				`## ${epicId}: ${epicTitle}`,
-				"",
-				`### Reference`,
-				hasPrd ? `- **PRD:** [docs/PRD.md](docs/PRD.md)` : "",
-				`- **Checklist:** [features/00-IMPLEMENTATION-CHECKLIST.md](features/00-IMPLEMENTATION-CHECKLIST.md)`,
-				"",
-				prdContent ? `### Epic Scope (from PRD)\n${prdContent}` : "",
-				"",
-				`### Tasks (${epicTasks.length})`,
-				taskList,
-				"",
-				`---`,
-				`*Created by pi-blueprint*`,
-			].filter(Boolean).join("\n");
-
-			const tmpFile = join(logDir, `_epic_body_${epicId.replace(/\s+/g, "_")}.md`);
-			writeFileSync(tmpFile, body, "utf-8");
-
-			const result = shellExec(
-				`cd '${cwd}' && gh issue create --title "${epicId}: ${epicTitle}" --label "epic" --body-file '${tmpFile}'`
-			);
-			try { unlinkSync(tmpFile); } catch {}
-
-			if (result.ok) {
-				const num = parseInt(result.stdout.split("/").pop() || "0", 10);
-				epicIssueNumbers.set(epicId, num);
+		try {
+			if (!options?.skipParallelPlanning) {
+				setRebuildProgress("parallel", 0, 1, "Planning execution waves and parallel groups");
+				await applyParallelExecutionPlanToChecklist(checklistPath, ctx);
 			}
-		}
+			const { epics, tasks } = parseChecklist(checklistPath);
+			const hasPrd = existsSync(prdPath);
+			const prdEpics = hasPrd ? parsePrdEpics(prdPath) : new Map<string, ParsedEpic>();
+			const existingIssues = await loadExistingIssues(cwd);
 
-		// Create task issues — full body from checklist, linked to epic and PRD
-		const taskIssueNumbers = new Map<string, number>();
-		let tasksCreated = 0;
-		let tasksFailed = 0;
-		const rejectedTasks: Array<{ taskId: string; title: string; status: PlanningGateStatus; reason: string }> = [];
+			// Create labels
+			ctx.ui.notify("GitHub rebuild started. Creating labels, then epics, tasks, and checklist links.", "info");
+			spinner.update("Creating GitHub labels...");
+			const labels = ["epic", "phase", "task", "sub-task"];
+			for (const [labelIdx, label] of labels.entries()) {
+				setRebuildProgress("labels", labelIdx + 1, labels.length, `Creating label: ${label}`);
+				const colors: Record<string, string> = { epic: "7057ff", phase: "0e8a16", task: "1d76db", "sub-task": "c5def5" };
+				await shellExecAsync(`cd '${cwd}' && gh label create "${label}" --color "${colors[label]}" --force 2>/dev/null`);
+			}
 
-		let taskIdx = 0;
-		for (const task of tasks) {
-			taskIdx++;
-			ctx.ui.setStatus("pi-blueprint", `Creating task ${taskIdx}/${tasks.length}: ${task.id}...`);
-			const epicNum = epicIssueNumbers.get(task.epic);
-			const packet = buildBlueprintTaskPacket(task);
-			const gate = evaluatePlanningGate(packet);
-			if (gate.status !== "execution-ready") {
-				rejectedTasks.push({ taskId: task.id, title: task.title, status: gate.status, reason: gate.reason });
-				const metadataBlock = [
-					`  - **Planning Gate:** ${gate.status}`,
-					`  - **Gate Reason:** ${gate.reason}`,
-				];
-				let checklist = readFileSync(checklistPath, "utf-8");
-				checklist = upsertChecklistTaskMetadata(checklist, task.id, metadataBlock);
-				writeFileSync(checklistPath, checklist, "utf-8");
-				const parentEpicIssue = epicNum ? `#${epicNum}` : task.epic;
-				shellExec(`cd '${cwd}' && gh issue comment '${parentEpicIssue}' --body-file - <<'EOF'
+			// Create epic issues — enriched with PRD content
+			const epicIssueNumbers = new Map<string, number>();
+			let epicsCreated = 0;
+			let epicsUpdated = 0;
+			let epicIdx = 0;
+			ctx.ui.notify(`Publishing ${epics.size} epic issue${epics.size !== 1 ? "s" : ""}...`, "info");
+			for (const [epicId, epicEntry] of epics) {
+				const epicTitle = epicEntry.title;
+				epicIdx++;
+				spinner.update(`Creating epic ${epicIdx}/${epics.size}: ${epicId}`);
+				setRebuildProgress("epics", epicIdx, epics.size, `${epicId}: ${epicTitle}`);
+				const epicTasks = tasks.filter(t => t.epic === epicId);
+				const taskList = epicTasks.map(t => `- [ ] **${t.id}** — ${t.title}`).join("\n");
+
+				const prdEpic = prdEpics.get(epicId);
+				const prdContent = prdEpic ? prdEpic.prdBody : "";
+
+				const body = [
+					`## ${epicId}: ${epicTitle}`,
+					"",
+					`### Reference`,
+					hasPrd ? `- **PRD:** [docs/PRD.md](docs/PRD.md)` : "",
+					`- **Checklist:** [features/00-IMPLEMENTATION-CHECKLIST.md](features/00-IMPLEMENTATION-CHECKLIST.md)`,
+					"",
+					prdContent ? `### Epic Scope (from PRD)\n${prdContent}` : "",
+					"",
+					`### Tasks (${epicTasks.length})`,
+					taskList,
+					"",
+					`---`,
+					`*Created by pi-blueprint*`,
+				].filter(Boolean).join("\n");
+
+				const tmpFile = join(logDir, `_epic_body_${epicId.replace(/\s+/g, "_")}.md`);
+				writeFileSync(tmpFile, body, "utf-8");
+
+				const existingEpicIssueNumber = epicEntry.issueNumber ?? findExistingIssueNumber(existingIssues, `${epicId}: ${epicTitle}`, "epic");
+				const result = existingEpicIssueNumber
+					? await shellExecAsync(
+						`cd '${cwd}' && gh issue edit ${existingEpicIssueNumber} --title "${epicId}: ${epicTitle}" --add-label "epic" --body-file '${tmpFile}'`
+					)
+					: await shellExecAsync(
+						`cd '${cwd}' && gh issue create --title "${epicId}: ${epicTitle}" --label "epic" --body-file '${tmpFile}'`
+					);
+				try { unlinkSync(tmpFile); } catch {}
+
+				if (result.ok) {
+					const num = existingEpicIssueNumber || parseInt(result.stdout.split("/").pop() || "0", 10);
+					epicIssueNumbers.set(epicId, num);
+					if (existingEpicIssueNumber) epicsUpdated++;
+					else epicsCreated++;
+				}
+			}
+
+			// Create task issues — full body from checklist, linked to epic and PRD
+			const taskIssueNumbers = new Map<string, number>();
+			let tasksCreated = 0;
+			let tasksUpdated = 0;
+			let tasksFailed = 0;
+			const rejectedTasks: Array<{ taskId: string; title: string; status: PlanningGateStatus; reason: string }> = [];
+
+			let taskIdx = 0;
+			ctx.ui.notify(`Publishing ${tasks.length} task issue${tasks.length !== 1 ? "s" : ""}...`, "info");
+			for (const task of tasks) {
+				taskIdx++;
+				spinner.update(`Creating task ${taskIdx}/${tasks.length}: ${task.id}`);
+				setRebuildProgress("tasks", taskIdx, tasks.length, `${task.id} — ${task.title}`);
+				const epicNum = epicIssueNumbers.get(task.epic);
+				const packet = buildBlueprintTaskPacket(task);
+				const gate = evaluatePlanningGate(packet);
+				if (gate.status !== "execution-ready") {
+					rejectedTasks.push({ taskId: task.id, title: task.title, status: gate.status, reason: gate.reason });
+					const metadataBlock = [
+						`  - **Planning Gate:** ${gate.status}`,
+						`  - **Gate Reason:** ${gate.reason}`,
+					];
+					let checklist = readFileSync(checklistPath, "utf-8");
+					checklist = upsertChecklistTaskMetadata(checklist, task.id, metadataBlock);
+					writeFileSync(checklistPath, checklist, "utf-8");
+					const parentEpicIssue = epicNum ? `#${epicNum}` : task.epic;
+					await shellExecAsync(`cd '${cwd}' && gh issue comment '${parentEpicIssue}' --body-file - <<'EOF'
 ${renderPlanningGateComment(task, packet, gate)}
 EOF`);
-				continue;
+					continue;
+				}
+				const depRefs = task.dependencies
+					.map(d => {
+						const num = taskIssueNumbers.get(d);
+						return num ? `#${num}` : d;
+					})
+					.join(", ");
+
+				const body = [
+					`## Task: ${task.id} — ${task.title}`,
+					"",
+					renderReferenceIndex(task, packet, epicNum),
+					hasPrd ? `- **PRD:** [docs/PRD.md](docs/PRD.md)` : "",
+					`- **Checklist Source:** [features/00-IMPLEMENTATION-CHECKLIST.md](features/00-IMPLEMENTATION-CHECKLIST.md)`,
+					depRefs ? `- **GitHub Dependency Links:** ${depRefs}` : "- **GitHub Dependency Links:** none",
+					"",
+					renderBlueprintTaskPacket(packet),
+					"",
+					renderBlueprintSyncContract(),
+					"",
+					`### Task Detail`,
+					task.body,
+					"",
+					`---`,
+					`*Created by pi-blueprint*`,
+				].filter(Boolean).join("\n");
+
+				const issueTitle = `[${task.id}] ${task.title}`;
+				const tmpFile = join(logDir, `_task_body_${task.id.replace(/\./g, "_")}.md`);
+				writeFileSync(tmpFile, body, "utf-8");
+
+				const existingTaskIssueNumber = task.issueNumber ?? findExistingIssueNumber(existingIssues, issueTitle, "task");
+				const result = existingTaskIssueNumber
+					? await shellExecAsync(
+						`cd '${cwd}' && gh issue edit ${existingTaskIssueNumber} --title "${issueTitle.replace(/"/g, '\\"')}" --add-label "task" --body-file '${tmpFile}'`
+					)
+					: await shellExecAsync(
+						`cd '${cwd}' && gh issue create --title "${issueTitle.replace(/"/g, '\\"')}" --label "task" --body-file '${tmpFile}'`
+					);
+				try { unlinkSync(tmpFile); } catch {}
+
+				if (result.ok) {
+					const num = existingTaskIssueNumber || parseInt(result.stdout.split("/").pop() || "0", 10);
+					taskIssueNumbers.set(task.id, num);
+					if (existingTaskIssueNumber) tasksUpdated++;
+					else tasksCreated++;
+				} else {
+					tasksFailed++;
+				}
 			}
-			const depRefs = task.dependencies
-				.map(d => {
-					const num = taskIssueNumbers.get(d);
-					return num ? `#${num}` : d;
-				})
-				.join(", ");
 
-			const body = [
-				`## Task: ${task.id} — ${task.title}`,
-				"",
-				renderReferenceIndex(task, packet, epicNum),
-				hasPrd ? `- **PRD:** [docs/PRD.md](docs/PRD.md)` : "",
-				`- **Checklist Source:** [features/00-IMPLEMENTATION-CHECKLIST.md](features/00-IMPLEMENTATION-CHECKLIST.md)`,
-				depRefs ? `- **GitHub Dependency Links:** ${depRefs}` : "- **GitHub Dependency Links:** none",
-				"",
-				renderBlueprintTaskPacket(packet),
-				"",
-				renderBlueprintSyncContract(),
-				"",
-				`### Task Detail`,
-				task.body,
-				"",
-				`---`,
-				`*Created by pi-blueprint*`,
-			].filter(Boolean).join("\n");
-
-			const issueTitle = `[${task.id}] ${task.title}`;
-			const tmpFile = join(logDir, `_task_body_${task.id.replace(/\./g, "_")}.md`);
-			writeFileSync(tmpFile, body, "utf-8");
-
-			const result = shellExec(
-				`cd '${cwd}' && gh issue create --title "${issueTitle.replace(/"/g, '\\"')}" --label "task" --body-file '${tmpFile}'`
-			);
-			try { unlinkSync(tmpFile); } catch {}
-
-			if (result.ok) {
-				const num = parseInt(result.stdout.split("/").pop() || "0", 10);
-				taskIssueNumbers.set(task.id, num);
-				tasksCreated++;
-			} else {
-				tasksFailed++;
+			// Update checklist with issue numbers
+			spinner.update("Updating checklist with issue numbers...");
+			ctx.ui.notify("Updating checklist with issue links and planning metadata...", "info");
+			setRebuildProgress("checklist", 1, 1, "Linking issue numbers and planning metadata");
+			if (taskIssueNumbers.size > 0) {
+				let checklist = readFileSync(checklistPath, "utf-8");
+				for (const [taskId, issueNum] of taskIssueNumbers) {
+					const task = tasks.find(candidate => candidate.id === taskId);
+					if (!task) continue;
+					const packet = buildBlueprintTaskPacket(task);
+					const ownedAreas = packet.ownedAreas.length > 0 ? packet.ownedAreas.join(", ") : "none declared yet";
+					const prerequisiteState = task.prerequisiteState ??
+						(packet.prerequisites.some(prereq => prereq.status === "missing")
+							? "missing"
+							: packet.prerequisites.some(prereq => prereq.status === "waived")
+								? "waived"
+								: "satisfied");
+					const metadataBlock = [
+						`  - **GitHub Issue:** #${issueNum}`,
+						`  - **Complexity Score:** ${packet.complexityScore}/10`,
+						`  - **Prerequisite State:** ${prerequisiteState}`,
+						`  - **Owned Areas:** ${ownedAreas}`,
+						`  - **Planning Gate:** execution-ready`,
+					];
+					checklist = upsertChecklistTaskMetadata(checklist, taskId, metadataBlock);
+				}
+				writeFileSync(checklistPath, checklist, "utf-8");
 			}
+
+			const remoteCheck = await shellExecAsync(`git -C '${cwd}' remote get-url origin`);
+			const repoUrl = remoteCheck.ok ? remoteCheck.stdout.replace(/\.git$/, "") : "";
+
+			spinner.stop(`GitHub rebuild complete: ${epicsCreated} created, ${epicsUpdated} updated, ${tasksCreated} tasks created, ${tasksUpdated} updated`);
+			clearRebuildProgress();
+			return {
+				success: tasksFailed === 0 && rejectedTasks.length === 0,
+				epicsCreated,
+				epicsUpdated,
+				tasksCreated,
+				tasksUpdated,
+				tasksFailed,
+				tasksRejected: rejectedTasks.length,
+				epicIssueNumbers,
+				taskIssueNumbers,
+				repoUrl,
+				rejectedTasks,
+			};
+		} catch (error) {
+			spinner.stop("GitHub rebuild failed");
+			clearRebuildProgress();
+			throw error;
 		}
-
-		// Update checklist with issue numbers
-		ctx.ui.setStatus("pi-blueprint", "Updating checklist with issue numbers...");
-		if (taskIssueNumbers.size > 0) {
-			let checklist = readFileSync(checklistPath, "utf-8");
-			for (const [taskId, issueNum] of taskIssueNumbers) {
-				const task = tasks.find(candidate => candidate.id === taskId);
-				if (!task) continue;
-				const packet = buildBlueprintTaskPacket(task);
-				const ownedAreas = packet.ownedAreas.length > 0 ? packet.ownedAreas.join(", ") : "none declared yet";
-				const prerequisiteState = task.prerequisiteState ??
-					(packet.prerequisites.some(prereq => prereq.status === "missing")
-						? "missing"
-						: packet.prerequisites.some(prereq => prereq.status === "waived")
-							? "waived"
-							: "satisfied");
-				const escaped = taskId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-				const metadataBlock = [
-					`  - **GitHub Issue:** #${issueNum}`,
-					`  - **Complexity Score:** ${packet.complexityScore}/10`,
-					`  - **Prerequisite State:** ${prerequisiteState}`,
-					`  - **Owned Areas:** ${ownedAreas}`,
-					`  - **Planning Gate:** execution-ready`,
-				];
-				checklist = upsertChecklistTaskMetadata(checklist, taskId, metadataBlock);
-			}
-			writeFileSync(checklistPath, checklist, "utf-8");
-		}
-
-		const remoteCheck = shellExec(`git -C '${cwd}' remote get-url origin`);
-		const repoUrl = remoteCheck.ok ? remoteCheck.stdout.replace(/\.git$/, "") : "";
-
-		return {
-			success: tasksFailed === 0 && rejectedTasks.length === 0,
-			epicsCreated: epicIssueNumbers.size,
-			tasksCreated,
-			tasksFailed,
-			tasksRejected: rejectedTasks.length,
-			epicIssueNumbers,
-			taskIssueNumbers,
-			repoUrl,
-			rejectedTasks,
-		};
 	}
 
 	function isGhAuthenticated(): boolean {
@@ -2846,7 +3241,7 @@ EOF`);
 
 			ctx.ui.setStatus("pi-blueprint", `Publishing ${epics.size} epics and ${tasks.length} tasks to GitHub...`);
 
-			const pub = await publishToGitHub(cwd, checklistPath, prdPath, ctx as ExtensionContext);
+				const pub = await publishToGitHub(cwd, checklistPath, prdPath, ctx as ExtensionContext);
 			ctx.ui.setStatus("pi-blueprint", "");
 
 			const epicList = Array.from(pub.epicIssueNumbers.entries())
@@ -2854,10 +3249,10 @@ EOF`);
 				.join("\n");
 
 			ctx.ui.notify(
-				`GitHub Issues Created!\n\n` +
-				`Epics: ${pub.epicsCreated}\n` +
+				`GitHub Issues Synced!\n\n` +
+				`Epics: ${pub.epicsCreated} created` + (pub.epicsUpdated > 0 ? `, ${pub.epicsUpdated} updated` : "") + "\n" +
 				epicList + "\n\n" +
-				`Tasks: ${pub.tasksCreated}` + (pub.tasksFailed > 0 ? ` (${pub.tasksFailed} failed)` : "") + "\n\n" +
+				`Tasks: ${pub.tasksCreated} created` + (pub.tasksUpdated > 0 ? `, ${pub.tasksUpdated} updated` : "") + (pub.tasksFailed > 0 ? ` (${pub.tasksFailed} failed)` : "") + "\n\n" +
 				`Checklist updated with issue numbers.\n` +
 				(pub.repoUrl ? `View: ${pub.repoUrl}/issues` : ""),
 					"info",
