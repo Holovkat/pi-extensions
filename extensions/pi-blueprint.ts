@@ -22,11 +22,12 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth, matchesKey, Key } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
-import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, mkdirSync, unlinkSync, statSync, openSync } from "fs";
 import { join, resolve, dirname } from "path";
 import { homedir } from "os";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
+import { createConnection, Socket } from "net";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 // ── Types ────────────────────────────────────────
@@ -82,6 +83,42 @@ interface RebuildProgressState {
 	current: number;
 	total: number;
 }
+
+interface BlueprintReviewScoreSummary {
+	score: number;
+	covered: number;
+	missing: string[];
+	ready: boolean;
+	source: "specialists" | "artifacts";
+	label: string;
+	coverageScore: number;
+	coverageMissing: string[];
+	alignmentScore: number | null;
+	alignmentStatus: AlignmentCheckResult["status"] | "not-run";
+	effortTarget: string;
+	effortKind: "required" | "none";
+}
+
+interface BlueprintWebState {
+	phase: Phase;
+	iteration: number;
+	activeConsultant: string;
+	consultationCount: number;
+	specialistsCovered: number;
+	rebuildProgress: RebuildProgressState | null;
+	lastAlignmentCheck: AlignmentCheckResult | null;
+	localAssetSync: LocalAssetSyncResult | null;
+	pendingRevisionPrompt: PendingRevisionPrompt | null;
+	reviewScore: BlueprintReviewScoreSummary | null;
+	webUrl: string;
+	prdPath: string | null;
+	checklistPath: string | null;
+	chatHistory: Array<{ role: string; timestamp: string; title: string; content: string }>;
+	updatedAt: string;
+}
+
+const BLUEPRINT_WEB_PORT = 3151;
+const BLUEPRINT_WEB_CONTROL_PORT = 3152;
 
 class BlueprintOverlayUI {
 	private scrollOffset = 0;
@@ -701,11 +738,14 @@ function readRelativePaths(dir: string): string[] {
 function collectSessionHistoryFromFiles(sessionDir: string): SessionHistorySegment[] {
 	if (!sessionDir || !existsSync(sessionDir)) return [];
 	const files = readdirSync(sessionDir)
-		.filter(file => file.endsWith(".json") && file !== "pi-blueprint-state.json")
+		.filter(file => (file.endsWith(".json") || file.endsWith(".jsonl")) && file !== "pi-blueprint-state.json")
 		.sort();
+	return collectSessionHistoryFromFilePaths(files.map(file => join(sessionDir, file)));
+}
+
+function collectSessionHistoryFromFilePaths(paths: string[]): SessionHistorySegment[] {
 	const segments: SessionHistorySegment[] = [];
-	for (const file of files) {
-		const path = join(sessionDir, file);
+	for (const path of paths) {
 		try {
 			const raw = readFileSync(path, "utf-8");
 			for (const line of raw.split("\n")) {
@@ -743,6 +783,60 @@ function collectSessionHistoryFromFiles(sessionDir: string): SessionHistorySegme
 	return segments.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
 }
 
+function getGlobalSessionDirsForCwd(cwd: string): string[] {
+	const base = join(homedir(), ".pi", "agent", "sessions");
+	if (!existsSync(base)) return [];
+	const normalized = cwd.replace(/[\\/]+/g, "-").replace(/^-+|-+$/g, "");
+	try {
+		return readdirSync(base)
+			.map(name => join(base, name))
+			.filter(path => {
+				const name = path.split("/").pop() || "";
+				return existsSync(path) && name.includes(normalized);
+			})
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+function getLatestGlobalSessionFilesForCwd(cwd: string, limit: number = 1): string[] {
+	const files = getGlobalSessionDirsForCwd(cwd)
+		.flatMap(dir => {
+			try {
+				return readdirSync(dir)
+					.filter(file => file.endsWith(".jsonl"))
+					.map(file => join(dir, file));
+			} catch {
+				return [];
+			}
+		})
+		.map(path => {
+			try {
+				return { path, mtimeMs: statSync(path).mtimeMs };
+			} catch {
+				return null;
+			}
+		})
+		.filter(Boolean) as Array<{ path: string; mtimeMs: number }>;
+	return files
+		.sort((a, b) => b.mtimeMs - a.mtimeMs)
+		.slice(0, Math.max(1, limit))
+		.map(item => item.path);
+}
+
+function dedupeSessionHistory(segments: SessionHistorySegment[]): SessionHistorySegment[] {
+	const seen = new Set<string>();
+	const deduped: SessionHistorySegment[] = [];
+	for (const segment of segments.sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
+		const key = `${segment.timestamp}|${segment.role}|${segment.title}|${segment.content}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		deduped.push(segment);
+	}
+	return deduped;
+}
+
 function extractPersistedMessageContent(msg: any): string {
 	const content = msg?.content;
 	if (!content) return "";
@@ -772,6 +866,10 @@ function padRenderedLine(line: string, width: number): string {
 
 function getExtensionRepoRoot(): string {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+
+function getBlueprintWebScriptPath(sourceRoot: string): string {
+	return join(sourceRoot, "bin", "blueprint-dashboard-web");
 }
 
 function syncProjectAssets(cwd: string, namespace: string, sourceRoot: string): LocalAssetSyncResult {
@@ -876,6 +974,207 @@ export default function (pi: ExtensionAPI) {
 	let consultStartTime = 0;
 	let sessionStateFile = "";
 	let rebuildProgress: RebuildProgressState | null = null;
+	let blueprintWebUrl = "";
+	let blueprintControlSocket: Socket | null = null;
+	let blueprintControlConnected = false;
+	let blueprintStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	let lastBlueprintStateJson = "";
+	let transcriptWatchTimer: ReturnType<typeof setInterval> | null = null;
+	let lastTranscriptSignature = "";
+
+	function getBlueprintStateFile(): string {
+		return join(logDir, "blueprint-state.json");
+	}
+
+	function collectBlueprintChatHistory(ctx: ExtensionContext, maxEntries: number = 120) {
+		const transcriptEntries = collectSessionHistory(ctx).map(segment => ({
+			role: segment.role,
+			timestamp: segment.timestamp,
+			title: segment.title,
+			content: segment.content,
+		}));
+		const consultationEntries = consultations.map(record => ({
+			role: "assistant",
+			timestamp: new Date(record.timestamp).toISOString(),
+			title: `${displayName(record.specialist)} (iteration ${record.iteration})`,
+			content: `${displayName(record.specialist)} (iteration ${record.iteration})\n\nQ: ${record.question}\n\nA: ${record.response}`,
+		}));
+		return [...transcriptEntries, ...consultationEntries]
+			.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)))
+			.slice(-maxEntries);
+	}
+
+	function getTranscriptSignature(ctx: ExtensionContext): string {
+		try {
+			const branch = ctx.sessionManager.getBranch();
+			const last = branch.length > 0 ? branch[branch.length - 1] : null;
+			return `${branch.length}:${JSON.stringify(last ?? null).slice(0, 500)}`;
+		} catch {
+			return "";
+		}
+	}
+
+	function buildBlueprintWebState(ctx: ExtensionContext): BlueprintWebState {
+		const specialistNames = Object.keys(SPECIALISTS);
+		const reviewScore = getBlueprintReviewScore(specialistNames);
+		const prdPath = join(ctx.cwd, "docs", "PRD.md");
+		const checklistPath = join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
+		return {
+			phase,
+			iteration,
+			activeConsultant,
+			consultationCount: consultations.length,
+			specialistsCovered: new Set(consultations.map(c => c.specialist)).size,
+			rebuildProgress,
+			lastAlignmentCheck,
+			localAssetSync,
+			pendingRevisionPrompt,
+			reviewScore,
+			webUrl: blueprintWebUrl,
+			prdPath: existsSync(prdPath) ? prdPath : null,
+			checklistPath: existsSync(checklistPath) ? checklistPath : null,
+			chatHistory: collectBlueprintChatHistory(ctx),
+			updatedAt: new Date().toISOString(),
+		};
+	}
+
+	function flushBlueprintState() {
+		if (!widgetCtx || !logDir) return;
+		try {
+			const json = JSON.stringify(buildBlueprintWebState(widgetCtx), null, 2);
+			if (json === lastBlueprintStateJson) return;
+			writeFileSync(getBlueprintStateFile(), json, "utf-8");
+			lastBlueprintStateJson = json;
+		} catch {}
+	}
+
+	function scheduleBlueprintStateWrite() {
+		if (blueprintStateFlushTimer) return;
+		blueprintStateFlushTimer = setTimeout(() => {
+			blueprintStateFlushTimer = null;
+			flushBlueprintState();
+		}, 75);
+	}
+
+	function registerBlueprintOnControl() {
+		if (!blueprintControlSocket || !blueprintControlConnected) return;
+		try {
+			blueprintControlSocket.write(JSON.stringify({
+				type: "register",
+				agentId: "blueprint-main",
+				sessionKey: "blueprint-main",
+				info: {
+					name: "pi-blueprint",
+					phase,
+					iteration,
+					url: blueprintWebUrl,
+				},
+			}) + "\n");
+		} catch {}
+	}
+
+	function handleBlueprintForwardedCommand(msg: any) {
+		if (!msg?.forward) return;
+		const body = String(msg.message || "").trim();
+		if ((msg.type === "chat" || msg.type === "follow_up" || msg.type === "steer") && body) {
+			pi.sendUserMessage(body);
+			widgetCtx?.ui.notify(`Blueprint web chat injected a new turn.`, "info");
+		}
+	}
+
+	function connectBlueprintControlSocket() {
+		if (blueprintControlSocket) return;
+		try {
+			blueprintControlSocket = createConnection(BLUEPRINT_WEB_CONTROL_PORT, "127.0.0.1");
+			blueprintControlSocket.setEncoding("utf-8");
+			let buffer = "";
+			blueprintControlSocket.on("data", (chunk: string) => {
+				buffer += chunk;
+				let nl;
+				while ((nl = buffer.indexOf("\n")) !== -1) {
+					const line = buffer.slice(0, nl).trim();
+					buffer = buffer.slice(nl + 1);
+					if (!line) continue;
+					try {
+						handleBlueprintForwardedCommand(JSON.parse(line));
+					} catch {}
+				}
+			});
+			blueprintControlSocket.on("connect", () => {
+				blueprintControlConnected = true;
+				registerBlueprintOnControl();
+			});
+			blueprintControlSocket.on("error", () => {
+				blueprintControlSocket = null;
+				blueprintControlConnected = false;
+			});
+			blueprintControlSocket.on("close", () => {
+				blueprintControlSocket = null;
+				blueprintControlConnected = false;
+			});
+		} catch {
+			blueprintControlSocket = null;
+			blueprintControlConnected = false;
+		}
+	}
+
+	function ensureBlueprintWebServer(ctx: ExtensionContext) {
+		const scriptPath = getBlueprintWebScriptPath(extensionRepoRoot);
+		const scriptVersion = String(statSync(scriptPath).mtimeMs);
+		blueprintWebUrl = `http://127.0.0.1:${BLUEPRINT_WEB_PORT}`;
+		let needsRestart = false;
+		try {
+			const raw = execSync(`curl -fsS '${blueprintWebUrl}/api/version'`, { encoding: "utf-8" }).trim();
+			const parsed = JSON.parse(raw || "{}");
+			const remoteVersion = parsed?.version ? String(parsed.version) : "";
+			needsRestart = remoteVersion !== scriptVersion;
+		} catch {
+			needsRestart = true;
+		}
+		if (needsRestart) {
+			try { execSync(`pids=$(lsof -ti tcp:${BLUEPRINT_WEB_PORT} -sTCP:LISTEN 2>/dev/null); if [ -n "$pids" ]; then kill $pids; fi`, { stdio: "ignore" }); } catch {}
+			try { execSync(`pids=$(lsof -ti tcp:${BLUEPRINT_WEB_CONTROL_PORT} -sTCP:LISTEN 2>/dev/null); if [ -n "$pids" ]; then kill $pids; fi`, { stdio: "ignore" }); } catch {}
+			try {
+				const webLogPath = join(logDir || join(ctx.cwd, ".pi", "pipeline-logs"), "blueprint-dashboard-web.log");
+				mkdirSync(dirname(webLogPath), { recursive: true });
+				const logFd = openSync(webLogPath, "a");
+				const proc = spawn(process.execPath, [scriptPath, ctx.cwd, "--port", String(BLUEPRINT_WEB_PORT), "--control-port", String(BLUEPRINT_WEB_CONTROL_PORT)], {
+					detached: true,
+					stdio: ["ignore", logFd, logFd],
+					env: process.env,
+				});
+				proc.unref();
+			} catch (err: any) {
+				ctx.ui.notify(`Failed to start blueprint web UI: ${err.message}`, "warning");
+			}
+		}
+		connectBlueprintControlSocket();
+		scheduleBlueprintStateWrite();
+	}
+
+	function startTranscriptWatch(ctx: ExtensionContext) {
+		lastTranscriptSignature = getTranscriptSignature(ctx);
+		if (transcriptWatchTimer) clearInterval(transcriptWatchTimer);
+		transcriptWatchTimer = setInterval(() => {
+			const nextSignature = getTranscriptSignature(ctx);
+			if (nextSignature !== lastTranscriptSignature) {
+				lastTranscriptSignature = nextSignature;
+				scheduleBlueprintStateWrite();
+			}
+		}, 750);
+	}
+
+	function stopTranscriptWatch() {
+		if (transcriptWatchTimer) {
+			clearInterval(transcriptWatchTimer);
+			transcriptWatchTimer = null;
+		}
+	}
+
+	setTimeout(connectBlueprintControlSocket, 1500);
+	setInterval(() => {
+		if (!blueprintControlConnected) connectBlueprintControlSocket();
+	}, 10000);
 
 	// ── Session Persistence ──────────────────────
 
@@ -897,6 +1196,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			writeFileSync(sessionStateFile, JSON.stringify(state, null, 2), "utf-8");
 		} catch {}
+		scheduleBlueprintStateWrite();
 	}
 
 	function loadSessionState(): PersistedState | null {
@@ -912,6 +1212,7 @@ export default function (pi: ExtensionAPI) {
 		iteration = saved.iteration;
 		phase = saved.phase === "done" ? "done" : "review";
 		updateWidget();
+		scheduleBlueprintStateWrite();
 	}
 
 	function buildResumeSummary(saved: PersistedState, hasPrd: boolean, hasChecklist: boolean): string {
@@ -1218,28 +1519,28 @@ export default function (pi: ExtensionAPI) {
 
 	function collectSessionHistory(ctx: ExtensionContext): SessionHistorySegment[] {
 		const branch = ctx.sessionManager.getBranch();
-		const segments: SessionHistorySegment[] = [];
+		const branchSegments: SessionHistorySegment[] = [];
 		for (const entry of branch) {
 			if (entry.type !== "message" || !entry.message) continue;
 			const msg = entry.message;
 			const content = extractSessionMessageContent(entry).trim();
 			if (!content) continue;
 			if (msg.role === "user") {
-				segments.push({
+				branchSegments.push({
 					role: "user",
 					timestamp: String(msg.timestamp || new Date().toISOString()),
 					title: "User Prompt",
 					content,
 				});
 			} else if (msg.role === "assistant") {
-				segments.push({
+				branchSegments.push({
 					role: "assistant",
 					timestamp: String(msg.timestamp || new Date().toISOString()),
 					title: "Assistant Response",
 					content,
 				});
 			} else if (msg.role === "toolResult") {
-				segments.push({
+				branchSegments.push({
 					role: "tool",
 					timestamp: String(msg.timestamp || new Date().toISOString()),
 					title: `Tool Result: ${(msg as any).toolName || "tool"}`,
@@ -1247,7 +1548,14 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 		}
-		return segments.length > 0 ? segments : collectSessionHistoryFromFiles(sessionDir);
+		const globalSegments = collectSessionHistoryFromFilePaths(getLatestGlobalSessionFilesForCwd(ctx.cwd));
+		const localSegments = collectSessionHistoryFromFiles(sessionDir);
+		const merged = dedupeSessionHistory([
+			...globalSegments,
+			...localSegments,
+			...branchSegments,
+		]);
+		return merged;
 	}
 
 	function buildSessionTranscript(ctx: ExtensionContext, maxSegments: number = 40): string {
@@ -1643,6 +1951,8 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 
 	function updateWidget() {
 		if (!widgetCtx) return;
+		registerBlueprintOnControl();
+		scheduleBlueprintStateWrite();
 
 		widgetCtx.ui.setWidget("pi-blueprint", (_tui: any, theme: any) => {
 			const text = new Text("", 0, 1);
@@ -2420,6 +2730,19 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		description: "Open the implementation checklist in nano inside tmux, or Antigravity outside tmux",
 		handler: async (_args, ctx) => {
 			openBlueprintDocument(join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md"), "implementation checklist", ctx);
+		},
+	});
+
+	pi.registerCommand("blueprint-web", {
+		description: "Start or reuse the Blueprint web mirror and open it in the default browser",
+		handler: async (_args, ctx) => {
+			ensureBlueprintWebServer(ctx);
+			if (!blueprintWebUrl) blueprintWebUrl = `http://127.0.0.1:${BLUEPRINT_WEB_PORT}`;
+			try {
+				execSync(`open '${blueprintWebUrl}'`, { stdio: "ignore" });
+			} catch {}
+			ctx.ui.notify(`Blueprint web UI: ${blueprintWebUrl}`, "info");
+			updateWidget();
 		},
 	});
 
@@ -3534,6 +3857,9 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 		if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
 
 		sessionStateFile = join(sessionDir, "pi-blueprint-state.json");
+		blueprintWebUrl = `http://127.0.0.1:${BLUEPRINT_WEB_PORT}`;
+		ensureBlueprintWebServer(ctx);
+		startTranscriptWatch(ctx);
 
 		localAssetSync = syncProjectAssets(ctx.cwd, "pi-blueprint", extensionRepoRoot);
 		agents = scanAgents(ctx.cwd);
@@ -3642,6 +3968,7 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 			`  /blueprint-close-panes  Close all watch panes\n` +
 			`  /blueprint-prd          Open PRD in nano or Antigravity\n` +
 			`  /blueprint-checklist    Open checklist in nano or Antigravity\n` +
+			`  /blueprint-web          Open the live Blueprint web mirror\n` +
 			`  /blueprint-details      Open scrollable blueprint details overlay\n` +
 			`  /blueprint-sync-assets  Sync repo-managed agents and skills into .pi\n` +
 			`  /blueprint-check-alignment  Verify transcript-backed decisions\n` +
@@ -3670,11 +3997,24 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 					theme.fg("accent", "pi-blueprint") +
 					theme.fg("muted", " · ") + phaseStr +
 					theme.fg("muted", ` · iter ${iteration}`) +
+					theme.fg("muted", " · ") +
+					theme.fg("dim", blueprintWebUrl || "web: off") +
 					theme.fg("dim", " · /blueprint-details");
 				const right = theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
 				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 				return [truncateToWidth(left + pad + right, width)];
 			},
 		}));
+	});
+
+	pi.on("session_shutdown", async () => {
+		stopTranscriptWatch();
+		if (blueprintStateFlushTimer) {
+			clearTimeout(blueprintStateFlushTimer);
+			blueprintStateFlushTimer = null;
+		}
+		try { blueprintControlSocket?.end(); } catch {}
+		blueprintControlSocket = null;
+		blueprintControlConnected = false;
 	});
 }

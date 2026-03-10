@@ -1,0 +1,888 @@
+#!/usr/bin/env node
+// Blueprint Web Mirror — HTTP/SSE dashboard + chat bridge for pi-blueprint
+// Usage: blueprint-dashboard-web [project-dir] [--port PORT] [--control-port PORT]
+
+import http from "node:http";
+import net from "node:net";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const args = process.argv.slice(2);
+let projectDir = process.cwd();
+let port = 3151;
+let controlPort = 3152;
+
+for (let i = 0; i < args.length; i++) {
+	if (args[i] === "--port" && args[i + 1]) { port = parseInt(args[i + 1], 10); i++; }
+	else if (args[i] === "--control-port" && args[i + 1]) { controlPort = parseInt(args[i + 1], 10); i++; }
+	else if (!args[i].startsWith("-")) projectDir = args[i];
+}
+
+const stateFile = path.join(projectDir, ".pi", "pipeline-logs", "blueprint-state.json");
+const sseClients = new Set();
+const registeredAgents = new Map();
+const chatLog = [];
+const SCRIPT_VERSION = String(fs.statSync(fileURLToPath(import.meta.url)).mtimeMs);
+
+function titleizeSpecialist(name) {
+	return String(name || "")
+		.split(/[-_\s]+/)
+		.filter(Boolean)
+		.map(part => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+}
+
+function readBlueprintSessionState() {
+	const sessionStateFile = path.join(projectDir, ".pi", "agent-sessions", "pi-blueprint-state.json");
+	try {
+		return JSON.parse(fs.readFileSync(sessionStateFile, "utf-8"));
+	} catch {
+		return null;
+	}
+}
+
+function mergeConsultationsIntoState(state) {
+	if (!state) return state;
+	const saved = readBlueprintSessionState();
+	const consults = Array.isArray(saved?.consultations) ? saved.consultations : [];
+	if (!consults.length) return state;
+	const existing = Array.isArray(state.chatHistory) ? state.chatHistory : [];
+	const merged = [...existing];
+	const seen = new Set(existing.map(item =>
+		[String(item?.timestamp || ""), String(item?.title || ""), String(item?.content || "")].join("|")
+	));
+	for (const record of consults) {
+		const specialist = titleizeSpecialist(record?.specialist);
+		const title = `${specialist} (iteration ${record?.iteration ?? "?"})`;
+		const content = `${title}\nQ: ${record?.question || ""}\nA: ${record?.response || ""}`;
+		const timestamp = new Date(record?.timestamp || Date.now()).toISOString();
+		const key = [timestamp, title, content].join("|");
+		if (seen.has(key)) continue;
+		merged.push({
+			role: "assistant",
+			timestamp,
+			title,
+			content,
+		});
+		seen.add(key);
+	}
+	merged.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+	return {
+		...state,
+		chatHistory: dedupeConsultationHistory(merged),
+	};
+}
+
+function normalizeConsultationText(text) {
+	return String(text || "")
+		.replace(/\r/g, "")
+		.replace(/\s+/g, " ")
+		.replace(/\s*Q:\s*/g, " Q: ")
+		.replace(/\s*A:\s*/g, " A: ")
+		.trim();
+}
+
+function consultationQuality(item) {
+	const content = String(item?.content || "");
+	let score = 0;
+	if (/\n\nQ:\s*/.test(content)) score += 3;
+	if (/\n\nA:\s*/.test(content)) score += 3;
+	if (/^\w.+\(iteration \d+\)\n\nQ:/s.test(content)) score += 2;
+	score += Math.min((content.match(/\n/g) || []).length, 10);
+	return score;
+}
+
+function dedupeConsultationHistory(items) {
+	const result = [];
+	const byConsultation = new Map();
+	for (const item of items || []) {
+		const title = String(item?.title || "");
+		const content = String(item?.content || "");
+		if (/\(iteration \d+\)/.test(title) && /\bQ:\b/.test(content) && /\bA:\b/.test(content)) {
+			const qMatch = content.match(/\bQ:\s*([\s\S]*?)\bA:\s*/);
+			const questionKey = qMatch ? normalizeConsultationText(qMatch[1]).slice(0, 400) : normalizeConsultationText(content).slice(0, 400);
+			const key = `${title}|${questionKey}`;
+			const existing = byConsultation.get(key);
+			if (!existing || consultationQuality(item) > consultationQuality(existing.item)) {
+				if (existing) result[existing.index] = item;
+				else {
+					byConsultation.set(key, { item, index: result.length });
+					result.push(item);
+				}
+			}
+			continue;
+		}
+		result.push(item);
+	}
+	return result;
+}
+
+const THEME_CSS = `
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --background: oklch(0.9818 0.0054 95.0986);
+  --foreground: oklch(0.3438 0.0269 95.7226);
+  --card: oklch(0.9818 0.0054 95.0986);
+  --card-foreground: oklch(0.1908 0.0020 106.5859);
+  --primary: oklch(0.6171 0.1375 39.0427);
+  --primary-foreground: oklch(1.0000 0 0);
+  --secondary: oklch(0.9245 0.0138 92.9892);
+  --secondary-foreground: oklch(0.4334 0.0177 98.6048);
+  --muted: oklch(0.9341 0.0153 90.2390);
+  --muted-foreground: oklch(0.6059 0.0075 97.4233);
+  --accent: oklch(0.9245 0.0138 92.9892);
+  --accent-foreground: oklch(0.2671 0.0196 98.9390);
+  --destructive: oklch(0.6368 0.2078 25.3313);
+  --border: oklch(0.8847 0.0069 97.3627);
+  --ring: oklch(0.6171 0.1375 39.0427);
+  --radius: 0.5rem;
+  --green: oklch(0.62 0.17 145);
+  --yellow: oklch(0.75 0.15 85);
+  --cyan: oklch(0.72 0.12 195);
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+.dark{
+  --background: oklch(0.2679 0.0036 106.6427);
+  --foreground: oklch(0.8074 0.0142 93.0137);
+  --card: oklch(0.2679 0.0036 106.6427);
+  --card-foreground: oklch(0.9818 0.0054 95.0986);
+  --primary: oklch(0.6724 0.1308 38.7559);
+  --primary-foreground: oklch(1.0000 0 0);
+  --secondary: oklch(0.9818 0.0054 95.0986);
+  --secondary-foreground: oklch(0.3085 0.0035 106.6039);
+  --muted: oklch(0.2213 0.0038 106.7070);
+  --muted-foreground: oklch(0.7713 0.0169 99.0657);
+  --accent: oklch(0.2130 0.0078 95.4245);
+  --accent-foreground: oklch(0.9663 0.0080 98.8792);
+  --destructive: oklch(0.6368 0.2078 25.3313);
+  --border: oklch(0.3618 0.0101 106.8928);
+  --ring: oklch(0.6724 0.1308 38.7559);
+  --green: oklch(0.72 0.17 145);
+  --yellow: oklch(0.80 0.14 85);
+  --cyan: oklch(0.78 0.10 195);
+}
+body{background:var(--background);color:var(--foreground);min-height:100vh;padding:0;transition:background .3s,color .3s}
+.container{max-width:1400px;margin:0 auto;padding:16px 20px}
+a{color:var(--primary);text-decoration:none}
+a:hover{text-decoration:underline}
+.nav{display:flex;align-items:center;gap:20px;padding:16px 0;border-bottom:1px solid var(--border)}
+.nav-brand{font-size:1.1rem;font-weight:700;color:var(--primary);letter-spacing:1px}
+.nav-links{display:flex;gap:16px;flex:1}
+.nav-link{padding:4px 12px;border-radius:var(--radius);font-size:.82rem;font-weight:500;color:var(--muted-foreground);transition:all .2s}
+.nav-link:hover,.nav-link.active{background:var(--accent);color:var(--accent-foreground);text-decoration:none}
+.theme-toggle{background:var(--accent);border:1px solid var(--border);border-radius:var(--radius);padding:5px 10px;cursor:pointer;color:var(--accent-foreground);font-size:.72rem;font-weight:500}
+.badge{padding:3px 10px;border-radius:calc(var(--radius) - 2px);font-size:.75rem;font-weight:500;background:var(--secondary);color:var(--secondary-foreground);border:1px solid var(--border)}
+`;
+
+const THEME_JS = `
+function toggleTheme(){document.body.classList.toggle('dark');var d=document.body.classList.contains('dark');document.getElementById('theme-btn').textContent=d?'Light':'Dark';localStorage.setItem('pi-dash-theme',d?'dark':'light')}
+(function(){var s=localStorage.getItem('pi-dash-theme');if(s==='light'){document.body.classList.remove('dark');document.getElementById('theme-btn').textContent='Dark'}})();
+`;
+
+function readState() {
+	try { return mergeConsultationsIntoState(JSON.parse(fs.readFileSync(stateFile, "utf-8"))); }
+	catch { return null; }
+}
+
+function broadcastState() {
+	const state = readState();
+	if (!state) return;
+	const msg = `data: ${JSON.stringify(state)}\n\n`;
+	for (const res of sseClients) {
+		try { res.write(msg); } catch { sseClients.delete(res); }
+	}
+}
+
+function logChat(entry) {
+	chatLog.push({ ts: new Date().toISOString(), ...entry });
+	if (chatLog.length > 200) chatLog.shift();
+}
+
+const controlServer = net.createServer((socket) => {
+	let buffer = "";
+	socket.setEncoding("utf-8");
+	socket.on("data", (chunk) => {
+		buffer += chunk;
+		let nl;
+		while ((nl = buffer.indexOf("\n")) !== -1) {
+			const line = buffer.slice(0, nl).trim();
+			buffer = buffer.slice(nl + 1);
+			if (!line) continue;
+			try {
+				const cmd = JSON.parse(line);
+				handleControlCommand(cmd, socket);
+			} catch (err) {
+				socket.write(JSON.stringify({ success: false, error: String(err?.message || err) }) + "\n");
+			}
+		}
+	});
+	socket.on("error", () => {});
+	socket.on("close", () => {
+		for (const [id, agent] of registeredAgents) {
+			if (agent.socket === socket) registeredAgents.delete(id);
+		}
+	});
+});
+
+function handleControlCommand(cmd, socket) {
+	switch (cmd.type) {
+		case "register":
+			registeredAgents.set(cmd.agentId, { socket, sessionKey: cmd.sessionKey || cmd.agentId, info: cmd.info || {} });
+			socket.write(JSON.stringify({ success: true, command: "register" }) + "\n");
+			break;
+		case "unregister":
+			registeredAgents.delete(cmd.agentId);
+			socket.write(JSON.stringify({ success: true, command: "unregister" }) + "\n");
+			break;
+		case "list_agents":
+			socket.write(JSON.stringify({
+				success: true,
+				command: "list_agents",
+				agents: Array.from(registeredAgents.entries()).map(([agentId, entry]) => ({ agentId, sessionKey: entry.sessionKey, info: entry.info })),
+			}) + "\n");
+			break;
+		case "chat":
+		case "steer":
+		case "follow_up": {
+			const agentId = cmd.agentId || "blueprint-main";
+			const agent = registeredAgents.get(agentId);
+			if (!agent) {
+				socket.write(JSON.stringify({ success: false, error: `agent not found: ${agentId}` }) + "\n");
+				return;
+			}
+			agent.socket.write(JSON.stringify({ forward: true, type: cmd.type, message: cmd.message || "", agentId }) + "\n");
+			socket.write(JSON.stringify({ success: true, command: cmd.type }) + "\n");
+			break;
+		}
+		default:
+			socket.write(JSON.stringify({ success: false, error: `unknown command: ${cmd.type}` }) + "\n");
+	}
+}
+
+let lastMtime = 0;
+setInterval(() => {
+	try {
+		const stat = fs.statSync(stateFile);
+		if (stat.mtimeMs !== lastMtime) {
+			lastMtime = stat.mtimeMs;
+			broadcastState();
+		}
+	} catch {}
+}, 500);
+
+const server = http.createServer((req, res) => {
+	if (req.url === "/api/state") {
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
+		res.end(JSON.stringify(readState()));
+		return;
+	}
+	if (req.url === "/api/version") {
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
+		res.end(JSON.stringify({ version: SCRIPT_VERSION }));
+		return;
+	}
+	if (req.url === "/api/chat-log") {
+		res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" });
+		res.end(JSON.stringify({ log: chatLog }));
+		return;
+	}
+	if (req.url === "/events") {
+		res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", "Connection": "keep-alive", "Access-Control-Allow-Origin": "*" });
+		res.write("\n");
+		sseClients.add(res);
+		const state = readState();
+		if (state) res.write(`data: ${JSON.stringify(state)}\n\n`);
+		req.on("close", () => sseClients.delete(res));
+		return;
+	}
+	if (req.url === "/api/chat" && req.method === "POST") {
+		let body = "";
+		req.on("data", c => body += c);
+		req.on("end", () => {
+			res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+			try {
+				const cmd = JSON.parse(body || "{}");
+				const agent = registeredAgents.get("blueprint-main");
+				if (!agent) {
+					res.end(JSON.stringify({ success: false, error: "blueprint-main not connected" }));
+					return;
+				}
+				const message = String(cmd.message || "").trim();
+				if (!message) {
+					res.end(JSON.stringify({ success: false, error: "message is required" }));
+					return;
+				}
+				logChat({ type: "chat", message });
+				agent.socket.write(JSON.stringify({ forward: true, type: "chat", message, agentId: "blueprint-main" }) + "\n");
+				res.end(JSON.stringify({ success: true }));
+			} catch (err) {
+				res.end(JSON.stringify({ success: false, error: String(err?.message || err) }));
+			}
+		});
+		return;
+	}
+
+	res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+	res.end(HTML);
+});
+
+controlServer.listen(controlPort, "127.0.0.1");
+server.listen(port, "127.0.0.1", () => {
+	console.log(`Blueprint Web Mirror: http://127.0.0.1:${port}`);
+});
+
+const HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Blueprint Control Center</title>
+<style>${THEME_CSS}
+.status-bar{display:flex;align-items:center;gap:16px;padding:14px 0;flex-wrap:wrap}
+.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.status-dot.running{background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 1.5s infinite}
+.status-dot.idle{background:var(--muted-foreground)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.layout{display:grid;grid-template-columns:1.15fr .85fr;gap:20px;margin-top:20px;align-items:start}
+.layout > *{min-width:0;min-height:0}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;min-width:0}
+.panel h2,.panel h3{font-size:.82rem;color:var(--primary);margin-bottom:12px;font-weight:600}
+.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.metric{padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background)}
+.metric-value{font-size:1.7rem;font-weight:800;margin-bottom:6px}
+.metric-value.pass{color:var(--green)} .metric-value.warn{color:var(--yellow)} .metric-value.fail{color:var(--destructive)}
+.metric-meta,.muted{font-size:.75rem;color:var(--muted-foreground);line-height:1.5}
+.decision-list{display:grid;gap:8px}
+.decision-item{padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);font-size:.74rem;line-height:1.5}
+.chat-panel{display:flex;flex-direction:column;min-height:72vh;max-height:72vh;overflow:hidden}
+.chat-shell{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+.msgs{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;display:flex;flex-direction:column;align-items:stretch;gap:10px;padding-right:4px}
+.msg{padding:10px 12px;border-radius:var(--radius);border:1px solid var(--border);background:var(--background);white-space:normal;font-size:.78rem;line-height:1.55;overflow:visible;min-width:0;flex:0 0 auto}
+.msg.user{border-color:var(--primary)}
+.msg.assistant{border-color:var(--border)}
+.msg.tool{border-color:var(--cyan)}
+/* Adapted from the official VS Code markdown preview stylesheet:
+   https://raw.githubusercontent.com/microsoft/vscode/main/extensions/markdown-language-features/media/markdown.css */
+.msg-body.markdown-body{
+	--markdown-font-family:-apple-system,BlinkMacSystemFont,"Segoe WPC","Segoe UI",system-ui,"Ubuntu","Droid Sans",sans-serif;
+	--markdown-font-size:14px;
+	--markdown-line-height:22px;
+	--vscode-editor-font-family:"SF Mono",Monaco,Menlo,Consolas,"Ubuntu Mono","Liberation Mono","DejaVu Sans Mono","Courier New",monospace;
+	--vscode-editor-foreground:var(--foreground);
+	--vscode-textCodeBlock-background:var(--muted);
+	--vscode-widget-border:var(--border);
+	--vscode-textPreformat-foreground:var(--foreground);
+	--vscode-textBlockQuote-background:color-mix(in oklch,var(--background) 84%,var(--muted));
+	--vscode-textBlockQuote-border:var(--primary);
+	--vscode-textLink-foreground:var(--primary);
+	--vscode-textSeparator-foreground:var(--border);
+	font-family:var(--markdown-font-family);
+	font-size:var(--markdown-font-size);
+	line-height:var(--markdown-line-height);
+	word-wrap:break-word;
+	overflow-wrap:anywhere;
+	color:var(--foreground);
+}
+.msg-body.markdown-body :where(h1,h2,h3,h4,h5,h6,p,ol,ul,pre){margin-top:0}
+.msg-body.markdown-body :where(h1,h2,h3,h4,h5,h6){
+	font-weight:600;
+	margin-top:24px;
+	margin-bottom:16px;
+	line-height:1.25;
+}
+.msg-body.markdown-body :where(h1,h2,h3,h4,h5,h6):first-child{margin-top:0}
+.msg-body.markdown-body p{margin-bottom:16px}
+.msg-body.markdown-body li p{margin-bottom:.7em}
+.msg-body.markdown-body ul,
+.msg-body.markdown-body ol{margin:0 0 .7em 1.5em}
+.msg-body.markdown-body ul ul:first-child,
+.msg-body.markdown-body ul ol:first-child,
+.msg-body.markdown-body ol ul:first-child,
+.msg-body.markdown-body ol ol:first-child{margin-bottom:0}
+.msg-body.markdown-body li{margin:0}
+.msg-body.markdown-body img,
+.msg-body.markdown-body video{max-width:100%;max-height:100%}
+.msg-body.markdown-body a{color:var(--vscode-textLink-foreground);text-decoration:none}
+.msg-body.markdown-body a:hover{text-decoration:underline}
+.msg-body.markdown-body hr{
+	border:0;
+	height:1px;
+	border-bottom:1px solid var(--vscode-textSeparator-foreground);
+}
+.msg-body.markdown-body h1{
+	font-size:2em;
+	padding-bottom:.3em;
+	border-bottom:1px solid var(--vscode-textSeparator-foreground);
+}
+.msg-body.markdown-body h2{
+	font-size:1.5em;
+	padding-bottom:.3em;
+	border-bottom:1px solid var(--vscode-textSeparator-foreground);
+}
+.msg-body.markdown-body h3{font-size:1.25em}
+.msg-body.markdown-body h4{font-size:1em}
+.msg-body.markdown-body h5{font-size:.875em}
+.msg-body.markdown-body h6{font-size:.85em}
+.msg-body.markdown-body table{
+	display:block;
+	max-width:100%;
+	overflow:auto;
+	border-collapse:collapse;
+	margin-bottom:.7em;
+}
+.msg-body.markdown-body th{
+	text-align:left;
+	border-bottom:1px solid var(--vscode-textSeparator-foreground);
+}
+.msg-body.markdown-body th,
+.msg-body.markdown-body td{
+	padding:5px 10px;
+	vertical-align:top;
+}
+.msg-body.markdown-body table > tbody > tr + tr > td{
+	border-top:1px solid var(--vscode-textSeparator-foreground);
+}
+.msg-body.markdown-body blockquote{
+	margin:0 0 16px;
+	padding:0 16px 0 10px;
+	border-left:5px solid var(--vscode-textBlockQuote-border);
+	border-radius:2px;
+	background:var(--vscode-textBlockQuote-background);
+	color:var(--muted-foreground);
+}
+.msg-body.markdown-body code{
+	font-family:var(--vscode-editor-font-family);
+	font-size:1em;
+	line-height:1.357em;
+	background:var(--muted);
+	padding:1px 5px;
+	border-radius:4px;
+}
+.msg-body.markdown-body pre{
+	background-color:var(--vscode-textCodeBlock-background);
+	border:1px solid var(--vscode-widget-border);
+	padding:16px;
+	border-radius:3px;
+	overflow:auto;
+	margin:0 0 16px;
+}
+.msg-body.markdown-body pre code{
+	display:inline-block;
+	color:var(--vscode-editor-foreground);
+	background:none;
+	padding:0;
+	border-radius:0;
+	tab-size:4;
+}
+.msg-body.markdown-body > :last-child{margin-bottom:0}
+.qa-block{display:grid;gap:12px}
+.qa-heading{font-size:1rem;font-weight:700;color:var(--primary);margin:4px 0 2px}
+.qa-row{display:grid;gap:6px}
+.qa-label{font-weight:700;color:var(--foreground)}
+.qa-json{display:grid;gap:10px;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:color-mix(in oklch,var(--background) 90%,var(--muted))}
+.qa-json-kv{display:grid;gap:4px}
+.qa-json-key{font-weight:700;color:var(--primary)}
+.qa-json-key em{font-style:italic}
+.qa-json-children{display:grid;gap:10px;padding-left:14px;border-left:2px solid var(--border)}
+.qa-json-array{display:grid;gap:8px;padding-left:14px;border-left:2px dashed var(--border)}
+.qa-json-index{font-size:.72rem;font-weight:700;color:var(--muted-foreground);text-transform:uppercase;letter-spacing:.04em}
+.qa-json-primitive{white-space:pre-wrap;overflow-wrap:anywhere}
+.chat-form{display:grid;gap:10px}
+.chat-input{width:100%;min-height:120px;max-height:220px;padding:12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);color:var(--foreground);font-size:.82rem;font-family:inherit;resize:vertical}
+.chat-input:focus{outline:none;border-color:var(--ring);box-shadow:0 0 0 2px oklch(0.62 0.13 39 / .2)}
+.btn{padding:10px 16px;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;font-size:.78rem;font-weight:600;font-family:inherit;background:var(--primary);color:var(--primary-foreground)}
+.btn:hover{opacity:.9}
+.updated{font-size:.7rem;color:var(--muted-foreground);text-align:right;padding:8px 0}
+@media(max-width:960px){.container{padding:10px}.layout,.summary-grid{grid-template-columns:1fr}.chat-panel{min-height:60vh;max-height:60vh}}
+</style>
+</head>
+<body class="dark"><div class="container">
+	<nav class="nav">
+		<span class="nav-brand">BLUEPRINT CONTROL CENTER</span>
+		<div class="nav-links">
+			<a href="/" class="nav-link active">Blueprint</a>
+		</div>
+		<button class="theme-toggle" onclick="toggleTheme()" id="theme-btn">Light</button>
+	</nav>
+	<div class="status-bar">
+		<span class="status-dot idle" id="statusDot"></span>
+		<strong>LIVE</strong>
+		<span class="badge" id="statusLine">Connecting...</span>
+		<span class="muted" id="urlLine">http://127.0.0.1:${port}</span>
+	</div>
+	<div class="layout">
+		<div>
+			<div class="panel">
+			<h2>Progress</h2>
+			<div class="summary-grid">
+				<div class="metric">
+					<h3>Blueprint Score</h3>
+					<div class="metric-value" id="scoreValue">--</div>
+					<div class="metric-meta" id="scoreMeta">Waiting for state…</div>
+				</div>
+				<div class="metric">
+					<h3>Alignment</h3>
+					<div class="metric-value" id="alignValue">--</div>
+					<div class="metric-meta" id="alignMeta">Waiting for state…</div>
+				</div>
+				<div class="metric">
+					<h3>Phase</h3>
+					<div class="metric-value" id="phaseValue">idle</div>
+					<div class="metric-meta" id="phaseMeta">Iteration --</div>
+				</div>
+				<div class="metric">
+					<h3>Rebuild</h3>
+					<div class="metric-value" id="rebuildValue">idle</div>
+					<div class="metric-meta" id="rebuildMeta">No active rebuild</div>
+				</div>
+			</div>
+			</div>
+			<div class="panel" style="margin-top:12px">
+				<h3>Recent Decisions</h3>
+				<div class="decision-list" id="decisionList"><div class="muted">No transcript segments yet.</div></div>
+			</div>
+		</div>
+		<div class="panel chat-panel">
+			<h2>Blueprint Chat</h2>
+			<div class="chat-shell">
+			<div class="msgs" id="chat"></div>
+			<form id="chatForm" class="chat-form">
+				<textarea id="chatInput" class="chat-input" placeholder="Discuss gaps, ask for revision, or pressure-test decisions..."></textarea>
+				<button type="submit" class="btn">Send to Pi Blueprint</button>
+			</form>
+			</div>
+		</div>
+	</div>
+	<div class="updated" id="updated">waiting for state...</div>
+<script>${THEME_JS}
+	const el = (id) => document.getElementById(id);
+	const chat = el('chat');
+	const decisionList = el('decisionList');
+	let cumulativeChatHistory = [];
+	let shouldStickChatToBottom = true;
+
+	function scoreClass(score) {
+		if (score > 95) return 'pass';
+		if (score > 85) return 'warn';
+		return 'fail';
+	}
+
+	function esc(value) {
+		if (value == null) return '';
+		return String(value)
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
+	}
+
+	function parseInlineMarkdown(text) {
+		const tick = '\u0060';
+		return esc(text)
+			.replace(new RegExp(tick + '([^' + tick + ']+)' + tick, 'g'), '<code>$1</code>')
+			.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+			.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+	}
+
+	function isTableSeparator(line) {
+		return /^\s*\|?[\s:-]+\|[\s|:-]*$/.test(line);
+	}
+
+	function parseMarkdownTable(lines, start) {
+		if (start + 1 >= lines.length) return null;
+		const header = lines[start];
+		const separator = lines[start + 1];
+		if (!header.includes('|') || !isTableSeparator(separator)) return null;
+		const rows = [];
+		let i = start;
+		while (i < lines.length && lines[i].includes('|')) {
+			rows.push(lines[i]);
+			i++;
+		}
+			const splitRow = (row) => row.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => parseInlineMarkdown(cell.trim()));
+		const head = splitRow(rows[0]);
+		const body = rows.slice(2).map(splitRow);
+		const html = [
+			'<table><thead><tr>',
+			head.map(cell => '<th>' + cell + '</th>').join(''),
+			'</tr></thead><tbody>',
+			body.map(row => '<tr>' + row.map(cell => '<td>' + cell + '</td>').join('') + '</tr>').join(''),
+			'</tbody></table>',
+		].join('');
+		return { html, nextIndex: i };
+	}
+
+	function renderMarkdown(text) {
+		const lines = String(text || '').split('\n');
+		const parts = [];
+		const fence = '\u0060\u0060\u0060';
+		let i = 0;
+		while (i < lines.length) {
+			const line = lines[i];
+			if (!line.trim()) { i++; continue; }
+			if (line.startsWith(fence)) {
+				const lang = line.slice(3).trim();
+				const body = [];
+				i++;
+				while (i < lines.length && !lines[i].startsWith(fence)) {
+					body.push(lines[i]);
+					i++;
+				}
+				if (i < lines.length) i++;
+				parts.push('<pre><code class="lang-' + esc(lang) + '">' + esc(body.join('\n')) + '</code></pre>');
+				continue;
+			}
+			const table = parseMarkdownTable(lines, i);
+			if (table) {
+				parts.push(table.html);
+				i = table.nextIndex;
+				continue;
+			}
+				if (/^###\s+/.test(line)) { parts.push('<h3>' + parseInlineMarkdown(line.replace(/^###\s+/, '')) + '</h3>'); i++; continue; }
+				if (/^##\s+/.test(line)) { parts.push('<h2>' + parseInlineMarkdown(line.replace(/^##\s+/, '')) + '</h2>'); i++; continue; }
+				if (/^#\s+/.test(line)) { parts.push('<h1>' + parseInlineMarkdown(line.replace(/^#\s+/, '')) + '</h1>'); i++; continue; }
+				if (/^>\s?/.test(line)) { parts.push('<blockquote>' + parseInlineMarkdown(line.replace(/^>\s?/, '')) + '</blockquote>'); i++; continue; }
+				if (/^[-*]\s+/.test(line)) {
+					const items = [];
+					while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+						items.push('<li>' + parseInlineMarkdown(lines[i].replace(/^[-*]\s+/, '')) + '</li>');
+						i++;
+					}
+					parts.push('<ul>' + items.join('') + '</ul>');
+					continue;
+				}
+				if (/^\d+\.\s+/.test(line)) {
+					const items = [];
+					while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+						items.push('<li>' + parseInlineMarkdown(lines[i].replace(/^\d+\.\s+/, '')) + '</li>');
+						i++;
+					}
+					parts.push('<ol>' + items.join('') + '</ol>');
+					continue;
+				}
+				const paragraph = [];
+				while (i < lines.length && lines[i].trim() && !lines[i].startsWith(fence) && !/^#/.test(lines[i]) && !/^[-*]\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i]) && !/^>\s?/.test(lines[i])) {
+					const maybeTable = parseMarkdownTable(lines, i);
+				if (maybeTable) break;
+				paragraph.push(lines[i]);
+				i++;
+			}
+			parts.push('<p>' + parseInlineMarkdown(paragraph.join(' ')) + '</p>');
+		}
+		return parts.join('');
+	}
+
+	function tryParseJson(text) {
+		const trimmed = String(text || '').trim();
+		if (!trimmed) return null;
+		if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return null;
+		try { return JSON.parse(trimmed); } catch {}
+		try {
+			const repaired = trimmed
+				.replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'(\s*[,}])/g, (_m, value, suffix) => {
+					return ': ' + JSON.stringify(value) + suffix;
+				})
+				.replace(/,\s*([}\]])/g, '$1');
+			return JSON.parse(repaired);
+		} catch {
+			return null;
+		}
+	}
+
+	function renderJsonFallback(text) {
+		return '<pre><code class="lang-json">' + esc(String(text || '').trim()) + '</code></pre>';
+	}
+
+	function renderJsonValue(value, depth = 0) {
+		if (value == null) return '<div class="qa-json-primitive">' + esc(String(value)) + '</div>';
+		if (typeof value === 'string') return '<div class="qa-json-primitive">' + renderMarkdown(value) + '</div>';
+		if (typeof value === 'number' || typeof value === 'boolean') return '<div class="qa-json-primitive">' + esc(String(value)) + '</div>';
+		if (Array.isArray(value)) {
+			if (!value.length) return '<div class="qa-json-primitive">[]</div>';
+			return '<div class="qa-json-array">' + value.map((item, index) =>
+				'<div class="qa-json-kv"><div class="qa-json-index">Item ' + (index + 1) + '</div><div>' + renderJsonValue(item, depth + 1) + '</div></div>'
+			).join('') + '</div>';
+		}
+		const entries = Object.entries(value);
+		if (!entries.length) return '<div class="qa-json-primitive">{}</div>';
+		return '<div class="' + (depth === 0 ? 'qa-json' : 'qa-json-children') + '">' + entries.map(([key, item]) =>
+			'<div class="qa-json-kv"><div class="qa-json-key"><strong><em>' + esc(key) + ':</em></strong></div><div>' + renderJsonValue(item, depth + 1) + '</div></div>'
+		).join('') + '</div>';
+	}
+
+	function renderQaContent(text) {
+		const source = String(text || '');
+		const rawJson = tryParseJson(source);
+		if (rawJson != null) {
+			return renderJsonValue(rawJson);
+		}
+		const qMatch = source.match(/(?:^|\n)Q:\s*/);
+		const aMatch = source.match(/(?:^|\n)A:\s*/);
+		if (!qMatch || !aMatch || aMatch.index <= qMatch.index) return null;
+		const prefix = source.slice(0, qMatch.index).trim();
+		const question = source.slice(qMatch.index + qMatch[0].length, aMatch.index).trim();
+		const answer = source.slice(aMatch.index + aMatch[0].length).trim();
+		const parsedAnswer = tryParseJson(answer);
+		const parts = ['<div class="qa-block">'];
+		if (prefix) {
+			parts.push('<div class="qa-heading">' + esc(prefix) + '</div>');
+		}
+		if (question) {
+			parts.push('<div class="qa-row"><div class="qa-label"><strong><em>Q:</em></strong></div><div>' + renderMarkdown(question) + '</div></div>');
+		}
+		if (answer) {
+			parts.push('<div class="qa-row"><div class="qa-label"><strong><em>A:</em></strong></div><div>' + (parsedAnswer != null ? renderJsonValue(parsedAnswer) : tryParseJson(answer) === null && /^[\[{]/.test(answer.trim()) ? renderJsonFallback(answer) : renderMarkdown(answer)) + '</div></div>');
+		}
+		parts.push('</div>');
+		return parts.join('');
+	}
+
+	function renderConsultationSections(text) {
+		const source = String(text || '');
+		const sectionRegex = /(^|\n)(?:###\s*)?([^\n]+\(iteration \d+\))\n(?:\*\*Q:\*\*|Q:)\s*([\s\S]*?)\n(?:\*\*A:\*\*|A:)\s*([\s\S]*?)(?=\n(?:###\s*)?[^\n]+\(iteration \d+\)\n(?:\*\*Q:\*\*|Q:)|\n*$)/g;
+		let match;
+		let lastIndex = 0;
+		const pieces = [];
+		while ((match = sectionRegex.exec(source)) !== null) {
+			const start = match.index + (match[1] ? match[1].length : 0);
+			if (start > lastIndex) {
+				const before = source.slice(lastIndex, start).trim();
+				if (before) pieces.push(renderMarkdown(before));
+			}
+			const title = match[2].trim();
+			const question = match[3].trim();
+			const answer = match[4].trim();
+			const parsedAnswer = tryParseJson(answer);
+			pieces.push([
+				'<div class="qa-block">',
+				'<div class="qa-heading">' + esc(title) + '</div>',
+				question ? '<div class="qa-row"><div class="qa-label"><strong><em>Q:</em></strong></div><div>' + renderMarkdown(question) + '</div></div>' : '',
+				answer ? '<div class="qa-row"><div class="qa-label"><strong><em>A:</em></strong></div><div>' + (parsedAnswer != null ? renderJsonValue(parsedAnswer) : /^[\[{]/.test(answer.trim()) ? renderJsonFallback(answer) : renderMarkdown(answer)) + '</div></div>' : '',
+				'</div>',
+			].join(''));
+			lastIndex = sectionRegex.lastIndex;
+		}
+		if (!pieces.length) return null;
+		const tail = source.slice(lastIndex).trim();
+		if (tail) pieces.push(renderMarkdown(tail));
+		return pieces.join('');
+	}
+
+	function compactEmbeddedConsultationHistory(text) {
+		const source = String(text || '');
+		const marker = '## Previous Specialist Consultations';
+		const index = source.indexOf(marker);
+		if (index === -1) return source;
+		const before = source.slice(0, index).trimEnd();
+		const after = source.slice(index);
+		if (!/(?:###\s*)?[^\n]+\(iteration \d+\)\n(?:\*\*Q:\*\*|Q:)/.test(after)) return source;
+		return [
+			before,
+			'## Previous Specialist Consultations',
+			'Formatted consultation entries are shown separately in this chat view.',
+		].filter(Boolean).join('\n\n');
+	}
+
+	function renderMessageContent(text) {
+		const compacted = compactEmbeddedConsultationHistory(text);
+		const consultationSections = renderConsultationSections(compacted);
+		if (consultationSections) return consultationSections;
+		const qa = renderQaContent(compacted);
+		if (qa) return qa;
+		return renderMarkdown(compacted);
+	}
+
+	function mergeChatHistory(items) {
+		const seen = new Set(cumulativeChatHistory.map(item => item._key));
+		for (const item of items || []) {
+			const key = String(item.timestamp || '') + '|' + String(item.role || '') + '|' + String(item.title || '') + '|' + String(item.content || '');
+			if (seen.has(key)) continue;
+			cumulativeChatHistory.push({ ...item, _key: key });
+			seen.add(key);
+		}
+		cumulativeChatHistory.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+	}
+
+	function renderState(state) {
+		if (!state) return;
+		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+		const wasNearBottom = distanceFromBottom <= 40 || shouldStickChatToBottom;
+		el('statusDot').className = 'status-dot ' + (state.phase === 'idle' ? 'idle' : 'running');
+		el('statusLine').textContent = state.phase || 'connected';
+		el('urlLine').textContent = state.webUrl || window.location.href;
+		el('scoreValue').textContent = state.reviewScore ? state.reviewScore.score + '/100' : '--';
+		el('scoreValue').className = 'metric-value ' + scoreClass(state.reviewScore ? state.reviewScore.score : 0);
+		el('scoreMeta').textContent = state.reviewScore
+			? state.reviewScore.ready
+				? 'Review gate clear'
+				: state.reviewScore.effortTarget
+			: 'Waiting for review data';
+		el('alignValue').textContent = state.lastAlignmentCheck ? state.lastAlignmentCheck.score + '/100' : '--';
+		el('alignValue').className = 'metric-value ' + scoreClass(state.lastAlignmentCheck ? state.lastAlignmentCheck.score : 0);
+		el('alignMeta').textContent = state.lastAlignmentCheck ? (state.lastAlignmentCheck.status + ' · ' + state.lastAlignmentCheck.summary) : 'Not run';
+		el('phaseValue').textContent = state.phase || 'idle';
+		el('phaseMeta').textContent = 'Iteration ' + (state.iteration || 0) + ' · ' + (state.consultationCount || 0) + ' consultations';
+		el('rebuildValue').textContent = state.rebuildProgress ? (state.rebuildProgress.stage + ' ' + state.rebuildProgress.current + '/' + state.rebuildProgress.total) : 'idle';
+		el('rebuildMeta').textContent = state.rebuildProgress ? state.rebuildProgress.detail : 'No active rebuild';
+		decisionList.innerHTML = '';
+		const decisions = (state.chatHistory || []).slice(-6);
+		if (!decisions.length) {
+			decisionList.innerHTML = '<div class="muted">No transcript segments yet.</div>';
+		} else {
+			for (const item of decisions) {
+				const row = document.createElement('div');
+				row.className = 'decision-item';
+				row.textContent = '[' + item.role + '] ' + item.content.slice(0, 180);
+				decisionList.appendChild(row);
+			}
+		}
+		mergeChatHistory(state.chatHistory || []);
+		chat.innerHTML = '';
+		for (const item of cumulativeChatHistory) {
+			const div = document.createElement('div');
+			div.className = 'msg ' + item.role;
+			div.innerHTML = '<div class="msg-body markdown-body">' + renderMessageContent(item.content) + '</div>';
+			chat.appendChild(div);
+		}
+		if (wasNearBottom) {
+			chat.scrollTop = chat.scrollHeight;
+			shouldStickChatToBottom = true;
+		}
+		el('updated').textContent = 'updated ' + new Date(state.updatedAt || Date.now()).toLocaleTimeString();
+	}
+
+	async function refresh() {
+		try {
+			const res = await fetch('/api/state');
+			renderState(await res.json());
+		} catch {}
+	}
+
+	new EventSource('/events').onmessage = (event) => {
+		try { renderState(JSON.parse(event.data)); } catch {}
+	};
+
+	el('chatForm').addEventListener('submit', async (event) => {
+		event.preventDefault();
+		const input = el('chatInput');
+		const message = input.value.trim();
+		if (!message) return;
+		await fetch('/api/chat', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ message }),
+		});
+		input.value = '';
+	});
+
+	chat.addEventListener('scroll', () => {
+		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+		shouldStickChatToBottom = distanceFromBottom <= 40;
+	});
+
+	refresh();
+</script>
+</div></body>
+</html>`;
