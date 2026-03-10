@@ -840,6 +840,7 @@ cd ~/.pi-init && npm install @mariozechner/pi-tui
 # 4. Add aliases to ~/.zshrc
 _PIX="$HOME/.pi-init/extensions"
 alias pi-dev='pi -ne -e "$_PIX/dev-pipeline.ts" -e "$_PIX/theme-cycler.ts"'
+alias pi-blueprint='pi -ne -e "$_PIX/pi-blueprint.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-req='pi -ne -e "$_PIX/req-qa.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-dash='~/.pi-init/bin/pipeline-dashboard'
 
@@ -861,6 +862,7 @@ brew install glow
 
 | Alias | Purpose |
 |-------|---------|
+| `pi-blueprint` | Launch the new planning extension baseline |
 | `pi-req` | Launch requirements discovery session |
 | `pi-dev` | Launch sprint development pipeline |
 | `pi-dash` | Launch standalone terminal dashboard |
@@ -869,6 +871,19 @@ brew install glow
 ---
 
 ## Commands Reference
+
+### pi-blueprint Commands
+
+| Command | Description |
+|---------|-------------|
+| `/blueprint-status` | Show current phase and consultation count |
+| `/blueprint-history` | Show all specialist consultations |
+| `/blueprint-logs` | Open all specialist logs in tmux panes |
+| `/blueprint-watch <name>` | Tail a specific specialist's log |
+| `/blueprint-close-panes` | Close all tmux log panes |
+| `/blueprint-prd` | View PRD in glow (rendered markdown) |
+| `/blueprint-rebuild-issues` | Re-publish all GitHub issues from checklist |
+| `/blueprint-reset` | Clear session state and start fresh |
 
 ### req-qa Commands
 
@@ -909,6 +924,7 @@ brew install glow
 pi-extensions/
 ├── README.md
 ├── extensions/
+│   ├── pi-blueprint.ts        # New planning extension baseline
 │   ├── req-qa.ts              # Requirements discovery extension (~1640 lines)
 │   ├── dev-pipeline.ts        # Sprint development extension (~5050 lines)
 │   ├── bailian-provider.ts    # Alibaba Cloud Bailian provider
