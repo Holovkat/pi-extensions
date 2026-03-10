@@ -99,6 +99,76 @@ interface BlueprintReviewScoreSummary {
 	effortKind: "required" | "none";
 }
 
+interface BlueprintWebSpecialistCardState {
+	id: string;
+	label: string;
+	color: string;
+	statusIcon: string;
+	statusTone: "active" | "done" | "idle";
+	statusText: string;
+	detail: string;
+	question: string;
+	response: string;
+	timestamp: string | null;
+	isActive: boolean;
+	isRebuildLane: boolean;
+	iteration: number | null;
+}
+
+interface BlueprintWebScoreCardState {
+	score: number;
+	label: string;
+	tone: "success" | "warning" | "error";
+	active: boolean;
+	prdExists: boolean;
+	checklistExists: boolean;
+	gateLabel: string;
+	coverageLabel: string;
+	alignmentLabel: string;
+	effortLabel: string;
+	revisionRequired: boolean;
+	revisionLabel: string;
+	revisionSummary: string;
+	revisionActions: string;
+	openMode: string;
+}
+
+interface BlueprintWebInfoCardState {
+	title: string;
+	score: number;
+	statusText: string;
+	summary: string;
+	evidence: string;
+	commandLine: string;
+	tone: "success" | "warning" | "error";
+	active: boolean;
+	statusIcon: string;
+}
+
+interface BlueprintWebAssetCardState {
+	title: string;
+	statusText: string;
+	stateText: string;
+	sourceLine: string;
+	warning: string;
+	commandLine: string;
+	tone: "success" | "warning" | "error";
+	active: boolean;
+	statusIcon: string;
+	status: "ready" | "partial" | "error" | "not-checked";
+}
+
+interface BlueprintWebWidgetMirrorState {
+	phaseLabel: string;
+	specialists: BlueprintWebSpecialistCardState[];
+	scoreCard: BlueprintWebScoreCardState;
+	alignmentCard: BlueprintWebInfoCardState;
+	assetCard: BlueprintWebAssetCardState;
+	consultationCount: number;
+	specialistsCovered: number;
+	totalSpecialists: number;
+}
+
 interface BlueprintWebState {
 	phase: Phase;
 	iteration: number;
@@ -113,6 +183,7 @@ interface BlueprintWebState {
 	webUrl: string;
 	prdPath: string | null;
 	checklistPath: string | null;
+	widgetMirror: BlueprintWebWidgetMirrorState;
 	chatHistory: Array<{ role: string; timestamp: string; title: string; content: string }>;
 	updatedAt: string;
 }
@@ -1019,6 +1090,7 @@ export default function (pi: ExtensionAPI) {
 		const reviewScore = getBlueprintReviewScore(specialistNames);
 		const prdPath = join(ctx.cwd, "docs", "PRD.md");
 		const checklistPath = join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
+		const widgetMirror = buildBlueprintWidgetMirrorState(ctx);
 		return {
 			phase,
 			iteration,
@@ -1033,6 +1105,7 @@ export default function (pi: ExtensionAPI) {
 			webUrl: blueprintWebUrl,
 			prdPath: existsSync(prdPath) ? prdPath : null,
 			checklistPath: existsSync(checklistPath) ? checklistPath : null,
+			widgetMirror,
 			chatHistory: collectBlueprintChatHistory(ctx),
 			updatedAt: new Date().toISOString(),
 		};
@@ -1500,6 +1573,168 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
+	function getBlueprintPhaseLabel(): string {
+		return rebuildProgress?.active
+			? `Rebuilding GitHub issues — ${rebuildProgress.stage} ${rebuildProgress.current}/${rebuildProgress.total}`
+			: phase === "idle" ? "Describe what you want to build."
+			: phase === "interview" ? "Discovery interview in progress..."
+			: phase === "consulting" ? `Consulting ${displayName(activeConsultant)}...`
+			: phase === "review" ? "Reviewing findings — provide feedback or approve."
+			: phase === "finalizing" ? "Generating artifacts..."
+			: "Requirements discovery complete.";
+	}
+
+	function buildWebSpecialistCardState(name: string, record: ConsultRecord | null): BlueprintWebSpecialistCardState {
+		const spec = SPECIALISTS[name] || { label: displayName(name), color: "dim" };
+		const pulseOn = Math.floor(Date.now() / 450) % 2 === 0;
+		const isRebuildLane = name === "req-analyst" && rebuildProgress?.active;
+		const isActive = activeConsultant === name || !!isRebuildLane;
+		const hasConsulted = record !== null;
+
+		const statusIcon = isRebuildLane
+			? (pulseOn ? "●" : "○")
+			: isActive ? "●" : hasConsulted ? "✓" : "○";
+		const statusText = isRebuildLane
+			? `${rebuildProgress!.stage} ${rebuildProgress!.current}/${rebuildProgress!.total}`
+			: activeConsultant === name ? "consulting..." : hasConsulted ? `done (iter ${record!.iteration})` : "standby";
+		const detail = isRebuildLane
+			? rebuildProgress!.detail || "Publishing GitHub issues..."
+			: record ? record.question : "—";
+
+		return {
+			id: name,
+			label: spec.label,
+			color: spec.color,
+			statusIcon,
+			statusTone: isActive ? "active" : hasConsulted ? "done" : "idle",
+			statusText,
+			detail,
+			question: record?.question || "",
+			response: record?.response || "",
+			timestamp: record?.timestamp ? new Date(record.timestamp).toISOString() : null,
+			isActive,
+			isRebuildLane,
+			iteration: record?.iteration ?? null,
+		};
+	}
+
+	function buildWebScoreCardState(ctx: ExtensionContext, specialistNames: string[]): BlueprintWebScoreCardState {
+		const reviewScore = getBlueprintReviewScore(specialistNames);
+		const prdExists = existsSync(join(ctx.cwd, "docs", "PRD.md"));
+		const checklistExists = existsSync(join(ctx.cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md"));
+		const tone: "success" | "warning" | "error" = reviewScore.score > 95 ? "success" : reviewScore.score > 85 ? "warning" : "error";
+		const gateLabel = reviewScore.ready
+			? "Review gate: pass"
+			: reviewScore.source === "artifacts" && reviewScore.alignmentStatus === "pass" && reviewScore.coverageMissing.length > 0
+				? `Review needed: ${reviewScore.coverageMissing.map(displayName).join(", ")}`
+				: reviewScore.source === "artifacts"
+					? "Review needed: artifact gaps"
+					: `Review needed: ${reviewScore.missing.map(displayName).join(", ")}`;
+		const revisionRequired = !!pendingRevisionPrompt && !reviewScore.ready;
+		return {
+			score: reviewScore.score,
+			label: reviewScore.label,
+			tone,
+			active: !!activeWidgetCheck,
+			prdExists,
+			checklistExists,
+			gateLabel,
+			coverageLabel: `Planning coverage: ${reviewScore.coverageScore}/100`,
+			alignmentLabel: reviewScore.alignmentStatus === "not-run"
+				? "Artifact alignment: not run"
+				: `Artifact alignment: ${reviewScore.alignmentScore}/100 · ${reviewScore.alignmentStatus}`,
+			effortLabel: `${reviewScore.effortKind === "none" ? "Next step" : "Required next step"}: ${reviewScore.effortTarget}`,
+			revisionRequired,
+			revisionLabel: revisionRequired ? "Revision required" : "Revision clear",
+			revisionSummary: revisionRequired ? pendingRevisionPrompt!.message : "",
+			revisionActions: revisionRequired ? "/blueprint-revise [reason]  ·  /blueprint-dismiss-revision" : "",
+			openMode: isInTmux() ? "tmux+nano" : "antigravity",
+		};
+	}
+
+	function buildWebAlignmentCardState(): BlueprintWebInfoCardState {
+		const status = lastAlignmentCheck?.status ?? "needs-review";
+		const score = lastAlignmentCheck?.score ?? 0;
+		const statusText = status === "pass"
+			? "Alignment: pass"
+			: status === "error"
+				? "Alignment: error"
+				: "Alignment: review needed";
+		const summary = lastAlignmentCheck?.summary || "Run alignment to verify transcript-backed decisions.";
+		const evidence = lastAlignmentCheck?.evidence?.[0] || "No transcript evidence pinned yet.";
+		const pulseOn = Math.floor(Date.now() / 450) % 2 === 0;
+		const statusIcon = activeWidgetCheck === "alignment"
+			? (pulseOn ? "●" : "○")
+			: status === "pass"
+				? "✓"
+				: status === "error"
+					? "✗"
+					: "○";
+		return {
+			title: "Alignment Review",
+			score,
+			statusText,
+			summary,
+			evidence,
+			commandLine: "/blueprint-details  ·  /blueprint-check-alignment",
+			tone: status === "pass" ? "success" : status === "error" ? "error" : "warning",
+			active: activeWidgetCheck === "alignment",
+			statusIcon,
+		};
+	}
+
+	function buildWebAssetCardState(): BlueprintWebAssetCardState {
+		const sync = localAssetSync;
+		const changed = sync
+			? [
+				sync.created.length > 0 ? `created ${sync.created.length}` : "",
+				sync.updated.length > 0 ? `updated ${sync.updated.length}` : "",
+			].filter(Boolean).join(" · ") || "no local changes needed"
+			: "Run /blueprint-sync-assets";
+		const pulseOn = Math.floor(Date.now() / 450) % 2 === 0;
+		const statusIcon = activeWidgetCheck === "assets"
+			? (pulseOn ? "●" : "○")
+			: sync?.status === "ready"
+				? "✓"
+				: sync?.status === "partial"
+					? "!"
+					: "○";
+		return {
+			title: "Local Assets",
+			statusText: sync ? `${sync.present}/${sync.required} synced` : "not checked",
+			stateText: sync?.status === "ready"
+				? "Project assets: ready"
+				: sync?.status === "partial"
+					? "Project assets: partial"
+					: "Project assets: review needed",
+			sourceLine: "Repo source: agents/pi-blueprint + skills/pi-blueprint",
+			warning: sync?.missingSources?.length
+				? `Missing repo sources: ${sync.missingSources.join(", ")}`
+				: changed,
+			commandLine: "/blueprint-details  ·  /blueprint-sync-assets",
+			tone: sync?.status === "ready" ? "success" : sync?.status === "partial" ? "warning" : "error",
+			active: activeWidgetCheck === "assets",
+			statusIcon,
+			status: sync?.status ?? "not-checked",
+		};
+	}
+
+	function buildBlueprintWidgetMirrorState(ctx: ExtensionContext): BlueprintWebWidgetMirrorState {
+		const specialistNames = Object.keys(SPECIALISTS);
+		const lastConsultBySpec = new Map<string, ConsultRecord>();
+		for (const c of consultations) lastConsultBySpec.set(c.specialist, c);
+		return {
+			phaseLabel: getBlueprintPhaseLabel(),
+			specialists: specialistNames.map(name => buildWebSpecialistCardState(name, lastConsultBySpec.get(name) || null)),
+			scoreCard: buildWebScoreCardState(ctx, specialistNames),
+			alignmentCard: buildWebAlignmentCardState(),
+			assetCard: buildWebAssetCardState(),
+			consultationCount: consultations.length,
+			specialistsCovered: new Set(consultations.map(c => c.specialist)).size,
+			totalSpecialists: specialistNames.length,
+		};
+	}
+
 	function extractSessionMessageContent(entry: any): string {
 		const msg = entry.message;
 		if (!msg?.content) return "";
@@ -1959,14 +2194,7 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 
 			return {
 				render(width: number): string[] {
-					const phaseLabel = rebuildProgress?.active
-						? `Rebuilding GitHub issues — ${rebuildProgress.stage} ${rebuildProgress.current}/${rebuildProgress.total}`
-						: phase === "idle" ? "Describe what you want to build."
-						: phase === "interview" ? "Discovery interview in progress..."
-						: phase === "consulting" ? `Consulting ${displayName(activeConsultant)}...`
-						: phase === "review" ? "Reviewing findings — provide feedback or approve."
-						: phase === "finalizing" ? "Generating artifacts..."
-						: "Requirements discovery complete.";
+					const phaseLabel = getBlueprintPhaseLabel();
 
 					const headerLine = theme.fg("accent", theme.bold("Pi Blueprint")) +
 						theme.fg("muted", ` · `) +
@@ -2164,7 +2392,7 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 			iteration++;
 			const record: ConsultRecord = {
 				specialist: agentName,
-				question: question.slice(0, 200),
+				question,
 				response: result.output,
 				timestamp: Date.now(),
 				iteration,

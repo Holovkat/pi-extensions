@@ -24,6 +24,12 @@ const sseClients = new Set();
 const registeredAgents = new Map();
 const chatLog = [];
 const SCRIPT_VERSION = String(fs.statSync(fileURLToPath(import.meta.url)).mtimeMs);
+const SPECIALISTS = {
+	"req-analyst": { label: "Requirements", color: "accent" },
+	"tech-analyst": { label: "Technical", color: "success" },
+	"ux-analyst": { label: "UX & Workflows", color: "warning" },
+	"scenario-analyst": { label: "Scenarios", color: "error" },
+};
 
 function titleizeSpecialist(name) {
 	return String(name || "")
@@ -46,7 +52,6 @@ function mergeConsultationsIntoState(state) {
 	if (!state) return state;
 	const saved = readBlueprintSessionState();
 	const consults = Array.isArray(saved?.consultations) ? saved.consultations : [];
-	if (!consults.length) return state;
 	const existing = Array.isArray(state.chatHistory) ? state.chatHistory : [];
 	const merged = [...existing];
 	const seen = new Set(existing.map(item =>
@@ -68,8 +73,98 @@ function mergeConsultationsIntoState(state) {
 		seen.add(key);
 	}
 	merged.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+	const specialistNames = Object.keys(SPECIALISTS);
+	const reviewScore = state.reviewScore || null;
+	const lastBySpec = new Map();
+	for (const record of consults) lastBySpec.set(record?.specialist, record);
+	const phaseLabel = state.rebuildProgress?.active
+		? `Rebuilding GitHub issues — ${state.rebuildProgress.stage} ${state.rebuildProgress.current}/${state.rebuildProgress.total}`
+		: state.phase === "idle" ? "Describe what you want to build."
+		: state.phase === "interview" ? "Discovery interview in progress..."
+		: state.phase === "consulting" ? `Consulting ${titleizeSpecialist(state.activeConsultant)}...`
+		: state.phase === "review" ? "Reviewing findings — provide feedback or approve."
+		: state.phase === "finalizing" ? "Generating artifacts..."
+		: "Requirements discovery complete.";
+	const widgetMirror = state.widgetMirror || {
+		phaseLabel,
+		specialists: specialistNames.map((name) => {
+			const spec = SPECIALISTS[name];
+			const record = lastBySpec.get(name);
+			const isRebuildLane = name === "req-analyst" && !!state.rebuildProgress?.active;
+			const isActive = state.activeConsultant === name || isRebuildLane;
+			const hasConsulted = !!record;
+				return {
+					id: name,
+					label: spec.label,
+					color: spec.color,
+					statusIcon: isRebuildLane ? "●" : isActive ? "●" : hasConsulted ? "✓" : "○",
+					statusTone: isActive ? "active" : hasConsulted ? "done" : "idle",
+					statusText: isRebuildLane
+						? `${state.rebuildProgress.stage} ${state.rebuildProgress.current}/${state.rebuildProgress.total}`
+						: isActive ? "consulting..." : hasConsulted ? `done (iter ${record?.iteration ?? "?"})` : "standby",
+					detail: isRebuildLane ? (state.rebuildProgress?.detail || "Publishing GitHub issues...") : cleanSummaryText(record?.question || "—"),
+					question: record?.question || "",
+					response: record?.response || "",
+					timestamp: record?.timestamp || null,
+					isActive,
+					isRebuildLane,
+					iteration: record?.iteration ?? null,
+				};
+		}),
+		scoreCard: {
+			score: reviewScore?.score ?? 0,
+			label: reviewScore?.label ?? `${consults.length}/${specialistNames.length} specialists`,
+			tone: (reviewScore?.score ?? 0) > 95 ? "success" : (reviewScore?.score ?? 0) > 85 ? "warning" : "error",
+			active: false,
+			prdExists: !!state.prdPath,
+			checklistExists: !!state.checklistPath,
+			gateLabel: reviewScore?.ready ? "Review gate: pass" : "Review needed",
+			coverageLabel: `Planning coverage: ${reviewScore?.coverageScore ?? 0}/100`,
+			alignmentLabel: reviewScore?.alignmentStatus === "not-run" || reviewScore?.alignmentStatus == null
+				? "Artifact alignment: not run"
+				: `Artifact alignment: ${reviewScore?.alignmentScore ?? 0}/100 · ${reviewScore.alignmentStatus}`,
+			effortLabel: `${reviewScore?.effortKind === "none" ? "Next step" : "Required next step"}: ${reviewScore?.effortTarget || "Continue review"}`,
+			revisionRequired: !!state.pendingRevisionPrompt,
+			revisionLabel: state.pendingRevisionPrompt ? "Revision required" : "Revision clear",
+			revisionSummary: state.pendingRevisionPrompt?.message || "",
+			revisionActions: state.pendingRevisionPrompt ? "/blueprint-revise [reason]  ·  /blueprint-dismiss-revision" : "",
+			openMode: "tmux+nano",
+		},
+		alignmentCard: {
+			title: "Alignment Review",
+			score: state.lastAlignmentCheck?.score ?? 0,
+			statusText: state.lastAlignmentCheck?.status === "pass" ? "Alignment: pass" : state.lastAlignmentCheck?.status === "error" ? "Alignment: error" : "Alignment: review needed",
+			summary: state.lastAlignmentCheck?.summary || "Run alignment to verify transcript-backed decisions.",
+			evidence: state.lastAlignmentCheck?.evidence?.[0] || "No transcript evidence pinned yet.",
+			commandLine: "/blueprint-details  ·  /blueprint-check-alignment",
+			tone: state.lastAlignmentCheck?.status === "pass" ? "success" : state.lastAlignmentCheck?.status === "error" ? "error" : "warning",
+			active: false,
+			statusIcon: state.lastAlignmentCheck?.status === "pass" ? "✓" : state.lastAlignmentCheck?.status === "error" ? "✗" : "○",
+		},
+		assetCard: {
+			title: "Local Assets",
+			statusText: state.localAssetSync ? `${state.localAssetSync.present}/${state.localAssetSync.required} synced` : "not checked",
+			stateText: state.localAssetSync?.status === "ready" ? "Project assets: ready" : state.localAssetSync?.status === "partial" ? "Project assets: partial" : "Project assets: review needed",
+			sourceLine: "Repo source: agents/pi-blueprint + skills/pi-blueprint",
+			warning: state.localAssetSync?.missingSources?.length ? `Missing repo sources: ${state.localAssetSync.missingSources.join(", ")}` : "no local changes needed",
+			commandLine: "/blueprint-details  ·  /blueprint-sync-assets",
+			tone: state.localAssetSync?.status === "ready" ? "success" : state.localAssetSync?.status === "partial" ? "warning" : "error",
+			active: false,
+			statusIcon: state.localAssetSync?.status === "ready" ? "✓" : state.localAssetSync?.status === "partial" ? "!" : "○",
+			status: state.localAssetSync?.status || "not-checked",
+		},
+		consultationCount: consults.length,
+		specialistsCovered: new Set(consults.map(c => c?.specialist)).size,
+		totalSpecialists: specialistNames.length,
+	};
 	return {
 		...state,
+		phase: saved?.phase || state.phase,
+		iteration: saved?.iteration ?? state.iteration,
+		activeConsultant: state.activeConsultant || "",
+		consultationCount: consults.length || state.consultationCount || 0,
+		specialistsCovered: new Set(consults.map(c => c?.specialist)).size || state.specialistsCovered || 0,
+		widgetMirror,
 		chatHistory: dedupeConsultationHistory(merged),
 	};
 }
@@ -81,6 +176,14 @@ function normalizeConsultationText(text) {
 		.replace(/\s*Q:\s*/g, " Q: ")
 		.replace(/\s*A:\s*/g, " A: ")
 		.trim();
+}
+
+function cleanSummaryText(text) {
+	const value = String(text || "").trim();
+	if (!value) return "—";
+	if (value.length < 180) return value;
+	const trimmed = value.replace(/\s+\S*$/, "").trimEnd();
+	return (trimmed || value).replace(/[,:;.\-–—\s]+$/, "") + "...";
 }
 
 function consultationQuality(item) {
@@ -348,8 +451,42 @@ const HTML = String.raw`<!doctype html>
 .layout > *{min-width:0;min-height:0}
 .panel{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px;min-width:0}
 .panel h2,.panel h3{font-size:.82rem;color:var(--primary);margin-bottom:12px;font-weight:600}
-.summary-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
-.metric{padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background)}
+.activity-line{font-size:.76rem;color:var(--muted-foreground)}
+.widget-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.widget-secondary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}
+.widget-card{padding:14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--background);display:grid;gap:8px;min-width:0}
+.widget-card.tone-success{border-color:color-mix(in oklch,var(--green) 55%,var(--border))}
+.widget-card.tone-warning{border-color:color-mix(in oklch,var(--yellow) 60%,var(--border))}
+.widget-card.tone-error{border-color:color-mix(in oklch,var(--destructive) 65%,var(--border))}
+.widget-card.active{box-shadow:0 0 0 1px color-mix(in oklch,var(--primary) 45%,transparent)}
+.widget-title{display:flex;align-items:center;gap:8px;font-size:.82rem;font-weight:700;color:var(--primary)}
+.widget-actions-inline{display:inline-flex;align-items:center;gap:6px}
+.widget-title-text{flex:1;min-width:0}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:1px solid var(--border);border-radius:999px;background:var(--muted);color:var(--foreground);font-size:.78rem;font-weight:700;cursor:pointer}
+.icon-btn:hover{background:var(--accent);color:var(--accent-foreground)}
+.widget-state{font-size:.92rem;font-weight:700}
+.widget-state.pass{color:var(--green)}
+.widget-state.warn{color:var(--yellow)}
+.widget-state.fail{color:var(--destructive)}
+.widget-detail,.widget-meta,.widget-actions,.widget-footer{font-size:.74rem;line-height:1.5;color:var(--muted-foreground)}
+.widget-actions code{background:var(--muted);padding:1px 5px;border-radius:4px}
+.status-chip{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;font-size:.7rem;font-weight:700;background:var(--muted);color:var(--foreground);width:fit-content}
+.status-chip.active{background:color-mix(in oklch,var(--primary) 18%,var(--muted));color:var(--primary)}
+.status-chip.done{background:color-mix(in oklch,var(--green) 18%,var(--muted));color:var(--green)}
+.status-chip.idle{background:var(--muted);color:var(--muted-foreground)}
+.lamp{font-size:.85rem;line-height:1}
+.lamp.pulse{animation:pulse 1.2s infinite}
+.overlay{position:fixed;inset:0;background:color-mix(in oklch,var(--background) 30%,black 70%);display:none;align-items:center;justify-content:center;padding:24px;z-index:1000}
+.overlay.open{display:flex}
+.overlay-panel{width:min(980px,96vw);max-height:88vh;background:var(--card);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 20px 80px rgba(0,0,0,.35)}
+.overlay-header{display:flex;align-items:center;gap:12px;justify-content:space-between;padding:16px 18px;border-bottom:1px solid var(--border)}
+.overlay-title{font-size:1rem;font-weight:700;color:var(--primary)}
+.overlay-meta{font-size:.74rem;color:var(--muted-foreground)}
+.overlay-close{background:transparent;border:1px solid var(--border);color:var(--foreground);border-radius:999px;width:28px;height:28px;cursor:pointer}
+.overlay-body{padding:18px;overflow:auto;display:grid;gap:16px}
+.overlay-section{display:grid;gap:8px}
+.overlay-label{font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted-foreground)}
+.overlay-value{font-size:.84rem;line-height:1.6;color:var(--foreground)}
 .metric-value{font-size:1.7rem;font-weight:800;margin-bottom:6px}
 .metric-value.pass{color:var(--green)} .metric-value.warn{color:var(--yellow)} .metric-value.fail{color:var(--destructive)}
 .metric-meta,.muted{font-size:.75rem;color:var(--muted-foreground);line-height:1.5}
@@ -494,7 +631,8 @@ const HTML = String.raw`<!doctype html>
 .btn{padding:10px 16px;border:1px solid var(--border);border-radius:var(--radius);cursor:pointer;font-size:.78rem;font-weight:600;font-family:inherit;background:var(--primary);color:var(--primary-foreground)}
 .btn:hover{opacity:.9}
 .updated{font-size:.7rem;color:var(--muted-foreground);text-align:right;padding:8px 0}
-@media(max-width:960px){.container{padding:10px}.layout,.summary-grid{grid-template-columns:1fr}.chat-panel{min-height:60vh;max-height:60vh}}
+@media(max-width:1200px){.widget-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:960px){.container{padding:10px}.layout,.widget-grid,.widget-secondary{grid-template-columns:1fr}.chat-panel{min-height:60vh;max-height:60vh}}
 </style>
 </head>
 <body class="dark"><div class="container">
@@ -510,33 +648,19 @@ const HTML = String.raw`<!doctype html>
 		<strong>LIVE</strong>
 		<span class="badge" id="statusLine">Connecting...</span>
 		<span class="muted" id="urlLine">http://127.0.0.1:${port}</span>
+		<span class="activity-line" id="activityLine">Waiting for state...</span>
 	</div>
 	<div class="layout">
 		<div>
 			<div class="panel">
 			<h2>Progress</h2>
-			<div class="summary-grid">
-				<div class="metric">
-					<h3>Blueprint Score</h3>
-					<div class="metric-value" id="scoreValue">--</div>
-					<div class="metric-meta" id="scoreMeta">Waiting for state…</div>
-				</div>
-				<div class="metric">
-					<h3>Alignment</h3>
-					<div class="metric-value" id="alignValue">--</div>
-					<div class="metric-meta" id="alignMeta">Waiting for state…</div>
-				</div>
-				<div class="metric">
-					<h3>Phase</h3>
-					<div class="metric-value" id="phaseValue">idle</div>
-					<div class="metric-meta" id="phaseMeta">Iteration --</div>
-				</div>
-				<div class="metric">
-					<h3>Rebuild</h3>
-					<div class="metric-value" id="rebuildValue">idle</div>
-					<div class="metric-meta" id="rebuildMeta">No active rebuild</div>
-				</div>
+			<div class="widget-grid" id="specialistGrid"></div>
+			<div style="margin-top:12px" id="scoreCard"></div>
+			<div class="widget-secondary" id="secondaryCards">
+				<div id="alignmentCard"></div>
+				<div id="assetCard"></div>
 			</div>
+			<div class="widget-footer" id="widgetFooter" style="margin-top:12px">Waiting for state...</div>
 			</div>
 			<div class="panel" style="margin-top:12px">
 				<h3>Recent Decisions</h3>
@@ -554,18 +678,44 @@ const HTML = String.raw`<!doctype html>
 			</div>
 		</div>
 	</div>
+	<div class="overlay" id="detailOverlay" aria-hidden="true">
+		<div class="overlay-panel">
+			<div class="overlay-header">
+				<div>
+					<div class="overlay-title" id="overlayTitle">Specialist Detail</div>
+					<div class="overlay-meta" id="overlayMeta">Waiting for detail...</div>
+				</div>
+				<button class="overlay-close" id="overlayClose" aria-label="Close">×</button>
+			</div>
+			<div class="overlay-body" id="overlayBody"></div>
+		</div>
+	</div>
 	<div class="updated" id="updated">waiting for state...</div>
 <script>${THEME_JS}
 	const el = (id) => document.getElementById(id);
 	const chat = el('chat');
 	const decisionList = el('decisionList');
+	const specialistGrid = el('specialistGrid');
+	const scoreCard = el('scoreCard');
+	const alignmentCard = el('alignmentCard');
+	const assetCard = el('assetCard');
+	const widgetFooter = el('widgetFooter');
+	const detailOverlay = el('detailOverlay');
+	const overlayTitle = el('overlayTitle');
+	const overlayMeta = el('overlayMeta');
+	const overlayBody = el('overlayBody');
 	let cumulativeChatHistory = [];
 	let shouldStickChatToBottom = true;
+	let currentState = null;
 
 	function scoreClass(score) {
 		if (score > 95) return 'pass';
 		if (score > 85) return 'warn';
 		return 'fail';
+	}
+
+	function toneClass(tone) {
+		return tone === 'success' ? 'pass' : tone === 'warning' ? 'warn' : 'fail';
 	}
 
 	function esc(value) {
@@ -805,27 +955,126 @@ const HTML = String.raw`<!doctype html>
 		cumulativeChatHistory.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 	}
 
+	function renderSpecialistWidget(card) {
+		const toneClassName = card.statusTone === 'done' ? ' tone-success' : card.statusTone === 'active' ? ' tone-warning' : '';
+		return [
+			'<div class="widget-card' + toneClassName + (card.isActive ? ' active' : '') + '">',
+			'<div class="widget-title"><span class="widget-title-text">' + esc(card.label) + '</span><span class="widget-actions-inline"><button class="icon-btn specialist-info" data-specialist-id="' + esc(card.id) + '" aria-label="Open specialist summary">i</button><button class="icon-btn specialist-search" data-specialist-id="' + esc(card.id) + '" aria-label="Open full specialist consultation">⌕</button></span></div>',
+			'<div class="status-chip ' + esc(card.statusTone) + '"><span class="lamp' + (card.isActive ? ' pulse' : '') + '">' + esc(card.statusIcon) + '</span>' + esc(card.statusText) + '</div>',
+			'</div>',
+		].join('');
+	}
+
+	function closeSpecialistOverlay() {
+		detailOverlay.classList.remove('open');
+		detailOverlay.setAttribute('aria-hidden', 'true');
+	}
+
+	function openSpecialistSummaryOverlay(id) {
+		const card = currentState?.widgetMirror?.specialists?.find(item => item.id === id);
+		if (!card) return;
+		overlayTitle.textContent = card.label + ' Summary';
+		overlayMeta.textContent = [
+			card.statusText || '',
+			card.iteration != null ? ('iteration ' + card.iteration) : '',
+			card.timestamp ? new Date(card.timestamp).toLocaleString() : '',
+		].filter(Boolean).join(' · ');
+		overlayBody.innerHTML = '<div class="overlay-section"><div class="overlay-label">Card Detail</div><div class="overlay-value markdown-body">' + renderMarkdown(card.detail || 'No summary available.') + '</div></div>';
+		detailOverlay.classList.add('open');
+		detailOverlay.setAttribute('aria-hidden', 'false');
+	}
+
+	function openSpecialistOverlay(id) {
+		const card = currentState?.widgetMirror?.specialists?.find(item => item.id === id);
+		if (!card) return;
+		overlayTitle.textContent = card.label;
+		overlayMeta.textContent = [
+			card.statusText || '',
+			card.iteration != null ? ('iteration ' + card.iteration) : '',
+			card.timestamp ? new Date(card.timestamp).toLocaleString() : '',
+		].filter(Boolean).join(' · ');
+		const sections = [];
+		if (card.question) {
+			sections.push('<div class="overlay-section"><div class="overlay-label">Question</div><div class="overlay-value markdown-body">' + renderMarkdown(card.question) + '</div></div>');
+		}
+		if (card.response) {
+			sections.push('<div class="overlay-section"><div class="overlay-label">Response</div><div class="overlay-value markdown-body">' + renderMessageContent(String(card.label || '') + ' (detail)\nQ: ' + card.question + '\nA: ' + card.response) + '</div></div>');
+		}
+		if (!sections.length) {
+			sections.push('<div class="overlay-section"><div class="overlay-label">Detail</div><div class="overlay-value">' + esc(card.detail || 'No detail available.') + '</div></div>');
+		}
+		overlayBody.innerHTML = sections.join('');
+		detailOverlay.classList.add('open');
+		detailOverlay.setAttribute('aria-hidden', 'false');
+	}
+
+	function renderScoreWidget(card) {
+		const actions = card.revisionRequired
+			? '<div class="widget-actions"><code>/blueprint-revise [reason]</code> · <code>/blueprint-dismiss-revision</code></div>'
+			: '';
+		const revisionSummary = card.revisionRequired && card.revisionSummary
+			? '<div class="widget-meta">' + esc(card.revisionSummary) + '</div>'
+			: '';
+		return [
+			'<div class="widget-card tone-' + esc(card.tone) + (card.active ? ' active' : '') + '">',
+			'<div class="widget-title"><span class="lamp' + (card.active ? ' pulse' : '') + '">' + (card.active ? '●' : card.revisionRequired ? '●' : '✓') + '</span>Blueprint Score</div>',
+			'<div class="metric-value ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100</div>',
+			'<div class="widget-meta">' + esc(card.label) + '</div>',
+			'<div class="widget-meta">' + (card.prdExists ? 'PRD ✓' : 'PRD ○') + ' · <code>/blueprint-prd</code></div>',
+			'<div class="widget-meta">' + (card.checklistExists ? 'Checklist ✓' : 'Checklist ○') + ' · <code>/blueprint-checklist</code></div>',
+			'<div class="widget-meta">' + esc(card.gateLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.coverageLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.alignmentLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.effortLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.revisionLabel) + '</div>',
+			'<div class="widget-meta">Open mode: ' + esc(card.openMode) + '</div>',
+			revisionSummary,
+			actions,
+			'</div>',
+		].join('');
+	}
+
+	function renderInfoWidget(card) {
+		return [
+			'<div class="widget-card tone-' + esc(card.tone) + (card.active ? ' active' : '') + '">',
+			'<div class="widget-title"><span class="lamp' + (card.active ? ' pulse' : '') + '">' + esc(card.statusIcon) + '</span>' + esc(card.title) + '</div>',
+			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100 · ' + esc(card.statusText) + '</div>',
+			'<div class="widget-detail">' + esc(card.summary) + '</div>',
+			'<div class="widget-meta">Evidence: ' + esc(card.evidence) + '</div>',
+			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
+			'</div>',
+		].join('');
+	}
+
+	function renderAssetWidget(card) {
+		return [
+			'<div class="widget-card tone-' + esc(card.tone) + (card.active ? ' active' : '') + '">',
+			'<div class="widget-title"><span class="lamp' + (card.active ? ' pulse' : '') + '">' + esc(card.statusIcon) + '</span>' + esc(card.title) + '</div>',
+			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(card.statusText) + '</div>',
+			'<div class="widget-meta">' + esc(card.stateText) + '</div>',
+			'<div class="widget-meta">' + esc(card.sourceLine) + '</div>',
+			'<div class="widget-detail">' + esc(card.warning) + '</div>',
+			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
+			'</div>',
+		].join('');
+	}
+
 	function renderState(state) {
 		if (!state) return;
+		currentState = state;
 		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
 		const wasNearBottom = distanceFromBottom <= 40 || shouldStickChatToBottom;
 		el('statusDot').className = 'status-dot ' + (state.phase === 'idle' ? 'idle' : 'running');
 		el('statusLine').textContent = state.phase || 'connected';
 		el('urlLine').textContent = state.webUrl || window.location.href;
-		el('scoreValue').textContent = state.reviewScore ? state.reviewScore.score + '/100' : '--';
-		el('scoreValue').className = 'metric-value ' + scoreClass(state.reviewScore ? state.reviewScore.score : 0);
-		el('scoreMeta').textContent = state.reviewScore
-			? state.reviewScore.ready
-				? 'Review gate clear'
-				: state.reviewScore.effortTarget
-			: 'Waiting for review data';
-		el('alignValue').textContent = state.lastAlignmentCheck ? state.lastAlignmentCheck.score + '/100' : '--';
-		el('alignValue').className = 'metric-value ' + scoreClass(state.lastAlignmentCheck ? state.lastAlignmentCheck.score : 0);
-		el('alignMeta').textContent = state.lastAlignmentCheck ? (state.lastAlignmentCheck.status + ' · ' + state.lastAlignmentCheck.summary) : 'Not run';
-		el('phaseValue').textContent = state.phase || 'idle';
-		el('phaseMeta').textContent = 'Iteration ' + (state.iteration || 0) + ' · ' + (state.consultationCount || 0) + ' consultations';
-		el('rebuildValue').textContent = state.rebuildProgress ? (state.rebuildProgress.stage + ' ' + state.rebuildProgress.current + '/' + state.rebuildProgress.total) : 'idle';
-		el('rebuildMeta').textContent = state.rebuildProgress ? state.rebuildProgress.detail : 'No active rebuild';
+		el('activityLine').textContent = state.widgetMirror?.phaseLabel || 'Waiting for state...';
+		if (state.widgetMirror) {
+			specialistGrid.innerHTML = (state.widgetMirror.specialists || []).map(renderSpecialistWidget).join('');
+			scoreCard.innerHTML = renderScoreWidget(state.widgetMirror.scoreCard);
+			alignmentCard.innerHTML = renderInfoWidget(state.widgetMirror.alignmentCard);
+			assetCard.innerHTML = renderAssetWidget(state.widgetMirror.assetCard);
+			widgetFooter.textContent = state.widgetMirror.consultationCount + ' consultation' + (state.widgetMirror.consultationCount === 1 ? '' : 's') + ' · ' + state.widgetMirror.specialistsCovered + '/' + state.widgetMirror.totalSpecialists + ' specialists consulted';
+		}
 		decisionList.innerHTML = '';
 		const decisions = (state.chatHistory || []).slice(-6);
 		if (!decisions.length) {
@@ -880,6 +1129,26 @@ const HTML = String.raw`<!doctype html>
 	chat.addEventListener('scroll', () => {
 		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
 		shouldStickChatToBottom = distanceFromBottom <= 40;
+	});
+
+	document.addEventListener('click', (event) => {
+		const target = event.target;
+		if (target instanceof HTMLElement && target.classList.contains('specialist-info')) {
+			openSpecialistSummaryOverlay(target.dataset.specialistId);
+		}
+		if (target instanceof HTMLElement && target.classList.contains('specialist-search')) {
+			openSpecialistOverlay(target.dataset.specialistId);
+		}
+	});
+
+	el('overlayClose').addEventListener('click', closeSpecialistOverlay);
+	detailOverlay.addEventListener('click', (event) => {
+		if (event.target === detailOverlay) closeSpecialistOverlay();
+	});
+	document.addEventListener('keydown', (event) => {
+		if (event.key === 'Escape' && detailOverlay.classList.contains('open')) {
+			closeSpecialistOverlay();
+		}
 	});
 
 	refresh();
