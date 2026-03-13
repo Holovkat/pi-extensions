@@ -6,8 +6,8 @@ This checklist is the local sign-off view for the new extension rebuild:
 - `pi-blueprint` replaces `pi-req` over time, but ships alongside it first.
 - `pi-builder` replaces `pi-dev` over time, but ships alongside it first.
 - GitHub issues remain the source of truth for specification content.
-- No execution-ready task should exceed `15 minutes`.
-- Any `20+ minute` task is treated as complexity creep / planning failure.
+- No execution-ready task should exceed complexity score `5/10`.
+- Any task at complexity score `8/10` or higher is treated as complexity creep / planning failure.
 
 ## Reference Documents
 
@@ -23,7 +23,7 @@ This checklist is the local sign-off view for the new extension rebuild:
     - [x] [#5 Task: implement hierarchy and execution-grain classifier](https://github.com/Holovkat/pi-extensions/issues/5)
     - [x] [#6 Task: define blueprint task-packet publication shape](https://github.com/Holovkat/pi-extensions/issues/6)
   - [x] [#7 Sprint 2: pi-blueprint complexity, prerequisites, and routing](https://github.com/Holovkat/pi-extensions/issues/7)
-    - [x] [#8 Task: implement complexity scoring and estimated-minute model](https://github.com/Holovkat/pi-extensions/issues/8)
+    - [x] [#8 Task: implement complexity scoring model and gating rubric](https://github.com/Holovkat/pi-extensions/issues/8)
     - [x] [#9 Task: add prerequisite and dependency modeling](https://github.com/Holovkat/pi-extensions/issues/9)
     - [x] [#10 Task: implement execution lane routing metadata](https://github.com/Holovkat/pi-extensions/issues/10)
   - [x] [#11 Sprint 3: pi-blueprint GitHub publication and checklist enrichment](https://github.com/Holovkat/pi-extensions/issues/11)
@@ -31,8 +31,8 @@ This checklist is the local sign-off view for the new extension rebuild:
     - [x] [#13 Task: enrich checklist generation for execution-ready planning](https://github.com/Holovkat/pi-extensions/issues/13)
     - [x] [#14 Task: define replan and split sync conventions](https://github.com/Holovkat/pi-extensions/issues/14)
   - [x] [#15 Sprint 4: pi-blueprint planning quality gate and rejection rules](https://github.com/Holovkat/pi-extensions/issues/15)
-    - [x] [#16 Task: enforce hard 15-minute execution ceiling](https://github.com/Holovkat/pi-extensions/issues/16)
-    - [x] [#17 Task: implement 20-plus-minute complexity-creep red flags](https://github.com/Holovkat/pi-extensions/issues/17)
+    - [x] [#16 Task: enforce hard complexity-based execution ceiling](https://github.com/Holovkat/pi-extensions/issues/16)
+    - [x] [#17 Task: implement high-complexity red-flag behavior](https://github.com/Holovkat/pi-extensions/issues/17)
     - [x] [#18 Task: finalize operator planning flows for enhancement, PRD, and bugfix modes](https://github.com/Holovkat/pi-extensions/issues/18)
 
 ## Epic 2: pi-builder

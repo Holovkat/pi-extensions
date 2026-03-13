@@ -27,7 +27,7 @@ The target outcome is:
 4. Run targeted tests before broad validation.
 5. Stop and replan when execution grain or prerequisites were wrong.
 6. Write workflow state back to GitHub continuously.
-7. Refuse execution-ready tasks that exceed the hard planning ceiling of `15 minutes`.
+7. Refuse execution-ready tasks that exceed the hard planning ceiling of complexity score `5/10`.
 
 ### Success Metrics
 
@@ -36,7 +36,7 @@ The target outcome is:
 3. Reduce broad validator runs per local fix by at least 60%.
 4. Ensure 100% of major state transitions are synced back to GitHub/checklist state.
 5. Keep at least 95% of restarts reconstructable from GitHub and repo artifacts alone.
-6. Ensure no task enters execution with an estimated time above `15 minutes`.
+6. Ensure no task enters execution with a complexity score above `5/10`.
 
 ## User Personas
 
@@ -81,8 +81,8 @@ Needs:
 Acceptance criteria:
 
 - execution begins only after task readiness is confirmed
-- lane and time budget are derived from planning metadata
-- tasks estimated above `15 minutes` are rejected back to replanning before build begins
+- lane and execution gating are derived from planning metadata
+- tasks scoring above `5/10` are rejected back to replanning before build begins
 
 ### 2. Task Context Loading
 
@@ -146,7 +146,7 @@ Acceptance criteria:
 
 - overrun and blocked-prerequisite events are visible
 - replanning can split, defer, or reprioritize work
-- any runtime reaching `20+ minutes` is treated as a red-flag planning failure, not tolerated as normal execution
+- any task packet that reveals hidden scope at complexity score `8/10` or higher is treated as a red-flag planning failure, not tolerated as normal execution
 
 ### 9. Promotion Gates
 
@@ -163,7 +163,7 @@ Acceptance criteria:
 2. Execution must minimize repeated whole-repo rereads.
 3. Operator visibility must remain compatible with current dashboard/state patterns.
 4. The system must preserve steer, abort, and watchdog control behavior.
-5. The system must enforce the planning ceiling consistently even if oversized work is handed to execution.
+5. The system must enforce the planning score ceiling consistently even if oversized work is handed to execution.
 
 ## User Stories & Workflows
 
@@ -226,8 +226,8 @@ Add execution logic for:
   "taskId": "4.2",
   "issueNumber": 58,
   "complexityScore": 6,
-  "estimatedMinutes": 12,
-  "lane": "feature-construction",
+  "planningGate": "rejected-decompose",
+  "lane": "blocked-replan",
   "ownedFiles": ["src/pathfinding/*"],
   "acceptanceCriteria": ["...", "..."],
   "prerequisites": [
@@ -324,7 +324,7 @@ Risk:
 
 Mitigation:
 
-- tune score bands and time budgets from pilot data
+- tune score bands and gating thresholds from pilot data
 
 ## Scenario Validation
 
@@ -430,8 +430,8 @@ Expose lane, score, prerequisite, and line-stop state in the UI/status layer.
   - Acceptance criteria:
     - overrun does not just continue blindly
     - blocked tasks can be split, deferred, or reprioritized
-    - tasks estimated above `15 minutes` never enter execution
-    - any `20+ minute` run is surfaced as planning failure / complexity creep
+    - tasks scoring above `5/10` never enter execution
+    - any task that drifts into `8/10+` scope is surfaced as planning failure / complexity creep
   - Dependencies: 2.2, 4.1
 
 - [ ] **5.1 — Add promotion gates**

@@ -111,7 +111,7 @@ Acceptance criteria:
 
 - `10` denotes epic-scale or non-execution-ready work
 - `1` denotes atomic, near-trivial implementation work
-- the score determines execution lane, time budget, and decomposition requirement
+- the score determines execution lane, rejection behavior, and decomposition requirement
 
 ### 3. Prerequisite Tracking
 
@@ -129,7 +129,7 @@ Planning must determine whether a work item is execution-ready at the task, sub-
 Acceptance criteria:
 
 - oversized tasks are decomposed before entering the line
-- execution packets are narrow enough for a builder to complete within the assigned time budget
+- execution packets are narrow enough for a builder to complete within the assigned score band
 
 ### 5. Warm Builder Continuity
 
@@ -176,7 +176,7 @@ Acceptance criteria:
 
 ### 9. Line Stop and Replanning
 
-The system must stop work when execution grain, prerequisites, or time budget were misjudged.
+The system must stop work when execution grain, prerequisites, or complexity band were misjudged.
 
 Acceptance criteria:
 
@@ -214,7 +214,7 @@ Add planning logic that:
 - scores complexity
 - validates prerequisites
 - assigns execution lane
-- assigns time budget
+- enforces score-band gating
 - decides when decomposition is required
 
 ### 2. Task Context Loader
@@ -315,7 +315,7 @@ Implementation should be staged:
 ### Phase 5
 
 - run pilot on one greenfield slice, one enhancement, one bugfix
-- tune score bands and time budgets
+- tune score bands and gating thresholds
 
 ## Risk Register
 
@@ -357,7 +357,7 @@ Mitigation:
 
 Risk:
 
-- tasks enter the wrong lane or get the wrong time budget
+- tasks enter the wrong lane or get the wrong score band
 
 Mitigation:
 
@@ -425,7 +425,7 @@ Expose line-stop, lane, prerequisite, and score-band information in status outpu
   - Dependencies: none
 
 - [ ] **1.2 — Define complexity scoring rubric**
-  - Description: Implement `10` to `1` scoring guidance and attach expected execution grain and time budget rules.
+  - Description: Implement `10` to `1` scoring guidance and attach expected execution grain and score-band gating rules.
   - Files to create/modify: `extensions/req-qa.ts`, planning docs/prompts
   - Acceptance criteria:
     - each work item can be scored
@@ -507,6 +507,6 @@ Expose line-stop, lane, prerequisite, and score-band information in status outpu
   - Description: Validate the new model with one greenfield slice, one enhancement, and one bugfix.
   - Files to create/modify: checklist/issues/test docs as needed
   - Acceptance criteria:
-    - pilots produce measurable timing and churn data
-    - score bands and time budgets can be tuned from evidence
+    - pilots produce measurable churn and replanning data
+    - score bands and gating thresholds can be tuned from evidence
   - Dependencies: 3.2, 4.1, 4.2, 4.3, 5.1

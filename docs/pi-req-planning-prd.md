@@ -25,7 +25,7 @@ The target outcome is for `pi-blueprint` to produce execution-ready work packets
 4. Add prerequisite awareness and readiness scoring.
 5. Produce build-ready task packets and checklist artifacts for `pi-builder`.
 6. Ensure planning can stop and rework oversized or blocked items before execution begins.
-7. Enforce a hard rule that no execution-ready task is planned above `15 minutes`.
+7. Enforce a hard rule that no execution-ready task exceeds complexity score `5/10`.
 
 ### Success Metrics
 
@@ -33,7 +33,7 @@ The target outcome is for `pi-blueprint` to produce execution-ready work packets
 2. At least 90% of planned executable items are at task, sub-task, or atomic-step grain rather than epic grain.
 3. At least 80% of line-stop events in `pi-builder` trace back to known planning rules rather than missing planning metadata.
 4. Planning outputs are sufficient for `pi-builder` to reconstruct task context from GitHub/checklist state without private sidecar dependency.
-5. 100% of tasks estimated above `15 minutes` are rejected in planning and decomposed further before publication.
+5. 100% of tasks scoring above `5/10` are rejected in planning and decomposed further before publication.
 
 ## User Personas
 
@@ -85,8 +85,8 @@ Acceptance criteria:
 
 - `10` means non-executable, must decompose
 - `1` means atomic and immediately executable
-- score influences execution lane and time budget metadata
-- no execution-ready task may be published if its estimated time exceeds `15 minutes`
+- score influences execution lane, decomposition pressure, and validation depth
+- no execution-ready task may be published if its complexity score exceeds `5/10`
 
 ### 3. Execution-Grain Decision
 
@@ -101,7 +101,7 @@ Acceptance criteria:
 
 - oversized items are decomposed before publication
 - execution-ready items are clearly marked
-- any item estimated above `15 minutes` is marked not execution-ready and sent back for decomposition
+- any item scoring above `5/10` is marked not execution-ready and sent back for decomposition
 
 ### 4. Prerequisite Tracking
 
@@ -151,8 +151,8 @@ Before publication, each task must be checked for execution readiness.
 Acceptance criteria:
 
 - tasks with weak ownership, vague acceptance, or unmet critical prerequisites are sent back for replanning
-- tasks estimated above `15 minutes` are rejected from execution publication
-- tasks estimated at `20+ minutes` are explicitly flagged as complexity creep or planning failure
+- tasks scoring above `5/10` are rejected from execution publication
+- tasks scoring at `8/10` or higher are explicitly flagged as complexity creep or planning failure
 
 ## Non-Functional Requirements
 
@@ -160,7 +160,7 @@ Acceptance criteria:
 2. Planning must preserve GitHub and repo artifacts as the only durable source of truth.
 3. Planning should not create unnecessary bureaucracy for atomic or low-complexity work.
 4. Planning decisions must be auditable from generated issues, checklist items, and comments.
-5. Time-budget rejection must be deterministic and visible in planning outputs.
+5. Complexity-based rejection must be deterministic and visible in planning outputs.
 
 ## User Stories & Workflows
 
@@ -186,8 +186,8 @@ Add schema support for:
 - complexity score
 - prerequisite state
 - execution lane
-- time budget hint
-- execution-ready boolean derived from the hard `15 minute` rule
+- planning gate status
+- execution-ready boolean derived from the hard score ceiling
 
 ### 2. Prompt / Planning Logic Updates
 
@@ -222,9 +222,9 @@ Published issues must carry enough structured detail for downstream packet recon
   "id": "2.3",
   "title": "Invoice tax calculation",
   "complexityScore": 6,
-  "executionReady": true,
-  "estimatedMinutes": 12,
-  "lane": "feature-construction",
+  "executionReady": false,
+  "planningGate": "rejected-decompose",
+  "lane": "blocked-replan",
   "prerequisites": [
     { "id": "1.2", "status": "satisfied" },
     { "id": "2.1", "status": "satisfied" }
@@ -299,12 +299,12 @@ Prevent weak or oversized tasks from entering execution.
   - Dependencies: none
 
 - [ ] **1.2 — Define complexity scoring rubric**
-  - Description: Add `10` to `1` scoring guidance and bind it to execution grain, hard `15 minute` ceiling, and rejection rules.
+  - Description: Add `10` to `1` scoring guidance and bind it to execution grain, score-band rejection rules, and replanning behavior.
   - Files to create/modify: new `pi-blueprint` extension files, planning docs/prompts
   - Acceptance criteria:
     - each work item can be scored
     - score affects decomposition and routing
-    - work estimated above `15 minutes` is rejected from execution publication
+    - work scoring above `5/10` is rejected from execution publication
   - Dependencies: 1.1
 
 - [ ] **1.3 — Define prerequisite schema**
@@ -323,11 +323,11 @@ Prevent weak or oversized tasks from entering execution.
   - Dependencies: 1.2, 1.3
 
 - [ ] **2.2 — Add planning quality gate**
-  - Description: Block publication of weakly-scoped, blocked, or over-budget tasks.
+  - Description: Block publication of weakly-scoped, blocked, or over-complex tasks.
   - Files to create/modify: new `pi-blueprint` extension files
   - Acceptance criteria:
-    - vague acceptance, unclear ownership, unmet prerequisites, or `>15 minute` estimates trigger replanning
-    - `20+ minute` estimates are flagged as complexity creep
+    - vague acceptance, unclear ownership, unmet prerequisites, or complexity score `>5/10` trigger replanning
+    - complexity score `>=8/10` is flagged as complexity creep
   - Dependencies: 2.1
 
 - [ ] **3.1 — Enrich checklist publication**

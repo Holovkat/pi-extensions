@@ -2,7 +2,7 @@
 
 ## Reframing `pi-blueprint` and `pi-builder` as a GitHub-Backed Delivery Line
 
-**Audience:** operator / workflow architect  
+**Audience:** operator / workflow architect
 **Scope:** define `pi-blueprint` and `pi-builder` as new extensions built from the current `pi-req` and `pi-dev` foundations, reducing churn, repeated code rereads, and phase-to-phase relearning while keeping the repository, issues, and checklist as the only durable source of truth.
 
 ---
@@ -276,13 +276,13 @@ The planner should assign a complexity score before execution and use that score
 ### Score 6-7
 
 - normal implementation task candidate
-- only execution-ready if decomposed to fit under the hard time limit
+- not execution-ready until decomposed below the hard score ceiling
 
 ### Score 4-5
 
 - focused sub-task
 - limited file ownership
-- expected to fit under the hard time limit with one short builder cycle plus targeted review/test
+- execution-ready when prerequisites are clean and scope remains narrow
 
 ### Score 2-3
 
@@ -301,7 +301,7 @@ The planner should assign a complexity score before execution and use that score
 ```mermaid
 flowchart LR
     SCORE["Complexity Score"] --> GRAIN["Execution Grain"]
-    SCORE --> TIME["Expected Time Budget"]
+    SCORE --> GATE["Planning Gate Outcome"]
     SCORE --> PRE["Prerequisite Strictness"]
     SCORE --> REV["Review Depth"]
     SCORE --> TEST["Testing Depth"]
@@ -414,7 +414,7 @@ Planning should decide which layer each task belongs to and should resist schedu
 
 ## Planning as a Scheduling Engine
 
-Planning should not just decompose work.  
+Planning should not just decompose work.
 Planning should schedule the line.
 
 It should know:
@@ -468,38 +468,38 @@ This is how the line stops feeling like a single queue.
 
 ---
 
-## Time Budgeting and Line Stops
+## Complexity Gating and Line Stops
 
-If a task takes too long, the line should stop, ask why, and potentially reprioritize prerequisites or decompose the work.
+If a task reveals more scope than its score band allows, the line should stop, ask why, and potentially reprioritize prerequisites or decompose the work.
 
-## Proposed Time Policy
+## Proposed Complexity Policy
 
-Each score band gets a hard planning envelope, not a soft target.
+Each score band gets a hard gating rule, not a soft timing target.
 
-| Score | Typical Unit | Initial Budget | Escalation Rule |
-|------|--------------|----------------|-----------------|
-| 10 | epic | no build allowed | decompose |
-| 8-9 | large task cluster | no build allowed | decompose |
-| 6-7 | normal task | must plan to <= 15 min | reject and split if > 15 min |
-| 4-5 | focused sub-task | 8-15 min | acceptable if <= 15 min |
-| 2-3 | small fix | 3-10 min | direct correction path |
-| 1 | atomic | 1-5 min | no analysis loop, patch directly |
+| Score | Typical Unit | Execution Status | Required Action |
+|------|--------------|------------------|-----------------|
+| 10 | epic | not executable | decompose |
+| 8-9 | large task cluster | red-flag complexity creep | redesign or decompose |
+| 6-7 | normal task | split-required | reject and split |
+| 4-5 | focused sub-task | execution-ready | proceed if prerequisites are clean |
+| 2-3 | small fix | fast corrective | direct correction path |
+| 1 | atomic | atomic-ready | patch directly |
 
 Hard rules:
 
-- no execution-ready task should be planned above `15 minutes`
-- anything estimated above `15 minutes` is rejected in planning and must be decomposed further
-- anything running past `20 minutes` is a red-flag signal of complexity creep or planning failure
-- `20+ minutes` is not normal overrun tolerance; it is evidence the task entered the line at the wrong grain
+- no execution-ready task should score above `5/10`
+- anything scoring above `5/10` is rejected in planning and must be decomposed further
+- anything scoring at `8/10` or higher is a red-flag signal of complexity creep or planning failure
+- `8/10+` is not normal overrun tolerance; it is evidence the task entered the line at the wrong grain
 
 ## Line Stop Logic
 
 ```mermaid
 flowchart TD
-    RUN["Task running"] --> TIME{"Within time budget?"}
-    TIME -->|yes| CONT["Continue"]
-    TIME -->|no| STOP["Stop line for this task"]
-    STOP --> RCA["Analyze overrun"]
+    RUN["Task running"] --> CHECK{"Still within declared score band?"}
+    CHECK -->|yes| CONT["Continue"]
+    CHECK -->|no| STOP["Stop line for this task"]
+    STOP --> RCA["Analyze scope drift"]
     RCA --> Q1{"Blocked by missing prerequisite?"}
     RCA --> Q2{"Too broad or too complex?"}
     RCA --> Q3{"Bad task definition?"}
@@ -665,8 +665,8 @@ Suggested shape:
   "title": "A* pathfinding",
   "parentEpic": 14,
   "complexityScore": 6,
-  "estimatedMinutes": 12,
-  "lane": "feature-construction",
+  "planningGate": "rejected-decompose",
+  "lane": "blocked-replan",
   "requirements": ["...", "..."],
   "acceptanceCriteria": ["...", "..."],
   "ownedFiles": ["src/pathfinding/*", "src/ghosts/blinky.ts"],
@@ -813,7 +813,7 @@ Before task creation, `pi-blueprint` should run a planning quality gate:
 - whether it is executable yet
 - whether it must be decomposed
 - what lane it belongs in
-- how much time budget to assign
+- what planning gate status it receives
 - what prerequisites must be proven first
 
 ### 6. Prerequisite enforcement
@@ -1166,7 +1166,7 @@ For all workflows:
 - assigns complexity score
 - validates prerequisite readiness
 - chooses execution lane
-- chooses time budget
+- chooses planning gate outcome
 - decides when a work item must be decomposed before entering the line
 
 ### `task-context-loader`
@@ -1302,7 +1302,7 @@ It should first ask:
 - are its prerequisites satisfied?
 - is it too large for the line?
 - what lane should it enter?
-- what time budget applies?
+- what planning gate result applies?
 
 That is how the line becomes adaptive instead of procedural.
 
@@ -1344,7 +1344,7 @@ The right direction for `pi-extensions` is:
 - make review and test narrow and structured
 - use dedicated sync skills to continuously update GitHub and checklist state
 - add a planning engine that decides execution grain, prerequisites, and lane routing before build starts
-- enforce a hard `15 minute` ceiling for any execution-ready task
+- enforce a hard complexity ceiling of `5/10` for any execution-ready task
 - reserve broad UAT and broad validation for promotion points, not every local correction
 
 That turns `pi-builder` from a sequence of fresh specialist passes into a true production line:
