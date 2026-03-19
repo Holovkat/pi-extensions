@@ -7,6 +7,7 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
 - [Architecture Overview](#architecture-overview)
 - [Extensions](#extensions)
   - [req-qa — Requirements Discovery](#req-qa--requirements-discovery)
+  - [pi-builder — Task-First Production-Line Execution](#pi-builder--task-first-production-line-execution)
   - [dev-pipeline — Sprint Development](#dev-pipeline--sprint-development)
     - [Fast Track Mode (default)](#fast-track-mode-default)
     - [3-Wave Mode](#3-wave-mode---multiwave)
@@ -20,7 +21,7 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
 
 ## Architecture Overview
 
-The system is built on two main extension pipelines that form a complete software development lifecycle:
+The system is built on planning and execution extensions that form a complete software development lifecycle. The legacy path remains `pi-req` -> `pi-dev`, while the newer task-first execution path is `pi-blueprint` -> `pi-builder`.
 
 ```mermaid
 graph TD
@@ -33,7 +34,7 @@ graph TD
         E --> F[Publish to GitHub Issues]
     end
 
-    subgraph "Phase 2: Sprint Development"
+    subgraph "Phase 2A: Legacy Epic-First Execution"
         G[pi-dev] --> H[Read Checklist]
         H --> I[Plan & Create Branch]
         I -->|default| J2[Build → Evaluate → Fix → UAT]
@@ -45,10 +46,24 @@ graph TD
         M --> N[Squash Merge + Push]
     end
 
+    subgraph "Phase 2B: Task-First Production Line"
+        P[pi-blueprint task in GitHub] --> Q[pi-builder intake]
+        Q --> R{Execution-ready and <=5/10?}
+        R -->|yes| S[Warm builder execution]
+        S --> T[Diff-scoped review]
+        T --> U[Targeted testing]
+        U --> V[Tracker sync]
+        V --> W[Promotion gate / UAT-ready]
+        R -->|no| X[Line stop / replan]
+        U -->|scope drift >=8/10| X
+    end
+
     F -.->|checklist| G
+    F -.->|task metadata| P
 
     style A fill:#c4b5fd,color:#1e1b4b
     style G fill:#86efac,color:#14532d
+    style Q fill:#86efac,color:#14532d
 ```
 
 ### How Agent Subprocess Execution Works
@@ -235,6 +250,60 @@ After `generate_artifacts` runs, the extension:
 5. Handles auth validation, repo creation (interactive), and error recovery
 
 `/req-rebuild-issues` can re-publish all issues if GitHub wasn't available during generation.
+
+---
+
+### pi-builder — Task-First Production-Line Execution
+
+**File:** `extensions/pi-builder.ts`
+**Alias:** `pi-builder`
+**Theme:** midnight-ocean
+
+A task-first execution extension built for blueprint-published GitHub task issues. It reconstructs a builder packet from issue state, enforces execution-readiness, keeps the writer warm across correction loops, narrows review/testing to the changed surface first, and syncs promotion state back to GitHub.
+
+#### Core Commands
+
+| Command | Purpose |
+|---------|---------|
+| `/builder-start <issue>` | Reconstruct task packet and run the intake gate |
+| `/builder-next` | Run build → review → test → compliance on the active packet |
+| `/builder-status` | Show current lane, packet, and blockers |
+| `/builder-sync` | Write the current builder state back to the issue |
+| `/builder-promote` | Record a promotion-gate / UAT-ready decision |
+
+#### Task Packet Shape
+
+`pi-builder` reconstructs a packet from:
+- issue body
+- issue comments
+- referenced files
+- current git diff / repo state
+
+The packet includes:
+- task id and issue refs
+- goal and expected output
+- owned files
+- validation scope
+- regression surface
+- lessons learned
+- blockers and line-stop conditions
+
+#### Readiness Rules
+
+The intake gate blocks execution when:
+- acceptance criteria are missing
+- dependencies are unresolved
+- complexity is above `5/10`
+- substantial prerequisites are missing
+
+#### Promotion Rules
+
+A task is promoted toward UAT-ready only after:
+- implementation is complete
+- diff-scoped review is non-blocking
+- targeted testing passes
+- compliance clears the threshold
+- GitHub sync is recorded
 
 ---
 
@@ -839,6 +908,7 @@ cd ~/.pi-init && npm install @mariozechner/pi-tui
 
 # 4. Add aliases to ~/.zshrc
 _PIX="$HOME/.pi-init/extensions"
+alias pi-builder='pi -ne -e "$_PIX/pi-builder.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-dev='pi -ne -e "$_PIX/dev-pipeline.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-req='pi -ne -e "$_PIX/req-qa.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-dash='~/.pi-init/bin/pipeline-dashboard'
@@ -862,6 +932,7 @@ brew install glow
 | Alias | Purpose |
 |-------|---------|
 | `pi-req` | Launch requirements discovery session |
+| `pi-builder` | Launch task-first production-line execution |
 | `pi-dev` | Launch sprint development pipeline |
 | `pi-dash` | Launch standalone terminal dashboard |
 | `pi-web` | Launch Pipeline Control Center (web, port 3141) |
@@ -882,6 +953,16 @@ brew install glow
 | `/req-prd` | View PRD in glow (rendered markdown) |
 | `/req-rebuild-issues` | Re-publish all GitHub issues from checklist |
 | `/req-reset` | Clear session state and start fresh |
+
+### pi-builder Commands
+
+| Command | Description |
+|---------|-------------|
+| `/builder-start <issue>` | Reconstruct a task packet from GitHub issue state and repo state |
+| `/builder-next` | Run the current task through build, review, test, and compliance |
+| `/builder-status` | Show the active builder packet and lane state |
+| `/builder-sync` | Post the current builder state back to the active issue |
+| `/builder-promote` | Record a promotion-gate / UAT-ready decision |
 
 ### dev-pipeline Commands
 
@@ -910,6 +991,7 @@ pi-extensions/
 ├── README.md
 ├── extensions/
 │   ├── req-qa.ts              # Requirements discovery extension (~1640 lines)
+│   ├── pi-builder.ts          # Task-first production-line execution extension
 │   ├── dev-pipeline.ts        # Sprint development extension (~5050 lines)
 │   ├── bailian-provider.ts    # Alibaba Cloud Bailian provider
 │   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
@@ -936,6 +1018,8 @@ pi-extensions/
 │   ├── pipeline-dashboard     # Standalone terminal dashboard (bash)
 │   └── pipeline-dashboard-web # Pipeline Control Center (Node.js HTTP + SSE + TCP)
 └── docs/
+    ├── pi-dev-build-prd.md
+    ├── pi-dev-production-line-whitepaper.md
     ├── walkthrough-fasttrack.md
     └── research-diffusion-llm-code-generation.md
 ```
