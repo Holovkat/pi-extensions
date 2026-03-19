@@ -1,16 +1,17 @@
 # Pi Builder Implementation Checklist
 
-Source of truth epic: [GitHub issue #2](https://github.com/Holovkat/pi-extensions/issues/2)
+Source of truth epic: [GitHub issue #72](https://github.com/Holovkat/pi-extensions/issues/72)
 
 ## Current Read of the Repo
 
 - `extensions/dev-pipeline.ts` exists and is still the primary execution engine.
 - `extensions/req-qa.ts` exists and is still the primary planning engine.
-- `extensions/pi-builder.ts` does not exist yet.
+- `extensions/pi-builder.ts` does not exist yet on `master`.
 - The repo does not currently contain the referenced epic docs:
   - `docs/pi-dev-build-prd.md`
   - `docs/pi-dev-production-line-whitepaper.md`
 - The architecture documented in `README.md` is still centered on `pi-req` and `pi-dev`.
+- Recovered implementation evidence exists on PR [#71](https://github.com/Holovkat/pi-extensions/pull/71): `feat: add pi-builder task-first execution flow`.
 
 ## Priority Order
 
@@ -18,7 +19,7 @@ Source of truth epic: [GitHub issue #2](https://github.com/Holovkat/pi-extension
 - [ ] Restore or recreate the missing spec docs:
   - [ ] `docs/pi-dev-build-prd.md`
   - [ ] `docs/pi-dev-production-line-whitepaper.md`
-- [ ] Regenerate a clean task breakdown under Epic #2 so execution work can be tracked at task level again.
+- [ ] Regenerate a clean task breakdown under Epic #72 so execution work can be tracked at task level again.
 - [ ] Align the local checklist and GitHub issue tree so future `/next-phase` runs have a valid task source.
 
 ### Phase 1 — Stand Up `pi-builder`
@@ -83,3 +84,27 @@ Source of truth epic: [GitHub issue #2](https://github.com/Holovkat/pi-extension
 - [ ] Review and test run on changed surfaces first, with broader promotion gates later.
 - [ ] GitHub issue/comment state is sufficient to reconstruct task context after restart.
 - [ ] `8/10+` scope-drift events are treated as red-flag planning failures and route back to replanning.
+
+## Recovered GitHub Issue Tree
+
+- [ ] [#72 Epic: Build pi-builder execution engine](https://github.com/Holovkat/pi-extensions/issues/72)
+  - [ ] [#73 Sprint 1: pi-builder intake and task packet runtime](https://github.com/Holovkat/pi-extensions/issues/73)
+    - [ ] [#74 Task: create pi-builder extension entrypoint](https://github.com/Holovkat/pi-extensions/issues/74)
+    - [ ] [#75 Task: implement runtime task-packet reconstruction](https://github.com/Holovkat/pi-extensions/issues/75)
+    - [ ] [#76 Task: enforce execution-readiness checks at intake](https://github.com/Holovkat/pi-extensions/issues/76)
+  - [ ] [#77 Sprint 2: pi-builder warm builder continuity and change snapshots](https://github.com/Holovkat/pi-extensions/issues/77)
+    - [ ] [#78 Task: implement task-local warm builder continuity](https://github.com/Holovkat/pi-extensions/issues/78)
+    - [ ] [#79 Task: emit narrow change snapshots](https://github.com/Holovkat/pi-extensions/issues/79)
+    - [ ] [#80 Task: implement correction-packet injection](https://github.com/Holovkat/pi-extensions/issues/80)
+  - [ ] [#81 Sprint 3: pi-builder diff review and targeted testing](https://github.com/Holovkat/pi-extensions/issues/81)
+    - [ ] [#82 Task: implement diff-reviewer lane](https://github.com/Holovkat/pi-extensions/issues/82)
+    - [ ] [#83 Task: implement layered targeted testing](https://github.com/Holovkat/pi-extensions/issues/83)
+    - [ ] [#84 Task: define promotion-gate handoff behavior](https://github.com/Holovkat/pi-extensions/issues/84)
+  - [ ] [#85 Sprint 4: pi-builder tracker sync and line-stop handling](https://github.com/Holovkat/pi-extensions/issues/85)
+    - [ ] [#86 Task: implement tracker-sync GitHub write-backs](https://github.com/Holovkat/pi-extensions/issues/86)
+    - [ ] [#87 Task: implement line-stop and replanning handoff](https://github.com/Holovkat/pi-extensions/issues/87)
+    - [ ] [#88 Task: expose builder runtime lane and readiness visibility](https://github.com/Holovkat/pi-extensions/issues/88)
+  - [ ] [#89 Sprint 5: pi-builder end-to-end pilots and UAT-ready validation](https://github.com/Holovkat/pi-extensions/issues/89)
+    - [ ] [#90 Task: pilot greenfield end-to-end flow](https://github.com/Holovkat/pi-extensions/issues/90)
+    - [ ] [#91 Task: pilot enhancement end-to-end flow](https://github.com/Holovkat/pi-extensions/issues/91)
+    - [ ] [#92 Task: pilot bugfix root-cause-to-regression flow](https://github.com/Holovkat/pi-extensions/issues/92)
