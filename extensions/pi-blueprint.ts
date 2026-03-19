@@ -339,6 +339,34 @@ interface ExistingIssueSummary {
 	labels: string[];
 }
 
+interface DetailedGitHubIssue extends ExistingIssueSummary {
+	body: string;
+	state: string;
+	url: string;
+}
+
+interface RecoveredIssueTaskEntry {
+	issue: DetailedGitHubIssue;
+	sprintIssue: DetailedGitHubIssue | null;
+	sprintOrder: number;
+}
+
+interface RecoveredIssueEpicGroup {
+	issue: DetailedGitHubIssue;
+	sprintIssues: DetailedGitHubIssue[];
+	taskEntries: RecoveredIssueTaskEntry[];
+}
+
+interface RecoveredArtifactSummary {
+	createdPrd: boolean;
+	createdChecklist: boolean;
+	prdPath: string;
+	checklistPath: string;
+	epicCount: number;
+	sprintCount: number;
+	taskCount: number;
+}
+
 interface ParsedEpic {
 	id: string;
 	title: string;
@@ -937,6 +965,18 @@ function padRenderedLine(line: string, width: number): string {
 
 function getExtensionRepoRoot(): string {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+
+function getProjectMcpSummary(cwd: string): { configured: boolean; count: number } {
+	const path = join(cwd, ".mcp.json");
+	if (!existsSync(path)) return { configured: false, count: 0 };
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		const servers = raw?.mcpServers && typeof raw.mcpServers === "object" ? Object.keys(raw.mcpServers) : [];
+		return { configured: servers.length > 0, count: servers.length };
+	} catch {
+		return { configured: true, count: 0 };
+	}
 }
 
 function getBlueprintWebScriptPath(sourceRoot: string): string {
@@ -3337,9 +3377,605 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		}
 	}
 
+	async function loadDetailedIssues(cwd: string): Promise<DetailedGitHubIssue[]> {
+		const result = await shellExecAsync(`cd '${cwd}' && gh issue list --state all --limit 500 --json number,title,body,labels,state,url`);
+		if (!result.ok || !result.stdout) return [];
+		try {
+			const parsed = JSON.parse(result.stdout);
+			if (!Array.isArray(parsed)) return [];
+			return parsed.map((issue: any) => ({
+				number: Number(issue.number),
+				title: String(issue.title || ""),
+				body: String(issue.body || ""),
+				state: String(issue.state || ""),
+				url: String(issue.url || ""),
+				labels: Array.isArray(issue.labels) ? issue.labels.map((label: any) => String(label?.name || "")).filter(Boolean) : [],
+			})).filter((issue: DetailedGitHubIssue) => Number.isFinite(issue.number) && issue.title);
+		} catch {
+			return [];
+		}
+	}
+
+	function issueHasLabel(issue: { labels: string[] }, ...expectedLabels: string[]): boolean {
+		const labels = new Set(issue.labels.map(label => label.toLowerCase()));
+		return expectedLabels.some(label => labels.has(label.toLowerCase()));
+	}
+
+	function looksLikeEpicIssue(issue: { title: string; labels: string[] }): boolean {
+		return issueHasLabel(issue, "epic") || /^epic\s*:/i.test(issue.title);
+	}
+
+	function looksLikeSprintIssue(issue: { title: string; labels: string[] }): boolean {
+		return issueHasLabel(issue, "sprint", "phase") || /^sprint\s+\d+\s*:/i.test(issue.title) || /^phase\s+\d+\s*:/i.test(issue.title);
+	}
+
+	function looksLikeTaskIssue(issue: { title: string; labels: string[] }): boolean {
+		return issueHasLabel(issue, "task", "sub-task") || /^task\s*:/i.test(issue.title) || /^\[\d+\.\d+\]/.test(issue.title);
+	}
+
+	function stripIssueTitlePrefix(title: string): string {
+		return title.replace(/^(epic|task)\s*:\s*/i, "").trim();
+	}
+
+	function normalizeIssueSemanticTitle(title: string, role: string): string {
+		let normalized = String(title || "").trim().toLowerCase();
+		normalized = normalized.replace(/[`"']/g, "");
+		if (role === "task" || role === "sub-task") {
+			normalized = normalized.replace(/^\[(?:\d+(?:\.\d+)*)\]\s*/, "");
+			normalized = normalized.replace(/^\d+(?:\.\d+)*\s*[—–-]\s*/, "");
+		}
+		normalized = normalized.replace(/^(epic|task|sprint|phase|sub-task)\s*:\s*/i, "");
+		normalized = normalized.replace(/^(epic|sprint|phase)\s+\d+\s*[:—–-]\s*/i, "");
+		normalized = normalized.replace(/^phase\/feature\s*:\s*/i, "");
+		normalized = normalized.replace(/\s+/g, " ").trim();
+		return normalized;
+	}
+
+	function issueBodyHasPlanningPlaceholder(body: string): boolean {
+		const normalized = String(body || "").toLowerCase();
+		return normalized.includes("planning bootstrap issue") ||
+			normalized.includes("final task references will be added") ||
+			normalized.includes("will be created after") ||
+			normalized.includes("todo: fill") ||
+			normalized.includes("tbd");
+	}
+
+	function scoreIssueForCanonicalSelection(issue: { title: string; body: string; number: number }, role: string): number {
+		const body = String(issue.body || "");
+		let score = Math.min(body.length, 4000) / 120;
+		if (/^##\s+/m.test(body)) score += 6;
+		if (/done when|acceptance criteria/i.test(body)) score += 10;
+		if (/\*\*complexity(?:\s+score)?\*\*/i.test(body)) score += 6;
+		if (/\*\*depends on\*\*/i.test(body)) score += 5;
+		if (/\*\*owned areas\*\*/i.test(body)) score += 4;
+		if (/\*\*parent epic\*\*/i.test(body)) score += 3;
+		if (/\*\*execution lane\*\*/i.test(body)) score += 3;
+		if (/\*\*github issue\*\*/i.test(body)) score += 2;
+		if (role === "epic" && /^##\s+summary/m.test(body)) score += 5;
+		if (role === "phase" && /^##\s+sprint goal/m.test(body)) score += 5;
+		if (role === "task" && /^##\s+task/m.test(body)) score += 5;
+		if (issueBodyHasPlanningPlaceholder(body)) score -= 25;
+		return score + issue.number / 100000;
+	}
+
+	function collapseMarkdownToSentence(markdown: string): string {
+		return String(markdown || "")
+			.replace(/```[\s\S]*?```/g, " ")
+			.replace(/`([^`]+)`/g, "$1")
+			.replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+			.replace(/^\s*[-*]\s+\[[ x]\]\s*/gim, "")
+			.replace(/^\s*[-*]\s+/gim, "")
+			.replace(/\r/g, "")
+			.replace(/\s+/g, " ")
+			.trim();
+	}
+
+	function extractMarkdownSection(body: string, headingPatterns: RegExp[]): string {
+		const lines = String(body || "").split("\n");
+		const captured: string[] = [];
+		let capture = false;
+		let startLevel = 0;
+		for (const line of lines) {
+			const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/);
+			if (headingMatch) {
+				const level = headingMatch[1].length;
+				const headingText = headingMatch[2].trim();
+				if (!capture && headingPatterns.some(pattern => pattern.test(headingText))) {
+					capture = true;
+					startLevel = level;
+					continue;
+				}
+				if (capture && level <= startLevel) break;
+			}
+			if (capture) captured.push(line);
+		}
+		return captured.join("\n").trim();
+	}
+
+	function extractIssueRefs(text: string): number[] {
+		const refs: number[] = [];
+		const seen = new Set<number>();
+		for (const match of String(text || "").matchAll(/#(\d+)/g)) {
+			const value = Number(match[1]);
+			if (!Number.isFinite(value) || seen.has(value)) continue;
+			seen.add(value);
+			refs.push(value);
+		}
+		return refs;
+	}
+
+	function extractParentEpicRef(body: string): number | null {
+		const match = String(body || "").match(/\*\*(?:Parent\s+)?Epic\*\*:\s*#(\d+)/i);
+		return match ? Number(match[1]) : null;
+	}
+
+	function extractRecoveredComplexityScore(body: string): number | null {
+		const match = String(body || "").match(/\*\*Complexity(?:\s+Score)?\*\*:\s*(\d+)/i);
+		if (!match) return null;
+		const score = Number(match[1]);
+		return Number.isFinite(score) ? score : null;
+	}
+
+	function extractRecoveredDependencyIssueNumbers(body: string): number[] {
+		const match = String(body || "").match(/\*\*Depends\s+on\*\*:\s*(.+)/i);
+		if (!match) return [];
+		if (/\bnone\b/i.test(match[1])) return [];
+		return extractIssueRefs(match[1]);
+	}
+
+	function extractRecoveredAcceptanceCriteria(body: string): string[] {
+		const doneWhen = extractMarkdownSection(body, [/^Done\s+When$/i, /^Acceptance\s+Criteria$/i]);
+		const criteria: string[] = [];
+		for (const line of doneWhen.split("\n")) {
+			const trimmed = line.trim();
+			const match = trimmed.match(/^[-*]\s+\[[ x]\]\s+(.+)/i) || trimmed.match(/^[-*]\s+(.+)/);
+			if (!match) continue;
+			const criterion = collapseMarkdownToSentence(match[1]);
+			if (!criterion) continue;
+			criteria.push(criterion);
+		}
+		return Array.from(new Set(criteria));
+	}
+
+	function extractRecoveredNarrative(body: string): string {
+		const section = extractMarkdownSection(body, [/^Task$/i, /^Summary$/i, /^Sprint\s+Goal$/i, /^Overview$/i]);
+		if (section) return collapseMarkdownToSentence(section);
+		const withoutReferenceIndex = String(body || "").replace(/^###\s+Reference Index[\s\S]*?(?=^##\s|\Z)/m, "").trim();
+		const firstParagraph = withoutReferenceIndex.split(/\n\s*\n/).map(part => part.trim()).find(Boolean) || "";
+		return collapseMarkdownToSentence(firstParagraph);
+	}
+
+	function normalizeRecoveredOwnedArea(candidate: string): string {
+		let normalized = String(candidate || "").trim();
+		if (!normalized) return "";
+		normalized = normalized.replace(/^['"`]+|['"`]+$/g, "");
+		const blobIndex = normalized.indexOf("/blob/");
+		if (blobIndex !== -1) {
+			const tail = normalized.slice(blobIndex + 6);
+			const slashIndex = tail.indexOf("/");
+			normalized = slashIndex === -1 ? tail : tail.slice(slashIndex + 1);
+		}
+		normalized = normalized.replace(/^main\//, "");
+		normalized = normalized.replace(/^github\.com\//, "");
+		normalized = normalized.replace(/^[^/]+\/[^/]+\/blob\/[^/]+\//, "");
+		if (!/[A-Za-z0-9_./-]+\.(ts|tsx|js|jsx|md|json|yml|yaml|css|html|sql|sh)$/i.test(normalized)) return "";
+		return normalized;
+	}
+
+	function extractRecoveredOwnedAreas(body: string): string[] {
+		const ownedAreas = extractOwnedAreas(body)
+			.map(normalizeRecoveredOwnedArea)
+			.filter(Boolean);
+		return Array.from(new Set(ownedAreas));
+	}
+
+	function mapRecoveredExecutionLane(rawLane: string, complexityScore: number | null, hasDependencies: boolean, hasMissingDependencies: boolean): ExecutionLane {
+		const normalized = String(rawLane || "").trim().toLowerCase();
+		if (hasMissingDependencies) return "blocked-replan";
+		if (normalized.includes("blocked") || normalized.includes("replan")) return "blocked-replan";
+		if (normalized.includes("promotion") || normalized.includes("uat") || normalized.includes("integration")) return "broader-promotion";
+		if (normalized.includes("corrective") || normalized.includes("quick") || normalized.includes("hotfix")) return "fast-corrective";
+		if (normalized.includes("feature") || normalized.includes("serial") || normalized.includes("parallel")) return "feature-construction";
+		if ((complexityScore ?? 0) > 5) return "blocked-replan";
+		if ((complexityScore ?? 0) <= 3 && !hasDependencies) return "fast-corrective";
+		return "feature-construction";
+	}
+
+	function demoteMarkdownHeadings(markdown: string, levels: number): string {
+		return String(markdown || "").split("\n").map((line) => {
+			const match = line.match(/^(#{1,6})(\s+.*)$/);
+			if (!match) return line;
+			const nextLevel = Math.min(6, match[1].length + levels);
+			return `${"#".repeat(nextLevel)}${match[2]}`;
+		}).join("\n");
+	}
+
+	function scoreRecoveredEpicGroup(group: RecoveredIssueEpicGroup): number {
+		const taskRefs = extractIssueRefs(extractMarkdownSection(group.issue.body, [/^Task\s+Breakdown$/i, /^Tasks?(?:\s*\(\d+\))?$/i, /^Execution\s+Strategy$/i]));
+		const descendantTaskNumbers = new Set(group.taskEntries.map(entry => entry.issue.number));
+		const uniqueRefs = Array.from(new Set(taskRefs));
+		const matchedRefs = uniqueRefs.filter(ref => descendantTaskNumbers.has(ref));
+		let score = scoreIssueForCanonicalSelection(group.issue, "epic");
+		score += group.sprintIssues.length * 4;
+		score += group.taskEntries.length * 8;
+		score += group.sprintIssues.reduce((sum, issue) => sum + scoreIssueForCanonicalSelection(issue, "phase"), 0) / 4;
+		score += group.taskEntries.reduce((sum, entry) => sum + scoreIssueForCanonicalSelection(entry.issue, "task"), 0) / 5;
+		if (uniqueRefs.length > 0) {
+			score += matchedRefs.length * 5;
+			score -= (uniqueRefs.length - matchedRefs.length) * 4;
+			if (uniqueRefs.length === 1 && taskRefs.length >= 3) score -= 12;
+		}
+		if (issueBodyHasPlanningPlaceholder(group.issue.body) && group.taskEntries.length > 0) score -= 20;
+		return score;
+	}
+
+	function dedupeRecoveredPhaseIssues(issues: DetailedGitHubIssue[]): { issues: DetailedGitHubIssue[]; duplicates: DetailedGitHubIssue[] } {
+		const groups = new Map<string, DetailedGitHubIssue[]>();
+		for (const issue of issues) {
+			const key = normalizeIssueSemanticTitle(issue.title, "phase") || `phase-${issue.number}`;
+			const bucket = groups.get(key) || [];
+			bucket.push(issue);
+			groups.set(key, bucket);
+		}
+		const kept: DetailedGitHubIssue[] = [];
+		const duplicates: DetailedGitHubIssue[] = [];
+		for (const bucket of groups.values()) {
+			bucket.sort((a, b) => scoreIssueForCanonicalSelection(b, "phase") - scoreIssueForCanonicalSelection(a, "phase") || b.number - a.number);
+			kept.push(bucket[0]);
+			duplicates.push(...bucket.slice(1));
+		}
+		kept.sort((a, b) => a.number - b.number);
+		return { issues: kept, duplicates };
+	}
+
+	function dedupeRecoveredTaskEntries(entries: RecoveredIssueTaskEntry[]): { entries: RecoveredIssueTaskEntry[]; duplicates: DetailedGitHubIssue[] } {
+		const groups = new Map<string, RecoveredIssueTaskEntry[]>();
+		for (const entry of entries) {
+			const key = normalizeIssueSemanticTitle(entry.issue.title, "task") || `task-${entry.issue.number}`;
+			const bucket = groups.get(key) || [];
+			bucket.push(entry);
+			groups.set(key, bucket);
+		}
+		const kept: RecoveredIssueTaskEntry[] = [];
+		const duplicates: DetailedGitHubIssue[] = [];
+		for (const bucket of groups.values()) {
+			bucket.sort((a, b) => scoreIssueForCanonicalSelection(b.issue, "task") - scoreIssueForCanonicalSelection(a.issue, "task") || b.issue.number - a.issue.number);
+			kept.push(bucket[0]);
+			duplicates.push(...bucket.slice(1).map(entry => entry.issue));
+		}
+		kept.sort((a, b) => a.sprintOrder - b.sprintOrder || a.issue.number - b.issue.number);
+		return { entries: kept, duplicates };
+	}
+
+	function selectCanonicalRecoveredEpicGroups(groups: RecoveredIssueEpicGroup[]): { groups: RecoveredIssueEpicGroup[]; duplicates: DetailedGitHubIssue[] } {
+		const buckets = new Map<string, RecoveredIssueEpicGroup[]>();
+		for (const group of groups) {
+			const key = normalizeIssueSemanticTitle(group.issue.title, "epic") || `epic-${group.issue.number}`;
+			const bucket = buckets.get(key) || [];
+			bucket.push(group);
+			buckets.set(key, bucket);
+		}
+		const kept: RecoveredIssueEpicGroup[] = [];
+		const duplicates: DetailedGitHubIssue[] = [];
+		for (const bucket of buckets.values()) {
+			bucket.sort((a, b) => scoreRecoveredEpicGroup(b) - scoreRecoveredEpicGroup(a) || b.issue.number - a.issue.number);
+			const canonical = bucket[0];
+			const canonicalPhases = dedupeRecoveredPhaseIssues(canonical.sprintIssues);
+			const canonicalTasks = dedupeRecoveredTaskEntries(canonical.taskEntries);
+			kept.push({
+				issue: canonical.issue,
+				sprintIssues: canonicalPhases.issues,
+				taskEntries: canonicalTasks.entries,
+			});
+			duplicates.push(...canonicalPhases.duplicates, ...canonicalTasks.duplicates);
+			for (const obsolete of bucket.slice(1)) {
+				duplicates.push(obsolete.issue, ...obsolete.sprintIssues, ...obsolete.taskEntries.map(entry => entry.issue));
+			}
+		}
+		const uniqueDuplicates = Array.from(new Map(duplicates.map(issue => [issue.number, issue])).values()).sort((a, b) => a.number - b.number);
+		kept.sort((a, b) => a.issue.number - b.issue.number);
+		return { groups: kept, duplicates: uniqueDuplicates };
+	}
+
+	async function deleteObsoleteBlueprintIssues(cwd: string, issues: DetailedGitHubIssue[], ctx: ExtensionContext): Promise<{ deleted: number; closed: number; failed: number }> {
+		const uniqueIssues = Array.from(new Map(issues.map(issue => [issue.number, issue])).values()).sort((a, b) => b.number - a.number);
+		let deleted = 0;
+		let closed = 0;
+		let failed = 0;
+		for (const issue of uniqueIssues) {
+			const deleteResult = await shellExecAsync(`cd '${cwd}' && gh issue delete ${issue.number} --yes`);
+			if (deleteResult.ok) {
+				deleted++;
+				continue;
+			}
+			const closeResult = await shellExecAsync(
+				`cd '${cwd}' && gh issue close ${issue.number} --comment "Obsolete duplicate planning issue removed by /blueprint-rebuild-issues cleanup."`
+			);
+			if (closeResult.ok) closed++;
+			else failed++;
+		}
+		if (uniqueIssues.length > 0) {
+			ctx.ui.notify(
+				[
+					`Duplicate issue cleanup: ${deleted} deleted${closed > 0 ? `, ${closed} closed` : ""}${failed > 0 ? `, ${failed} failed` : ""}.`,
+					`Removed older duplicate blueprint issues that conflicted with the canonical rebuild set.`,
+				].join("\n"),
+				failed > 0 ? "warning" : "info",
+			);
+		}
+		return { deleted, closed, failed };
+	}
+
+	function buildRecoveredEpicGroups(issues: DetailedGitHubIssue[]): RecoveredIssueEpicGroup[] {
+		const byNumber = new Map(issues.map(issue => [issue.number, issue]));
+		const epicIssues = issues.filter(looksLikeEpicIssue).sort((a, b) => a.number - b.number);
+		const sprintIssues = issues.filter(looksLikeSprintIssue).sort((a, b) => a.number - b.number);
+		const taskIssues = issues.filter(looksLikeTaskIssue).sort((a, b) => a.number - b.number);
+
+		return epicIssues.map((epicIssue) => {
+			const sprintIssuesForEpic: DetailedGitHubIssue[] = [];
+			const seenSprintNumbers = new Set<number>();
+			const explicitSprintRefs = extractIssueRefs(extractMarkdownSection(epicIssue.body, [/^Sprint\s+Breakdown$/i, /^Phase\s+Breakdown$/i]));
+			for (const sprintRef of explicitSprintRefs) {
+				const sprintIssue = byNumber.get(sprintRef);
+				if (!sprintIssue || !looksLikeSprintIssue(sprintIssue) || seenSprintNumbers.has(sprintIssue.number)) continue;
+				seenSprintNumbers.add(sprintIssue.number);
+				sprintIssuesForEpic.push(sprintIssue);
+			}
+			for (const sprintIssue of sprintIssues) {
+				if (seenSprintNumbers.has(sprintIssue.number)) continue;
+				if (extractParentEpicRef(sprintIssue.body) !== epicIssue.number) continue;
+				seenSprintNumbers.add(sprintIssue.number);
+				sprintIssuesForEpic.push(sprintIssue);
+			}
+
+			const taskEntries: RecoveredIssueTaskEntry[] = [];
+			const seenTaskNumbers = new Set<number>();
+			for (const [sprintOrder, sprintIssue] of sprintIssuesForEpic.entries()) {
+				const explicitTaskRefs = extractIssueRefs(extractMarkdownSection(sprintIssue.body, [/^Task\s+Breakdown$/i, /^Sub-?task\s+Breakdown$/i]));
+				for (const taskRef of explicitTaskRefs) {
+					const taskIssue = byNumber.get(taskRef);
+					if (!taskIssue || !looksLikeTaskIssue(taskIssue) || seenTaskNumbers.has(taskIssue.number)) continue;
+					seenTaskNumbers.add(taskIssue.number);
+					taskEntries.push({ issue: taskIssue, sprintIssue, sprintOrder });
+				}
+			}
+			for (const taskIssue of taskIssues) {
+				if (seenTaskNumbers.has(taskIssue.number)) continue;
+				if (extractParentEpicRef(taskIssue.body) !== epicIssue.number) continue;
+				seenTaskNumbers.add(taskIssue.number);
+				taskEntries.push({ issue: taskIssue, sprintIssue: null, sprintOrder: sprintIssuesForEpic.length });
+			}
+
+			return { issue: epicIssue, sprintIssues: sprintIssuesForEpic, taskEntries };
+		}).filter(group => group.sprintIssues.length > 0 || group.taskEntries.length > 0);
+	}
+
+	function renderRecoveredPrd(groups: RecoveredIssueEpicGroup[], repoUrl: string): string {
+		const sprintCount = groups.reduce((sum, group) => sum + group.sprintIssues.length, 0);
+		const taskCount = groups.reduce((sum, group) => sum + group.taskEntries.length, 0);
+		const lines = [
+			"# Product Requirements Document",
+			"",
+			"## Document Metadata",
+			repoUrl ? `- **Source Repository:** ${repoUrl}` : "",
+			`- **Recovered Via:** /blueprint-rebuild-issues GitHub fallback`,
+			`- **Recovered At:** ${new Date().toISOString()}`,
+			`- **Recovered Epic Count:** ${groups.length}`,
+			`- **Recovered Sprint / Phase Count:** ${sprintCount}`,
+			`- **Recovered Task Count:** ${taskCount}`,
+			"",
+			"## 1. Executive Summary",
+			`This PRD was reconstructed from the existing GitHub issue hierarchy. Epic issue bodies provide the product narrative, sprint/phase issues preserve the delivery breakdown, and task issues provide execution detail, dependencies, and acceptance criteria.`,
+			"",
+			"## 2. Source of Truth",
+			"- Existing epic issue bodies are treated as the canonical planning narrative.",
+			"- Sprint / phase issues preserve the mid-level decomposition under each epic.",
+			"- Task issues preserve execution metadata, dependencies, and completion criteria.",
+			"",
+			"## 13. Epics",
+			"",
+		];
+		for (const [index, group] of groups.entries()) {
+			const epicIndex = index + 1;
+			const epicTitle = stripIssueTitlePrefix(group.issue.title);
+			lines.push(`### Epic ${epicIndex}: ${epicTitle}`);
+			lines.push("");
+			lines.push(`- **Source Issue:** [#${group.issue.number}](${group.issue.url})`);
+			lines.push(`- **Recovered Sprint / Phase Issues:** ${group.sprintIssues.length > 0 ? group.sprintIssues.map(issue => `[#${issue.number}](${issue.url}) ${issue.title}`).join("; ") : "none"}`);
+			lines.push(`- **Recovered Task Count:** ${group.taskEntries.length}`);
+			lines.push("");
+			if (group.issue.body.trim()) {
+				lines.push(demoteMarkdownHeadings(group.issue.body.trim(), 1));
+				lines.push("");
+			}
+			if (group.sprintIssues.length > 0) {
+				lines.push("#### Sprint / Phase Breakdown");
+				for (const sprintIssue of group.sprintIssues) {
+					const goal = extractRecoveredNarrative(sprintIssue.body);
+					lines.push(`- **[#${sprintIssue.number}](${sprintIssue.url}) ${sprintIssue.title}**${goal ? ` — ${goal}` : ""}`);
+				}
+				lines.push("");
+			}
+		}
+		return lines.filter((line, index, array) => !(line === "" && array[index - 1] === "")).join("\n").trim() + "\n";
+	}
+
+	function renderRecoveredChecklist(groups: RecoveredIssueEpicGroup[], repoUrl: string): string {
+		const preparedGroups = groups.map((group, index) => {
+			let nextTaskIndex = 1;
+			return {
+				...group,
+				epicIndex: index + 1,
+				preparedTasks: group.taskEntries.map((entry) => ({
+					...entry,
+					taskId: `${index + 1}.${nextTaskIndex++}`,
+					title: stripIssueTitlePrefix(entry.issue.title),
+					description: extractRecoveredNarrative(entry.issue.body),
+					acceptanceCriteria: extractRecoveredAcceptanceCriteria(entry.issue.body),
+					complexityScore: extractRecoveredComplexityScore(entry.issue.body),
+					dependencyIssueNumbers: extractRecoveredDependencyIssueNumbers(entry.issue.body),
+					ownedAreas: extractRecoveredOwnedAreas(entry.issue.body),
+					rawLane: ((entry.issue.body.match(/\*\*Execution\s+Lane\*\*:\s*(.+)/i) || [])[1] || "").trim(),
+				})),
+			};
+		});
+
+		const taskIdByIssueNumber = new Map<number, string>();
+		for (const group of preparedGroups) {
+			for (const task of group.preparedTasks) taskIdByIssueNumber.set(task.issue.number, task.taskId);
+		}
+
+		const lines = [
+			"# 00 - Implementation Checklist",
+			"",
+			"This checklist was reconstructed from the existing GitHub issue hierarchy by `/blueprint-rebuild-issues`.",
+			repoUrl ? `Source repository: ${repoUrl}` : "",
+			`Recovered at: ${new Date().toISOString()}`,
+			"",
+		];
+
+		for (const group of preparedGroups) {
+			const epicTitle = stripIssueTitlePrefix(group.issue.title);
+			lines.push(`## Epic ${group.epicIndex}: ${epicTitle}`);
+			lines.push("");
+			lines.push(`- [ ] [#${group.issue.number} Epic: ${epicTitle}](${group.issue.url})`);
+			lines.push("");
+			if (group.sprintIssues.length > 0) {
+				lines.push("### Sprint / Phase Breakdown");
+				for (const sprintIssue of group.sprintIssues) {
+					const sprintGoal = extractRecoveredNarrative(sprintIssue.body);
+					lines.push(`- [#${sprintIssue.number}](${sprintIssue.url}) ${sprintIssue.title}${sprintGoal ? ` — ${sprintGoal}` : ""}`);
+				}
+				lines.push("");
+			}
+			for (const task of group.preparedTasks) {
+				const mappedDependencies = task.dependencyIssueNumbers
+					.map(issueNumber => taskIdByIssueNumber.get(issueNumber))
+					.filter((value): value is string => !!value);
+				const externalDependencyRefs = task.dependencyIssueNumbers
+					.filter(issueNumber => !taskIdByIssueNumber.has(issueNumber))
+					.map(issueNumber => `#${issueNumber}`);
+				const prerequisiteState: PrerequisiteStatus = externalDependencyRefs.length > 0 ? "missing" : "satisfied";
+				const taskBodyForInference = [task.description, ...task.acceptanceCriteria].join("\n").trim() || task.issue.body;
+				const complexityScore = task.complexityScore ?? inferComplexityScore({
+					id: task.taskId,
+					title: task.title,
+					body: taskBodyForInference,
+					dependencies: mappedDependencies,
+				});
+				const lane = mapRecoveredExecutionLane(task.rawLane, complexityScore, mappedDependencies.length > 0, externalDependencyRefs.length > 0);
+				const acceptanceCriteria = task.acceptanceCriteria.length > 0
+					? task.acceptanceCriteria
+					: [task.description || `Review issue #${task.issue.number} for the recovered task intent.`];
+				const sprintLabel = task.sprintIssue
+					? `#${task.sprintIssue.number} ${task.sprintIssue.title}`
+					: `Recovered directly from epic #${group.issue.number}`;
+				lines.push(`- [ ] **${task.taskId} — ${task.title}** (#${task.issue.number})`);
+				lines.push(`  - **Description:** ${task.description || `Recovered from task issue #${task.issue.number}.`}`);
+				lines.push(`  - **Sprint:** ${sprintLabel}`);
+				lines.push(`  - **Complexity Score:** ${complexityScore}/10`);
+				lines.push(`  - **Prerequisite State:** ${prerequisiteState}`);
+				lines.push(`  - **Execution Lane:** ${lane}`);
+				if (task.ownedAreas.length > 0) lines.push(`  - **Owned Areas:** ${task.ownedAreas.join(", ")}`);
+				lines.push(`  - **Files to create/modify:** ${task.ownedAreas.length > 0 ? task.ownedAreas.join(", ") : "not specified in GitHub issue"}`);
+				lines.push(`  - **Acceptance criteria:**`);
+				for (const criterion of acceptanceCriteria) lines.push(`    - ${criterion}`);
+				lines.push(`  - **Dependencies:** ${mappedDependencies.length > 0 ? mappedDependencies.join(", ") : "None"}`);
+				if (externalDependencyRefs.length > 0) lines.push(`  - **Source Dependencies:** ${externalDependencyRefs.join(", ")}`);
+				lines.push(`  - **Validators:** planning-review`);
+				if (task.ownedAreas.length > 0) lines.push(`  - **Regression Surface:** ${task.ownedAreas.join(", ")}`);
+				lines.push(`  - **GitHub Issue:** #${task.issue.number}`);
+				lines.push("");
+			}
+		}
+
+		return lines.filter((line, index, array) => !(line === "" && array[index - 1] === "")).join("\n").trim() + "\n";
+	}
+
+	async function recoverArtifactsFromIssueHierarchy(
+		cwd: string,
+		ctx: ExtensionContext,
+		options: { createPrd: boolean; createChecklist: boolean },
+	): Promise<RecoveredArtifactSummary | null> {
+		if (!options.createPrd && !options.createChecklist) return null;
+		const issues = await loadDetailedIssues(cwd);
+		if (issues.length === 0) return null;
+		const recovered = selectCanonicalRecoveredEpicGroups(buildRecoveredEpicGroups(issues));
+		const groups = recovered.groups;
+		if (groups.length === 0) return null;
+		if (recovered.duplicates.length > 0) {
+			await deleteObsoleteBlueprintIssues(cwd, recovered.duplicates, ctx);
+		}
+
+		const repoUrl = groups[0]?.issue.url ? groups[0].issue.url.replace(/\/issues\/\d+$/, "") : "";
+		const prdPath = join(cwd, "docs", "PRD.md");
+		const checklistPath = join(cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
+		let createdPrd = false;
+		let createdChecklist = false;
+
+		if (options.createPrd) {
+			mkdirSync(dirname(prdPath), { recursive: true });
+			writeFileSync(prdPath, renderRecoveredPrd(groups, repoUrl), "utf-8");
+			createdPrd = true;
+		}
+		const recoveredTaskCount = groups.reduce((sum, group) => sum + group.taskEntries.length, 0);
+		if (options.createChecklist && recoveredTaskCount > 0) {
+			mkdirSync(dirname(checklistPath), { recursive: true });
+			writeFileSync(checklistPath, renderRecoveredChecklist(groups, repoUrl), "utf-8");
+			createdChecklist = true;
+		}
+		if (!createdPrd && !createdChecklist) return null;
+
+		const sprintCount = groups.reduce((sum, group) => sum + group.sprintIssues.length, 0);
+		ctx.ui.notify(
+			[
+				"Recovered missing blueprint artifacts from the canonical GitHub issue hierarchy.",
+				createdPrd ? `- PRD: ${prdPath}` : "",
+				createdChecklist ? `- Checklist: ${checklistPath}` : "",
+				recovered.duplicates.length > 0 ? `- Removed duplicate issues: ${recovered.duplicates.length}` : "",
+				`- Recovered epics: ${groups.length}`,
+				`- Recovered sprint / phase issues: ${sprintCount}`,
+				`- Recovered task issues: ${recoveredTaskCount}`,
+			].filter(Boolean).join("\n"),
+			"info",
+		);
+		return {
+			createdPrd,
+			createdChecklist,
+			prdPath,
+			checklistPath,
+			epicCount: groups.length,
+			sprintCount,
+			taskCount: recoveredTaskCount,
+		};
+	}
+
 	function findExistingIssueNumber(existingIssues: ExistingIssueSummary[], title: string, label: string): number | null {
-		const match = existingIssues.find(issue => issue.title === title && issue.labels.includes(label));
-		return match ? match.number : null;
+		const exactMatch = existingIssues.find(issue => issue.title === title && issue.labels.includes(label));
+		if (exactMatch) return exactMatch.number;
+		const targetKey = normalizeIssueSemanticTitle(title, label);
+		const candidates = existingIssues
+			.filter(issue => issue.labels.includes(label) && normalizeIssueSemanticTitle(issue.title, label) === targetKey)
+			.sort((a, b) => b.number - a.number);
+		return candidates[0]?.number ?? null;
+	}
+
+	function collectObsoletePublishedIssues(
+		issues: DetailedGitHubIssue[],
+		desired: Array<{ label: string; title: string; keepNumber: number }>,
+	): DetailedGitHubIssue[] {
+		const obsolete = new Map<number, DetailedGitHubIssue>();
+		for (const item of desired) {
+			const targetKey = normalizeIssueSemanticTitle(item.title, item.label);
+			for (const issue of issues) {
+				if (issue.number === item.keepNumber) continue;
+				if (!issue.labels.includes(item.label)) continue;
+				if (normalizeIssueSemanticTitle(issue.title, item.label) !== targetKey) continue;
+				obsolete.set(issue.number, issue);
+			}
+		}
+		return Array.from(obsolete.values()).sort((a, b) => a.number - b.number);
 	}
 
 	function startUiSpinner(ctx: ExtensionContext, key: string, initialMessage: string) {
@@ -3612,6 +4248,30 @@ EOF`);
 				writeFileSync(checklistPath, checklist, "utf-8");
 			}
 
+			const detailedIssues = await loadDetailedIssues(cwd);
+			const obsoletePublishedIssues = collectObsoletePublishedIssues(detailedIssues, [
+				...Array.from(epicIssueNumbers.entries()).map(([epicId, issueNum]) => {
+					const epicEntry = epics.get(epicId);
+					return {
+						label: "epic",
+						title: `${epicId}: ${epicEntry?.title || epicId}`,
+						keepNumber: issueNum,
+					};
+				}),
+				...Array.from(taskIssueNumbers.entries()).map(([taskId, issueNum]) => {
+					const task = tasks.find(candidate => candidate.id === taskId);
+					return {
+						label: "task",
+						title: task ? `[${task.id}] ${task.title}` : taskId,
+						keepNumber: issueNum,
+					};
+				}),
+			]);
+			if (obsoletePublishedIssues.length > 0) {
+				spinner.update(`Deleting ${obsoletePublishedIssues.length} obsolete duplicate issue(s)...`);
+				await deleteObsoleteBlueprintIssues(cwd, obsoletePublishedIssues, ctx);
+			}
+
 			const remoteCheck = await shellExecAsync(`git -C '${cwd}' remote get-url origin`);
 			const repoUrl = remoteCheck.ok ? remoteCheck.stdout.replace(/\.git$/, "") : "";
 
@@ -3680,7 +4340,7 @@ EOF`);
 	}
 
 	pi.registerCommand("blueprint-rebuild-issues", {
-		description: "Rebuild GitHub issues from PRD + checklist (use when issues weren't created during generate_artifacts)",
+		description: "Rebuild GitHub issues from PRD + checklist, or recover missing artifacts from the existing GitHub issue hierarchy",
 		handler: async (_args, ctx) => {
 			const cwd = (ctx as any).cwd || process.cwd();
 
@@ -3767,11 +4427,20 @@ EOF`);
 			// Find artifacts
 			const checklistPath = join(cwd, "features", "00-IMPLEMENTATION-CHECKLIST.md");
 			const prdPath = join(cwd, "docs", "PRD.md");
+			const recoverySummary = await recoverArtifactsFromIssueHierarchy(cwd, ctx as ExtensionContext, {
+				createPrd: !existsSync(prdPath),
+				createChecklist: !existsSync(checklistPath),
+			});
+			const hasChecklist = existsSync(checklistPath);
 
-			if (!existsSync(checklistPath)) {
+			if (!hasChecklist) {
 				const generate = await ctx.ui.confirm(
 					"No Checklist Found",
-					"No checklist at features/00-IMPLEMENTATION-CHECKLIST.md.\nGenerate artifacts (PRD + checklist) first?",
+					"No checklist at features/00-IMPLEMENTATION-CHECKLIST.md.\n" +
+						(recoverySummary
+							? "GitHub issue recovery could not produce a checklist with tasks.\n"
+							: "No recoverable GitHub issue hierarchy was found.\n") +
+						"Generate artifacts (PRD + checklist) first?",
 				);
 				if (!generate) return;
 
@@ -4193,8 +4862,10 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 			);
 		}
 
+		const mcpSummary = getProjectMcpSummary(ctx.cwd);
 		ctx.ui.notify(
 			`Commands:\n` +
+			`  /mcp                    Show MCP servers and tools${mcpSummary.configured ? ` (${mcpSummary.count} configured in .mcp.json)` : ""}\n` +
 			`  /blueprint-status       Current session status\n` +
 			`  /blueprint-history      Consultation history\n` +
 			`  /blueprint-logs         Open all specialist logs in tmux\n` +
@@ -4209,7 +4880,7 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 			`  /blueprint-search-history <query>  Search transcript evidence\n` +
 			`  /blueprint-revise [reason]  Reopen manual requirements review\n` +
 			`  /blueprint-dismiss-revision  Continue without revising now\n` +
-			`  /blueprint-rebuild-issues  Rebuild GitHub issues from artifacts\n` +
+			`  /blueprint-rebuild-issues  Rebuild issues or recover missing artifacts from GitHub\n` +
 			`  /blueprint-reset        Start fresh`,
 			"info",
 		);
@@ -4226,6 +4897,10 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 				const phaseStr = phase === "consulting"
 					? theme.fg("accent", `consulting ${displayName(activeConsultant)}`)
 					: theme.fg(phase === "idle" ? "dim" : "accent", phase);
+				const mcpSummary = getProjectMcpSummary(ctx.cwd);
+				const mcpText = mcpSummary.configured
+					? theme.fg("dim", ` · MCP cfg ${mcpSummary.count} · /mcp`)
+					: theme.fg("dim", " · /mcp");
 				const left = theme.fg("dim", ` ${model}`) +
 					theme.fg("muted", " · ") +
 					theme.fg("accent", "pi-blueprint") +
@@ -4233,7 +4908,8 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 					theme.fg("muted", ` · iter ${iteration}`) +
 					theme.fg("muted", " · ") +
 					theme.fg("dim", blueprintWebUrl || "web: off") +
-					theme.fg("dim", " · /blueprint-details");
+					theme.fg("dim", " · /blueprint-details") +
+					mcpText;
 				const right = theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
 				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
 				return [truncateToWidth(left + pad + right, width)];
