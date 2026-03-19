@@ -1,0 +1,931 @@
+#!/usr/bin/env node
+// Blueprint Web Mirror — HTTP/SSE dashboard + chat bridge for pi-blueprint
+// Usage: blueprint-dashboard-web [project-dir] [--port PORT] [--control-port PORT]
+
+const http = require("node:http");
+const net = require("node:net");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const args = process.argv.slice(2);
+let projectDir = process.cwd();
+let port = 3151;
+let controlPort = 3152;
+
+for (let i = 0; i < args.length; i++) {
+	if (args[i] === "--port" && args[i + 1]) {
+		port = parseInt(args[i + 1], 10);
+		i++;
+	} else if (args[i] === "--control-port" && args[i + 1]) {
+		controlPort = parseInt(args[i + 1], 10);
+		i++;
+	} else if (!String(args[i]).startsWith("-")) {
+		projectDir = args[i];
+	}
+}
+
+const stateFile = path.join(projectDir, ".pi", "pipeline-logs", "blueprint-state.json");
+const sessionStateFile = path.join(projectDir, ".pi", "agent-sessions", "pi-blueprint-state.json");
+const SCRIPT_VERSION = String(fs.statSync(__filename).mtimeMs);
+const MAX_WEB_CHAT_ITEMS = 40;
+const MAX_WEB_CHAT_ITEM_CHARS = 12000;
+const MAX_WEB_CHAT_TOTAL_CHARS = 180000;
+const SPECIALISTS = {
+	"req-analyst": { label: "Requirements", color: "accent" },
+	"tech-analyst": { label: "Technical", color: "success" },
+	"ux-analyst": { label: "UX & Workflows", color: "warning" },
+	"scenario-analyst": { label: "Scenarios", color: "error" },
+};
+
+const sseClients = new Set();
+const registeredAgents = new Map();
+let lastMtime = 0;
+
+function titleizeSpecialist(name) {
+	return String(name || "")
+		.split(/[-_\s]+/)
+		.filter(Boolean)
+		.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+		.join(" ");
+}
+
+function truncateWebChatContent(value, maxChars = MAX_WEB_CHAT_ITEM_CHARS) {
+	const text = String(value || "");
+	if (text.length <= maxChars) return text;
+	const headChars = Math.max(2000, Math.floor(maxChars * 0.72));
+	const tailChars = Math.max(800, Math.floor(maxChars * 0.18));
+	const head = text.slice(0, headChars).trimEnd();
+	const tail = text.slice(-tailChars).trimStart();
+	const omitted = Math.max(0, text.length - head.length - tail.length);
+	return `${head}\n\n...[${omitted} chars truncated for Blueprint web mirror]...\n\n${tail}`;
+}
+
+function capWebChatHistory(items) {
+	if (!Array.isArray(items) || items.length === 0) return [];
+	const recent = items.slice(-MAX_WEB_CHAT_ITEMS).map((item) => ({
+		...item,
+		content: truncateWebChatContent(item?.content),
+	}));
+	let totalChars = 0;
+	const kept = [];
+	for (const item of [...recent].reverse()) {
+		const content = String(item?.content || "");
+		if (kept.length > 0 && totalChars + content.length > MAX_WEB_CHAT_TOTAL_CHARS) break;
+		totalChars += content.length;
+		kept.push(item);
+	}
+	return kept.reverse();
+}
+
+function normalizeConsultationText(text) {
+	return String(text || "")
+		.replace(/\r/g, "")
+		.replace(/\s+/g, " ")
+		.replace(/\s*Q:\s*/g, " Q: ")
+		.replace(/\s*A:\s*/g, " A: ")
+		.trim();
+}
+
+function cleanSummaryText(text) {
+	const value = String(text || "").trim();
+	if (!value) return "—";
+	if (value.length < 180) return value;
+	const trimmed = value.replace(/\s+\S*$/, "").trimEnd();
+	return (trimmed || value).replace(/[,:;.\-–—\s]+$/, "") + "...";
+}
+
+function consultationQuality(item) {
+	const content = String(item?.content || "");
+	let score = 0;
+	if (/\n\nQ:\s*/.test(content)) score += 3;
+	if (/\n\nA:\s*/.test(content)) score += 3;
+	if (/^\w.+\(iteration \d+\)\n\nQ:/s.test(content)) score += 2;
+	score += Math.min((content.match(/\n/g) || []).length, 10);
+	return score;
+}
+
+function dedupeConsultationHistory(items) {
+	const result = [];
+	const byConsultation = new Map();
+	for (const item of items || []) {
+		const title = String(item?.title || "");
+		const content = String(item?.content || "");
+		if (/\(iteration \d+\)/.test(title) && /\bQ:\b/.test(content) && /\bA:\b/.test(content)) {
+			const qMatch = content.match(/\bQ:\s*([\s\S]*?)\bA:\s*/);
+			const questionKey = qMatch
+				? normalizeConsultationText(qMatch[1]).slice(0, 400)
+				: normalizeConsultationText(content).slice(0, 400);
+			const key = `${title}|${questionKey}`;
+			const existing = byConsultation.get(key);
+			if (!existing || consultationQuality(item) > consultationQuality(existing.item)) {
+				if (existing) result[existing.index] = item;
+				else {
+					byConsultation.set(key, { item, index: result.length });
+					result.push(item);
+				}
+			}
+			continue;
+		}
+		result.push(item);
+	}
+	return result;
+}
+
+function normalizeStateValue(value, fallback = "") {
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		return trimmed && trimmed !== "[object Object]" ? trimmed : fallback;
+	}
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	if (Array.isArray(value)) {
+		const parts = value.map((item) => normalizeStateValue(item)).filter(Boolean);
+		return parts.length ? parts.join("; ") : fallback;
+	}
+	if (value && typeof value === "object") {
+		const parts = [];
+		for (const key of ["id", "title", "name", "summary", "description", "detail", "message", "reason", "requirement", "decision", "quote", "source", "path", "field", "status"]) {
+			if (!(key in value)) continue;
+			const normalized = normalizeStateValue(value[key]);
+			if (!normalized) continue;
+			if (["summary", "description", "detail", "message", "reason", "requirement", "decision", "quote"].includes(key)) parts.push(normalized);
+			else parts.push(`${key}: ${normalized}`);
+		}
+		if (parts.length) return Array.from(new Set(parts)).join(" · ");
+		try {
+			const json = JSON.stringify(value);
+			return json.length > 240 ? json.slice(0, 237) + "..." : json;
+		} catch {
+			return fallback;
+		}
+	}
+	return fallback;
+}
+
+function normalizeStateList(value, fallbackPrefix) {
+	if (!Array.isArray(value)) return [];
+	return value.map((item, index) => normalizeStateValue(item, `${fallbackPrefix} ${index + 1}`)).filter(Boolean);
+}
+
+function onlyGenericFallbacks(items, fallbackPrefix) {
+	return Array.isArray(items) && items.length > 0 && items.every((item) => new RegExp(`^${fallbackPrefix} \\d+$`).test(String(item || "")));
+}
+
+function sanitizeDashboardState(state) {
+	if (!state || typeof state !== "object") return state;
+	const alignmentSummary = normalizeStateValue(state.lastAlignmentCheck?.summary, "Run alignment to verify transcript-backed decisions.");
+	let missingDecisions = normalizeStateList(state.lastAlignmentCheck?.missingDecisions, "Missing decision");
+	let contradictions = normalizeStateList(state.lastAlignmentCheck?.contradictions, "Contradiction");
+	let evidence = normalizeStateList(state.lastAlignmentCheck?.evidence, "Evidence").slice(0, 5);
+	if (onlyGenericFallbacks(missingDecisions, "Missing decision")) missingDecisions = [];
+	if (onlyGenericFallbacks(contradictions, "Contradiction")) contradictions = [];
+	if (onlyGenericFallbacks(evidence, "Evidence")) evidence = alignmentSummary ? [alignmentSummary] : [];
+	const normalizedAlignment = state.lastAlignmentCheck
+		? {
+			...state.lastAlignmentCheck,
+			summary: alignmentSummary,
+			missingDecisions,
+			contradictions,
+			evidence,
+		}
+		: null;
+		let reviewMissing = normalizeStateList(state.reviewScore?.missing, "Review gap");
+	if (onlyGenericFallbacks(reviewMissing, "Review gap")) reviewMissing = [];
+	const normalizedReviewScore = state.reviewScore
+		? {
+			...state.reviewScore,
+			missing: reviewMissing,
+			effortTarget: normalizeStateValue(
+				state.reviewScore.effortTarget,
+				normalizedAlignment?.contradictions?.[0] || normalizedAlignment?.missingDecisions?.[0] || "Resolve artifact review gaps",
+			),
+		}
+		: null;
+	return {
+		...state,
+		lastAlignmentCheck: normalizedAlignment,
+		reviewScore: normalizedReviewScore,
+		widgetMirror: null,
+	};
+}
+
+function readBlueprintSessionState() {
+	try {
+		return JSON.parse(fs.readFileSync(sessionStateFile, "utf-8"));
+	} catch {
+		return null;
+	}
+}
+
+function mergeConsultationsIntoState(state) {
+	if (!state) return state;
+	const saved = readBlueprintSessionState();
+	const consults = Array.isArray(saved?.consultations) ? saved.consultations : [];
+	const existing = Array.isArray(state.chatHistory) ? state.chatHistory : [];
+	const merged = [...existing];
+	const seen = new Set(existing.map((item) =>
+		[String(item?.timestamp || ""), String(item?.title || ""), String(item?.content || "")].join("|")
+	));
+	for (const record of consults) {
+		const specialist = titleizeSpecialist(record?.specialist);
+		const title = `${specialist} (iteration ${record?.iteration ?? "?"})`;
+		const content = `${title}\nQ: ${record?.question || ""}\nA: ${record?.response || ""}`;
+		const timestamp = new Date(record?.timestamp || Date.now()).toISOString();
+		const key = [timestamp, title, content].join("|");
+		if (seen.has(key)) continue;
+		merged.push({ role: "assistant", timestamp, title, content });
+		seen.add(key);
+	}
+	merged.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+	const specialistNames = Object.keys(SPECIALISTS);
+	const reviewScore = state.reviewScore || null;
+	const lastBySpec = new Map();
+	for (const record of consults) lastBySpec.set(record?.specialist, record);
+	const phaseLabel = state.rebuildProgress?.active
+		? `Rebuilding GitHub issues — ${state.rebuildProgress.stage} ${state.rebuildProgress.current}/${state.rebuildProgress.total}`
+		: state.phase === "idle" ? "Describe what you want to build."
+		: state.phase === "interview" ? "Discovery interview in progress..."
+		: state.phase === "consulting" ? `Consulting ${titleizeSpecialist(state.activeConsultant)}...`
+		: state.phase === "review" ? "Reviewing findings — provide feedback or approve."
+		: state.phase === "finalizing" ? "Generating artifacts..."
+		: "Requirements discovery complete.";
+	const widgetMirror = state.widgetMirror || {
+		phaseLabel,
+		specialists: specialistNames.map((name) => {
+			const spec = SPECIALISTS[name] || { label: titleizeSpecialist(name), color: "accent" };
+			const record = lastBySpec.get(name);
+			const isRebuildLane = name === "req-analyst" && !!state.rebuildProgress?.active;
+			const isActive = state.activeConsultant === name || isRebuildLane;
+			const hasConsulted = !!record;
+			return {
+				id: name,
+				label: spec.label,
+				color: spec.color,
+				statusIcon: isRebuildLane ? "●" : isActive ? "●" : hasConsulted ? "✓" : "○",
+				statusTone: isActive ? "active" : hasConsulted ? "done" : "idle",
+				statusText: isRebuildLane
+					? `${state.rebuildProgress.stage} ${state.rebuildProgress.current}/${state.rebuildProgress.total}`
+					: isActive ? "consulting..." : hasConsulted ? `done (iter ${record?.iteration ?? "?"})` : "standby",
+				detail: isRebuildLane ? (state.rebuildProgress?.detail || "Publishing GitHub issues...") : cleanSummaryText(record?.question || "—"),
+				question: record?.question || "",
+				response: record?.response || "",
+				timestamp: record?.timestamp || null,
+				isActive,
+				isRebuildLane,
+				iteration: record?.iteration ?? null,
+			};
+		}),
+		scoreCard: {
+			score: reviewScore?.score ?? 0,
+			label: reviewScore?.label ?? `${consults.length}/${specialistNames.length} specialists`,
+			tone: (reviewScore?.score ?? 0) > 95 ? "success" : (reviewScore?.score ?? 0) > 85 ? "warning" : "error",
+			active: false,
+			prdExists: !!state.prdPath,
+			checklistExists: !!state.checklistPath,
+			gateLabel: reviewScore?.ready ? "Review gate: pass" : "Review needed",
+			coverageLabel: `Planning coverage: ${reviewScore?.coverageScore ?? 0}/100`,
+			alignmentLabel: reviewScore?.alignmentStatus === "not-run" || reviewScore?.alignmentStatus == null
+				? "Artifact alignment: not run"
+				: `Artifact alignment: ${reviewScore?.alignmentScore ?? 0}/100 · ${reviewScore.alignmentStatus}`,
+			effortLabel: `${reviewScore?.effortKind === "none" ? "Next step" : "Required next step"}: ${reviewScore?.effortTarget || "Continue review"}`,
+			revisionRequired: !!state.pendingRevisionPrompt,
+			revisionLabel: state.pendingRevisionPrompt ? "Revision required" : "Revision clear",
+			revisionSummary: state.pendingRevisionPrompt?.message || "",
+			revisionActions: state.pendingRevisionPrompt ? "/blueprint-revise [reason]  ·  /blueprint-dismiss-revision" : "",
+			openMode: "tmux+nano",
+		},
+		alignmentCard: {
+			title: "Alignment Review",
+			score: state.lastAlignmentCheck?.score ?? 0,
+			statusText: state.lastAlignmentCheck?.status === "pass"
+				? "Alignment: pass"
+				: state.lastAlignmentCheck?.status === "error"
+					? "Alignment: error"
+					: "Alignment: review needed",
+				summary: state.lastAlignmentCheck?.summary || "Run alignment to verify transcript-backed decisions.",
+				evidence: state.lastAlignmentCheck?.evidence?.[0] || "No transcript evidence pinned yet.",
+				commandLine: "/blueprint-details  ·  /blueprint-check-alignment",
+				tone: state.lastAlignmentCheck?.status === "pass" ? "success" : state.lastAlignmentCheck?.status === "error" ? "error" : "warning",
+				active: false,
+				statusIcon: state.lastAlignmentCheck?.status === "pass" ? "✓" : state.lastAlignmentCheck?.status === "error" ? "✗" : "○",
+			},
+		assetCard: {
+			title: "Local Assets",
+			statusText: state.localAssetSync ? `${state.localAssetSync.present}/${state.localAssetSync.required} synced` : "not checked",
+			stateText: state.localAssetSync?.status === "ready" ? "Project assets: ready" : state.localAssetSync?.status === "partial" ? "Project assets: partial" : "Project assets: review needed",
+			sourceLine: "Repo source: agents/pi-blueprint + skills/pi-blueprint",
+			warning: state.localAssetSync?.missingSources?.length ? `Missing repo sources: ${state.localAssetSync.missingSources.join(", ")}` : "no local changes needed",
+			commandLine: "/blueprint-details  ·  /blueprint-sync-assets",
+			tone: state.localAssetSync?.status === "ready" ? "success" : state.localAssetSync?.status === "partial" ? "warning" : "error",
+			active: false,
+			statusIcon: state.localAssetSync?.status === "ready" ? "✓" : state.localAssetSync?.status === "partial" ? "!" : "○",
+			status: state.localAssetSync?.status || "not-checked",
+		},
+		consultationCount: consults.length,
+		specialistsCovered: new Set(consults.map((c) => c?.specialist)).size,
+		totalSpecialists: specialistNames.length,
+	};
+	return {
+		...state,
+		phase: saved?.phase || state.phase,
+		iteration: saved?.iteration ?? state.iteration,
+		activeConsultant: state.activeConsultant || "",
+		consultationCount: consults.length || state.consultationCount || 0,
+		specialistsCovered: new Set(consults.map((c) => c?.specialist)).size || state.specialistsCovered || 0,
+		widgetMirror,
+		chatHistory: capWebChatHistory(dedupeConsultationHistory(merged)),
+	};
+}
+
+function readState() {
+	try {
+		const raw = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+		return mergeConsultationsIntoState(sanitizeDashboardState(raw));
+	} catch {
+		return null;
+	}
+}
+
+function broadcastState() {
+	const state = readState();
+	if (!state) return;
+	const msg = `data: ${JSON.stringify(state)}\n\n`;
+	for (const res of sseClients) {
+		try {
+			res.write(msg);
+		} catch {
+			sseClients.delete(res);
+		}
+	}
+}
+
+const controlServer = net.createServer((socket) => {
+	let buf = "";
+	socket.setEncoding("utf-8");
+	socket.on("data", (chunk) => {
+		buf += chunk;
+		let nl;
+		while ((nl = buf.indexOf("\n")) !== -1) {
+			const line = buf.slice(0, nl).trim();
+			buf = buf.slice(nl + 1);
+			if (!line) continue;
+			try {
+				handleControlCommand(JSON.parse(line), socket);
+			} catch (error) {
+				try {
+					socket.write(JSON.stringify({ success: false, error: `parse error: ${error.message}` }) + "\n");
+				} catch {}
+			}
+		}
+	});
+	socket.on("error", () => {});
+	socket.on("close", () => {
+		for (const [id, agent] of registeredAgents.entries()) {
+			if (agent.socket === socket) registeredAgents.delete(id);
+		}
+	});
+});
+
+function handleControlCommand(cmd, socket) {
+	switch (cmd.type) {
+		case "register": {
+			registeredAgents.set(cmd.agentId, {
+				sessionKey: cmd.sessionKey || cmd.agentId,
+				socket,
+				info: cmd.info || {},
+				registeredAt: Date.now(),
+			});
+			try { socket.write(JSON.stringify({ success: true, command: "register" }) + "\n"); } catch {}
+			break;
+		}
+		case "unregister": {
+			registeredAgents.delete(cmd.agentId);
+			try { socket.write(JSON.stringify({ success: true, command: "unregister" }) + "\n"); } catch {}
+			break;
+		}
+		case "chat":
+		case "steer":
+		case "follow_up":
+		case "abort": {
+			const targets = cmd.agentId
+				? [...registeredAgents.entries()].filter(([id]) => id === cmd.agentId)
+				: [...registeredAgents.entries()];
+			if (targets.length === 0) {
+				try { socket.write(JSON.stringify({ success: false, error: "agent not found" }) + "\n"); } catch {}
+				return;
+			}
+			const payload = cmd.type === "abort"
+				? { forward: true, type: "abort" }
+				: { forward: true, type: cmd.type === "chat" ? "chat" : cmd.type, message: String(cmd.message || "") };
+			for (const [, agent] of targets) {
+				try { agent.socket.write(JSON.stringify(payload) + "\n"); } catch {}
+			}
+			try { socket.write(JSON.stringify({ success: true, command: cmd.type }) + "\n"); } catch {}
+			break;
+		}
+		case "list_agents": {
+			const agents = [...registeredAgents.entries()].map(([id, agent]) => ({
+				agentId: id,
+				sessionKey: agent.sessionKey,
+				info: agent.info,
+				registeredAt: agent.registeredAt,
+			}));
+			try { socket.write(JSON.stringify({ success: true, command: "list_agents", agents }) + "\n"); } catch {}
+			break;
+		}
+		default:
+			try { socket.write(JSON.stringify({ success: false, error: `unknown command: ${cmd.type}` }) + "\n"); } catch {}
+	}
+}
+
+setInterval(() => {
+	try {
+		const stat = fs.statSync(stateFile);
+		if (stat.mtimeMs !== lastMtime) {
+			lastMtime = stat.mtimeMs;
+			broadcastState();
+		}
+	} catch {}
+}, 500);
+
+function sendJson(res, status, value) {
+	res.writeHead(status, {
+		"Content-Type": "application/json",
+		"Access-Control-Allow-Origin": "*",
+		"Cache-Control": "no-cache",
+	});
+	res.end(JSON.stringify(value));
+}
+
+function sendText(res, status, text, type = "text/plain; charset=utf-8") {
+	res.writeHead(status, {
+		"Content-Type": type,
+		"Access-Control-Allow-Origin": "*",
+		"Cache-Control": "no-cache",
+	});
+	res.end(text);
+}
+
+const DASHBOARD_CSS = `
+*{box-sizing:border-box}
+body{margin:0;background:#121315;color:#ececec;font:14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+body.light{background:#f7f7f8;color:#191919}
+a{color:inherit}
+.container{max-width:1400px;margin:0 auto;padding:16px 20px}
+.nav{display:flex;align-items:center;gap:16px;padding:12px 0 16px;border-bottom:1px solid rgba(255,255,255,.12)}
+body.light .nav{border-bottom-color:rgba(0,0,0,.1)}
+.nav-brand{font-size:18px;font-weight:700;letter-spacing:.04em}
+.nav-meta{margin-left:auto;font-size:12px;opacity:.75}
+.theme-toggle{background:#222;border:1px solid rgba(255,255,255,.12);color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer}
+body.light .theme-toggle{background:#fff;color:#111;border-color:rgba(0,0,0,.12)}
+.hero{display:grid;grid-template-columns:1.25fr .95fr;gap:16px;margin-top:16px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}
+.card,.widget-card,.panel{background:#1a1c1f;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:14px}
+body.light .card,body.light .widget-card,body.light .panel{background:#fff;border-color:rgba(0,0,0,.1)}
+.status-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:#888}
+.status-dot.running{background:#5ad66f;box-shadow:0 0 0 4px rgba(90,214,111,.14)}
+.status-dot.idle{background:#f0b44c;box-shadow:0 0 0 4px rgba(240,180,76,.14)}
+.big{font-size:28px;font-weight:700}
+.muted{opacity:.72}
+.specialist-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.widget-title{font-weight:700;margin-bottom:10px;display:flex;justify-content:space-between;gap:8px;align-items:center}
+.widget-title-text{display:flex;align-items:center;gap:8px}
+.status-chip{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:6px 10px;background:rgba(255,255,255,.05);font-size:12px}
+body.light .status-chip{background:rgba(0,0,0,.05)}
+.status-chip.active{color:#ffd166}.status-chip.done{color:#4ade80}.status-chip.idle{opacity:.8}
+.widget-card.tone-success{border-color:rgba(74,222,128,.35)}
+.widget-card.tone-warning{border-color:rgba(245,158,11,.35)}
+.widget-card.tone-error{border-color:rgba(239,68,68,.35)}
+.metric-value{font-size:28px;font-weight:700;margin-bottom:6px}.tone-success{color:#4ade80}.tone-warning{color:#f59e0b}.tone-error{color:#ef4444}
+.widget-meta,.widget-detail,.widget-state{margin-top:6px;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.widget-actions{margin-top:10px;font-size:12px;opacity:.82}
+.footer-line{margin-top:10px;font-size:12px;opacity:.72}
+.layout{display:grid;grid-template-columns:1.05fr .95fr;gap:16px;margin-top:16px}
+.chat{height:520px;overflow:auto;border-radius:12px;background:rgba(255,255,255,.03);padding:12px;border:1px solid rgba(255,255,255,.08)}
+body.light .chat{background:#f7f7f8;border-color:rgba(0,0,0,.06)}
+.msg{margin-bottom:12px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.04)}
+.msg.user{border-left:3px solid #60a5fa}.msg.assistant{border-left:3px solid #a78bfa}.msg.tool{border-left:3px solid #f59e0b}
+body.light .msg{background:#fff}
+.msg-title{font-size:12px;opacity:.7;margin-bottom:6px}.msg-body{white-space:pre-wrap;word-break:break-word}
+.chat-form{display:flex;gap:10px;margin-top:12px}.chat-input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#101113;color:inherit}
+body.light .chat-input{background:#fff;border-color:rgba(0,0,0,.12)}
+.btn{padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#222;color:#fff;cursor:pointer}
+body.light .btn{background:#fff;color:#111;border-color:rgba(0,0,0,.12)}
+.decisions{display:flex;flex-direction:column;gap:8px}.decision-item{padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.04);font-size:13px;white-space:pre-wrap;word-break:break-word}
+body.light .decision-item{background:#f7f7f8}
+.icon-btn{appearance:none;background:transparent;border:1px solid rgba(255,255,255,.12);color:inherit;border-radius:999px;padding:2px 8px;cursor:pointer;font-size:12px}
+body.light .icon-btn{border-color:rgba(0,0,0,.12)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px;z-index:20}.overlay.open{display:flex}
+.overlay-card{max-width:960px;width:min(960px,100%);max-height:80vh;overflow:auto;background:#16181b;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:18px}
+body.light .overlay-card{background:#fff;border-color:rgba(0,0,0,.12)}
+.overlay-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}.overlay-title{font-size:22px;font-weight:700}.overlay-meta{font-size:12px;opacity:.7;margin-top:4px}.overlay-section{margin-top:14px}.overlay-label{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:8px}.overlay-value{white-space:pre-wrap;word-break:break-word}
+@media (max-width: 1100px){.hero,.layout,.cards,.specialist-grid{grid-template-columns:1fr}}
+`;
+
+const DASHBOARD_HTML = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Blueprint Dashboard</title>
+<style>${DASHBOARD_CSS}</style>
+</head>
+<body>
+<div class="container">
+	<div class="nav">
+		<div class="nav-brand">PI BLUEPRINT</div>
+		<button id="theme-btn" class="theme-toggle" type="button">Light</button>
+		<div class="nav-meta" id="updated">waiting…</div>
+	</div>
+
+	<div class="hero">
+		<div class="card">
+			<div class="status-row">
+				<span id="statusDot" class="status-dot idle"></span>
+				<div class="big" id="statusLine">idle</div>
+			</div>
+			<div class="widget-meta" id="activityLine">Waiting for state...</div>
+			<div class="widget-meta">Web: <span id="urlLine">-</span></div>
+		</div>
+		<div class="card">
+			<div class="widget-title">Recent Decisions</div>
+			<div id="decisionList" class="decisions"><div class="muted">No transcript segments yet.</div></div>
+		</div>
+	</div>
+
+	<div class="cards">
+		<div id="scoreCard" class="widget-card"></div>
+		<div id="alignmentCard" class="widget-card"></div>
+		<div id="assetCard" class="widget-card"></div>
+		<div class="widget-card">
+			<div class="widget-title">Commands</div>
+			<div class="widget-meta"><code>/blueprint-details</code></div>
+			<div class="widget-meta"><code>/blueprint-check-alignment</code></div>
+			<div class="widget-meta"><code>/blueprint-search-history &lt;query&gt;</code></div>
+			<div class="widget-meta"><code>/blueprint-sync-assets</code></div>
+		</div>
+	</div>
+
+	<div class="panel" style="margin-top:16px">
+		<div class="widget-title">Specialists</div>
+		<div id="specialistGrid" class="specialist-grid"></div>
+		<div id="widgetFooter" class="footer-line"></div>
+	</div>
+
+	<div class="layout">
+		<div class="panel">
+			<div class="widget-title">Transcript</div>
+			<div id="chat" class="chat"></div>
+			<form id="chatForm" class="chat-form">
+				<input id="chatInput" class="chat-input" placeholder="Send a message into the live blueprint session" />
+				<button class="btn" type="submit">Send</button>
+			</form>
+		</div>
+		<div class="panel">
+			<div class="widget-title">State Snapshot</div>
+			<div class="widget-meta">Project: <code>${projectDir}</code></div>
+			<div class="widget-meta">State file: <code>${stateFile}</code></div>
+			<div class="widget-meta">Control port: <code>${controlPort}</code></div>
+			<div class="widget-meta">Widget bar data and transcript stream update live from <code>blueprint-state.json</code>.</div>
+		</div>
+	</div>
+</div>
+
+<div id="detailOverlay" class="overlay" aria-hidden="true">
+	<div class="overlay-card">
+		<div class="overlay-head">
+			<div>
+				<div id="overlayTitle" class="overlay-title">Specialist</div>
+				<div id="overlayMeta" class="overlay-meta"></div>
+			</div>
+			<button id="overlayClose" class="btn" type="button">Close</button>
+		</div>
+		<div id="overlayBody"></div>
+	</div>
+</div>
+
+<script>
+(() => {
+	const el = (id) => document.getElementById(id);
+	const chat = el('chat');
+	const detailOverlay = el('detailOverlay');
+	const specialistGrid = el('specialistGrid');
+	const scoreCard = el('scoreCard');
+	const alignmentCard = el('alignmentCard');
+	const assetCard = el('assetCard');
+	const widgetFooter = el('widgetFooter');
+	const decisionList = el('decisionList');
+	let currentState = null;
+	let cumulativeChatHistory = [];
+	let shouldStickChatToBottom = true;
+
+	function toggleTheme() {
+		document.body.classList.toggle('light');
+		const light = document.body.classList.contains('light');
+		el('theme-btn').textContent = light ? 'Dark' : 'Light';
+		localStorage.setItem('pi-blueprint-theme', light ? 'light' : 'dark');
+	}
+	(function initTheme() {
+		const saved = localStorage.getItem('pi-blueprint-theme');
+		if (saved === 'light') {
+			document.body.classList.add('light');
+			el('theme-btn').textContent = 'Dark';
+		}
+	})();
+	el('theme-btn').addEventListener('click', toggleTheme);
+
+	function esc(value) {
+		return String(value ?? '')
+			.replace(/&/g, '&amp;')
+			.replace(/</g, '&lt;')
+			.replace(/>/g, '&gt;')
+			.replace(/"/g, '&quot;')
+			.replace(/'/g, '&#39;');
+	}
+
+	function renderMarkdown(text) {
+		return esc(String(text || '')).replace(/\n/g, '<br>');
+	}
+
+	function renderQaContent(text) {
+		const value = String(text || '');
+		if (!/\bQ:\b/.test(value) || !/\bA:\b/.test(value)) return null;
+		return '<div class="overlay-value">' + renderMarkdown(value) + '</div>';
+	}
+
+	function renderConsultationSections(source) {
+		const text = String(source || '');
+		if (!/\(iteration \d+\)/.test(text) || !/\bQ:\b/.test(text)) return null;
+		return '<div class="overlay-value">' + renderMarkdown(text) + '</div>';
+	}
+
+	function compactEmbeddedConsultationHistory(source) {
+		const text = String(source || '');
+		const marker = '## Previous Specialist Consultations';
+		const idx = text.indexOf(marker);
+		if (idx === -1) return text;
+		const before = text.slice(0, idx).trimEnd();
+		const after = text.slice(idx + marker.length).trimStart();
+		if (!/(?:###\s*)?[^\n]+\(iteration \d+\)\n(?:\*\*Q:\*\*|Q:)/.test(after)) return text;
+		return [before, marker, 'Formatted consultation entries are shown separately in this chat view.'].filter(Boolean).join('\n\n');
+	}
+
+	function renderMessageContent(text) {
+		const compacted = compactEmbeddedConsultationHistory(text);
+		const consultationSections = renderConsultationSections(compacted);
+		if (consultationSections) return consultationSections;
+		const qa = renderQaContent(compacted);
+		if (qa) return qa;
+		return renderMarkdown(compacted);
+	}
+
+	function toneClass(tone) {
+		return tone === 'success' ? 'tone-success' : tone === 'warning' ? 'tone-warning' : 'tone-error';
+	}
+
+	function mergeChatHistory(items) {
+		const seen = new Set(cumulativeChatHistory.map((item) => item._key));
+		for (const item of items || []) {
+			const key = String(item.timestamp || '') + '|' + String(item.role || '') + '|' + String(item.title || '') + '|' + String(item.content || '');
+			if (seen.has(key)) continue;
+			cumulativeChatHistory.push({ ...item, _key: key });
+			seen.add(key);
+		}
+		cumulativeChatHistory.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
+		if (cumulativeChatHistory.length > 80) cumulativeChatHistory = cumulativeChatHistory.slice(-80);
+	}
+
+	function renderSpecialistWidget(card) {
+		const chip = card.statusTone === 'done' ? 'done' : card.statusTone === 'active' ? 'active' : 'idle';
+		return [
+			'<div class="widget-card tone-' + esc(card.statusTone === 'done' ? 'success' : card.statusTone === 'active' ? 'warning' : 'error') + '">',
+			'<div class="widget-title"><span class="widget-title-text">' + esc(card.label) + '</span><span><button class="icon-btn specialist-info" data-specialist-id="' + esc(card.id) + '">i</button> <button class="icon-btn specialist-search" data-specialist-id="' + esc(card.id) + '">⌕</button></span></div>',
+			'<div class="status-chip ' + chip + '"><span>' + esc(card.statusIcon) + '</span>' + esc(card.statusText) + '</div>',
+			(card.detail ? '<div class="widget-meta">' + esc(card.detail) + '</div>' : ''),
+			'</div>',
+		].join('');
+	}
+
+	function closeSpecialistOverlay() {
+		detailOverlay.classList.remove('open');
+		detailOverlay.setAttribute('aria-hidden', 'true');
+	}
+
+	function openSpecialistSummaryOverlay(id) {
+		const card = currentState?.widgetMirror?.specialists?.find((item) => item.id === id);
+		if (!card) return;
+		el('overlayTitle').textContent = card.label + ' Summary';
+		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? new Date(card.timestamp).toLocaleString() : ''].filter(Boolean).join(' · ');
+		el('overlayBody').innerHTML = '<div class="overlay-section"><div class="overlay-label">Card Detail</div><div class="overlay-value">' + renderMarkdown(card.detail || 'No summary available.') + '</div></div>';
+		detailOverlay.classList.add('open');
+		detailOverlay.setAttribute('aria-hidden', 'false');
+	}
+
+	function openSpecialistOverlay(id) {
+		const card = currentState?.widgetMirror?.specialists?.find((item) => item.id === id);
+		if (!card) return;
+		el('overlayTitle').textContent = card.label;
+		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? new Date(card.timestamp).toLocaleString() : ''].filter(Boolean).join(' · ');
+		const sections = [];
+		if (card.question) sections.push('<div class="overlay-section"><div class="overlay-label">Question</div><div class="overlay-value">' + renderMarkdown(card.question) + '</div></div>');
+		if (card.response) sections.push('<div class="overlay-section"><div class="overlay-label">Response</div><div class="overlay-value">' + renderMessageContent(String(card.label || '') + ' (detail)\nQ: ' + card.question + '\nA: ' + card.response) + '</div></div>');
+		if (!sections.length) sections.push('<div class="overlay-section"><div class="overlay-label">Detail</div><div class="overlay-value">' + renderMarkdown(card.detail || 'No detail available.') + '</div></div>');
+		el('overlayBody').innerHTML = sections.join('');
+		detailOverlay.classList.add('open');
+		detailOverlay.setAttribute('aria-hidden', 'false');
+	}
+
+	function renderScoreWidget(card) {
+		if (!card) return '<div class="widget-title">Blueprint Score</div><div class="muted">No score yet.</div>';
+		const actions = card.revisionRequired ? '<div class="widget-actions"><code>/blueprint-revise [reason]</code> · <code>/blueprint-dismiss-revision</code></div>' : '';
+		const revisionSummary = card.revisionRequired && card.revisionSummary ? '<div class="widget-meta">' + esc(card.revisionSummary) + '</div>' : '';
+		return [
+			'<div class="widget-title">Blueprint Score</div>',
+			'<div class="metric-value ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100</div>',
+			'<div class="widget-meta">' + esc(card.label) + '</div>',
+			'<div class="widget-meta">' + (card.prdExists ? 'PRD ✓' : 'PRD ○') + ' · <code>/blueprint-prd</code></div>',
+			'<div class="widget-meta">' + (card.checklistExists ? 'Checklist ✓' : 'Checklist ○') + ' · <code>/blueprint-checklist</code></div>',
+			'<div class="widget-meta">' + esc(card.gateLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.coverageLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.alignmentLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.effortLabel) + '</div>',
+			'<div class="widget-meta">' + esc(card.revisionLabel) + '</div>',
+			'<div class="widget-meta">Open mode: ' + esc(card.openMode || 'browser') + '</div>',
+			revisionSummary,
+			actions,
+		].join('');
+	}
+
+	function renderInfoWidget(card) {
+		if (!card) return '<div class="widget-title">Alignment Review</div><div class="muted">No alignment review yet.</div>';
+		return [
+			'<div class="widget-title">' + esc(card.title) + '</div>',
+			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100 · ' + esc(card.statusText) + '</div>',
+			'<div class="widget-detail">' + esc(card.summary) + '</div>',
+			'<div class="widget-meta">Evidence: ' + esc(card.evidence) + '</div>',
+			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
+		].join('');
+	}
+
+	function renderAssetWidget(card) {
+		if (!card) return '<div class="widget-title">Local Assets</div><div class="muted">No asset sync data.</div>';
+		return [
+			'<div class="widget-title">' + esc(card.title) + '</div>',
+			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(card.statusText) + '</div>',
+			'<div class="widget-meta">' + esc(card.stateText) + '</div>',
+			'<div class="widget-meta">' + esc(card.sourceLine) + '</div>',
+			'<div class="widget-detail">' + esc(card.warning) + '</div>',
+			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
+		].join('');
+	}
+
+	function renderState(state) {
+		if (!state) return;
+		currentState = state;
+		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+		const wasNearBottom = distanceFromBottom <= 40 || shouldStickChatToBottom;
+		el('statusDot').className = 'status-dot ' + (state.phase === 'idle' ? 'idle' : 'running');
+		el('statusLine').textContent = state.phase || 'connected';
+		el('urlLine').textContent = state.webUrl || window.location.href;
+		el('activityLine').textContent = state.widgetMirror?.phaseLabel || 'Waiting for state...';
+		if (state.widgetMirror) {
+			specialistGrid.innerHTML = (state.widgetMirror.specialists || []).map(renderSpecialistWidget).join('');
+			scoreCard.innerHTML = renderScoreWidget(state.widgetMirror.scoreCard);
+			alignmentCard.innerHTML = renderInfoWidget(state.widgetMirror.alignmentCard);
+			assetCard.innerHTML = renderAssetWidget(state.widgetMirror.assetCard);
+			widgetFooter.textContent = state.widgetMirror.consultationCount + ' consultation' + (state.widgetMirror.consultationCount === 1 ? '' : 's') + ' · ' + state.widgetMirror.specialistsCovered + '/' + state.widgetMirror.totalSpecialists + ' specialists consulted';
+		}
+		decisionList.innerHTML = '';
+		const decisions = (state.chatHistory || []).slice(-6);
+		if (!decisions.length) {
+			decisionList.innerHTML = '<div class="muted">No transcript segments yet.</div>';
+		} else {
+			for (const item of decisions) {
+				const row = document.createElement('div');
+				row.className = 'decision-item';
+				row.textContent = '[' + item.role + '] ' + String(item.content || '').slice(0, 180);
+				decisionList.appendChild(row);
+			}
+		}
+		mergeChatHistory(state.chatHistory || []);
+		chat.innerHTML = '';
+		const renderedChat = cumulativeChatHistory.slice(-60);
+		for (const item of renderedChat) {
+			const div = document.createElement('div');
+			div.className = 'msg ' + item.role;
+			div.innerHTML = '<div class="msg-title">' + esc(item.title || item.role || 'message') + '</div><div class="msg-body">' + renderMessageContent(item.content) + '</div>';
+			chat.appendChild(div);
+		}
+		if (wasNearBottom) {
+			chat.scrollTop = chat.scrollHeight;
+			shouldStickChatToBottom = true;
+		}
+		el('updated').textContent = 'updated ' + new Date(state.updatedAt || Date.now()).toLocaleTimeString();
+	}
+
+	async function refresh() {
+		try {
+			const res = await fetch('/api/state');
+			renderState(await res.json());
+		} catch {}
+	}
+
+	new EventSource('/events').onmessage = (event) => {
+		try { renderState(JSON.parse(event.data)); } catch {}
+	};
+
+	el('chatForm').addEventListener('submit', async (event) => {
+		event.preventDefault();
+		const input = el('chatInput');
+		const message = input.value.trim();
+		if (!message) return;
+		await fetch('/api/chat', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ message }),
+		});
+		input.value = '';
+	});
+
+	chat.addEventListener('scroll', () => {
+		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+		shouldStickChatToBottom = distanceFromBottom <= 40;
+	});
+
+	document.addEventListener('click', (event) => {
+		const target = event.target;
+		if (target instanceof HTMLElement && target.classList.contains('specialist-info')) openSpecialistSummaryOverlay(target.dataset.specialistId);
+		if (target instanceof HTMLElement && target.classList.contains('specialist-search')) openSpecialistOverlay(target.dataset.specialistId);
+	});
+
+	el('overlayClose').addEventListener('click', closeSpecialistOverlay);
+	detailOverlay.addEventListener('click', (event) => { if (event.target === detailOverlay) closeSpecialistOverlay(); });
+	document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && detailOverlay.classList.contains('open')) closeSpecialistOverlay(); });
+	refresh();
+})();
+</script>
+</body>
+</html>`;
+
+const server = http.createServer((req, res) => {
+	if (!req.url) return sendText(res, 404, "not found");
+	if (req.method === "OPTIONS") {
+		res.writeHead(204, {
+			"Access-Control-Allow-Origin": "*",
+			"Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+			"Access-Control-Allow-Headers": "Content-Type",
+		});
+		res.end();
+		return;
+	}
+
+	if (req.url === "/api/version") return sendJson(res, 200, { version: SCRIPT_VERSION });
+	if (req.url === "/api/state") return sendJson(res, 200, readState());
+	if (req.url === "/events") {
+		res.writeHead(200, {
+			"Content-Type": "text/event-stream",
+			"Cache-Control": "no-cache, no-transform",
+			Connection: "keep-alive",
+			"Access-Control-Allow-Origin": "*",
+		});
+		res.write(`data: ${JSON.stringify(readState())}\n\n`);
+		sseClients.add(res);
+		req.on("close", () => sseClients.delete(res));
+		return;
+	}
+	if (req.url === "/api/chat" && req.method === "POST") {
+		let body = "";
+		req.on("data", (chunk) => body += chunk);
+		req.on("end", () => {
+			try {
+				const parsed = JSON.parse(body || "{}");
+				const message = String(parsed.message || "").trim();
+				if (!message) return sendJson(res, 400, { success: false, error: "message required" });
+				const targets = registeredAgents.has("blueprint-main")
+					? [["blueprint-main", registeredAgents.get("blueprint-main")]]
+					: [...registeredAgents.entries()];
+				for (const [, agent] of targets) {
+					try {
+						agent.socket.write(JSON.stringify({ forward: true, type: "chat", message }) + "\n");
+					} catch {}
+				}
+				sendJson(res, 200, { success: true, delivered: targets.length });
+			} catch (error) {
+				sendJson(res, 400, { success: false, error: error.message });
+			}
+		});
+		return;
+	}
+	if (req.url === "/" || req.url === "/dashboard") {
+		return sendText(res, 200, DASHBOARD_HTML, "text/html; charset=utf-8");
+	}
+	return sendText(res, 404, "not found");
+});
+
+controlServer.listen(controlPort, "127.0.0.1", () => {
+	console.log(`Blueprint control socket listening on 127.0.0.1:${controlPort}`);
+});
+server.listen(port, "127.0.0.1", () => {
+	console.log(`Blueprint dashboard listening on http://127.0.0.1:${port}`);
+	console.log(`State file: ${stateFile}`);
+});
