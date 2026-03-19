@@ -1,0 +1,29 @@
+{
+  "settings": {
+    "toolPrefix": "server",
+    "idleTimeout": 10
+  },
+  "mcpServers": {
+    "jcodemunch": {
+      "type": "stdio",
+      "command": "jcodemunch-mcp",
+      "args": []
+    },
+    "jdocmunch": {
+      "type": "stdio",
+      "command": "jdocmunch-mcp",
+      "args": []
+    },
+    "github": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
