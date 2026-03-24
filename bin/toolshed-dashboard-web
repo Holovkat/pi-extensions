@@ -407,6 +407,23 @@ function buildGeneratedAppBridgeScript(config) {
 		"    } catch {}",
 		"    return { ok: false, mode: mode };",
 		"  },",
+		"  async syncToolshedSession(input){",
+		"    try {",
+		"      if (window.parent && typeof window.parent.postMessage === 'function') {",
+		"        window.parent.postMessage({",
+		"          type:'toolshed-generated-app-session-sync',",
+		"          cardId:CARD_ID,",
+		"          itemId:ITEM_ID,",
+		"          adapter: input && input.adapter || '',",
+		"          title: input && input.title || '',",
+		"          sessionId: input && input.sessionId || window.__toolshedSessionId || '',",
+		"          appState: input && input.appState && typeof input.appState === 'object' ? input.appState : {},",
+		"        }, window.location.origin);",
+		"        return { ok: true };",
+		"      }",
+		"    } catch {}",
+		"    return { ok: false };",
+		"  },",
 		"  async openLink(input){",
 		"    if (input && input.url) window.open(input.url, '_blank', 'noopener,noreferrer');",
 		"    return { ok: true };",
@@ -1158,17 +1175,45 @@ function applyGeneratedAppViewportState() {
 	document.body.classList.toggle('generated-app-viewport-open', Boolean(viewportGeneratedAppItemId));
 }
 
+function generatedConversationAdapter(item) {
+	const runtime = item && item.appRuntime ? item.appRuntime : {};
+	if (runtime.adapter === 'calculator') return 'calculator';
+	const text = [
+		runtime.title || '',
+		item && item.title || '',
+		runtime.toolName || '',
+		runtime.serverId || '',
+		runtime.viewFile || '',
+	].join(' ').toLowerCase();
+	if (/github project kanban board|github.*kanban|kanban board/.test(text)) return 'github-project-kanban';
+	return '';
+}
+
 function buildInlineAppSyncAction(item) {
-	if (!item || !item.appRuntime || item.appRuntime.adapter !== 'calculator') return null;
-	const state = generatedAppState(item);
+	if (!item || !item.appRuntime) return null;
+	const adapter = generatedConversationAdapter(item);
+	if (!adapter) return null;
+	const state = adapter === 'calculator' ? generatedAppState(item) : (item.appState && typeof item.appState === 'object' ? item.appState : {});
 	return {
 		type: 'sync-inline-app-state',
 		itemId: String(item.id || ''),
 		cardId: String(item.cardId || ''),
-		title: String(item.title || item.appRuntime.title || 'Inline calculator'),
-		adapter: 'calculator',
+		title: String(item.title || item.appRuntime.title || 'Inline app'),
+		adapter: adapter,
 		appRuntime: item.appRuntime,
 		appState: state,
+	};
+}
+
+function buildInlineAppClearAction(item) {
+	if (!item || !item.appRuntime) return null;
+	const adapter = generatedConversationAdapter(item);
+	if (!adapter) return null;
+	return {
+		type: 'clear-inline-app-state',
+		itemId: String(item.id || ''),
+		cardId: String(item.cardId || ''),
+		adapter: adapter,
 	};
 }
 
@@ -1195,6 +1240,35 @@ function scheduleInlineAppSync(item, delay) {
 		postBackgroundAction(payload);
 	}, timeoutMs));
 	return true;
+}
+
+function nodeFromMarkup(markup) {
+	const template = document.createElement('template');
+	template.innerHTML = String(markup || '').trim();
+	return template.content.firstElementChild || null;
+}
+
+function captureGeneratedAppLaneNodes() {
+	const preserved = new Map();
+	if (!lane) return preserved;
+	Array.from(lane.querySelectorAll('.lane-item.generated-app[data-generated-app-item]')).forEach(function(node) {
+		const itemId = node.getAttribute('data-generated-app-item') || '';
+		const item = findLocalLaneItem(itemId);
+		const version = item && item.appRuntime ? generatedRuntimeVersion(item.appRuntime) : '';
+		if (!itemId || !version) return;
+		preserved.set(itemId, { node, version });
+	});
+	return preserved;
+}
+
+function buildLaneItemNode(item, preservedGeneratedApps) {
+	if (item && item.meta === 'Generated MCP app' && item.appRuntime) {
+		const itemId = String(item.id || '').trim();
+		const version = generatedRuntimeVersion(item.appRuntime);
+		const cached = itemId && preservedGeneratedApps ? preservedGeneratedApps.get(itemId) : null;
+		if (cached && cached.node && cached.version === version) return cached.node;
+	}
+	return nodeFromMarkup(laneItemMarkup(item));
 }
 
 function syncInlineAppsNow(itemId) {
@@ -1430,7 +1504,7 @@ function syncGeneratedAppLaneItemsFromState() {
 			summary: nextSummary,
 			tone: nextRuntime.ready ? 'success' : 'warning',
 			appRuntime: nextRuntime,
-			timestamp: new Date().toISOString(),
+			timestamp: item.timestamp,
 		};
 	});
 	if (changed) saveLocalLaneItems();
@@ -1611,6 +1685,8 @@ function removeLocalLaneItem(itemId) {
 	if (existing) {
 		if (viewportGeneratedAppItemId === itemId) viewportGeneratedAppItemId = '';
 		clearInlineAppSync(existing);
+		const clearPayload = buildInlineAppClearAction(existing);
+		if (clearPayload) postBackgroundAction(clearPayload);
 		if (existing.cardId && existing.appRuntime) {
 			fetch('/api/generated-app-close', {
 				method: 'POST',
@@ -2441,7 +2517,7 @@ function mcpExampleLaneMarkup(item) {
 	const sources = Array.isArray(example.sources) ? example.sources : [];
 	const presetPayload = encodePayload(example.preset || {});
 	return [
-		'<article class="lane-item card mcp-example">',
+		'<article class="lane-item card mcp-example" data-lane-item-id="' + escapeHtml(item.id || '') + '">',
 			'<div class="lane-card mcp-example-card ' + (item.state === 'active' ? 'frontier ' : '') + escapeHtml('tone-' + (item.tone || 'info')) + '"' + (item.state === 'active' ? ' data-frontier="true"' : '') + '>',
 				'<div class="lane-head">',
 					'<div>',
@@ -2551,8 +2627,9 @@ function generatedAppLaneMarkup(item) {
 	const body = runtime.adapter === 'calculator'
 		? renderGeneratedCalculatorApp(item)
 		: renderGeneratedGenericApp(item);
+	const runtimeVersion = generatedRuntimeVersion(runtime);
 	return [
-		'<article class="lane-item card generated-app" data-generated-app-item="' + escapeHtml(item.id || '') + '">',
+		'<article class="lane-item card generated-app" data-lane-item-id="' + escapeHtml(item.id || '') + '" data-generated-app-item="' + escapeHtml(item.id || '') + '"' + (runtimeVersion ? ' data-generated-app-version="' + escapeHtml(runtimeVersion) + '"' : '') + '>',
 			'<div class="lane-card generated-app-card ' + (item.state === 'active' ? 'frontier ' : '') + escapeHtml('tone-' + (item.tone || 'info')) + '"' + (item.state === 'active' ? ' data-frontier="true"' : '') + '>',
 				body,
 				'<div class="lane-tools mcp-example-actions generated-app-lane-actions"><button type="button" class="ghost-btn card-pill-btn" data-lane-example-dismiss="' + escapeHtml(item.id || '') + '">Dismiss</button></div>',
@@ -2562,6 +2639,7 @@ function generatedAppLaneMarkup(item) {
 }
 
 function laneItemMarkup(item) {
+	const laneItemId = escapeHtml(item.id || '');
 	const text = String(item.content || '');
 	const summary = String(item.summary || '');
 	const simplified = item.kind === 'user' || item.kind === 'assistant' || item.kind === 'system';
@@ -2592,7 +2670,7 @@ function laneItemMarkup(item) {
 		const detailText = [item.toolRequest, item.title || (item.kind === 'packet' ? 'Packet result' : 'Tool result'), text].filter(Boolean).join('\n\n');
 		const collapsedSummary = clipText(detailText.replace(/\s+/g, ' ').trim(), 120);
 		return [
-			'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '">',
+			'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '" data-lane-item-id="' + laneItemId + '">',
 				'<div class="lane-card ' + (item.state === 'active' ? 'frontier' : '') + ' ' + escapeHtml('tone-' + (item.tone || 'info')) + '"' + (item.state === 'active' ? ' data-frontier="true"' : '') + '>',
 					'<button type="button" class="lane-toggle" data-lane-expand="' + escapeHtml(item.id) + '" aria-expanded="' + escapeHtml(String(expanded)) + '">',
 						'<span class="lane-toggle-kind">' + escapeHtml(item.kind === 'packet' ? 'Packet' : 'Tool') + '</span>',
@@ -2613,7 +2691,7 @@ function laneItemMarkup(item) {
 	}
 	if (simplified) {
 		return [
-			'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '">',
+			'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '" data-lane-item-id="' + laneItemId + '">',
 				'<div class="lane-card ' + (item.state === 'active' ? 'frontier' : '') + ' ' + escapeHtml('tone-' + (item.tone || 'info')) + '"' + (item.state === 'active' ? ' data-frontier="true"' : '') + '>',
 					(primary ? '<div class="lane-summary">' + renderMarkdown(visible) + '</div>' : '<div class="empty-state">No lane content yet.</div>'),
 					(tools.length > 0 ? '<div class="lane-tools">' + tools.join('') + '</div>' : ''),
@@ -2622,7 +2700,7 @@ function laneItemMarkup(item) {
 		].join('');
 	}
 	return [
-		'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '">',
+		'<article class="lane-item ' + escapeHtml(item.kind || 'system') + '" data-lane-item-id="' + laneItemId + '">',
 			'<div class="lane-card ' + (item.state === 'active' ? 'frontier' : '') + ' ' + escapeHtml('tone-' + (item.tone || 'info')) + '"' + (item.state === 'active' ? ' data-frontier="true"' : '') + '>',
 				'<div class="lane-head">',
 					'<div>',
@@ -2662,10 +2740,44 @@ function renderLane() {
 	if (items.length === 0) {
 		viewportGeneratedAppItemId = '';
 		applyGeneratedAppViewportState();
-		lane.innerHTML = '<div class="lane-card"><div class="empty-state">Waiting for Toolshed lane items…</div></div>';
+		const emptyNode = nodeFromMarkup('<div class="lane-card"><div class="empty-state">Waiting for Toolshed lane items…</div></div>');
+		lane.replaceChildren(emptyNode || document.createTextNode(''));
 		return;
 	}
-	lane.innerHTML = mergeToolRequestLaneItems(items).map(laneItemMarkup).join('');
+	const mergedItems = mergeToolRequestLaneItems(items);
+	const desiredIds = new Set(mergedItems.map(function(item) { return String(item && item.id || '').trim(); }).filter(Boolean));
+	const preservedGeneratedApps = captureGeneratedAppLaneNodes();
+	const existingById = new Map();
+	Array.from(lane.children).forEach(function(node) {
+		if (!node || node.nodeType !== 1 || !node.getAttribute) return;
+		const itemId = String(node.getAttribute('data-lane-item-id') || '').trim();
+		if (itemId) existingById.set(itemId, node);
+	});
+	let cursor = lane.firstElementChild;
+	mergedItems.forEach(function(item) {
+		const itemId = String(item && item.id || '').trim();
+		const currentNode = cursor && cursor.nodeType === 1 ? cursor : null;
+		const currentId = currentNode && currentNode.getAttribute ? String(currentNode.getAttribute('data-lane-item-id') || '').trim() : '';
+		const existing = itemId ? existingById.get(itemId) : null;
+		const node = buildLaneItemNode(item, preservedGeneratedApps);
+		if (!node) return;
+		if (existing && existing !== currentNode && existing !== node && existing.parentNode === lane) existing.remove();
+		if (node === currentNode) {
+			cursor = node.nextElementSibling;
+			return;
+		}
+		if (currentNode && currentId === itemId) {
+			lane.replaceChild(node, currentNode);
+		} else {
+			lane.insertBefore(node, currentNode || null);
+		}
+		cursor = node.nextElementSibling;
+	});
+	Array.from(lane.children).forEach(function(node) {
+		if (!node || node.nodeType !== 1 || !node.getAttribute) return;
+		const itemId = String(node.getAttribute('data-lane-item-id') || '').trim();
+		if (!itemId || !desiredIds.has(itemId)) node.remove();
+	});
 	applyGeneratedAppViewportState();
 	if (shouldStickToBottom) {
 		requestAnimationFrame(scrollFrontierIntoView);
@@ -3271,8 +3383,36 @@ document.addEventListener('input', function(event) {
 window.addEventListener('message', function(event) {
 	if (!event || event.origin !== window.location.origin) return;
 	const data = event.data;
-	if (!data || data.type !== 'toolshed-generated-app-display-mode') return;
-	setGeneratedAppViewportMode(String(data.itemId || ''), String(data.mode || 'inline'));
+	if (!data) return;
+	if (data.type === 'toolshed-generated-app-display-mode') {
+		setGeneratedAppViewportMode(String(data.itemId || ''), String(data.mode || 'inline'));
+		return;
+	}
+	if (data.type === 'toolshed-generated-app-session-sync') {
+		const itemId = String(data.itemId || '').trim();
+		const item = findLocalLaneItem(itemId);
+		if (!item || !item.appRuntime) return;
+		if (data.appState && typeof data.appState === 'object') {
+			localLaneItems = localLaneItems.map(function(entry) {
+				if (entry.id !== itemId) return entry;
+				return {
+					...entry,
+					appState: data.appState,
+				};
+			});
+			saveLocalLaneItems();
+		}
+		postBackgroundAction({
+			type: 'sync-inline-app-state',
+			itemId: itemId,
+			cardId: String(data.cardId || item.cardId || ''),
+			title: String(data.title || item.title || item.appRuntime.title || 'Inline app'),
+			adapter: String(data.adapter || generatedConversationAdapter(item) || ''),
+			appRuntime: item.appRuntime,
+			appState: data.appState && typeof data.appState === 'object' ? data.appState : {},
+			sessionId: String(data.sessionId || ''),
+		});
+	}
 });
 
 document.addEventListener('keydown', function(event) {

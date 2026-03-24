@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, statSy
 import { join, resolve, dirname, basename } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
+import { runInNewContext } from "vm";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
 type WidgetPlacement = "float";
@@ -47,6 +48,37 @@ interface ToolshedInlineCalculatorSession {
 	expression: string;
 	history: ToolshedCalculatorHistoryEntry[];
 	steps: ToolshedCalculatorStepEntry[];
+	updatedAt: string;
+	syncedAt: string;
+}
+
+interface ToolshedGithubBoardCardEntry {
+	number: number;
+	title: string;
+	url: string;
+	column: string;
+	state: string;
+	labels: string[];
+	type: "task" | "epic" | "sprint" | "other";
+	order: number;
+}
+
+interface ToolshedGithubBoardColumnEntry {
+	id: string;
+	title: string;
+	cards: ToolshedGithubBoardCardEntry[];
+}
+
+interface ToolshedInlineGithubBoardSession {
+	itemId: string;
+	cardId?: string;
+	title: string;
+	sessionId: string;
+	repoNameWithOwner: string;
+	projectTitle: string;
+	projectNumber?: number;
+	projectScopeReady: boolean;
+	columns: ToolshedGithubBoardColumnEntry[];
 	updatedAt: string;
 	syncedAt: string;
 }
@@ -355,7 +387,7 @@ interface ToolshedLaneItem {
 
 interface PersistedLaneEvent {
 	id: string;
-	kind: Extract<LaneItemKind, "system" | "packet" | "card">;
+	kind: Extract<LaneItemKind, "system" | "user" | "assistant" | "packet" | "card">;
 	title: string;
 	content: string;
 	summary: string;
@@ -423,6 +455,13 @@ interface PersistedToolshedState {
 	packets: ToolshedPacket[];
 	laneEvents: PersistedLaneEvent[];
 	inlineCalculatorSessions: ToolshedInlineCalculatorSession[];
+	inlineGithubBoardSessions: ToolshedInlineGithubBoardSession[];
+	lastInlineGithubBoardFocus?: {
+		sessionId: string;
+		column?: string;
+		requestedTypes?: Array<"task" | "epic" | "sprint">;
+		askedAt: string;
+	};
 	timestamp: number;
 }
 
@@ -673,6 +712,392 @@ function buildInlineCalculatorPrompt(userText: string, session: ToolshedInlineCa
 		`Known session id: ${session.sessionId}`,
 		`Known current display: ${session.display}`,
 		latest ? `Known most recent calculation: ${latest.expression} = ${latest.result}` : "Known most recent calculation: none yet",
+		`Original user message: ${String(userText || "").trim()}`,
+	].join("\n\n");
+}
+
+function normalizeGithubBoardCardEntry(value: any, fallbackColumn: string): ToolshedGithubBoardCardEntry | null {
+	if (!value || typeof value !== "object") return null;
+	const number = Number(value.number);
+	const title = String(value.title || "").trim();
+	if (!Number.isFinite(number) || !title) return null;
+	const labels = Array.isArray(value.labels)
+		? value.labels
+			.map((entry: any) => typeof entry === "string" ? entry : String(entry?.name || ""))
+			.map((entry: string) => entry.trim())
+			.filter(Boolean)
+		: [];
+	return {
+		number,
+		title,
+		url: String(value.url || "").trim(),
+		column: String(value.column || fallbackColumn || "").trim(),
+		state: String(value.state || "").trim(),
+		labels,
+		type: ["task", "epic", "sprint", "other"].includes(String(value.type || "").trim().toLowerCase())
+			? String(value.type || "").trim().toLowerCase() as "task" | "epic" | "sprint" | "other"
+			: inferGithubBoardCardType({
+				number,
+				title,
+				url: String(value.url || "").trim(),
+				column: String(value.column || fallbackColumn || "").trim(),
+				state: String(value.state || "").trim(),
+				labels,
+				type: "other",
+				order: 0,
+			}),
+		order: Number.isFinite(Number(value.order)) && Number(value.order) > 0 ? Number(value.order) : 0,
+	};
+}
+
+function normalizeGithubBoardColumnEntry(value: any): ToolshedGithubBoardColumnEntry | null {
+	if (!value || typeof value !== "object") return null;
+	const id = String(value.id || value.title || "").trim();
+	const title = String(value.title || value.id || "").trim();
+	if (!id || !title) return null;
+	return {
+		id,
+		title,
+		cards: Array.isArray(value.cards) ? value.cards.map((card: any) => normalizeGithubBoardCardEntry(card, id)).filter(Boolean) as ToolshedGithubBoardCardEntry[] : [],
+	};
+}
+
+function normalizeInlineGithubBoardSession(value: any): ToolshedInlineGithubBoardSession | null {
+	if (!value || typeof value !== "object") return null;
+	const itemId = String(value.itemId || "").trim();
+	const sessionId = String(value.sessionId || "").trim();
+	if (!itemId || !sessionId) return null;
+	return {
+		itemId,
+		cardId: String(value.cardId || "").trim() || undefined,
+		title: String(value.title || "GitHub Project Board").trim(),
+		sessionId,
+		repoNameWithOwner: String(value.repoNameWithOwner || "").trim(),
+		projectTitle: String(value.projectTitle || "").trim(),
+		projectNumber: Number.isFinite(Number(value.projectNumber)) ? Number(value.projectNumber) : undefined,
+		projectScopeReady: Boolean(value.projectScopeReady),
+		columns: Array.isArray(value.columns) ? value.columns.map((column: any) => normalizeGithubBoardColumnEntry(column)).filter(Boolean) as ToolshedGithubBoardColumnEntry[] : [],
+		updatedAt: String(value.updatedAt || nowIso()),
+		syncedAt: String(value.syncedAt || nowIso()),
+	};
+}
+
+function getGithubBoardColumnCards(session: ToolshedInlineGithubBoardSession, columnId: string): ToolshedGithubBoardCardEntry[] {
+	const normalized = String(columnId || "").trim().toLowerCase();
+	const column = (session.columns || []).find((entry) =>
+		String(entry.id || "").trim().toLowerCase() === normalized
+		|| String(entry.title || "").trim().toLowerCase() === normalized
+	);
+	return Array.isArray(column?.cards) ? column!.cards : [];
+}
+
+function detectGithubBoardColumn(question: string): string | null {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	if (/\bin progress\b/.test(normalized)) return "In Progress";
+	if (/\bbacklog\b/.test(normalized)) return "Backlog";
+	if (/\breview\b/.test(normalized)) return "Review";
+	if (/\bdone\b/.test(normalized)) return "Done";
+	return null;
+}
+
+function formatGithubBoardCards(cards: ToolshedGithubBoardCardEntry[], limit: number = 12): string {
+	if (!cards.length) return "- None";
+	return cards.slice(0, limit).map((card) => `- #${card.number} ${card.title}`).join("\n");
+}
+
+function detectGithubBoardRequestedTypes(question: string): Array<"task" | "epic" | "sprint"> {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	const requested: Array<"task" | "epic" | "sprint"> = [];
+	if (/\btask(?:s)?\b/.test(normalized)) requested.push("task");
+	if (/\bepic(?:s)?\b/.test(normalized)) requested.push("epic");
+	if (/\bsprint(?:s)?\b/.test(normalized)) requested.push("sprint");
+	return requested;
+}
+
+function inferGithubBoardCardType(card: ToolshedGithubBoardCardEntry): "task" | "epic" | "sprint" | "other" {
+	const title = String(card.title || "").trim().toLowerCase();
+	const labels = Array.isArray(card.labels) ? card.labels.map((label) => String(label || "").trim().toLowerCase()) : [];
+	if (labels.includes("task") || /^task\b/.test(title)) return "task";
+	if (labels.includes("epic") || /^epic\b/.test(title)) return "epic";
+	if (labels.includes("sprint") || /^sprint\b/.test(title)) return "sprint";
+	return "other";
+}
+
+function countGithubBoardCardTypes(cards: ToolshedGithubBoardCardEntry[]): Record<"task" | "epic" | "sprint", number> {
+	const counts = { task: 0, epic: 0, sprint: 0 };
+	for (const card of cards) {
+		const type = inferGithubBoardCardType(card);
+		if (type === "task" || type === "epic" || type === "sprint") counts[type] += 1;
+	}
+	return counts;
+}
+
+function normalizeGithubBoardQueryColumn(value: any): "Backlog" | "In Progress" | "Review" | "Done" | null {
+	const normalized = String(value || "").trim().toLowerCase();
+	if (!normalized) return null;
+	if (normalized === "backlog") return "Backlog";
+	if (normalized === "in progress" || normalized === "in-progress") return "In Progress";
+	if (normalized === "review") return "Review";
+	if (normalized === "done") return "Done";
+	return null;
+}
+
+function normalizeGithubBoardQueryTypes(value: any): Array<"task" | "epic" | "sprint" | "other"> {
+	const raw = Array.isArray(value)
+		? value
+		: String(value || "")
+			.split(",")
+			.map((entry) => entry.trim())
+			.filter(Boolean);
+	const normalized = raw
+		.map((entry) => String(entry || "").trim().toLowerCase())
+		.filter((entry): entry is "task" | "epic" | "sprint" | "other" => entry === "task" || entry === "epic" || entry === "sprint" || entry === "other");
+	return Array.from(new Set(normalized));
+}
+
+function normalizeGithubBoardQueryView(value: any): "summary" | "counts" | "cards" {
+	const normalized = String(value || "").trim().toLowerCase();
+	if (normalized === "counts") return "counts";
+	if (normalized === "cards") return "cards";
+	return "summary";
+}
+
+function buildInlineGithubBoardSnapshot(session: ToolshedInlineGithubBoardSession) {
+	const columns = (session.columns || []).map((column) => {
+		const orderedCards = (column.cards || []).map((card, index) => {
+			const normalizedType = ["task", "epic", "sprint", "other"].includes(String(card.type || "").trim().toLowerCase())
+				? String(card.type || "").trim().toLowerCase() as "task" | "epic" | "sprint" | "other"
+				: inferGithubBoardCardType(card);
+			return {
+				number: Number(card.number),
+				title: String(card.title || "").trim(),
+				url: String(card.url || "").trim(),
+				column: String(column.title || card.column || "").trim(),
+				state: String(card.state || "").trim(),
+				labels: Array.isArray(card.labels) ? card.labels.map((label) => String(label || "").trim()).filter(Boolean) : [],
+				type: normalizedType,
+				order: Number.isFinite(Number(card.order)) && Number(card.order) > 0 ? Number(card.order) : index + 1,
+			};
+		});
+		return {
+			id: String(column.id || column.title || "").trim(),
+			title: String(column.title || column.id || "").trim(),
+			cards: orderedCards,
+		};
+	});
+	return {
+		sessionId: String(session.sessionId || "").trim(),
+		title: String(session.title || "").trim(),
+		repo: {
+			nameWithOwner: String(session.repoNameWithOwner || "").trim(),
+		},
+		project: {
+			title: String(session.projectTitle || "").trim(),
+			number: Number.isFinite(Number(session.projectNumber)) ? Number(session.projectNumber) : null,
+		},
+		projectScopeReady: Boolean(session.projectScopeReady),
+		updatedAt: String(session.updatedAt || session.syncedAt || nowIso()),
+		columns,
+		cards: columns.flatMap((column) => column.cards),
+	};
+}
+
+function buildInlineGithubBoardQueryResult(
+	snapshot: ReturnType<typeof buildInlineGithubBoardSnapshot>,
+	options?: {
+		view?: "summary" | "counts" | "cards";
+		column?: string | null;
+		types?: Array<"task" | "epic" | "sprint" | "other">;
+		limit?: number;
+	},
+) {
+	const view = normalizeGithubBoardQueryView(options?.view);
+	const column = normalizeGithubBoardQueryColumn(options?.column);
+	const types = normalizeGithubBoardQueryTypes(options?.types);
+	const limit = Math.max(1, Math.min(30, Number.isFinite(Number(options?.limit)) ? Number(options?.limit) : 10));
+	const cards = (snapshot.cards || []).filter((card) => {
+		const cardType = ["task", "epic", "sprint", "other"].includes(String(card.type || "").trim().toLowerCase())
+			? String(card.type || "").trim().toLowerCase() as "task" | "epic" | "sprint" | "other"
+			: inferGithubBoardCardType(card);
+		if (column && String(card.column || "").trim() !== column) return false;
+		if (types.length > 0 && !types.includes(cardType)) return false;
+		return true;
+	});
+	const cardsToReturn = cards
+		.slice()
+		.sort((a, b) => {
+			const columnOrder = ["Backlog", "In Progress", "Review", "Done"];
+			const columnDiff = columnOrder.indexOf(String(a.column || "")) - columnOrder.indexOf(String(b.column || ""));
+			if (columnDiff !== 0) return columnDiff;
+			return Number(a.order || 0) - Number(b.order || 0);
+		})
+		.slice(0, limit)
+		.map((card) => ({
+			number: Number(card.number),
+			title: String(card.title || "").trim(),
+			column: String(card.column || "").trim(),
+			type: ["task", "epic", "sprint", "other"].includes(String(card.type || "").trim().toLowerCase())
+				? String(card.type || "").trim().toLowerCase() as "task" | "epic" | "sprint" | "other"
+				: inferGithubBoardCardType(card),
+			state: String(card.state || "").trim(),
+			order: Number(card.order || 0),
+			url: String(card.url || "").trim(),
+		}));
+	return {
+		view,
+		board: {
+			title: snapshot.project?.title || snapshot.title || "GitHub Project Board",
+			repoNameWithOwner: snapshot.repo?.nameWithOwner || "",
+			projectNumber: snapshot.project?.number ?? null,
+			updatedAt: snapshot.updatedAt,
+			projectScopeReady: Boolean(snapshot.projectScopeReady),
+		},
+		filters: {
+			column,
+			types,
+		},
+		total: cards.length,
+		counts: {
+			boardByColumn: {
+				Backlog: snapshot.columns.find((entry) => entry.title === "Backlog")?.cards.length || 0,
+				"In Progress": snapshot.columns.find((entry) => entry.title === "In Progress")?.cards.length || 0,
+				Review: snapshot.columns.find((entry) => entry.title === "Review")?.cards.length || 0,
+				Done: snapshot.columns.find((entry) => entry.title === "Done")?.cards.length || 0,
+			},
+			matchingByType: cards.reduce<Record<"task" | "epic" | "sprint" | "other", number>>((acc, card) => {
+				const cardType = ["task", "epic", "sprint", "other"].includes(String(card.type || "").trim().toLowerCase())
+					? String(card.type || "").trim().toLowerCase() as "task" | "epic" | "sprint" | "other"
+					: inferGithubBoardCardType(card);
+				acc[cardType] += 1;
+				return acc;
+			}, { task: 0, epic: 0, sprint: 0, other: 0 }),
+		},
+		cards: view === "cards" || types.length > 0 || Boolean(column) ? cardsToReturn : [],
+	};
+}
+
+function formatInlineGithubBoardQueryResult(result: ReturnType<typeof buildInlineGithubBoardQueryResult>): string {
+	const boardLabel = `${result.board.title || "GitHub Project Board"}${result.board.projectNumber ? ` (#${result.board.projectNumber})` : ""}`;
+	const boardCounts = [
+		`Backlog: ${result.counts.boardByColumn.Backlog}`,
+		`In Progress: ${result.counts.boardByColumn["In Progress"]}`,
+		`Review: ${result.counts.boardByColumn.Review}`,
+		`Done: ${result.counts.boardByColumn.Done}`,
+	].join(" · ");
+	const lines = [
+		`${boardLabel}${result.board.repoNameWithOwner ? ` · ${result.board.repoNameWithOwner}` : ""}`,
+		`Board counts: ${boardCounts}`,
+	];
+	if (result.filters.column || result.filters.types.length > 0) {
+		lines.push(
+			`Matching cards: ${result.total}`
+			+ `${result.filters.column ? ` · column ${result.filters.column}` : ""}`
+			+ `${result.filters.types.length > 0 ? ` · types ${result.filters.types.join(", ")}` : ""}`,
+		);
+	}
+	if (result.view === "counts" || result.filters.types.length > 0) {
+		lines.push(
+			`Type counts: task ${result.counts.matchingByType.task} · epic ${result.counts.matchingByType.epic} · sprint ${result.counts.matchingByType.sprint} · other ${result.counts.matchingByType.other}`,
+		);
+	}
+	if (result.cards.length > 0) {
+		lines.push(
+			"Cards:",
+			...result.cards.map((card) => `- #${card.number} ${card.title}${card.column ? ` · ${card.column}` : ""}${card.type ? ` · ${card.type}` : ""}`),
+		);
+	}
+	lines.push(
+		`Board updated: ${relativeTimeStamp(result.board.updatedAt)}.`,
+		result.board.projectScopeReady ? "Source: active inline board session." : "Source: read-only fallback session.",
+	);
+	return lines.join("\n");
+}
+
+function executeGithubBoardSnapshotCode(snapshot: ReturnType<typeof buildInlineGithubBoardSnapshot>, code: string) {
+	const source = String(code || "").trim();
+	if (!source) throw new Error("Board computation code is required.");
+	const sandbox = {
+		snapshot: JSON.parse(JSON.stringify(snapshot)),
+		Math,
+		Number,
+		String,
+		Boolean,
+		Array,
+		Object,
+		JSON,
+	};
+	return runInNewContext(
+		`
+			const __candidate = (${source});
+			if (typeof __candidate !== "function") {
+				throw new Error("Code must evaluate to a function like (snapshot) => result.");
+			}
+			__candidate(snapshot);
+		`,
+		sandbox,
+		{ timeout: 1000 },
+	);
+}
+
+function answerInlineGithubBoardQuestion(
+	question: string,
+	session: ToolshedInlineGithubBoardSession,
+	options?: {
+		targetColumn?: string | null;
+		requestedTypes?: Array<"task" | "epic" | "sprint">;
+	},
+): string {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	const targetColumn = options?.targetColumn ?? detectGithubBoardColumn(normalized);
+	const requestedTypes = options?.requestedTypes && options.requestedTypes.length > 0
+		? options.requestedTypes
+		: detectGithubBoardRequestedTypes(normalized);
+	const asksForCount = /(how many|count|counts|number of)/.test(normalized);
+	if (requestedTypes.length > 0 && (asksForCount || targetColumn)) {
+		const cards = targetColumn
+			? getGithubBoardColumnCards(session, targetColumn)
+			: (session.columns || []).flatMap((column) => Array.isArray(column.cards) ? column.cards : []);
+		const counts = countGithubBoardCardTypes(cards);
+		return [
+			`${targetColumn || "Current"} ${targetColumn ? "type counts" : "board type counts"} on ${session.projectTitle || "the current board"}:`,
+			...requestedTypes.map((type) => `- ${humanize(type)}s: ${counts[type]}`),
+			`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
+		].join("\n");
+	}
+	if (targetColumn) {
+		const cards = getGithubBoardColumnCards(session, targetColumn);
+		return [
+			`${targetColumn} items on ${session.projectTitle || "the current board"}:`,
+			formatGithubBoardCards(cards),
+			`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
+		].join("\n");
+	}
+	const summary = (session.columns || []).map((column) => `${column.title}: ${Array.isArray(column.cards) ? column.cards.length : 0}`).join(" · ");
+	return [
+		`${session.projectTitle || "GitHub Project Board"} status: ${summary || "No columns available."}`,
+		session.projectScopeReady ? "This answer is from the active inline board session." : "Board is currently in read-only fallback mode.",
+	].join("\n");
+}
+
+function isInlineGithubBoardQuestion(value: string): boolean {
+	const text = normalizeInlineText(value).toLowerCase();
+	if (!text || text.startsWith("/")) return false;
+	const mentionsBoard = /(github app|github board|project board|kanban|github project|board\b|based on the github app|based on the board)/.test(text);
+	const asksBoardState = /(in progress|backlog|review|done|board status|what(?:'s| is) on the board|what(?:'s| is) in progress|what(?:'s| is) in review|what(?:'s| is) in backlog|what(?:'s| is) done)/.test(text);
+	const asksTypedCount = /(how many|count|counts|number of|each type|of each type)/.test(text) && /\b(task|tasks|epic|epics|sprint|sprints)\b/.test(text);
+	return (mentionsBoard && asksBoardState) || (mentionsBoard && asksTypedCount);
+}
+
+function buildInlineGithubBoardPrompt(userText: string, session: ToolshedInlineGithubBoardSession): string {
+	return [
+		"The user is referring to the active Toolshed inline GitHub project board session.",
+		'Use the `toolshed_github_board_query` tool first for compact counts, filtering, and card lists from the cached board session. Do not claim the board is unavailable, and do not fall back to raw GitHub unless the board session is missing.',
+		'If the user asks for exact grouping or ordering beyond the query tool, use `toolshed_github_board_compute` with a pure synchronous JavaScript function like `(snapshot) => ...`.',
+		'Use `toolshed_github_board_session` only when you truly need the raw snapshot in structured content for debugging or traceability.',
+		"Do not answer from canned board summaries when live board data is available.",
+		`Known session id: ${session.sessionId}`,
+		`Known board: ${session.projectTitle || "GitHub Project Board"}${session.projectNumber ? ` (#${session.projectNumber})` : ""}`,
+		session.repoNameWithOwner ? `Known repository: ${session.repoNameWithOwner}` : "Known repository: current repo",
 		`Original user message: ${String(userText || "").trim()}`,
 	].join("\n\n");
 }
@@ -1254,6 +1679,8 @@ export default function (pi: ExtensionAPI) {
 			packets: [],
 			laneEvents: [],
 			inlineCalculatorSessions: [],
+			inlineGithubBoardSessions: [],
+			lastInlineGithubBoardFocus: undefined,
 			timestamp: Date.now(),
 		};
 	}
@@ -1377,6 +1804,21 @@ export default function (pi: ExtensionAPI) {
 		persistedState.inlineCalculatorSessions = Array.isArray((state as any).inlineCalculatorSessions)
 			? (state as any).inlineCalculatorSessions.map((session: any) => normalizeInlineCalculatorSession(session)).filter(Boolean) as ToolshedInlineCalculatorSession[]
 			: [];
+		persistedState.inlineGithubBoardSessions = Array.isArray((state as any).inlineGithubBoardSessions)
+			? (state as any).inlineGithubBoardSessions.map((session: any) => normalizeInlineGithubBoardSession(session)).filter(Boolean) as ToolshedInlineGithubBoardSession[]
+			: [];
+		persistedState.lastInlineGithubBoardFocus = state.lastInlineGithubBoardFocus && typeof state.lastInlineGithubBoardFocus === "object"
+			? {
+				sessionId: String((state as any).lastInlineGithubBoardFocus.sessionId || "").trim(),
+				column: String((state as any).lastInlineGithubBoardFocus.column || "").trim() || undefined,
+				requestedTypes: Array.isArray((state as any).lastInlineGithubBoardFocus.requestedTypes)
+					? (state as any).lastInlineGithubBoardFocus.requestedTypes
+						.map((entry: any) => String(entry || "").trim().toLowerCase())
+						.filter((entry: string) => entry === "task" || entry === "epic" || entry === "sprint") as Array<"task" | "epic" | "sprint">
+					: undefined,
+				askedAt: String((state as any).lastInlineGithubBoardFocus.askedAt || nowIso()),
+			}
+			: undefined;
 		persistedState.timestamp = typeof state.timestamp === "number" ? state.timestamp : Date.now();
 	}
 
@@ -1435,11 +1877,146 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
+	function listInlineGithubBoardSessions(): ToolshedInlineGithubBoardSession[] {
+		return [...persistedState.inlineGithubBoardSessions].sort((a, b) =>
+			String(b.updatedAt || b.syncedAt || "").localeCompare(String(a.updatedAt || a.syncedAt || ""))
+		);
+	}
+
+	function getInlineGithubBoardSession(match?: { itemId?: string; cardId?: string; sessionId?: string }): ToolshedInlineGithubBoardSession | null {
+		const itemId = String(match?.itemId || "").trim();
+		if (itemId) {
+			const exact = persistedState.inlineGithubBoardSessions.find((session) => session.itemId === itemId);
+			if (exact) return exact;
+		}
+		const sessionId = String(match?.sessionId || "").trim();
+		if (sessionId) {
+			const exact = persistedState.inlineGithubBoardSessions.find((session) => session.sessionId === sessionId);
+			if (exact) return exact;
+		}
+		const cardId = String(match?.cardId || "").trim();
+		if (cardId) {
+			const exact = listInlineGithubBoardSessions().find((session) => session.cardId === cardId);
+			if (exact) return exact;
+		}
+		return listInlineGithubBoardSessions()[0] || null;
+	}
+
+	function syncInlineGithubBoardSession(value: any): ToolshedInlineGithubBoardSession | null {
+		const normalized = normalizeInlineGithubBoardSession(value);
+		if (!normalized) return null;
+		persistedState.inlineGithubBoardSessions = [
+			normalized,
+			...persistedState.inlineGithubBoardSessions.filter((session) => session.itemId !== normalized.itemId),
+		].slice(0, 6);
+		saveSessionState();
+		return normalized;
+	}
+
+	function removeInlineGithubBoardSession(itemId: string): boolean {
+		const normalizedItemId = String(itemId || "").trim();
+		if (!normalizedItemId) return false;
+		const before = persistedState.inlineGithubBoardSessions.length;
+		persistedState.inlineGithubBoardSessions = persistedState.inlineGithubBoardSessions.filter((session) => session.itemId !== normalizedItemId);
+		if (persistedState.inlineGithubBoardSessions.length === before) return false;
+		saveSessionState();
+		return true;
+	}
+
 	function maybeBuildInlineCalculatorPrompt(userText: string, match?: { itemId?: string; cardId?: string; sessionId?: string }): string | null {
 		if (!isInlineCalculatorQuestion(userText)) return null;
 		const session = getInlineCalculatorSession(match);
 		if (!session) return null;
 		return buildInlineCalculatorPrompt(userText, session);
+	}
+
+	function maybeBuildInlineGithubBoardPrompt(userText: string, match?: { itemId?: string; cardId?: string; sessionId?: string }): string | null {
+		if (!isInlineGithubBoardQuestion(userText)) return null;
+		const session = getInlineGithubBoardSession(match);
+		if (!session) return null;
+		return buildInlineGithubBoardPrompt(userText, session);
+	}
+
+	function resolveInlineGithubBoardFocus(
+		userText: string,
+		session: ToolshedInlineGithubBoardSession,
+	): {
+		targetColumn?: string | null;
+		requestedTypes?: Array<"task" | "epic" | "sprint">;
+	} {
+		const normalized = normalizeInlineText(userText).toLowerCase();
+		const targetColumn = detectGithubBoardColumn(normalized);
+		const requestedTypes = detectGithubBoardRequestedTypes(normalized);
+		if (targetColumn || requestedTypes.length > 0) {
+			return {
+				targetColumn,
+				requestedTypes: requestedTypes.length > 0 ? requestedTypes : undefined,
+			};
+		}
+		const isTypeFollowUp = /(each type|of each type|off each type|count(?:s)? by type|type count(?:s)?)/.test(normalized);
+		const focus = persistedState.lastInlineGithubBoardFocus;
+		if (
+			isTypeFollowUp
+			&& focus
+			&& focus.sessionId === session.sessionId
+			&& Number.isFinite(Date.parse(String(focus.askedAt || "")))
+			&& (Date.now() - Date.parse(String(focus.askedAt))) <= 10 * 60 * 1000
+		) {
+			return {
+				targetColumn: focus.column || null,
+				requestedTypes: Array.isArray(focus.requestedTypes) && focus.requestedTypes.length > 0 ? focus.requestedTypes : undefined,
+			};
+		}
+		return {};
+	}
+
+	function answerInlineGithubBoardQuestionFromMatch(userText: string, match?: { itemId?: string; cardId?: string; sessionId?: string }): string | null {
+		const session = getInlineGithubBoardSession(match);
+		if (!session) return null;
+		const focus = resolveInlineGithubBoardFocus(userText, session);
+		const requestedTypes = focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : detectGithubBoardRequestedTypes(userText);
+		const isBoardQuestion = isInlineGithubBoardQuestion(userText)
+			|| Boolean(focus.targetColumn)
+			|| requestedTypes.length > 0;
+		if (!isBoardQuestion) return null;
+		const answer = answerInlineGithubBoardQuestion(userText, session, focus);
+		if (focus.targetColumn || (focus.requestedTypes && focus.requestedTypes.length > 0)) {
+			persistedState.lastInlineGithubBoardFocus = {
+				sessionId: session.sessionId,
+				column: focus.targetColumn || undefined,
+				requestedTypes: focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : undefined,
+				askedAt: nowIso(),
+			};
+			saveSessionState();
+		}
+		return answer;
+	}
+
+	function appendLocalLaneExchange(userText: string, answerText: string, options?: { cardId?: string; tone?: Tone }) {
+		const userContent = String(userText || "").trim();
+		const assistantContent = String(answerText || "").trim();
+		if (!userContent || !assistantContent) return;
+		const userTimestamp = nowIso();
+		const assistantTimestamp = new Date(Date.now() + 1).toISOString();
+		addLaneEvent({
+			kind: "user",
+			title: "User Prompt",
+			content: userContent,
+			summary: excerptText(userContent, 180),
+			timestamp: userTimestamp,
+			tone: "neutral",
+			cardId: options?.cardId,
+		});
+		addLaneEvent({
+			kind: "assistant",
+			title: "Assistant Response",
+			content: assistantContent,
+			summary: excerptText(assistantContent, 220),
+			timestamp: assistantTimestamp,
+			tone: options?.tone || "success",
+			cardId: options?.cardId,
+		});
+		updateWidget();
 	}
 
 	function getTranscriptSignature(ctx: ExtensionContext): string {
@@ -1541,7 +2118,7 @@ export default function (pi: ExtensionAPI) {
 				tone: event.tone,
 				packetId: event.packetId,
 				cardId: event.cardId,
-				meta: event.kind === "packet" ? "Packet event" : event.kind === "card" ? "Card run" : "Toolshed event",
+				meta: event.kind === "packet" ? "Packet event" : event.kind === "card" ? "Card run" : event.kind === "system" ? "Toolshed event" : undefined,
 			});
 		}
 		lane.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
@@ -2372,6 +2949,17 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function verifyTrackedMcpApp(card: ToolshedGeneratedCard, ctx: ExtensionContext, lane: ToolshedLaneItem[], mcp: ToolshedMcpState): McpAppVerificationResult {
+		const finalizeVerification = (verification: McpAppVerificationResult): McpAppVerificationResult => {
+			const unchanged = (card.verificationStatus || "idle") === verification.status
+				&& (card.verificationSummary || null) === verification.summary
+				&& JSON.stringify(card.verificationDetails || []) === JSON.stringify(verification.details || [])
+				&& (card.pendingBuildAt || null) === verification.pendingBuildAt;
+			if (!unchanged) return verification;
+			return {
+				...verification,
+				verifiedAt: card.verificationUpdatedAt || verification.verifiedAt || null,
+			};
+		};
 		const latestResult = getLatestResultForCard(card, lane, card.pendingBuildAt || card.lastRunAt || null);
 		const fileState = getTrackedCardFileState(card, ctx);
 		const registered = isTrackedMcpCardRegistered(card, mcp);
@@ -2399,65 +2987,65 @@ export default function (pi: ExtensionAPI) {
 		const anyArtifactsPresent = fileState.serverExists || fileState.viewExists || registered;
 		if (card.pendingBuildAt && !latestResult) {
 			if (failures.length === 0 && anyArtifactsPresent) {
-				return {
+				return finalizeVerification({
 					status: "passed",
 					summary: "Verified tracked files, syntax checks, and MCP registration.",
 					details,
 					verifiedAt: nowIso(),
 					sourceResultAt: card.verificationSourceResultAt || null,
 					pendingBuildAt: null,
-				};
+				});
 			}
 			if (card.verificationStatus === "passed") {
-				return {
+				return finalizeVerification({
 					status: "passed",
 					summary: card.verificationSummary || "Verified build ready.",
 					details: card.verificationDetails || details,
 					verifiedAt: card.verificationUpdatedAt || null,
 					sourceResultAt: card.verificationSourceResultAt || null,
 					pendingBuildAt: card.pendingBuildAt,
-				};
+				});
 			}
-			return {
+			return finalizeVerification({
 				status: anyArtifactsPresent ? "pending" : "pending",
 				summary: "Awaiting the latest lane result before verifying the build.",
 				details,
 				verifiedAt: card.verificationUpdatedAt || null,
 				sourceResultAt: card.verificationSourceResultAt || null,
 				pendingBuildAt: card.pendingBuildAt,
-			};
+			});
 		}
 
 		if (!anyArtifactsPresent && !card.pendingBuildAt) {
-			return {
+			return finalizeVerification({
 				status: "idle",
 				summary: "No verified build artifacts yet.",
 				details: [],
 				verifiedAt: null,
 				sourceResultAt: null,
 				pendingBuildAt: null,
-			};
+			});
 		}
 
 		if (failures.length === 0) {
-			return {
+			return finalizeVerification({
 				status: "passed",
 				summary: "Verified tracked files, syntax checks, and MCP registration.",
 				details,
 				verifiedAt: nowIso(),
 				sourceResultAt: latestResult?.timestamp || null,
 				pendingBuildAt: null,
-			};
+			});
 		}
 
-		return {
+		return finalizeVerification({
 			status: "failed",
 			summary: failures[0],
 			details: [...details, ...failures],
 			verifiedAt: nowIso(),
 			sourceResultAt: latestResult?.timestamp || null,
 			pendingBuildAt: null,
-		};
+		});
 	}
 
 	function applyTrackedMcpAppVerification(cardId: string, verification: McpAppVerificationResult): ToolshedGeneratedCard | null {
@@ -3193,31 +3781,63 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 			if (await dispatchLocalSlashCommand(text, ctx, "web")) return;
-			pi.sendUserMessage(maybeBuildInlineCalculatorPrompt(text, calculatorMatch) || text);
+			const inlineGithubBoardAnswer = answerInlineGithubBoardQuestionFromMatch(text, calculatorMatch);
+			if (inlineGithubBoardAnswer) {
+				const session = getInlineGithubBoardSession(calculatorMatch);
+				appendLocalLaneExchange(text, inlineGithubBoardAnswer, {
+					cardId: session?.cardId || calculatorMatch.cardId,
+					tone: "success",
+				});
+				return;
+			}
+			pi.sendUserMessage(
+				maybeBuildInlineGithubBoardPrompt(text, calculatorMatch)
+				|| maybeBuildInlineCalculatorPrompt(text, calculatorMatch)
+				|| text
+			);
 			ctx.ui.notify("Toolshed web injected a new turn.", "info");
 			return;
 		}
 		switch (type) {
 			case "sync-inline-app-state": {
 				const adapter = String(msg.adapter || msg.appRuntime?.adapter || "").trim();
-				if (adapter !== "calculator") return;
-				const session = syncInlineCalculatorSession({
-					itemId: String(msg.itemId || "").trim(),
-					cardId: String(msg.cardId || "").trim(),
-					title: String(msg.title || msg.appRuntime?.title || "Inline calculator").trim(),
-					sessionId: String(msg.appState?.sessionId || msg.sessionId || "").trim(),
-					display: String(msg.appState?.display || "").trim(),
-					expression: String(msg.appState?.expression || "").trim(),
-					history: Array.isArray(msg.appState?.history) ? msg.appState.history : [],
-					steps: Array.isArray(msg.appState?.steps) ? msg.appState.steps : [],
-					updatedAt: String(msg.appState?.updatedAt || nowIso()),
-					syncedAt: nowIso(),
-				});
-				if (session) updateWidget();
+				if (adapter === "calculator") {
+					const session = syncInlineCalculatorSession({
+						itemId: String(msg.itemId || "").trim(),
+						cardId: String(msg.cardId || "").trim(),
+						title: String(msg.title || msg.appRuntime?.title || "Inline calculator").trim(),
+						sessionId: String(msg.appState?.sessionId || msg.sessionId || "").trim(),
+						display: String(msg.appState?.display || "").trim(),
+						expression: String(msg.appState?.expression || "").trim(),
+						history: Array.isArray(msg.appState?.history) ? msg.appState.history : [],
+						steps: Array.isArray(msg.appState?.steps) ? msg.appState.steps : [],
+						updatedAt: String(msg.appState?.updatedAt || nowIso()),
+						syncedAt: nowIso(),
+					});
+					if (session) updateWidget();
+					return;
+				}
+				if (adapter === "github-project-kanban") {
+					const session = syncInlineGithubBoardSession({
+						itemId: String(msg.itemId || "").trim(),
+						cardId: String(msg.cardId || "").trim(),
+						title: String(msg.title || msg.appRuntime?.title || "GitHub Project Board").trim(),
+						sessionId: String(msg.appState?.sessionId || msg.sessionId || "").trim(),
+						repoNameWithOwner: String(msg.appState?.repo?.nameWithOwner || msg.appState?.repoNameWithOwner || "").trim(),
+						projectTitle: String(msg.appState?.project?.title || msg.appState?.projectTitle || "").trim(),
+						projectNumber: msg.appState?.project?.number ?? msg.appState?.projectNumber,
+						projectScopeReady: Boolean(msg.appState?.projectScopeReady),
+						columns: Array.isArray(msg.appState?.columns) ? msg.appState.columns : [],
+						updatedAt: String(msg.appState?.updatedAt || nowIso()),
+						syncedAt: nowIso(),
+					});
+					if (session) updateWidget();
+					return;
+				}
 				return;
 			}
 			case "clear-inline-app-state":
-				if (removeInlineCalculatorSession(String(msg.itemId || "").trim())) updateWidget();
+				if (removeInlineCalculatorSession(String(msg.itemId || "").trim()) || removeInlineGithubBoardSession(String(msg.itemId || "").trim())) updateWidget();
 				return;
 			case "submit-slash-command": {
 				const command = ensureSlashCommand(String(msg.command || msg.message || "").trim());
@@ -3628,7 +4248,6 @@ export default function (pi: ExtensionAPI) {
 							viewFile: card.viewFile,
 							fingerprint: runtimeFingerprint,
 							versionTag: [
-								card.verificationUpdatedAt || "",
 								card.liveDeployedAt || "",
 								runtimeFingerprint,
 							].filter(Boolean).join("|") || runtimeFingerprint,
@@ -3994,6 +4613,171 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "toolshed_github_board_query",
+		label: "Toolshed GitHub Board Query",
+		description: "Query the active inline Toolshed GitHub project board session without dumping the full snapshot into the conversation. Use this first for counts, filtered card lists, and compact board summaries.",
+		parameters: Type.Object({
+			question: Type.Optional(Type.String({
+				description: "Optional original user question for traceability only.",
+			})),
+			view: Type.Optional(Type.String({
+				description: "Optional response shape: `summary`, `counts`, or `cards`. Defaults to `summary`.",
+			})),
+			column: Type.Optional(Type.String({
+				description: "Optional column filter such as `Backlog`, `In Progress`, `Review`, or `Done`.",
+			})),
+			types: Type.Optional(Type.Array(Type.String({
+				description: "Optional card type filter such as `task`, `epic`, `sprint`, or `other`.",
+			}))),
+			limit: Type.Optional(Type.Number({
+				description: "Optional maximum number of cards to return for card views. Defaults to 10 and is capped at 30.",
+			})),
+			itemId: Type.Optional(Type.String({
+				description: "Optional inline lane item id when a specific board session should be used.",
+			})),
+			cardId: Type.Optional(Type.String({
+				description: "Optional Toolshed card id when the board belongs to a specific generated app card.",
+			})),
+			sessionId: Type.Optional(Type.String({
+				description: "Optional board session id when the caller already knows it.",
+			})),
+		}),
+		async execute(_toolCallId, params) {
+			const session = getInlineGithubBoardSession({
+				itemId: String((params as any).itemId || "").trim() || undefined,
+				cardId: String((params as any).cardId || "").trim() || undefined,
+				sessionId: String((params as any).sessionId || "").trim() || undefined,
+			});
+			if (!session) {
+				return {
+					content: [{ type: "text", text: "No active Toolshed inline GitHub board session is available right now." }],
+					details: { status: "missing" },
+				};
+			}
+			const snapshot = buildInlineGithubBoardSnapshot(session);
+			const result = buildInlineGithubBoardQueryResult(snapshot, {
+				view: normalizeGithubBoardQueryView((params as any).view),
+				column: normalizeGithubBoardQueryColumn((params as any).column),
+				types: normalizeGithubBoardQueryTypes((params as any).types),
+				limit: Number((params as any).limit || 10),
+			});
+			return {
+				content: [{ type: "text", text: formatInlineGithubBoardQueryResult(result) }],
+				details: {
+					status: "ok",
+					question: String((params as any).question || "").trim(),
+					itemId: session.itemId,
+					cardId: session.cardId,
+					title: session.title,
+					sessionId: session.sessionId,
+					result,
+				},
+				structuredContent: result,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "toolshed_github_board_session",
+		label: "Toolshed GitHub Board Session",
+		description: "Read the active inline Toolshed GitHub project board session. Prefer `toolshed_github_board_query` for compact counts and filtering; use this when you need the raw snapshot attached in structured content.",
+		parameters: Type.Object({
+			question: Type.Optional(Type.String({
+				description: "Optional original user question. The text response stays compact, while the raw snapshot is attached in structured content.",
+			})),
+			itemId: Type.Optional(Type.String({
+				description: "Optional inline lane item id when a specific board session should be used.",
+			})),
+			cardId: Type.Optional(Type.String({
+				description: "Optional Toolshed card id when the board belongs to a specific generated app card.",
+			})),
+			sessionId: Type.Optional(Type.String({
+				description: "Optional board session id when the caller already knows it.",
+			})),
+		}),
+		async execute(_toolCallId, params) {
+			const session = getInlineGithubBoardSession({
+				itemId: String((params as any).itemId || "").trim() || undefined,
+				cardId: String((params as any).cardId || "").trim() || undefined,
+				sessionId: String((params as any).sessionId || "").trim() || undefined,
+			});
+			if (!session) {
+				return {
+					content: [{ type: "text", text: "No active Toolshed inline GitHub board session is available right now." }],
+					details: { status: "missing" },
+				};
+			}
+			const snapshot = buildInlineGithubBoardSnapshot(session);
+			return {
+				content: [{ type: "text", text: answerInlineGithubBoardQuestion(String((params as any).question || ""), session) }],
+				details: {
+					status: "ok",
+					question: String((params as any).question || "").trim(),
+					itemId: session.itemId,
+					cardId: session.cardId,
+					title: session.title,
+					sessionId: session.sessionId,
+					snapshot,
+				},
+				structuredContent: snapshot,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "toolshed_github_board_compute",
+		label: "Toolshed GitHub Board Compute",
+		description: "Run a pure synchronous JavaScript function over the active inline GitHub board snapshot. Prefer `toolshed_github_board_query` for common counts and lists; use this for exact custom grouping, ordering, or calculations.",
+		parameters: Type.Object({
+			code: Type.String({
+				description: "A pure synchronous JavaScript function source like `(snapshot) => snapshot.columns.find(c => c.title === \"In Progress\")?.cards.filter(card => card.type === \"task\").length ?? 0`.",
+			}),
+			itemId: Type.Optional(Type.String({
+				description: "Optional inline lane item id when a specific board session should be used.",
+			})),
+			cardId: Type.Optional(Type.String({
+				description: "Optional Toolshed card id when the board belongs to a specific generated app card.",
+			})),
+			sessionId: Type.Optional(Type.String({
+				description: "Optional board session id when the caller already knows it.",
+			})),
+		}),
+		async execute(_toolCallId, params) {
+			const session = getInlineGithubBoardSession({
+				itemId: String((params as any).itemId || "").trim() || undefined,
+				cardId: String((params as any).cardId || "").trim() || undefined,
+				sessionId: String((params as any).sessionId || "").trim() || undefined,
+			});
+			if (!session) {
+				return {
+					content: [{ type: "text", text: "No active Toolshed inline GitHub board session is available right now." }],
+					details: { status: "missing" },
+				};
+			}
+			const snapshot = buildInlineGithubBoardSnapshot(session);
+			const result = executeGithubBoardSnapshotCode(snapshot, String((params as any).code || ""));
+			const resultPayload = result !== null && typeof result === "object"
+				? result
+				: { value: result };
+			const text = typeof result === "string"
+				? result
+				: JSON.stringify(resultPayload, null, 2);
+			return {
+				content: [{ type: "text", text }],
+				details: {
+					status: "ok",
+					itemId: session.itemId,
+					cardId: session.cardId,
+					title: session.title,
+					sessionId: session.sessionId,
+					result,
+				},
+				structuredContent: { result: resultPayload },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "toolshed_calculator_session",
 		label: "Toolshed Calculator Session",
 		description: "Read the active inline Toolshed calculator session and answer questions about the current display, recent result, or recent expression. Use this when the user refers to the inline calculator or asks for the current/recent calculated value.",
@@ -4048,7 +4832,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("input", async (event) => {
 		if (event.source === "extension") return { action: "continue" as const };
-		const transformed = maybeBuildInlineCalculatorPrompt(event.text);
+		const transformed = maybeBuildInlineGithubBoardPrompt(event.text) || maybeBuildInlineCalculatorPrompt(event.text);
 		if (!transformed || transformed === event.text) return { action: "continue" as const };
 		return {
 			action: "transform" as const,
@@ -4059,6 +4843,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event) => {
 		const session = getInlineCalculatorSession();
+		const githubBoardSession = getInlineGithubBoardSession();
 		const ctx = widgetCtx;
 		const guidanceBlocks: string[] = [];
 		if (ctx) {
@@ -4085,6 +4870,18 @@ export default function (pi: ExtensionAPI) {
 				latest ? `Current known recent calculation: ${latest.expression} = ${latest.result}` : "Current known recent calculation: none yet",
 			].join("\n"));
 		}
+			if (githubBoardSession) {
+				guidanceBlocks.push([
+					"## Toolshed Inline GitHub Board",
+					"There is an active Toolshed inline GitHub project board session in this conversation context.",
+					'Use the `toolshed_github_board_query` tool first for compact counts, filtering, and card lists from the cached board session.',
+					'If the user needs exact grouping or ordering beyond the query tool, use `toolshed_github_board_compute` with a pure synchronous JavaScript function over the snapshot.',
+					'Use `toolshed_github_board_session` only when you truly need the raw snapshot attached in structured content.',
+					"Do not claim the board is unavailable, do not fall back to raw GitHub if this session exists, and do not answer from canned board summaries when live board data is available.",
+					`Current known board: ${githubBoardSession.projectTitle || "GitHub Project Board"}${githubBoardSession.projectNumber ? ` (#${githubBoardSession.projectNumber})` : ""}`,
+					`Current known repo: ${githubBoardSession.repoNameWithOwner || "current repo"}`,
+				].join("\n"));
+			}
 		if (guidanceBlocks.length === 0) return undefined;
 		return { systemPrompt: `${event.systemPrompt}\n\n${guidanceBlocks.join("\n\n")}` };
 	});

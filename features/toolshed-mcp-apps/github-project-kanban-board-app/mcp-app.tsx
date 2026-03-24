@@ -711,6 +711,7 @@ export const html = String.raw`<!doctype html>
       let activePointerDrag = null;
       let dragFrameHandle = 0;
       let queuedPointerPoint = null;
+      let sessionSyncTimer = 0;
 
       const app = window.openai || window.app || window.mcp?.app;
       const initialTheme = new URLSearchParams(window.location.search).get('theme');
@@ -822,6 +823,7 @@ export const html = String.raw`<!doctype html>
           pendingRefreshAttempt = 0;
         }
         render();
+        scheduleSessionSync();
       }
 
       function cloneColumns(columns) {
@@ -955,6 +957,61 @@ export const html = String.raw`<!doctype html>
           }
         }
         syncPendingMoveMarkers();
+      }
+
+	      function buildSessionSnapshot() {
+	        return {
+	          sessionId: state.sessionId,
+	          repo: state.repo ? { nameWithOwner: state.repo.nameWithOwner || "" } : null,
+	          project: state.project ? { title: state.project.title || "", number: state.project.number ?? null } : null,
+          projectScopeReady: Boolean(state.projectScopeReady),
+          updatedAt: state.updatedAt || "",
+          statusText: state.statusText || "",
+	          columns: (state.columns || []).map((column) => ({
+	            id: column.id,
+	            title: column.title,
+	            cards: Array.isArray(column.cards) ? column.cards.map((card, index) => ({
+	              number: card.number,
+	              title: card.title,
+	              url: card.url,
+	              column: column.id,
+	              state: card.state,
+	              labels: Array.isArray(card.labels) ? card.labels.map((label) => label?.name).filter(Boolean) : [],
+	              type: typeof card.type === "string" && card.type ? card.type : (
+	                Array.isArray(card.labels) && card.labels.some((label) => String(label?.name || "").toLowerCase() === "task")
+	                  ? "task"
+	                  : Array.isArray(card.labels) && card.labels.some((label) => String(label?.name || "").toLowerCase() === "epic")
+	                    ? "epic"
+	                    : Array.isArray(card.labels) && card.labels.some((label) => String(label?.name || "").toLowerCase() === "sprint")
+	                      ? "sprint"
+	                      : /^task\b/i.test(String(card.title || ""))
+	                        ? "task"
+	                        : /^epic\b/i.test(String(card.title || ""))
+	                          ? "epic"
+	                          : /^sprint\b/i.test(String(card.title || ""))
+	                            ? "sprint"
+	                            : "other"
+	              ),
+	              order: Number.isFinite(Number(card.order)) && Number(card.order) > 0 ? Number(card.order) : index + 1,
+	            })) : [],
+	          })),
+	        };
+	      }
+
+      function scheduleSessionSync() {
+        if (!app?.syncToolshedSession) return;
+        if (sessionSyncTimer) clearTimeout(sessionSyncTimer);
+        sessionSyncTimer = window.setTimeout(async () => {
+          sessionSyncTimer = 0;
+          try {
+            await app.syncToolshedSession({
+              adapter: "github-project-kanban",
+              title: state.project?.title || "GitHub Project Board",
+              sessionId: state.sessionId || "",
+              appState: buildSessionSnapshot(),
+            });
+          } catch {}
+        }, 90);
       }
 
       function queueOptimisticMove(issueNumber, toColumn, afterIssueNumber) {
@@ -1393,6 +1450,7 @@ export const html = String.raw`<!doctype html>
           dropDonePrompt(issueNumber);
         }
         setStatus('Moving #' + issueNumber + ' to ' + toColumn + (typeof afterIssueNumber === 'number' ? ' after #' + afterIssueNumber : ' at the top') + '…');
+        scheduleSessionSync();
         flushPendingMoveQueue();
       }
 

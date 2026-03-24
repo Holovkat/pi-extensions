@@ -10,6 +10,7 @@ type ColumnName = typeof COLUMN_ORDER[number];
 
 type LabelInfo = { name: string; color?: string };
 type AssigneeInfo = { login: string; name?: string; avatarUrl?: string; url?: string };
+type IssueCardType = "task" | "epic" | "sprint" | "other";
 
 type IssueCard = {
   id: string;
@@ -22,6 +23,8 @@ type IssueCard = {
   body?: string;
   labels: LabelInfo[];
   assignees: AssigneeInfo[];
+  type: IssueCardType;
+  order: number;
   column: ColumnName;
   isClosed: boolean;
 };
@@ -159,6 +162,15 @@ function mapColumnFromLabels(labels: LabelInfo[] = []): ColumnName {
   return "Backlog";
 }
 
+function inferIssueType(title: string, labels: LabelInfo[] = []): IssueCardType {
+  const normalizedTitle = String(title || "").trim().toLowerCase();
+  const names = labels.map((label) => String(label?.name || "").trim().toLowerCase());
+  if (names.includes("task") || /^task\b/.test(normalizedTitle)) return "task";
+  if (names.includes("epic") || /^epic\b/.test(normalizedTitle)) return "epic";
+  if (names.includes("sprint") || /^sprint\b/.test(normalizedTitle)) return "sprint";
+  return "other";
+}
+
 function normalizeIssueNode(node: any): IssueCard {
   const labels = Array.isArray(node?.labels?.nodes) ? node.labels.nodes.map((label: any) => ({ name: label.name, color: label.color })) : [];
   const assignees = Array.isArray(node?.assignees?.nodes)
@@ -175,6 +187,8 @@ function normalizeIssueNode(node: any): IssueCard {
     body: String(node.body || ""),
     labels,
     assignees,
+    type: inferIssueType(String(node.title || ""), labels),
+    order: 0,
     column: mapColumnFromLabels(labels),
     isClosed: String(node.state || "").toUpperCase() === "CLOSED",
   };
@@ -587,7 +601,11 @@ function columnize(cards: IssueCard[]) {
   return COLUMN_ORDER.map((column) => ({
     id: column,
     title: column,
-    cards: cards.filter((card) => card.column === column),
+    cards: cards.filter((card) => card.column === column).map((card, index) => ({
+      ...card,
+      column,
+      order: index + 1,
+    })),
   }));
 }
 
@@ -602,12 +620,13 @@ function countsFromColumns(columns: Array<{ id: ColumnName; cards: IssueCard[] }
 
 function buildSnapshot(session: SessionState, cards: IssueCard[], warnings: string[], renderInline: boolean, error?: string): BoardSnapshot {
   const columns = columnize(cards);
+  const orderedCards = columns.flatMap((column) => column.cards);
   return {
     sessionId: session.sessionId,
     repo: session.repo,
     project: session.project,
     columns,
-    cards,
+    cards: orderedCards,
     counts: countsFromColumns(columns),
     updatedAt: session.updatedAt,
     renderInline,
