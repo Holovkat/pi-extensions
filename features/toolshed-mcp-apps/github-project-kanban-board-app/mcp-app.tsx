@@ -960,6 +960,25 @@ export const html = String.raw`<!doctype html>
       }
 
 	      function buildSessionSnapshot() {
+	        function extractParentSprintNumber(body) {
+	          const match = String(body || "").match(/parent sprint[^#]*#(\d+)/i);
+	          return match ? Number(match[1]) : null;
+	        }
+
+	        function extractTaskBreakdownIssueNumbers(body) {
+	          const text = String(body || "");
+	          const sectionMatch = text.match(/##\s*Task Breakdown\s*([\s\S]*?)(?:\n##\s+|$)/i);
+	          const target = sectionMatch ? sectionMatch[1] : "";
+	          return Array.from(target.matchAll(/#(\d+)/g))
+	            .map((match) => Number(match[1]))
+	            .filter((value) => Number.isFinite(value));
+	        }
+
+	        function extractSprintOrdinal(title) {
+	          const match = String(title || "").match(/\bsprint\s+(\d+)\b/i);
+	          return match ? Number(match[1]) : null;
+	        }
+
 	        return {
 	          sessionId: state.sessionId,
 	          repo: state.repo ? { nameWithOwner: state.repo.nameWithOwner || "" } : null,
@@ -993,6 +1012,9 @@ export const html = String.raw`<!doctype html>
 	                            : "other"
 	              ),
 	              order: Number.isFinite(Number(card.order)) && Number(card.order) > 0 ? Number(card.order) : index + 1,
+	              parentSprintNumber: extractParentSprintNumber(card.body),
+	              taskBreakdownIssueNumbers: extractTaskBreakdownIssueNumbers(card.body),
+	              sprintOrdinal: extractSprintOrdinal(card.title),
 	            })) : [],
 	          })),
 	        };

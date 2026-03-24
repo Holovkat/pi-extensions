@@ -61,6 +61,9 @@ interface ToolshedGithubBoardCardEntry {
 	labels: string[];
 	type: "task" | "epic" | "sprint" | "other";
 	order: number;
+	parentSprintNumber?: number;
+	taskBreakdownIssueNumbers?: number[];
+	sprintOrdinal?: number;
 }
 
 interface ToolshedGithubBoardColumnEntry {
@@ -460,6 +463,8 @@ interface PersistedToolshedState {
 		sessionId: string;
 		column?: string;
 		requestedTypes?: Array<"task" | "epic" | "sprint">;
+		relation?: "tasks_for_sprints";
+		matchedIssueNumbers?: number[];
 		askedAt: string;
 	};
 	timestamp: number;
@@ -747,6 +752,13 @@ function normalizeGithubBoardCardEntry(value: any, fallbackColumn: string): Tool
 				order: 0,
 			}),
 		order: Number.isFinite(Number(value.order)) && Number(value.order) > 0 ? Number(value.order) : 0,
+		parentSprintNumber: Number.isFinite(Number(value.parentSprintNumber)) ? Number(value.parentSprintNumber) : undefined,
+		taskBreakdownIssueNumbers: Array.isArray(value.taskBreakdownIssueNumbers)
+			? value.taskBreakdownIssueNumbers
+				.map((entry: any) => Number(entry))
+				.filter((entry: number) => Number.isFinite(entry))
+			: undefined,
+		sprintOrdinal: Number.isFinite(Number(value.sprintOrdinal)) ? Number(value.sprintOrdinal) : undefined,
 	};
 }
 
@@ -814,6 +826,89 @@ function detectGithubBoardRequestedTypes(question: string): Array<"task" | "epic
 	return requested;
 }
 
+function isInlineGithubBoardListIntent(question: string): boolean {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	return /(what are they|which ones|which are they|list (?:them|those|the(?:se)?|the cards|the items|the tasks|the epics|the sprints)|show (?:me )?(?:them|those|the cards|the items|the tasks|the epics|the sprints)|which (?:tasks|cards|issues|epics|sprints)|what (?:tasks|cards|issues|epics|sprints))/i.test(normalized);
+}
+
+function isInlineGithubBoardTableIntent(question: string): boolean {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	return /\btable\b|\btabular\b|as a table|in a table|table of/.test(normalized);
+}
+
+function isInlineGithubBoardAssociationIntent(question: string): boolean {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	return /(associated with|belong(?:s|ing)? to|for sprint|for the sprint|under sprint|in sprint)/.test(normalized);
+}
+
+function isInlineGithubBoardBareSprintReference(question: string): boolean {
+	return /^sprint\s+\d+\??$/i.test(normalizeInlineText(question));
+}
+
+function detectGithubBoardSprintOrdinals(question: string): number[] {
+	const matches = Array.from(normalizeInlineText(question).matchAll(/\bsprint\s+(\d+)\b/gi));
+	return Array.from(new Set(matches
+		.map((match) => Number(match[1]))
+		.filter((value) => Number.isFinite(value) && value > 0)));
+}
+
+function getGithubBoardAllCards(session: ToolshedInlineGithubBoardSession): ToolshedGithubBoardCardEntry[] {
+	return (session.columns || []).flatMap((column) => Array.isArray(column.cards) ? column.cards : []);
+}
+
+function getGithubBoardCardsByNumbers(session: ToolshedInlineGithubBoardSession, numbers: number[]): ToolshedGithubBoardCardEntry[] {
+	if (!Array.isArray(numbers) || numbers.length === 0) return [];
+	const wanted = new Set(numbers.map((value) => Number(value)).filter((value) => Number.isFinite(value)));
+	return getGithubBoardAllCards(session).filter((card) => wanted.has(Number(card.number)));
+}
+
+function extractGithubBoardSprintOrdinal(card: ToolshedGithubBoardCardEntry): number | null {
+	if (Number.isFinite(Number(card.sprintOrdinal)) && Number(card.sprintOrdinal) > 0) return Number(card.sprintOrdinal);
+	const match = String(card.title || "").match(/\bsprint\s+(\d+)\b/i);
+	return match ? Number(match[1]) : null;
+}
+
+function getGithubBoardSprintCardsByOrdinals(session: ToolshedInlineGithubBoardSession, ordinals: number[]): ToolshedGithubBoardCardEntry[] {
+	if (!Array.isArray(ordinals) || ordinals.length === 0) return [];
+	const wanted = new Set(ordinals.map((value) => Number(value)).filter((value) => Number.isFinite(value)));
+	return getGithubBoardAllCards(session).filter((card) => inferGithubBoardCardType(card) === "sprint" && wanted.has(Number(extractGithubBoardSprintOrdinal(card))));
+}
+
+function getGithubBoardTasksAssociatedWithSprintCards(session: ToolshedInlineGithubBoardSession, sprintCards: ToolshedGithubBoardCardEntry[]): ToolshedGithubBoardCardEntry[] {
+	if (!Array.isArray(sprintCards) || sprintCards.length === 0) return [];
+	const allCards = getGithubBoardAllCards(session);
+	const byNumber = new Map(allCards.map((card) => [Number(card.number), card]));
+	const associated = new Map<number, ToolshedGithubBoardCardEntry>();
+	for (const sprint of sprintCards) {
+		const taskNumbers = Array.isArray(sprint.taskBreakdownIssueNumbers)
+			? sprint.taskBreakdownIssueNumbers.map((entry) => Number(entry)).filter((entry) => Number.isFinite(entry))
+			: [];
+		for (const taskNumber of taskNumbers) {
+			const taskCard = byNumber.get(taskNumber);
+			if (taskCard && inferGithubBoardCardType(taskCard) === "task") associated.set(Number(taskCard.number), taskCard);
+		}
+		for (const card of allCards) {
+			if (inferGithubBoardCardType(card) !== "task") continue;
+			if (Number(card.parentSprintNumber) === Number(sprint.number)) associated.set(Number(card.number), card);
+		}
+	}
+	return Array.from(associated.values()).sort((a, b) => {
+		const columnOrder = ["Backlog", "In Progress", "Review", "Done"];
+		const columnDiff = columnOrder.indexOf(String(a.column || "")) - columnOrder.indexOf(String(b.column || ""));
+		if (columnDiff !== 0) return columnDiff;
+		return Number(a.order || 0) - Number(b.order || 0);
+	});
+}
+
+function formatGithubBoardCardsTable(cards: ToolshedGithubBoardCardEntry[], limit: number = 12): string {
+	if (!cards.length) return "No matching cards.";
+	return [
+		"| Issue | Title | Column | Type |",
+		"| --- | --- | --- | --- |",
+		...cards.slice(0, limit).map((card) => `| #${card.number} | ${String(card.title || "").replace(/\|/g, "\\|")} | ${String(card.column || "").replace(/\|/g, "\\|")} | ${humanize(inferGithubBoardCardType(card))} |`),
+	].join("\n");
+}
+
 function inferGithubBoardCardType(card: ToolshedGithubBoardCardEntry): "task" | "epic" | "sprint" | "other" {
 	const title = String(card.title || "").trim().toLowerCase();
 	const labels = Array.isArray(card.labels) ? card.labels.map((label) => String(label || "").trim().toLowerCase()) : [];
@@ -877,6 +972,13 @@ function buildInlineGithubBoardSnapshot(session: ToolshedInlineGithubBoardSessio
 				labels: Array.isArray(card.labels) ? card.labels.map((label) => String(label || "").trim()).filter(Boolean) : [],
 				type: normalizedType,
 				order: Number.isFinite(Number(card.order)) && Number(card.order) > 0 ? Number(card.order) : index + 1,
+				parentSprintNumber: Number.isFinite(Number((card as any).parentSprintNumber)) ? Number((card as any).parentSprintNumber) : undefined,
+				taskBreakdownIssueNumbers: Array.isArray((card as any).taskBreakdownIssueNumbers)
+					? (card as any).taskBreakdownIssueNumbers
+						.map((entry: any) => Number(entry))
+						.filter((entry: number) => Number.isFinite(entry))
+					: undefined,
+				sprintOrdinal: Number.isFinite(Number((card as any).sprintOrdinal)) ? Number((card as any).sprintOrdinal) : undefined,
 			};
 		});
 		return {
@@ -1039,12 +1141,58 @@ function executeGithubBoardSnapshotCode(snapshot: ReturnType<typeof buildInlineG
 	);
 }
 
+function resolveInlineGithubBoardMatchedCards(
+	session: ToolshedInlineGithubBoardSession,
+	question: string,
+	options?: {
+		targetColumn?: string | null;
+		requestedTypes?: Array<"task" | "epic" | "sprint">;
+		preferList?: boolean;
+		renderMode?: "list" | "table";
+		relation?: "tasks_for_sprints";
+		sprintOrdinals?: number[];
+		sprintIssueNumbers?: number[];
+		matchedIssueNumbers?: number[];
+	},
+): ToolshedGithubBoardCardEntry[] {
+	const normalized = normalizeInlineText(question).toLowerCase();
+	const targetColumn = options?.targetColumn ?? detectGithubBoardColumn(normalized);
+	const requestedTypes = options?.requestedTypes && options.requestedTypes.length > 0
+		? options.requestedTypes
+		: detectGithubBoardRequestedTypes(normalized);
+	if (options?.relation === "tasks_for_sprints") {
+		const sprintCards = options?.sprintIssueNumbers && options.sprintIssueNumbers.length > 0
+			? getGithubBoardCardsByNumbers(session, options.sprintIssueNumbers).filter((card) => inferGithubBoardCardType(card) === "sprint")
+			: getGithubBoardSprintCardsByOrdinals(session, options?.sprintOrdinals || []);
+		let associatedTasks = getGithubBoardTasksAssociatedWithSprintCards(session, sprintCards);
+		if (targetColumn) associatedTasks = associatedTasks.filter((card) => String(card.column || "").trim() === targetColumn);
+		return associatedTasks;
+	}
+	const scopeCards = options?.matchedIssueNumbers && options.matchedIssueNumbers.length > 0
+		? getGithubBoardCardsByNumbers(session, options.matchedIssueNumbers)
+		: targetColumn
+			? getGithubBoardColumnCards(session, targetColumn)
+			: getGithubBoardAllCards(session);
+	if (requestedTypes.length > 0) {
+		return scopeCards.filter((card) => requestedTypes.includes(inferGithubBoardCardType(card)));
+	}
+	if (options?.matchedIssueNumbers && options.matchedIssueNumbers.length > 0) return scopeCards;
+	if (targetColumn) return scopeCards;
+	return [];
+}
+
 function answerInlineGithubBoardQuestion(
 	question: string,
 	session: ToolshedInlineGithubBoardSession,
 	options?: {
 		targetColumn?: string | null;
 		requestedTypes?: Array<"task" | "epic" | "sprint">;
+		preferList?: boolean;
+		renderMode?: "list" | "table";
+		relation?: "tasks_for_sprints";
+		sprintOrdinals?: number[];
+		sprintIssueNumbers?: number[];
+		matchedIssueNumbers?: number[];
 	},
 ): string {
 	const normalized = normalizeInlineText(question).toLowerCase();
@@ -1053,22 +1201,53 @@ function answerInlineGithubBoardQuestion(
 		? options.requestedTypes
 		: detectGithubBoardRequestedTypes(normalized);
 	const asksForCount = /(how many|count|counts|number of)/.test(normalized);
-	if (requestedTypes.length > 0 && (asksForCount || targetColumn)) {
-		const cards = targetColumn
-			? getGithubBoardColumnCards(session, targetColumn)
-			: (session.columns || []).flatMap((column) => Array.isArray(column.cards) ? column.cards : []);
-		const counts = countGithubBoardCardTypes(cards);
+	const renderMode = options?.renderMode || (isInlineGithubBoardTableIntent(normalized) ? "table" : "list");
+	const asksForList = Boolean(options?.preferList) || isInlineGithubBoardListIntent(normalized) || renderMode === "table";
+	if (options?.relation === "tasks_for_sprints") {
+		const sprintCards = options?.sprintIssueNumbers && options.sprintIssueNumbers.length > 0
+			? getGithubBoardCardsByNumbers(session, options.sprintIssueNumbers).filter((card) => inferGithubBoardCardType(card) === "sprint")
+			: getGithubBoardSprintCardsByOrdinals(session, options?.sprintOrdinals || []);
+		if (sprintCards.length === 0) {
+			return `No matching sprint was found on ${session.projectTitle || "the current board"}.`;
+		}
+		const matchingCards = resolveInlineGithubBoardMatchedCards(session, question, options);
+		if (asksForCount && !asksForList) {
+			return [
+				`Task count${targetColumn ? ` in ${targetColumn}` : ""} for ${sprintCards.length === 1 ? sprintCards[0].title : "the selected sprints"} on ${session.projectTitle || "the current board"}:`,
+				`- Tasks: ${matchingCards.length}`,
+				`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
+			].join("\n");
+		}
 		return [
-			`${targetColumn || "Current"} ${targetColumn ? "type counts" : "board type counts"} on ${session.projectTitle || "the current board"}:`,
-			...requestedTypes.map((type) => `- ${humanize(type)}s: ${counts[type]}`),
+			`Tasks${targetColumn ? ` in ${targetColumn}` : ""} for ${sprintCards.length === 1 ? sprintCards[0].title : "the selected sprints"} on ${session.projectTitle || "the current board"}:`,
+			renderMode === "table" ? formatGithubBoardCardsTable(matchingCards) : formatGithubBoardCards(matchingCards),
+			`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
+		].join("\n");
+	}
+	const scopeCards = targetColumn
+		? getGithubBoardColumnCards(session, targetColumn)
+		: getGithubBoardAllCards(session);
+	if (requestedTypes.length > 0) {
+		if (asksForCount && !asksForList) {
+			const counts = countGithubBoardCardTypes(scopeCards);
+			return [
+				`${targetColumn || "Current"} ${targetColumn ? "type counts" : "board type counts"} on ${session.projectTitle || "the current board"}:`,
+				...requestedTypes.map((type) => `- ${humanize(type)}s: ${counts[type]}`),
+				`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
+			].join("\n");
+		}
+		const matchingCards = resolveInlineGithubBoardMatchedCards(session, question, options);
+		const typedLabel = requestedTypes.map((type) => `${humanize(type)}s`).join(" / ");
+		return [
+			`${typedLabel}${targetColumn ? ` in ${targetColumn}` : ""} on ${session.projectTitle || "the current board"}:`,
+			renderMode === "table" ? formatGithubBoardCardsTable(matchingCards) : formatGithubBoardCards(matchingCards),
 			`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
 		].join("\n");
 	}
 	if (targetColumn) {
-		const cards = getGithubBoardColumnCards(session, targetColumn);
 		return [
 			`${targetColumn} items on ${session.projectTitle || "the current board"}:`,
-			formatGithubBoardCards(cards),
+			renderMode === "table" ? formatGithubBoardCardsTable(scopeCards) : formatGithubBoardCards(scopeCards),
 			`Board updated: ${relativeTimeStamp(session.updatedAt)}.`,
 		].join("\n");
 	}
@@ -1816,6 +1995,14 @@ export default function (pi: ExtensionAPI) {
 						.map((entry: any) => String(entry || "").trim().toLowerCase())
 						.filter((entry: string) => entry === "task" || entry === "epic" || entry === "sprint") as Array<"task" | "epic" | "sprint">
 					: undefined,
+				relation: String((state as any).lastInlineGithubBoardFocus.relation || "").trim() === "tasks_for_sprints"
+					? "tasks_for_sprints"
+					: undefined,
+				matchedIssueNumbers: Array.isArray((state as any).lastInlineGithubBoardFocus.matchedIssueNumbers)
+					? (state as any).lastInlineGithubBoardFocus.matchedIssueNumbers
+						.map((entry: any) => Number(entry))
+						.filter((entry: number) => Number.isFinite(entry))
+					: undefined,
 				askedAt: String((state as any).lastInlineGithubBoardFocus.askedAt || nowIso()),
 			}
 			: undefined;
@@ -1931,9 +2118,16 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function maybeBuildInlineGithubBoardPrompt(userText: string, match?: { itemId?: string; cardId?: string; sessionId?: string }): string | null {
-		if (!isInlineGithubBoardQuestion(userText)) return null;
 		const session = getInlineGithubBoardSession(match);
 		if (!session) return null;
+		const focus = resolveInlineGithubBoardFocus(userText, session);
+		const requestedTypes = focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : detectGithubBoardRequestedTypes(userText);
+		const isBoardQuestion = isInlineGithubBoardQuestion(userText)
+			|| Boolean(focus.targetColumn)
+			|| requestedTypes.length > 0
+			|| Boolean(focus.preferList)
+			|| Boolean(focus.relation);
+		if (!isBoardQuestion) return null;
 		return buildInlineGithubBoardPrompt(userText, session);
 	}
 
@@ -1943,28 +2137,71 @@ export default function (pi: ExtensionAPI) {
 	): {
 		targetColumn?: string | null;
 		requestedTypes?: Array<"task" | "epic" | "sprint">;
+		preferList?: boolean;
+		renderMode?: "list" | "table";
+		relation?: "tasks_for_sprints";
+		sprintOrdinals?: number[];
+		sprintIssueNumbers?: number[];
+		matchedIssueNumbers?: number[];
 	} {
 		const normalized = normalizeInlineText(userText).toLowerCase();
 		const targetColumn = detectGithubBoardColumn(normalized);
 		const requestedTypes = detectGithubBoardRequestedTypes(normalized);
+		const sprintOrdinals = detectGithubBoardSprintOrdinals(normalized);
+		const wantsTable = isInlineGithubBoardTableIntent(normalized);
+		const focus = persistedState.lastInlineGithubBoardFocus;
+		const recentFocusMatches = Boolean(
+			focus
+			&& focus.sessionId === session.sessionId
+			&& Number.isFinite(Date.parse(String(focus.askedAt || "")))
+			&& (Date.now() - Date.parse(String(focus.askedAt))) <= 10 * 60 * 1000,
+		);
+		if (isInlineGithubBoardBareSprintReference(normalized) && recentFocusMatches && focus?.relation === "tasks_for_sprints") {
+			return {
+				targetColumn: focus.column || null,
+				requestedTypes: focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : ["task"],
+				preferList: true,
+				renderMode: wantsTable ? "table" : "list",
+				relation: "tasks_for_sprints",
+				sprintOrdinals,
+				matchedIssueNumbers: Array.isArray(focus.matchedIssueNumbers) ? focus.matchedIssueNumbers : undefined,
+			};
+		}
+		if (isInlineGithubBoardAssociationIntent(normalized) && /\btask(?:s)?\b/.test(normalized)) {
+			return {
+				targetColumn,
+				requestedTypes: ["task"],
+				preferList: true,
+				renderMode: wantsTable ? "table" : "list",
+				relation: "tasks_for_sprints",
+				sprintOrdinals: sprintOrdinals.length > 0 ? sprintOrdinals : undefined,
+				sprintIssueNumbers: sprintOrdinals.length === 0 && recentFocusMatches && focus?.requestedTypes?.includes("sprint") && Array.isArray(focus.matchedIssueNumbers)
+					? focus.matchedIssueNumbers
+					: undefined,
+			};
+		}
 		if (targetColumn || requestedTypes.length > 0) {
 			return {
 				targetColumn,
 				requestedTypes: requestedTypes.length > 0 ? requestedTypes : undefined,
+				renderMode: wantsTable ? "table" : "list",
 			};
 		}
 		const isTypeFollowUp = /(each type|of each type|off each type|count(?:s)? by type|type count(?:s)?)/.test(normalized);
-		const focus = persistedState.lastInlineGithubBoardFocus;
+		const isListFollowUp = isInlineGithubBoardListIntent(normalized);
+		const isTableFollowUp = wantsTable;
 		if (
-			isTypeFollowUp
+			(isTypeFollowUp || isListFollowUp || isTableFollowUp)
+			&& recentFocusMatches
 			&& focus
-			&& focus.sessionId === session.sessionId
-			&& Number.isFinite(Date.parse(String(focus.askedAt || "")))
-			&& (Date.now() - Date.parse(String(focus.askedAt))) <= 10 * 60 * 1000
 		) {
 			return {
 				targetColumn: focus.column || null,
 				requestedTypes: Array.isArray(focus.requestedTypes) && focus.requestedTypes.length > 0 ? focus.requestedTypes : undefined,
+				preferList: (isListFollowUp || isTableFollowUp) ? true : undefined,
+				renderMode: wantsTable ? "table" : "list",
+				relation: focus.relation,
+				matchedIssueNumbers: Array.isArray(focus.matchedIssueNumbers) ? focus.matchedIssueNumbers : undefined,
 			};
 		}
 		return {};
@@ -1977,14 +2214,18 @@ export default function (pi: ExtensionAPI) {
 		const requestedTypes = focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : detectGithubBoardRequestedTypes(userText);
 		const isBoardQuestion = isInlineGithubBoardQuestion(userText)
 			|| Boolean(focus.targetColumn)
-			|| requestedTypes.length > 0;
+			|| requestedTypes.length > 0
+			|| Boolean(focus.relation);
 		if (!isBoardQuestion) return null;
 		const answer = answerInlineGithubBoardQuestion(userText, session, focus);
-		if (focus.targetColumn || (focus.requestedTypes && focus.requestedTypes.length > 0)) {
+		if (focus.targetColumn || (focus.requestedTypes && focus.requestedTypes.length > 0) || focus.relation) {
+			const matchedCards = resolveInlineGithubBoardMatchedCards(session, userText, focus);
 			persistedState.lastInlineGithubBoardFocus = {
 				sessionId: session.sessionId,
 				column: focus.targetColumn || undefined,
 				requestedTypes: focus.requestedTypes && focus.requestedTypes.length > 0 ? focus.requestedTypes : undefined,
+				relation: focus.relation,
+				matchedIssueNumbers: matchedCards.length > 0 ? matchedCards.map((card) => Number(card.number)) : undefined,
 				askedAt: nowIso(),
 			};
 			saveSessionState();
@@ -4708,8 +4949,9 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const snapshot = buildInlineGithubBoardSnapshot(session);
+			const focus = resolveInlineGithubBoardFocus(String((params as any).question || ""), session);
 			return {
-				content: [{ type: "text", text: answerInlineGithubBoardQuestion(String((params as any).question || ""), session) }],
+				content: [{ type: "text", text: answerInlineGithubBoardQuestion(String((params as any).question || ""), session, focus) }],
 				details: {
 					status: "ok",
 					question: String((params as any).question || "").trim(),

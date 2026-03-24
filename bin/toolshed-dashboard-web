@@ -736,6 +736,14 @@ body.light .lane-summary pre,body.light .lane-content pre{border-color:rgba(15,2
 body.light .lane-summary :not(pre) > code,body.light .lane-content :not(pre) > code{background:rgba(15,23,42,.045)}
 .lane-summary blockquote,.lane-content blockquote{padding-left:10px;border-left:1px solid rgba(255,255,255,.1);color:color-mix(in srgb,var(--text) 70%, var(--muted))}
 body.light .lane-summary blockquote,body.light .lane-content blockquote{border-left-color:rgba(15,23,42,.12)}
+.lane-table-wrap{overflow-x:auto;border:1px solid rgba(255,255,255,.05);border-radius:12px;background:rgba(255,255,255,.02)}
+body.light .lane-table-wrap{border-color:rgba(15,23,42,.08);background:rgba(15,23,42,.025)}
+.lane-summary table,.lane-content table{width:100%;min-width:420px;border-collapse:collapse}
+.lane-summary th,.lane-summary td,.lane-content th,.lane-content td{padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.05);text-align:left;vertical-align:top;white-space:normal}
+body.light .lane-summary th,body.light .lane-summary td,body.light .lane-content th,body.light .lane-content td{border-bottom-color:rgba(15,23,42,.08)}
+.lane-summary th,.lane-content th{font-weight:600;color:var(--text);background:rgba(255,255,255,.03)}
+body.light .lane-summary th,body.light .lane-content th{background:rgba(15,23,42,.035)}
+.lane-summary tbody tr:last-child td,.lane-content tbody tr:last-child td{border-bottom:none}
 .lane-tools{margin-top:14px;display:flex;gap:10px;flex-wrap:wrap;padding-top:10px;border-top:1px solid rgba(255,255,255,.04)}
 .lane-item.user .lane-tools{justify-content:flex-end}
 .lane-tools .mini-btn{padding:0;min-height:auto;border:none;background:transparent;color:var(--muted);font-size:12px;box-shadow:none}
@@ -1988,6 +1996,46 @@ function renderInlineMarkdown(text) {
 	return html;
 }
 
+function isMarkdownTableRow(line) {
+	const trimmed = String(line || '').trim();
+	return trimmed.includes('|') && !/^\s*[-*]\s+/.test(trimmed) && !/^\s*\d+\.\s+/.test(trimmed) && !/^\s*>/.test(trimmed);
+}
+
+function isMarkdownTableSeparator(line) {
+	const trimmed = String(line || '').trim().replace(/^\||\|$/g, '');
+	if (!trimmed) return false;
+	const cells = trimmed.split('|').map(function(cell) { return cell.trim(); }).filter(Boolean);
+	if (cells.length === 0) return false;
+	return cells.every(function(cell) { return /^:?-{3,}:?$/.test(cell); });
+}
+
+function splitMarkdownTableCells(line) {
+	return String(line || '')
+		.trim()
+		.replace(/^\||\|$/g, '')
+		.split('|')
+		.map(function(cell) { return cell.trim(); });
+}
+
+function renderMarkdownTable(lines) {
+	if (!Array.isArray(lines) || lines.length < 2) return '';
+	const headerCells = splitMarkdownTableCells(lines[0]);
+	if (headerCells.length === 0) return '';
+	const bodyRows = lines.slice(2)
+		.filter(function(line) { return String(line || '').trim(); })
+		.map(function(line) { return splitMarkdownTableCells(line); });
+	return '<div class="lane-table-wrap"><table><thead><tr>'
+		+ headerCells.map(function(cell) { return '<th>' + renderInlineMarkdown(cell) + '</th>'; }).join('')
+		+ '</tr></thead>'
+		+ '<tbody>'
+		+ bodyRows.map(function(row) {
+			return '<tr>' + headerCells.map(function(_cell, index) {
+				return '<td>' + renderInlineMarkdown(row[index] || '') + '</td>';
+			}).join('') + '</tr>';
+		}).join('')
+		+ '</tbody></table></div>';
+}
+
 function renderMarkdown(text) {
 	const source = String(text || '').replace(/\r/g, '');
 	if (!source.trim()) return '';
@@ -2011,6 +2059,17 @@ function renderMarkdownBlocks(text) {
 	return blocks.map(function(block) {
 		const trimmed = block.trim();
 		if (!trimmed) return '';
+		const lines = trimmed.split('\n');
+		for (let index = 0; index < lines.length - 1; index++) {
+			if (!isMarkdownTableRow(lines[index]) || !isMarkdownTableSeparator(lines[index + 1])) continue;
+			let end = index + 2;
+			while (end < lines.length && isMarkdownTableRow(lines[end])) end++;
+			return [
+				index > 0 ? renderMarkdownBlocks(lines.slice(0, index).join('\n')) : '',
+				renderMarkdownTable(lines.slice(index, end)),
+				end < lines.length ? renderMarkdownBlocks(lines.slice(end).join('\n')) : '',
+			].join('');
+		}
 		if (/^(?:[-*]\s.+\n?)+$/.test(trimmed)) {
 			return '<ul>' + trimmed.split('\n').map(function(line) {
 				return '<li>' + renderInlineMarkdown(line.replace(/^[-*]\s+/, '')) + '</li>';
