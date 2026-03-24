@@ -5,11 +5,15 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
+- [Documentation Hub](#documentation-hub)
+- [Current Repo State](#current-repo-state)
 - [Extensions](#extensions)
   - [req-qa — Requirements Discovery](#req-qa--requirements-discovery)
   - [dev-pipeline — Sprint Development](#dev-pipeline--sprint-development)
     - [Fast Track Mode (default)](#fast-track-mode-default)
     - [3-Wave Mode](#3-wave-mode---multiwave)
+  - [pi-blueprint — Interactive Planning Cockpit](#pi-blueprint--interactive-planning-cockpit)
+  - [pi-toolshed — Card-Based Workbench](#pi-toolshed--card-based-workbench)
   - [Supporting Extensions](#supporting-extensions)
 - [Agent Definitions](#agent-definitions)
 - [Installation](#installation)
@@ -88,6 +92,28 @@ Each agent subprocess:
 **Session reuse** means a dev agent called for task 1.1 keeps its conversation context when called again for task 1.2, reducing repeated codebase scanning.
 
 **RPC lifecycle:** `prompt` → `agent_start` → `turn_start` → `message_start` → `message_update` (text deltas) → `message_end` → `tool_execution_start/end` (if tools used) → `turn_end` → `agent_end` → `stdin.end()` (or keep alive for follow-up).
+
+---
+
+## Documentation Hub
+
+| Path | Purpose |
+|------|---------|
+| [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md) | Current rollout checklist and repo alignment tracker |
+| [docs/walkthrough-fasttrack.md](docs/walkthrough-fasttrack.md) | Fast Track workflow walkthrough |
+| [docs/research-diffusion-llm-code-generation.md](docs/research-diffusion-llm-code-generation.md) | Research context behind the pipeline design |
+| [PRD-PI-TOOLSHED.md](PRD-PI-TOOLSHED.md) | Toolshed product direction |
+| [TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md](TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md) | Current toolshed implementation notes |
+| [.mcp.json](.mcp.json) | Project-local MCP server wiring |
+| [agents/pi-blueprint/](agents/pi-blueprint/) | Repo-managed blueprint agents |
+| [skills/pi-blueprint/](skills/pi-blueprint/) | Repo-managed blueprint skills |
+
+## Current Repo State
+
+- `req-qa` and `dev-pipeline` remain the baseline discovery and delivery workflow extensions.
+- `pi-blueprint.ts` is the current GitHub-backed planning cockpit, with transcript search, alignment checks, issue rebuilds, asset sync, and a dedicated web mirror.
+- `pi-toolshed.ts` is the current card/workspace shell, with frontier packets, workspace presets, quick actions, and blueprint-aware web surfaces.
+- Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprint/`; use `/blueprint-sync-assets` to mirror them into a project-local `.pi` runtime.
 
 ---
 
@@ -770,6 +796,57 @@ Steering sources:
 
 ---
 
+### pi-blueprint — Interactive Planning Cockpit
+
+**File:** `extensions/pi-blueprint.ts`
+**Usage:** `pi -ne -e extensions/pi-blueprint.ts -e extensions/theme-cycler.ts`
+
+GitHub-backed planning workflow that adds transcript-backed specialist consultations, PRD/checklist generation, alignment scoring, issue rebuild/recovery, and repo-managed asset sync.
+
+Current repo surfaces tied to blueprint:
+
+- `agents/pi-blueprint/` — planning agents committed with the repo
+- `skills/pi-blueprint/` — planning skills committed with the repo
+- `bin/blueprint-dashboard-web` — live Blueprint web mirror
+
+Key commands:
+
+| Command | Description |
+|---------|-------------|
+| `/blueprint-status` | Show current planning status |
+| `/blueprint-web` | Open the live Blueprint web mirror |
+| `/blueprint-details` | Open the detailed Blueprint overlay |
+| `/blueprint-sync-assets` | Sync repo-managed agents/skills into local `.pi` |
+| `/blueprint-check-alignment` | Validate transcript-backed decisions |
+| `/blueprint-rebuild-issues` | Recover or rebuild GitHub issues from artifacts |
+
+---
+
+### pi-toolshed — Card-Based Workbench
+
+**File:** `extensions/pi-toolshed.ts`
+
+Interactive card/workspace shell for frontier packets, quick actions, workspace presets, and blueprint-aware planning handoffs.
+
+Current repo surfaces tied to toolshed:
+
+- `bin/toolshed-dashboard-web` — browser UI for the toolshed workspace
+- `PRD-PI-TOOLSHED.md` — product direction
+- `TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md` — implementation notes
+
+Key commands:
+
+| Command | Description |
+|---------|-------------|
+| `/toolshed-web` | Open the toolshed web workspace |
+| `/toolshed-status` | Show current toolshed state |
+| `/toolshed-workspace` | Switch workspace/card deck |
+| `/toolshed-freeze` | Freeze the current frontier into a packet |
+| `/toolshed-packets` | Inspect queued packets |
+| `/toolshed-reset-layout` | Reset card layout/collapse state |
+
+---
+
 ### Supporting Extensions
 
 | Extension | Purpose |
@@ -833,6 +910,8 @@ ln -sf ~/workspace/pi-extensions/agents/req-qa/* ~/.pi-init/agents/
 ln -sf ~/workspace/pi-extensions/agents/dev-pipeline/* ~/.pi-init/agents/
 ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard ~/.pi-init/bin/pipeline-dashboard
 ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard-web ~/.pi-init/bin/pipeline-dashboard-web
+ln -sf ~/workspace/pi-extensions/bin/blueprint-dashboard-web ~/.pi-init/bin/blueprint-dashboard-web
+ln -sf ~/workspace/pi-extensions/bin/toolshed-dashboard-web ~/.pi-init/bin/toolshed-dashboard-web
 
 # 3. Install dependencies
 cd ~/.pi-init && npm install @mariozechner/pi-tui
@@ -841,7 +920,9 @@ cd ~/.pi-init && npm install @mariozechner/pi-tui
 _PIX="$HOME/.pi-init/extensions"
 alias pi-dev='pi -ne -e "$_PIX/dev-pipeline.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-req='pi -ne -e "$_PIX/req-qa.ts" -e "$_PIX/theme-cycler.ts"'
+alias pi-blueprint='pi -ne -e "$_PIX/pi-blueprint.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-dash='~/.pi-init/bin/pipeline-dashboard'
+alias pi-web='~/.pi-init/bin/pipeline-dashboard-web'
 
 # 5. Install glow for PRD rendering (optional)
 brew install glow
@@ -863,6 +944,7 @@ brew install glow
 |-------|---------|
 | `pi-req` | Launch requirements discovery session |
 | `pi-dev` | Launch sprint development pipeline |
+| `pi-blueprint` | Launch the Blueprint planning cockpit |
 | `pi-dash` | Launch standalone terminal dashboard |
 | `pi-web` | Launch Pipeline Control Center (web, port 3141) |
 
@@ -901,21 +983,51 @@ brew install glow
 | `/pipeline-watch <name>` | Tail a specific agent's log |
 | `/pipeline-close-panes` | Close all tmux/dashboard panes |
 
+### pi-blueprint Commands
+
+| Command | Description |
+|---------|-------------|
+| `/blueprint-status` | Show current planning phase and readiness |
+| `/blueprint-history` | Show consultation history |
+| `/blueprint-prd` | Open the generated PRD |
+| `/blueprint-checklist` | Open the generated checklist |
+| `/blueprint-web` | Open the live Blueprint web mirror |
+| `/blueprint-sync-assets` | Sync repo-managed agents and skills into local `.pi` |
+| `/blueprint-check-alignment` | Verify transcript-backed alignment |
+| `/blueprint-rebuild-issues` | Rebuild or recover GitHub issues |
+
+### pi-toolshed Commands
+
+| Command | Description |
+|---------|-------------|
+| `/toolshed-web` | Open the toolshed web workspace |
+| `/toolshed-status` | Show current toolshed state |
+| `/toolshed-workspace` | Switch active workspace preset |
+| `/toolshed-freeze` | Freeze the active frontier into a packet |
+| `/toolshed-packets` | Inspect the packet queue |
+| `/toolshed-reset-layout` | Reset card collapse state |
+
 ---
 
 ## File Structure
 
 ```
 pi-extensions/
+├── 00-IMPLEMENTATION-CHECKLIST.md
+├── .mcp.json
+├── PRD-PI-TOOLSHED.md
 ├── README.md
+├── TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md
 ├── extensions/
-│   ├── req-qa.ts              # Requirements discovery extension (~1640 lines)
-│   ├── dev-pipeline.ts        # Sprint development extension (~5050 lines)
+│   ├── req-qa.ts              # Requirements discovery extension
+│   ├── dev-pipeline.ts        # Sprint development extension
+│   ├── pi-blueprint.ts        # GitHub-backed planning cockpit
+│   ├── pi-toolshed.ts         # Card/workspace shell
 │   ├── bailian-provider.ts    # Alibaba Cloud Bailian provider
 │   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
 │   ├── glm-provider.ts        # Zhipu GLM provider
 │   ├── ollama-provider.ts     # Ollama local models provider
-│   ├── themeMap.ts             # Per-extension theme assignments
+│   ├── themeMap.ts            # Per-extension theme assignments
 │   └── theme-cycler.ts        # Runtime theme switching
 ├── agents/
 │   ├── req-qa/                # Requirements discovery agents
@@ -924,6 +1036,7 @@ pi-extensions/
 │   │   ├── ux-analyst.md
 │   │   ├── scenario-analyst.md
 │   │   └── prd-writer.md
+│   ├── pi-blueprint/          # Repo-managed blueprint agents
 │   └── dev-pipeline/          # Development pipeline agents
 │       ├── dev.md
 │       ├── compliance.md
@@ -932,9 +1045,13 @@ pi-extensions/
 │       ├── tester.md
 │       ├── uat-signoff.md
 │       └── sharder.md
+├── skills/
+│   └── pi-blueprint/          # Repo-managed blueprint skills
 ├── bin/
 │   ├── pipeline-dashboard     # Standalone terminal dashboard (bash)
-│   └── pipeline-dashboard-web # Pipeline Control Center (Node.js HTTP + SSE + TCP)
+│   ├── pipeline-dashboard-web # Pipeline Control Center (Node.js HTTP + SSE + TCP)
+│   ├── blueprint-dashboard-web # Blueprint web mirror
+│   └── toolshed-dashboard-web # Toolshed workspace UI
 └── docs/
     ├── walkthrough-fasttrack.md
     └── research-diffusion-llm-code-generation.md

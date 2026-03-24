@@ -380,10 +380,12 @@ function displayName(name: string): string {
 }
 
 function inferExecutionGrain(task: { title: string; body: string }): ExecutionGrain {
-	const text = `${task.title}\n${task.body}`.toLowerCase();
+	const title = String(task.title || "").toLowerCase().trim();
+	const body = String(task.body || "").toLowerCase();
+	const text = `${title}\n${body}`;
 	if (text.includes("atomic")) return "atomic-step-ready";
-	if (text.includes("sub-task") || text.includes("subtask")) return "sub-task-ready";
-	if (text.includes("epic")) return "planning-only";
+	if (title.includes("sub-task") || title.includes("subtask") || /^#{1,6}\s+sub-?task\b/m.test(body)) return "sub-task-ready";
+	if (/^(epic|sprint|phase)\b/.test(title) || /^#{1,6}\s+(epic|sprint|phase)\b/m.test(body)) return "planning-only";
 	return "task-ready";
 }
 
@@ -924,11 +926,24 @@ function getLatestGlobalSessionFilesForCwd(cwd: string, limit: number = 1): stri
 		.map(item => item.path);
 }
 
+function normalizeSessionHistoryTimestamp(timestamp: string): string {
+	const parsed = Date.parse(timestamp);
+	if (!Number.isFinite(parsed)) return timestamp;
+	return new Date(Math.floor(parsed / 1000) * 1000).toISOString();
+}
+
+function normalizeSessionHistoryContent(content: string): string {
+	return String(content || "")
+		.replace(/\r/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
 function dedupeSessionHistory(segments: SessionHistorySegment[]): SessionHistorySegment[] {
 	const seen = new Set<string>();
 	const deduped: SessionHistorySegment[] = [];
 	for (const segment of segments.sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
-		const key = `${segment.timestamp}|${segment.role}|${segment.title}|${segment.content}`;
+		const key = `${normalizeSessionHistoryTimestamp(segment.timestamp)}|${segment.role}|${segment.title}|${normalizeSessionHistoryContent(segment.content)}`;
 		if (seen.has(key)) continue;
 		seen.add(key);
 		deduped.push(segment);
@@ -1241,12 +1256,14 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		const scriptVersion = String(statSync(scriptPath).mtimeMs);
+		const localProjectDir = resolve(ctx.cwd);
 		let needsRestart = false;
 		try {
 			const raw = execSync(`curl -fsS '${blueprintWebUrl}/api/version'`, { encoding: "utf-8" }).trim();
 			const parsed = JSON.parse(raw || "{}");
 			const remoteVersion = parsed?.version ? String(parsed.version) : "";
-			needsRestart = remoteVersion !== scriptVersion;
+			const remoteProjectDir = parsed?.projectDir ? resolve(String(parsed.projectDir)) : "";
+			needsRestart = remoteVersion !== scriptVersion || remoteProjectDir !== localProjectDir;
 		} catch {
 			needsRestart = true;
 		}
@@ -1804,26 +1821,27 @@ export default function (pi: ExtensionAPI) {
 		for (const entry of branch) {
 			if (entry.type !== "message" || !entry.message) continue;
 			const msg = entry.message;
+			const timestamp = String((entry as any).timestamp || msg.timestamp || new Date().toISOString());
 			const content = extractSessionMessageContent(entry).trim();
 			if (!content) continue;
 			if (msg.role === "user") {
 				branchSegments.push({
 					role: "user",
-					timestamp: String(msg.timestamp || new Date().toISOString()),
+					timestamp,
 					title: "User Prompt",
 					content,
 				});
 			} else if (msg.role === "assistant") {
 				branchSegments.push({
 					role: "assistant",
-					timestamp: String(msg.timestamp || new Date().toISOString()),
+					timestamp,
 					title: "Assistant Response",
 					content,
 				});
 			} else if (msg.role === "toolResult") {
 				branchSegments.push({
 					role: "tool",
-					timestamp: String(msg.timestamp || new Date().toISOString()),
+					timestamp,
 					title: `Tool Result: ${(msg as any).toolName || "tool"}`,
 					content,
 				});
@@ -3961,6 +3979,19 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 		return candidates[0]?.number ?? null;
 	}
 
+	function resolveReusableIssueNumber(
+		existingIssues: ExistingIssueSummary[],
+		preferredIssueNumber: number | null | undefined,
+		title: string,
+		label: string,
+	): number | null {
+		if (preferredIssueNumber != null) {
+			const byNumber = existingIssues.find(issue => issue.number === preferredIssueNumber && issue.labels.includes(label));
+			if (byNumber) return byNumber.number;
+		}
+		return findExistingIssueNumber(existingIssues, title, label);
+	}
+
 	function collectObsoletePublishedIssues(
 		issues: DetailedGitHubIssue[],
 		desired: Array<{ label: string; title: string; keepNumber: number }>,
@@ -4120,7 +4151,12 @@ function loadArtifactAlignmentSpec(cwd: string): { truthSource: AlignmentTruthSo
 				const tmpFile = join(logDir, `_epic_body_${epicId.replace(/\s+/g, "_")}.md`);
 				writeFileSync(tmpFile, body, "utf-8");
 
-				const existingEpicIssueNumber = epicEntry.issueNumber ?? findExistingIssueNumber(existingIssues, `${epicId}: ${epicTitle}`, "epic");
+				const existingEpicIssueNumber = resolveReusableIssueNumber(
+					existingIssues,
+					epicEntry.issueNumber,
+					`${epicId}: ${epicTitle}`,
+					"epic",
+				);
 				const result = existingEpicIssueNumber
 					? await shellExecAsync(
 						`cd '${cwd}' && gh issue edit ${existingEpicIssueNumber} --title "${epicId}: ${epicTitle}" --add-label "epic" --body-file '${tmpFile}'`
@@ -4199,7 +4235,12 @@ EOF`);
 				const tmpFile = join(logDir, `_task_body_${task.id.replace(/\./g, "_")}.md`);
 				writeFileSync(tmpFile, body, "utf-8");
 
-				const existingTaskIssueNumber = task.issueNumber ?? findExistingIssueNumber(existingIssues, issueTitle, "task");
+				const existingTaskIssueNumber = resolveReusableIssueNumber(
+					existingIssues,
+					task.issueNumber,
+					issueTitle,
+					"task",
+				);
 				const result = existingTaskIssueNumber
 					? await shellExecAsync(
 						`cd '${cwd}' && gh issue edit ${existingTaskIssueNumber} --title "${issueTitle.replace(/"/g, '\\"')}" --add-label "task" --body-file '${tmpFile}'`
@@ -4474,14 +4515,18 @@ EOF`);
 				.map(([id, num]) => `  #${num} — ${id}`)
 				.join("\n");
 
+			const rejectedSummary = pub.tasksRejected > 0
+				? `Rejected by planning gate: ${pub.tasksRejected}\n\n`
+				: "";
 			ctx.ui.notify(
 				`GitHub Issues Synced!\n\n` +
-				`Epics: ${pub.epicsCreated} created` + (pub.epicsUpdated > 0 ? `, ${pub.epicsUpdated} updated` : "") + "\n" +
+				`Epics: ${pub.epicsCreated} created` + (pub.epicsUpdated > 0 ? `, ${pub.epicsUpdated} updated` : "") + (pub.epicsCreated === 0 && pub.epicsUpdated === 0 ? `, 0 matched existing reusable issues` : "") + "\n" +
 				epicList + "\n\n" +
-				`Tasks: ${pub.tasksCreated} created` + (pub.tasksUpdated > 0 ? `, ${pub.tasksUpdated} updated` : "") + (pub.tasksFailed > 0 ? ` (${pub.tasksFailed} failed)` : "") + "\n\n" +
+				`Tasks: ${pub.tasksCreated} created` + (pub.tasksUpdated > 0 ? `, ${pub.tasksUpdated} updated` : "") + (pub.tasksFailed > 0 ? `, ${pub.tasksFailed} failed` : "") + "\n\n" +
+				rejectedSummary +
 				`Checklist updated with issue numbers.\n` +
 				(pub.repoUrl ? `View: ${pub.repoUrl}/issues` : ""),
-					"info",
+					pub.tasksFailed > 0 ? "warning" : "info",
 			);
 		},
 	});

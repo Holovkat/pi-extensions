@@ -26,6 +26,7 @@ for (let i = 0; i < args.length; i++) {
 
 const stateFile = path.join(projectDir, ".pi", "pipeline-logs", "blueprint-state.json");
 const sessionStateFile = path.join(projectDir, ".pi", "agent-sessions", "pi-blueprint-state.json");
+const projectName = path.basename(projectDir) || projectDir;
 const SCRIPT_VERSION = String(fs.statSync(__filename).mtimeMs);
 const MAX_WEB_CHAT_ITEMS = 40;
 const MAX_WEB_CHAT_ITEM_CHARS = 12000;
@@ -39,7 +40,68 @@ const SPECIALISTS = {
 
 const sseClients = new Set();
 const registeredAgents = new Map();
+const pendingWebChatItems = [];
+const PENDING_WEB_CHAT_TTL_MS = 5 * 60 * 1000;
 let lastMtime = 0;
+
+function parseChatTimestampMs(value) {
+	const numeric = Number(value);
+	if (Number.isFinite(numeric) && String(value || "").trim() !== "") return numeric;
+	const parsed = Date.parse(String(value || ""));
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeChatText(value) {
+	return String(value || "")
+		.replace(/\r/g, "")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+function createPendingWebChatItem(message) {
+	return {
+		role: "user",
+		timestamp: String(Date.now()),
+		title: "User Prompt",
+		content: String(message || "").trim(),
+		pending: true,
+	};
+}
+
+function getPendingWebChatItems(actualItems) {
+	const actualHistory = Array.isArray(actualItems) ? actualItems : [];
+	const consumedActualIndexes = new Set();
+	const nextPendingItems = [];
+	const now = Date.now();
+	for (const item of pendingWebChatItems) {
+		const timestampMs = parseChatTimestampMs(item?.timestamp);
+		if (!item?.content) continue;
+		if (timestampMs > 0 && now - timestampMs > PENDING_WEB_CHAT_TTL_MS) continue;
+		const matchIndex = actualHistory.findIndex((entry, index) => {
+			if (consumedActualIndexes.has(index)) return false;
+			if (String(entry?.role || "") !== String(item.role || "")) return false;
+			if (String(entry?.title || "") !== String(item.title || "")) return false;
+			if (normalizeChatText(entry?.content) !== normalizeChatText(item.content)) return false;
+			const entryTimestampMs = parseChatTimestampMs(entry?.timestamp);
+			return entryTimestampMs >= Math.max(0, timestampMs - 2000);
+		});
+		if (matchIndex !== -1) {
+			consumedActualIndexes.add(matchIndex);
+			continue;
+		}
+		nextPendingItems.push({ ...item, pending: true });
+	}
+	pendingWebChatItems.length = 0;
+	pendingWebChatItems.push(...nextPendingItems);
+	return nextPendingItems;
+}
+
+function mergePendingWebChatHistory(items) {
+	const actualItems = Array.isArray(items) ? items : [];
+	const pendingItems = getPendingWebChatItems(actualItems);
+	return [...actualItems, ...pendingItems]
+		.sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+}
 
 function titleizeSpecialist(name) {
 	return String(name || "")
@@ -265,7 +327,9 @@ function mergeConsultationsIntoState(state) {
 				statusText: isRebuildLane
 					? `${state.rebuildProgress.stage} ${state.rebuildProgress.current}/${state.rebuildProgress.total}`
 					: isActive ? "consulting..." : hasConsulted ? `done (iter ${record?.iteration ?? "?"})` : "standby",
-				detail: isRebuildLane ? (state.rebuildProgress?.detail || "Publishing GitHub issues...") : cleanSummaryText(record?.question || "—"),
+				detail: isRebuildLane
+					? (state.rebuildProgress?.detail || "Publishing GitHub issues...")
+					: cleanSummaryText(record?.response || record?.question || "—"),
 				question: record?.question || "",
 				response: record?.response || "",
 				timestamp: record?.timestamp || null,
@@ -336,10 +400,24 @@ function mergeConsultationsIntoState(state) {
 	};
 }
 
+function buildDashboardMeta() {
+	return {
+		projectDir,
+		projectName,
+		stateFile,
+		controlPort,
+		liveSessionConnected: registeredAgents.size > 0,
+		registeredAgents: [...registeredAgents.keys()],
+	};
+}
+
 function readState() {
 	try {
 		const raw = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
-		return mergeConsultationsIntoState(sanitizeDashboardState(raw));
+		return {
+			...mergeConsultationsIntoState(sanitizeDashboardState(raw)),
+			dashboardMeta: buildDashboardMeta(),
+		};
 	} catch {
 		return null;
 	}
@@ -467,59 +545,138 @@ function sendText(res, status, text, type = "text/plain; charset=utf-8") {
 
 const DASHBOARD_CSS = `
 *{box-sizing:border-box}
-body{margin:0;background:#121315;color:#ececec;font:14px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+:root{color-scheme:dark}
+body{margin:0;background:#121315;color:#ececec;font:14px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
 body.light{background:#f7f7f8;color:#191919}
+body.light{color-scheme:light}
 a{color:inherit}
-.container{max-width:1400px;margin:0 auto;padding:16px 20px}
-.nav{display:flex;align-items:center;gap:16px;padding:12px 0 16px;border-bottom:1px solid rgba(255,255,255,.12)}
+button{font:inherit}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.container{max-width:1480px;margin:0 auto;padding:18px 20px 110px}
+.nav{display:flex;align-items:center;gap:12px;padding:10px 0 18px;border-bottom:1px solid rgba(255,255,255,.12)}
 body.light .nav{border-bottom-color:rgba(0,0,0,.1)}
-.nav-brand{font-size:18px;font-weight:700;letter-spacing:.04em}
-.nav-meta{margin-left:auto;font-size:12px;opacity:.75}
-.theme-toggle{background:#222;border:1px solid rgba(255,255,255,.12);color:#fff;border-radius:8px;padding:6px 10px;cursor:pointer}
-body.light .theme-toggle{background:#fff;color:#111;border-color:rgba(0,0,0,.12)}
-.hero{display:grid;grid-template-columns:1.25fr .95fr;gap:16px;margin-top:16px}
-.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}
-.card,.widget-card,.panel{background:#1a1c1f;border:1px solid rgba(255,255,255,.1);border-radius:14px;padding:14px}
+.nav-brand{font-size:18px;font-weight:800;letter-spacing:.06em}
+.nav-spacer{margin-left:auto}
+.nav-meta{font-size:12px;opacity:.72}
+.card,.widget-card,.panel{background:#1a1c1f;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:16px}
 body.light .card,body.light .widget-card,body.light .panel{background:#fff;border-color:rgba(0,0,0,.1)}
-.status-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.hero{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.95fr);gap:16px;margin-top:16px}
+.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:16px}
+.specialist-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.eyebrow{font-size:11px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;opacity:.72}
+.status-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
 .status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;background:#888}
 .status-dot.running{background:#5ad66f;box-shadow:0 0 0 4px rgba(90,214,111,.14)}
 .status-dot.idle{background:#f0b44c;box-shadow:0 0 0 4px rgba(240,180,76,.14)}
-.big{font-size:28px;font-weight:700}
-.muted{opacity:.72}
-.specialist-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
-.widget-title{font-weight:700;margin-bottom:10px;display:flex;justify-content:space-between;gap:8px;align-items:center}
-.widget-title-text{display:flex;align-items:center;gap:8px}
-.status-chip{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:6px 10px;background:rgba(255,255,255,.05);font-size:12px}
-body.light .status-chip{background:rgba(0,0,0,.05)}
-.status-chip.active{color:#ffd166}.status-chip.done{color:#4ade80}.status-chip.idle{opacity:.8}
+.status-label{font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.78}
+.hero-title{font-size:32px;line-height:1.1;font-weight:800;margin:12px 0 8px}
+.hero-copy{font-size:14px;opacity:.84;max-width:72ch}
+.hero-meta,.specialist-meta,.hero-actions,.filter-group{display:flex;gap:8px;flex-wrap:wrap}
+.hero-meta{margin-top:14px}
+.hero-actions{margin-top:16px}
+.pill,.filter-pill,.mini-btn{display:inline-flex;align-items:center;gap:8px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);padding:6px 10px;font-size:12px}
+body.light .pill,body.light .filter-pill,body.light .mini-btn{border-color:rgba(0,0,0,.12);background:rgba(0,0,0,.04)}
+.pill.success,.filter-pill.success{color:#4ade80}
+.pill.warning,.filter-pill.warning{color:#f59e0b}
+.pill.error,.filter-pill.error{color:#ef4444}
+.pill.info,.filter-pill.info{color:#93c5fd}
+.filter-pill{cursor:pointer}
+.filter-pill.active{background:rgba(59,130,246,.16);border-color:rgba(59,130,246,.4);color:#bfdbfe}
+body.light .filter-pill.active{color:#1d4ed8;background:rgba(59,130,246,.08)}
+.btn{padding:10px 14px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#222;color:#fff;cursor:pointer}
+body.light .btn{background:#fff;color:#111;border-color:rgba(0,0,0,.12)}
+.btn.primary{background:#2563eb;border-color:#2563eb;color:#fff}
+.btn.secondary{background:rgba(255,255,255,.04)}
+body.light .btn.secondary{background:rgba(0,0,0,.03)}
+.btn.ghost{background:transparent}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.action-note,.widget-subtitle,.footer-line,.chat-status{font-size:12px;opacity:.72}
+.widget-title{font-weight:700;display:flex;justify-content:space-between;gap:8px;align-items:center}
+.widget-subtitle{margin-top:4px}
 .widget-card.tone-success{border-color:rgba(74,222,128,.35)}
 .widget-card.tone-warning{border-color:rgba(245,158,11,.35)}
 .widget-card.tone-error{border-color:rgba(239,68,68,.35)}
-.metric-value{font-size:28px;font-weight:700;margin-bottom:6px}.tone-success{color:#4ade80}.tone-warning{color:#f59e0b}.tone-error{color:#ef4444}
-.widget-meta,.widget-detail,.widget-state{margin-top:6px;font-size:13px;white-space:pre-wrap;word-break:break-word}
-.widget-actions{margin-top:10px;font-size:12px;opacity:.82}
-.footer-line{margin-top:10px;font-size:12px;opacity:.72}
-.layout{display:grid;grid-template-columns:1.05fr .95fr;gap:16px;margin-top:16px}
-.chat{height:520px;overflow:auto;border-radius:12px;background:rgba(255,255,255,.03);padding:12px;border:1px solid rgba(255,255,255,.08)}
+.metric-value{font-size:30px;font-weight:800;margin:12px 0 8px}
+.tone-success{color:#4ade80}
+.tone-warning{color:#f59e0b}
+.tone-error{color:#ef4444}
+.tone-info{color:#93c5fd}
+.widget-meta,.widget-detail,.widget-state,.activity-body,.overlay-value,.msg-body{margin-top:8px;font-size:13px;white-space:pre-wrap;word-break:break-word}
+.activity-feed{display:flex;flex-direction:column;gap:10px}
+.activity-item{padding:12px;border-radius:12px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06)}
+body.light .activity-item{background:#f7f7f8;border-color:rgba(0,0,0,.06)}
+.activity-tag{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:4px 8px;font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;background:rgba(255,255,255,.05)}
+body.light .activity-tag{background:rgba(0,0,0,.05)}
+.activity-title{font-size:14px;font-weight:700;margin-top:10px}
+.activity-meta{margin-top:8px;font-size:12px;opacity:.7}
+.specialist-card{height:100%}
+.status-chip{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:6px 10px;background:rgba(255,255,255,.05);font-size:12px}
+body.light .status-chip{background:rgba(0,0,0,.05)}
+.status-chip.active{color:#ffd166}
+.status-chip.done{color:#4ade80}
+.status-chip.idle{opacity:.8}
+.specialist-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.mini-btn{cursor:pointer;background:transparent}
+.transcript-drawer{position:fixed;left:0;right:0;bottom:0;z-index:30;pointer-events:none}
+.transcript-drawer-panel{pointer-events:auto;width:100%;height:min(75vh,780px);min-height:72px;background:#16181b;border-top:1px solid rgba(255,255,255,.12);box-shadow:0 -18px 48px rgba(0,0,0,.28);border-radius:18px 18px 0 0;transform:translateY(calc(100% - 72px));transition:transform .24s ease;display:flex;flex-direction:column;overflow:hidden}
+body.light .transcript-drawer-panel{background:#fff;border-top-color:rgba(0,0,0,.1)}
+.transcript-drawer.open .transcript-drawer-panel{transform:translateY(0)}
+.transcript-drawer-header{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid rgba(255,255,255,.08)}
+body.light .transcript-drawer-header{border-bottom-color:rgba(0,0,0,.08)}
+.transcript-header-copy{min-width:0;display:flex;flex-direction:column;gap:4px}
+.transcript-drawer-title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.transcript-summary{font-size:12px;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(90vw,900px)}
+.transcript-header-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.icon-circle,.icon-chevron{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:inherit;cursor:pointer}
+body.light .icon-circle,body.light .icon-chevron{border-color:rgba(0,0,0,.12);background:rgba(0,0,0,.04)}
+.icon-circle{font-weight:700}
+.icon-chevron{font-size:14px}
+.transcript-drawer-body{display:flex;flex-direction:column;gap:12px;padding:0 20px 16px;min-height:0;flex:1;opacity:0;transform:translateY(10px);transition:opacity .18s ease,transform .18s ease}
+.transcript-drawer.open .transcript-drawer-body{opacity:1;transform:none}
+.transcript-drawer:not(.open) .transcript-open-only{display:none!important}
+.transcript-header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap}
+.chat{flex:1;min-height:0;overflow:auto;border-radius:12px;background:rgba(255,255,255,.03);padding:12px;border:1px solid rgba(255,255,255,.08)}
 body.light .chat{background:#f7f7f8;border-color:rgba(0,0,0,.06)}
-.msg{margin-bottom:12px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.04)}
-.msg.user{border-left:3px solid #60a5fa}.msg.assistant{border-left:3px solid #a78bfa}.msg.tool{border-left:3px solid #f59e0b}
+.msg{margin-bottom:12px;padding:12px;border-radius:12px;background:rgba(255,255,255,.04)}
+.msg.user{border-left:3px solid #60a5fa}
+.msg.assistant{border-left:3px solid #a78bfa}
+.msg.tool{border-left:3px solid #f59e0b}
 body.light .msg{background:#fff}
-.msg-title{font-size:12px;opacity:.7;margin-bottom:6px}.msg-body{white-space:pre-wrap;word-break:break-word}
-.chat-form{display:flex;gap:10px;margin-top:12px}.chat-input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#101113;color:inherit}
+.msg-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+.msg-role{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;opacity:.72}
+.msg-title{font-size:13px;font-weight:700;margin-top:2px}
+.msg-time{font-size:11px;opacity:.6;text-align:right}
+.msg-actions{margin-top:10px}
+.link-btn{appearance:none;background:transparent;border:0;color:#93c5fd;cursor:pointer;padding:0;font-size:12px}
+body.light .link-btn{color:#2563eb}
+.chat-form{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px}
+.chat-input{padding:10px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.12);background:#101113;color:inherit}
 body.light .chat-input{background:#fff;border-color:rgba(0,0,0,.12)}
-.btn{padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:#222;color:#fff;cursor:pointer}
-body.light .btn{background:#fff;color:#111;border-color:rgba(0,0,0,.12)}
-.decisions{display:flex;flex-direction:column;gap:8px}.decision-item{padding:10px 12px;border-radius:10px;background:rgba(255,255,255,.04);font-size:13px;white-space:pre-wrap;word-break:break-word}
-body.light .decision-item{background:#f7f7f8}
-.icon-btn{appearance:none;background:transparent;border:1px solid rgba(255,255,255,.12);color:inherit;border-radius:999px;padding:2px 8px;cursor:pointer;font-size:12px}
-body.light .icon-btn{border-color:rgba(0,0,0,.12)}
-.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px;z-index:20}.overlay.open{display:flex}
+.transcript-footer{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}
+body.light .transcript-footer{border-top-color:rgba(0,0,0,.08)}
+.transcript-command-list{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.command-chip{cursor:pointer}
+.command-chip:disabled{opacity:.55;cursor:not-allowed}
+.side-drawer{position:fixed;top:0;right:0;bottom:0;z-index:42;pointer-events:none}
+.side-drawer-panel{pointer-events:auto;width:min(420px,100vw);height:100%;margin-left:auto;background:#16181b;border-left:1px solid rgba(255,255,255,.12);box-shadow:-12px 0 36px rgba(0,0,0,.24);transform:translateX(100%);transition:transform .24s ease;padding:20px;overflow:auto}
+body.light .side-drawer-panel{background:#fff;border-left-color:rgba(0,0,0,.1)}
+.side-drawer.open .side-drawer-panel{transform:translateX(0)}
+.side-drawer-header{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:16px}
+.side-drawer-body{display:flex;flex-direction:column;gap:12px}
+.drawer-scrim{position:fixed;inset:0;background:rgba(0,0,0,.32);opacity:0;pointer-events:none;transition:opacity .2s ease;z-index:41}
+.drawer-scrim.open{opacity:1;pointer-events:auto}
+.empty-state{font-size:13px;opacity:.72}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;padding:24px;z-index:50}
+.overlay.open{display:flex}
 .overlay-card{max-width:960px;width:min(960px,100%);max-height:80vh;overflow:auto;background:#16181b;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:18px}
 body.light .overlay-card{background:#fff;border-color:rgba(0,0,0,.12)}
-.overlay-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}.overlay-title{font-size:22px;font-weight:700}.overlay-meta{font-size:12px;opacity:.7;margin-top:4px}.overlay-section{margin-top:14px}.overlay-label{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:8px}.overlay-value{white-space:pre-wrap;word-break:break-word}
-@media (max-width: 1100px){.hero,.layout,.cards,.specialist-grid{grid-template-columns:1fr}}
+.overlay-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:14px}
+.overlay-title{font-size:22px;font-weight:700}
+.overlay-meta{font-size:12px;opacity:.7;margin-top:4px}
+.overlay-section{margin-top:14px}
+.overlay-label{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;opacity:.7;margin-bottom:8px}
+@media (max-width: 1280px){.hero{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width: 920px){.specialist-grid,.cards{grid-template-columns:1fr}.chat-form{grid-template-columns:1fr}.hero-title{font-size:26px}.nav{align-items:flex-start;flex-wrap:wrap}.transcript-drawer-header{padding:12px 16px}.transcript-drawer-body{padding:0 16px 14px}.side-drawer-panel{width:min(100vw,420px);padding:16px}.transcript-summary{max-width:78vw}.transcript-footer,.transcript-header-actions,.transcript-header{align-items:stretch}.transcript-command-list{justify-content:flex-start}}
 `;
 
 const DASHBOARD_HTML = String.raw`<!doctype html>
@@ -534,22 +691,34 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 <div class="container">
 	<div class="nav">
 		<div class="nav-brand">PI BLUEPRINT</div>
-		<button id="theme-btn" class="theme-toggle" type="button">Light</button>
+		<span id="projectBadge" class="pill info">${projectName}</span>
+		<span id="connectionPill" class="pill info">Dashboard connecting…</span>
+		<div class="nav-spacer"></div>
+		<button id="theme-btn" class="btn ghost" type="button">Light</button>
 		<div class="nav-meta" id="updated">waiting…</div>
 	</div>
 
 	<div class="hero">
 		<div class="card">
+			<div class="eyebrow">Blueprint cockpit</div>
 			<div class="status-row">
 				<span id="statusDot" class="status-dot idle"></span>
-				<div class="big" id="statusLine">idle</div>
+				<div id="statusLine" class="status-label">idle</div>
 			</div>
-			<div class="widget-meta" id="activityLine">Waiting for state...</div>
-			<div class="widget-meta">Web: <span id="urlLine">-</span></div>
+			<div id="heroTitle" class="hero-title">Waiting for state…</div>
+			<div id="heroCopy" class="hero-copy">Connect the browser to a live blueprint session, then use this page to review findings and steer the next step.</div>
+			<div class="hero-meta">
+				<span id="projectPill" class="pill info">Project: ${projectName}</span>
+				<span id="boundPill" class="pill info">Bound to ${projectDir}</span>
+				<span id="sessionPill" class="pill warning">Waiting for live session</span>
+			</div>
+			<div id="actionButtons" class="hero-actions"></div>
+			<div id="actionNote" class="action-note">Action buttons inject commands into the live blueprint session.</div>
 		</div>
 		<div class="card">
-			<div class="widget-title">Recent Decisions</div>
-			<div id="decisionList" class="decisions"><div class="muted">No transcript segments yet.</div></div>
+			<div class="widget-title">Activity Feed</div>
+			<div class="widget-subtitle">Curated milestones instead of raw transcript noise.</div>
+			<div id="activityFeed" class="activity-feed"><div class="empty-state">No blueprint activity yet.</div></div>
 		</div>
 	</div>
 
@@ -557,39 +726,69 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 		<div id="scoreCard" class="widget-card"></div>
 		<div id="alignmentCard" class="widget-card"></div>
 		<div id="assetCard" class="widget-card"></div>
-		<div class="widget-card">
-			<div class="widget-title">Commands</div>
-			<div class="widget-meta"><code>/blueprint-details</code></div>
-			<div class="widget-meta"><code>/blueprint-check-alignment</code></div>
-			<div class="widget-meta"><code>/blueprint-search-history &lt;query&gt;</code></div>
-			<div class="widget-meta"><code>/blueprint-sync-assets</code></div>
-		</div>
+		<div id="artifactCard" class="widget-card"></div>
 	</div>
 
 	<div class="panel" style="margin-top:16px">
 		<div class="widget-title">Specialists</div>
+		<div id="specialistSubtitle" class="widget-subtitle">Consultation coverage and the latest findings from each lane.</div>
 		<div id="specialistGrid" class="specialist-grid"></div>
 		<div id="widgetFooter" class="footer-line"></div>
 	</div>
 
-	<div class="layout">
-		<div class="panel">
-			<div class="widget-title">Transcript</div>
+</div>
+
+<div id="transcriptDrawer" class="transcript-drawer">
+	<div id="transcriptDrawerPanel" class="transcript-drawer-panel">
+		<div class="transcript-drawer-header">
+			<div class="transcript-header-copy">
+				<div class="transcript-drawer-title">
+					<div class="widget-title">Transcript</div>
+					<span id="transcriptCountPill" class="pill info">0 entries</span>
+				</div>
+				<div id="transcriptSummary" class="transcript-summary">Expand from the bottom to inspect the live transcript and controls.</div>
+			</div>
+			<div class="transcript-header-actions">
+				<button id="transcriptInfoButton" class="icon-circle" type="button" aria-label="Open session context">i</button>
+				<button id="jumpLatest" class="btn secondary transcript-open-only" type="button">Jump to latest</button>
+				<button id="transcriptToggle" class="icon-chevron" type="button" aria-expanded="false" aria-controls="transcriptDrawerPanel" aria-label="Expand transcript drawer"><span id="transcriptToggleGlyph">⌃</span></button>
+			</div>
+		</div>
+		<div id="transcriptDrawerBody" class="transcript-drawer-body">
+			<div class="transcript-header transcript-open-only">
+				<div class="widget-subtitle">Filter roles, collapse verbose output, and steer the live session from the browser.</div>
+				<div id="transcriptFilters" class="filter-group"></div>
+			</div>
 			<div id="chat" class="chat"></div>
 			<form id="chatForm" class="chat-form">
-				<input id="chatInput" class="chat-input" placeholder="Send a message into the live blueprint session" />
-				<button class="btn" type="submit">Send</button>
+				<input id="chatInput" class="chat-input" placeholder="Send a message or slash command into the live blueprint session" />
+				<button id="chatSendButton" class="btn primary" type="submit">Send</button>
 			</form>
-		</div>
-		<div class="panel">
-			<div class="widget-title">State Snapshot</div>
-			<div class="widget-meta">Project: <code>${projectDir}</code></div>
-			<div class="widget-meta">State file: <code>${stateFile}</code></div>
-			<div class="widget-meta">Control port: <code>${controlPort}</code></div>
-			<div class="widget-meta">Widget bar data and transcript stream update live from <code>blueprint-state.json</code>.</div>
+			<div id="chatStatus" class="chat-status">Waiting for dashboard connection…</div>
+			<div class="transcript-footer transcript-open-only">
+				<div>
+					<div class="widget-title">Useful commands</div>
+					<div class="widget-subtitle">Secondary actions you can inject directly into the live blueprint session.</div>
+				</div>
+				<div id="transcriptCommandList" class="transcript-command-list"></div>
+			</div>
 		</div>
 	</div>
 </div>
+
+<div id="sessionDrawerScrim" class="drawer-scrim" hidden></div>
+<aside id="sessionDrawer" class="side-drawer" aria-hidden="true">
+	<div class="side-drawer-panel">
+		<div class="side-drawer-header">
+			<div>
+				<div class="widget-title">Session context</div>
+				<div class="widget-subtitle">Project binding, runtime files, and connected agents.</div>
+			</div>
+			<button id="sessionDrawerClose" class="btn ghost" type="button">Close</button>
+		</div>
+		<div id="sessionContextPanel" class="side-drawer-body"></div>
+	</div>
+</aside>
 
 <div id="detailOverlay" class="overlay" aria-hidden="true">
 	<div class="overlay-card">
@@ -606,18 +805,72 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 
 <script>
 (() => {
+	const PROJECT_DIR = ${JSON.stringify(projectDir)};
+	const PROJECT_NAME = ${JSON.stringify(projectName)};
+	const STATE_FILE = ${JSON.stringify(stateFile)};
+	const CONTROL_PORT = ${JSON.stringify(controlPort)};
+	const FILTERS = [
+		{ id: 'all', label: 'All', tone: 'info' },
+		{ id: 'user', label: 'User', tone: 'info' },
+		{ id: 'assistant', label: 'Assistant', tone: 'success' },
+		{ id: 'tool', label: 'Tool', tone: 'warning' },
+	];
+	const USEFUL_COMMANDS = [
+		'/blueprint-details',
+		'/blueprint-check-alignment',
+		'/blueprint-search-history scope',
+		'/blueprint-sync-assets',
+		'/blueprint-revise [reason]',
+	];
 	const el = (id) => document.getElementById(id);
+	const transcriptDrawer = el('transcriptDrawer');
+	const transcriptToggle = el('transcriptToggle');
+	const transcriptToggleGlyph = el('transcriptToggleGlyph');
+	const transcriptInfoButton = el('transcriptInfoButton');
+	const transcriptSummary = el('transcriptSummary');
+	const transcriptCountPill = el('transcriptCountPill');
+	const transcriptCommandList = el('transcriptCommandList');
+	const sessionDrawer = el('sessionDrawer');
+	const sessionDrawerScrim = el('sessionDrawerScrim');
+	const sessionDrawerClose = el('sessionDrawerClose');
+	const sessionContextPanel = el('sessionContextPanel');
 	const chat = el('chat');
 	const detailOverlay = el('detailOverlay');
 	const specialistGrid = el('specialistGrid');
 	const scoreCard = el('scoreCard');
 	const alignmentCard = el('alignmentCard');
 	const assetCard = el('assetCard');
+	const artifactCard = el('artifactCard');
 	const widgetFooter = el('widgetFooter');
-	const decisionList = el('decisionList');
+	const activityFeed = el('activityFeed');
+	const projectBadge = el('projectBadge');
+	const connectionPill = el('connectionPill');
+	const projectPill = el('projectPill');
+	const boundPill = el('boundPill');
+	const sessionPill = el('sessionPill');
+	const statusDot = el('statusDot');
+	const statusLine = el('statusLine');
+	const heroTitle = el('heroTitle');
+	const heroCopy = el('heroCopy');
+	const actionButtons = el('actionButtons');
+	const actionNote = el('actionNote');
+	const transcriptFilters = el('transcriptFilters');
+	const chatForm = el('chatForm');
+	const chatInput = el('chatInput');
+	const chatSendButton = el('chatSendButton');
+	const chatStatus = el('chatStatus');
+	const specialistSubtitle = el('specialistSubtitle');
 	let currentState = null;
 	let cumulativeChatHistory = [];
 	let shouldStickChatToBottom = true;
+	let transcriptFilter = localStorage.getItem('pi-blueprint-filter') || 'all';
+	let transcriptDrawerOpen = localStorage.getItem('pi-blueprint-transcript-open') === 'true';
+	let expandedMessages = new Set();
+	let dashboardConnection = 'connecting';
+	let chatFeedback = '';
+	let chatFeedbackTone = 'info';
+	let chatSending = false;
+	let sessionDrawerOpen = false;
 
 	function toggleTheme() {
 		document.body.classList.toggle('light');
@@ -680,7 +933,103 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 	}
 
 	function toneClass(tone) {
-		return tone === 'success' ? 'tone-success' : tone === 'warning' ? 'tone-warning' : 'tone-error';
+		if (tone === 'success') return 'tone-success';
+		if (tone === 'warning') return 'tone-warning';
+		if (tone === 'error') return 'tone-error';
+		return 'tone-info';
+	}
+
+	function phaseTone(phase) {
+		if (phase === 'done') return 'success';
+		if (phase === 'review' || phase === 'consulting' || phase === 'interview' || phase === 'finalizing') return 'warning';
+		if (phase === 'idle') return 'info';
+		return 'info';
+	}
+
+	function humanizePhase(phase) {
+		if (phase === 'idle') return 'Idle';
+		if (phase === 'interview') return 'Interview';
+		if (phase === 'consulting') return 'Consulting';
+		if (phase === 'review') return 'Review';
+		if (phase === 'finalizing') return 'Finalizing';
+		if (phase === 'done') return 'Done';
+		return String(phase || 'Unknown');
+	}
+
+	function titleize(value) {
+		return String(value || '')
+			.split(/[-_\s]+/)
+			.filter(Boolean)
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+			.join(' ');
+	}
+
+	function formatTimestamp(value) {
+		const date = new Date(value || Date.now());
+		if (Number.isNaN(date.getTime())) return 'unknown';
+		return date.toLocaleString();
+	}
+
+	function relativeTime(value) {
+		const date = new Date(value || Date.now());
+		const ms = Date.now() - date.getTime();
+		if (Number.isNaN(date.getTime())) return 'unknown';
+		const minutes = Math.round(ms / 60000);
+		if (minutes <= 1) return 'just now';
+		if (minutes < 60) return minutes + 'm ago';
+		const hours = Math.round(minutes / 60);
+		if (hours < 24) return hours + 'h ago';
+		const days = Math.round(hours / 24);
+		return days + 'd ago';
+	}
+
+	function shortenPath(value) {
+		const parts = String(value || '').split(/[\\/]+/).filter(Boolean);
+		if (parts.length <= 3) return String(value || '');
+		return '…/' + parts.slice(-3).join('/');
+	}
+
+	function extractSummaryCandidate(text) {
+		let value = String(text || '').replace(/\r/g, '').trim();
+		if (!value) return '';
+		const answerMatch = value.match(/\bA:\s*([\s\S]*)$/);
+		if (answerMatch) value = answerMatch[1];
+		const codeFence = String.fromCharCode(96).repeat(3);
+		value = value.replace(new RegExp(codeFence + '[\\s\\S]*?' + codeFence, 'g'), ' ');
+		value = value.replace(/\n{3,}/g, '\n\n');
+		value = value.replace(/\s+/g, ' ').trim();
+		value = value.replace(/^Done\s+[—-]\s+/i, '');
+		value = value.replace(/^Tool:\s*[^\n]+/i, '');
+		return value;
+	}
+
+	function summarizeText(text, fallback) {
+		const value = extractSummaryCandidate(text);
+		if (!value) return fallback || 'No summary available.';
+		if (value.length <= 190) return value;
+		const trimmed = value.slice(0, 187).replace(/\s+\S*$/, '').trimEnd();
+		return (trimmed || value.slice(0, 187)).replace(/[,:;.\-–—\s]+$/, '') + '…';
+	}
+
+	function shouldCollapseMessage(item) {
+		return item.role === 'tool' || String(item.content || '').length > 520;
+	}
+
+	function collapsedMessageText(item) {
+		const source = String(item.content || '');
+		if (source.length <= 520) return source;
+		return source.slice(0, 520).replace(/\s+\S*$/, '').trimEnd() + '\n\n[…truncated — expand to inspect the full output]';
+	}
+
+	function buildPhaseBody(state) {
+		if (state.rebuildProgress?.active) return 'Blueprint changes are being published back into GitHub issues.';
+		if (state.phase === 'idle') return 'No live discovery turn is active yet. Start or resume the planning conversation to populate this cockpit.';
+		if (state.phase === 'interview') return 'Discovery questions are still shaping the plan and constraints.';
+		if (state.phase === 'consulting') return 'A specialist lane is actively reviewing the blueprint.';
+		if (state.phase === 'review') return 'The blueprint is ready for human feedback, revision, or alignment checks.';
+		if (state.phase === 'finalizing') return 'Artifacts are being generated for implementation handoff.';
+		if (state.phase === 'done') return 'Planning is complete and ready for downstream execution.';
+		return 'Blueprint state updated.';
 	}
 
 	function mergeChatHistory(items) {
@@ -692,16 +1041,299 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 			seen.add(key);
 		}
 		cumulativeChatHistory.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-		if (cumulativeChatHistory.length > 80) cumulativeChatHistory = cumulativeChatHistory.slice(-80);
+		if (cumulativeChatHistory.length > 100) cumulativeChatHistory = cumulativeChatHistory.slice(-100);
+	}
+
+	function filteredChatHistory() {
+		return cumulativeChatHistory
+			.filter((item) => transcriptFilter === 'all' || item.role === transcriptFilter)
+			.slice(-80);
+	}
+
+	function activeFilterLabel() {
+		return FILTERS.find((filter) => filter.id === transcriptFilter)?.label || 'All';
+	}
+
+	function transcriptEntryCountLabel() {
+		const count = filteredChatHistory().length;
+		return count + (count === 1 ? ' entry' : ' entries');
+	}
+
+	function buildTranscriptSummaryText() {
+		if (!currentState) return 'Expand from the bottom to inspect the live transcript and controls.';
+		const visible = filteredChatHistory().length;
+		const total = cumulativeChatHistory.length;
+		const liveLabel = currentState.dashboardMeta?.liveSessionConnected ? 'Live session attached' : 'Waiting for live session';
+		if (transcriptDrawerOpen) return activeFilterLabel() + ' view • ' + transcriptEntryCountLabel() + ' • ' + liveLabel;
+		const countLabel = transcriptFilter === 'all' || visible === total
+			? total + ' transcript ' + (total === 1 ? 'entry' : 'entries')
+			: visible + ' of ' + total + ' entries';
+		return countLabel + ' • ' + activeFilterLabel() + ' • ' + liveLabel;
+	}
+
+	function syncTranscriptDrawerChrome() {
+		transcriptDrawer.classList.toggle('open', transcriptDrawerOpen);
+		transcriptToggle.setAttribute('aria-expanded', String(transcriptDrawerOpen));
+		transcriptToggle.setAttribute('aria-label', transcriptDrawerOpen ? 'Collapse transcript drawer' : 'Expand transcript drawer');
+		transcriptToggleGlyph.textContent = transcriptDrawerOpen ? '⌄' : '⌃';
+		transcriptCountPill.textContent = transcriptEntryCountLabel();
+		transcriptSummary.textContent = buildTranscriptSummaryText();
+	}
+
+	function setTranscriptDrawerOpen(open) {
+		transcriptDrawerOpen = !!open;
+		localStorage.setItem('pi-blueprint-transcript-open', transcriptDrawerOpen ? 'true' : 'false');
+		syncTranscriptDrawerChrome();
+		if (transcriptDrawerOpen) {
+			requestAnimationFrame(() => {
+				shouldStickChatToBottom = true;
+				chat.scrollTop = chat.scrollHeight;
+			});
+		}
+	}
+
+	function openSessionDrawer() {
+		sessionDrawerOpen = true;
+		sessionDrawer.classList.add('open');
+		sessionDrawer.setAttribute('aria-hidden', 'false');
+		sessionDrawerScrim.hidden = false;
+		requestAnimationFrame(() => sessionDrawerScrim.classList.add('open'));
+	}
+
+	function closeSessionDrawer() {
+		sessionDrawerOpen = false;
+		sessionDrawer.classList.remove('open');
+		sessionDrawer.setAttribute('aria-hidden', 'true');
+		sessionDrawerScrim.classList.remove('open');
+		setTimeout(() => {
+			if (!sessionDrawerOpen) sessionDrawerScrim.hidden = true;
+		}, 200);
+	}
+
+	function buildSuggestedAction(state) {
+		const coverageMissing = Array.isArray(state.reviewScore?.coverageMissing)
+			? state.reviewScore.coverageMissing.map(titleize)
+			: [];
+		if (state.rebuildProgress?.active) {
+			return {
+				title: 'Publishing the current blueprint',
+				reason: state.rebuildProgress.detail || 'GitHub issues are being rebuilt from the latest blueprint state.',
+				buttons: [
+					{ label: 'Open details', command: '/blueprint-details', variant: 'secondary' },
+				],
+				note: 'Publishing is in progress. Use details to inspect the live rebuild lane.',
+			};
+		}
+		if (state.phase === 'idle' && (state.consultationCount || 0) === 0) {
+			return {
+				title: 'Start the discovery conversation',
+				reason: 'This worktree is ready, but no blueprint interview has run yet. Kick off discovery from the browser or CLI.',
+				buttons: [
+					{ label: 'Start discovery', command: 'I am ready to start blueprint discovery. Ask me the first planning question.', variant: 'primary' },
+				],
+				note: 'Action buttons inject messages into the live blueprint session.',
+			};
+		}
+		if (state.pendingRevisionPrompt) {
+			return {
+				title: 'Resolve the revision request',
+				reason: state.pendingRevisionPrompt.message || 'A revision cycle is required before the review gate can pass.',
+				buttons: [
+					{ label: 'Revise blueprint', command: '/blueprint-revise Need to address the current review gaps.', variant: 'primary' },
+					{ label: 'Dismiss revision', command: '/blueprint-dismiss-revision', variant: 'ghost' },
+				],
+				note: 'Use revision actions to reopen or explicitly defer the manual review cycle.',
+			};
+		}
+		if (coverageMissing.length > 0) {
+			return {
+				title: 'Continue specialist review',
+				reason: 'Still missing coverage from ' + coverageMissing.join(', ') + ' before the review gate can close cleanly.',
+				buttons: [
+					{ label: 'Continue review', command: 'Please continue the blueprint review and consult ' + coverageMissing.join(', ') + ' before we finalize.', variant: 'primary' },
+					{ label: 'Open details', command: '/blueprint-details', variant: 'secondary' },
+				],
+				note: 'The primary action sends a follow-up prompt into the live blueprint session.',
+			};
+		}
+		if (!state.lastAlignmentCheck || state.lastAlignmentCheck.status !== 'pass') {
+			return {
+				title: 'Run transcript alignment',
+				reason: state.lastAlignmentCheck?.summary || 'Verify that the current blueprint still matches the transcript-backed decisions.',
+				buttons: [
+					{ label: 'Run alignment', command: '/blueprint-check-alignment', variant: 'primary' },
+					{ label: 'Open details', command: '/blueprint-details', variant: 'secondary' },
+				],
+				note: 'Alignment is the next high-signal check once specialist coverage is complete.',
+			};
+		}
+		if (!state.prdPath || !state.checklistPath) {
+			return {
+				title: 'Populate the planning artifacts',
+				reason: 'The review is healthy, but the PRD and checklist are not both present yet.',
+				buttons: [
+					{ label: 'Open details', command: '/blueprint-details', variant: 'primary' },
+				],
+				note: 'Use details to inspect artifacts and the next operator step.',
+			};
+		}
+		return {
+			title: 'Ready for human sign-off',
+			reason: 'Specialist coverage and alignment look good. Use chat to approve the blueprint or request one final change.',
+			buttons: [
+				{ label: 'Ask for final summary', command: 'The blueprint looks good. Please give me the final review summary and next operator steps.', variant: 'primary' },
+				{ label: 'Open details', command: '/blueprint-details', variant: 'secondary' },
+			],
+			note: 'At this stage the browser should help you decide whether to approve or tweak the plan.',
+		};
+	}
+
+	function buildActivityFeed(state) {
+		const items = [];
+		items.push({
+			tone: phaseTone(state.phase),
+			tag: 'Phase',
+			title: state.widgetMirror?.phaseLabel || humanizePhase(state.phase),
+			body: buildPhaseBody(state),
+			meta: state.iteration ? 'Iteration ' + state.iteration : 'Latest browser state',
+		});
+		if (state.reviewScore) {
+			items.push({
+				tone: state.reviewScore.ready ? 'success' : (state.reviewScore.score >= 85 ? 'warning' : 'error'),
+				tag: 'Review gate',
+				title: String(state.reviewScore.score || 0) + '/100',
+				body: (state.widgetMirror?.scoreCard?.gateLabel || 'Review in progress') + '. ' + (state.widgetMirror?.scoreCard?.effortLabel || ''),
+				meta: state.reviewScore.label || 'Review readiness',
+			});
+		}
+		if (state.pendingRevisionPrompt) {
+			items.push({
+				tone: 'warning',
+				tag: 'Revision',
+				title: 'Revision requested',
+				body: state.pendingRevisionPrompt.message,
+				meta: 'Manual review reopened',
+			});
+		}
+		if (state.lastAlignmentCheck) {
+			items.push({
+				tone: state.lastAlignmentCheck.status === 'pass' ? 'success' : (state.lastAlignmentCheck.status === 'error' ? 'error' : 'warning'),
+				tag: 'Alignment',
+				title: state.widgetMirror?.alignmentCard?.statusText || 'Alignment review',
+				body: state.widgetMirror?.alignmentCard?.summary || state.lastAlignmentCheck.summary || 'Run alignment to verify transcript-backed decisions.',
+				meta: state.widgetMirror?.alignmentCard?.evidence || 'No transcript evidence pinned yet.',
+			});
+		} else {
+			items.push({
+				tone: 'warning',
+				tag: 'Alignment',
+				title: 'Alignment has not been run',
+				body: 'Transcript-backed decisions have not been verified yet.',
+				meta: 'Recommended action: /blueprint-check-alignment',
+			});
+		}
+		if (state.localAssetSync) {
+			items.push({
+				tone: state.localAssetSync.status === 'ready' ? 'success' : (state.localAssetSync.status === 'partial' ? 'warning' : 'error'),
+				tag: 'Assets',
+				title: state.widgetMirror?.assetCard?.stateText || 'Project assets status',
+				body: state.widgetMirror?.assetCard?.warning || 'No local changes needed.',
+				meta: (state.localAssetSync.present || 0) + '/' + (state.localAssetSync.required || 0) + ' synced',
+			});
+		}
+		const specialists = (state.widgetMirror?.specialists || [])
+			.filter((card) => card.isActive || card.iteration != null)
+			.sort((a, b) => {
+				if (a.isActive && !b.isActive) return -1;
+				if (!a.isActive && b.isActive) return 1;
+				return String(b.timestamp || '').localeCompare(String(a.timestamp || ''));
+			});
+		for (const card of specialists.slice(0, 3)) {
+			items.push({
+				tone: card.statusTone === 'done' ? 'success' : (card.statusTone === 'active' ? 'warning' : 'info'),
+				tag: card.label,
+				title: card.statusText,
+				body: summarizeText(card.response || card.detail, card.isActive ? 'Consultation in progress.' : 'No summary available.'),
+				meta: card.timestamp ? 'Updated ' + relativeTime(card.timestamp) : (card.iteration != null ? 'Iteration ' + card.iteration : 'Waiting for first consultation'),
+			});
+		}
+		items.push({
+			tone: state.prdPath && state.checklistPath ? 'success' : 'warning',
+			tag: 'Artifacts',
+			title: state.prdPath && state.checklistPath ? 'PRD and checklist are present' : 'Planning artifacts are incomplete',
+			body: 'PRD: ' + (state.prdPath ? 'ready' : 'missing') + ' · Checklist: ' + (state.checklistPath ? 'ready' : 'missing'),
+			meta: 'These artifacts become the handoff surface for implementation.',
+		});
+		return items.slice(0, 8);
+	}
+
+	function renderConnectionPill() {
+		let text = 'Dashboard connecting…';
+		let tone = 'info';
+		if (dashboardConnection === 'connected') {
+			text = 'Dashboard live';
+			tone = 'success';
+		} else if (dashboardConnection === 'reconnecting') {
+			text = 'Reconnecting…';
+			tone = 'warning';
+		} else if (dashboardConnection === 'offline') {
+			text = 'Dashboard offline';
+			tone = 'error';
+		}
+		connectionPill.textContent = text;
+		connectionPill.className = 'pill ' + tone;
+	}
+
+	function renderActionButtons(action, enabled) {
+		actionButtons.innerHTML = (action.buttons || []).map((button) => {
+			const variant = button.variant === 'primary' ? 'primary' : button.variant === 'ghost' ? 'ghost' : 'secondary';
+			return '<button class="btn ' + variant + ' action-btn" type="button" data-command="' + esc(button.command) + '"' + (enabled ? '' : ' disabled') + '>' + esc(button.label) + '</button>';
+		}).join('');
+		actionNote.textContent = enabled ? action.note : 'Connect or reopen the live blueprint session to enable browser actions.';
+	}
+
+	function renderFilters() {
+		transcriptFilters.innerHTML = FILTERS.map((filter) => {
+			const active = transcriptFilter === filter.id ? ' active' : '';
+			return '<button class="filter-pill ' + esc(filter.tone) + active + '" type="button" data-filter="' + esc(filter.id) + '">' + esc(filter.label) + '</button>';
+		}).join('');
+	}
+
+	function renderUsefulCommands(enabled) {
+		transcriptCommandList.innerHTML = USEFUL_COMMANDS.map((command) =>
+			'<button class="mini-btn command-chip" type="button" data-command="' + esc(command) + '"' + (enabled ? '' : ' disabled') + '>' + esc(command) + '</button>'
+		).join('');
+	}
+
+	function renderActivity(items) {
+		if (!items.length) {
+			activityFeed.innerHTML = '<div class="empty-state">No blueprint activity yet.</div>';
+			return;
+		}
+		activityFeed.innerHTML = items.map((item) => [
+			'<div class="activity-item">',
+			'<span class="activity-tag ' + toneClass(item.tone) + '">' + esc(item.tag) + '</span>',
+			'<div class="activity-title">' + esc(item.title) + '</div>',
+			'<div class="activity-body">' + esc(item.body) + '</div>',
+			(item.meta ? '<div class="activity-meta">' + esc(item.meta) + '</div>' : ''),
+			'</div>',
+		].join('')).join('');
 	}
 
 	function renderSpecialistWidget(card) {
 		const chip = card.statusTone === 'done' ? 'done' : card.statusTone === 'active' ? 'active' : 'idle';
+		const tone = card.statusTone === 'done' ? 'success' : card.statusTone === 'active' ? 'warning' : 'error';
+		const summary = summarizeText(card.response || card.detail, card.isActive ? 'Consultation in progress.' : 'No consultation yet.');
+		const meta = [];
+		meta.push(card.statusText || 'standby');
+		if (card.iteration != null) meta.push('Iteration ' + card.iteration);
+		if (card.timestamp) meta.push('Updated ' + relativeTime(card.timestamp));
 		return [
-			'<div class="widget-card tone-' + esc(card.statusTone === 'done' ? 'success' : card.statusTone === 'active' ? 'warning' : 'error') + '">',
-			'<div class="widget-title"><span class="widget-title-text">' + esc(card.label) + '</span><span><button class="icon-btn specialist-info" data-specialist-id="' + esc(card.id) + '">i</button> <button class="icon-btn specialist-search" data-specialist-id="' + esc(card.id) + '">⌕</button></span></div>',
-			'<div class="status-chip ' + chip + '"><span>' + esc(card.statusIcon) + '</span>' + esc(card.statusText) + '</div>',
-			(card.detail ? '<div class="widget-meta">' + esc(card.detail) + '</div>' : ''),
+			'<div class="widget-card specialist-card tone-' + esc(tone) + '">',
+			'<div class="widget-title"><span>' + esc(card.label) + '</span><span class="status-chip ' + chip + '"><span>' + esc(card.statusIcon) + '</span>' + esc(card.statusText) + '</span></div>',
+			'<div class="widget-detail">' + esc(summary) + '</div>',
+			'<div class="specialist-meta"><span>' + esc(meta.join(' · ')) + '</span></div>',
+			'<div class="specialist-actions"><button class="mini-btn specialist-info" type="button" data-specialist-id="' + esc(card.id) + '">Summary</button><button class="mini-btn specialist-search" type="button" data-specialist-id="' + esc(card.id) + '">' + esc(card.response ? 'Full response' : 'Details') + '</button></div>',
 			'</div>',
 		].join('');
 	}
@@ -715,8 +1347,12 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 		const card = currentState?.widgetMirror?.specialists?.find((item) => item.id === id);
 		if (!card) return;
 		el('overlayTitle').textContent = card.label + ' Summary';
-		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? new Date(card.timestamp).toLocaleString() : ''].filter(Boolean).join(' · ');
-		el('overlayBody').innerHTML = '<div class="overlay-section"><div class="overlay-label">Card Detail</div><div class="overlay-value">' + renderMarkdown(card.detail || 'No summary available.') + '</div></div>';
+		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? formatTimestamp(card.timestamp) : ''].filter(Boolean).join(' · ');
+		const sections = [
+			'<div class="overlay-section"><div class="overlay-label">Latest finding</div><div class="overlay-value">' + renderMarkdown(summarizeText(card.response || card.detail, 'No summary available.')) + '</div></div>',
+		];
+		if (card.question) sections.push('<div class="overlay-section"><div class="overlay-label">Question</div><div class="overlay-value">' + renderMarkdown(card.question) + '</div></div>');
+		el('overlayBody').innerHTML = sections.join('');
 		detailOverlay.classList.add('open');
 		detailOverlay.setAttribute('aria-hidden', 'false');
 	}
@@ -725,7 +1361,7 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 		const card = currentState?.widgetMirror?.specialists?.find((item) => item.id === id);
 		if (!card) return;
 		el('overlayTitle').textContent = card.label;
-		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? new Date(card.timestamp).toLocaleString() : ''].filter(Boolean).join(' · ');
+		el('overlayMeta').textContent = [card.statusText || '', card.iteration != null ? ('iteration ' + card.iteration) : '', card.timestamp ? formatTimestamp(card.timestamp) : ''].filter(Boolean).join(' · ');
 		const sections = [];
 		if (card.question) sections.push('<div class="overlay-section"><div class="overlay-label">Question</div><div class="overlay-value">' + renderMarkdown(card.question) + '</div></div>');
 		if (card.response) sections.push('<div class="overlay-section"><div class="overlay-label">Response</div><div class="overlay-value">' + renderMessageContent(String(card.label || '') + ' (detail)\nQ: ' + card.question + '\nA: ' + card.response) + '</div></div>');
@@ -736,115 +1372,246 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 	}
 
 	function renderScoreWidget(card) {
-		if (!card) return '<div class="widget-title">Blueprint Score</div><div class="muted">No score yet.</div>';
-		const actions = card.revisionRequired ? '<div class="widget-actions"><code>/blueprint-revise [reason]</code> · <code>/blueprint-dismiss-revision</code></div>' : '';
-		const revisionSummary = card.revisionRequired && card.revisionSummary ? '<div class="widget-meta">' + esc(card.revisionSummary) + '</div>' : '';
+		if (!card) return '<div class="widget-title">Review Gate</div><div class="empty-state">No review score yet.</div>';
+		const revisionSummary = card.revisionRequired && card.revisionSummary ? '<div class="widget-detail">' + esc(card.revisionSummary) + '</div>' : '';
 		return [
-			'<div class="widget-title">Blueprint Score</div>',
+			'<div class="widget-title">Review Gate</div>',
+			'<div class="widget-subtitle">Coverage, readiness, and the next planning step.</div>',
 			'<div class="metric-value ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100</div>',
-			'<div class="widget-meta">' + esc(card.label) + '</div>',
-			'<div class="widget-meta">' + (card.prdExists ? 'PRD ✓' : 'PRD ○') + ' · <code>/blueprint-prd</code></div>',
-			'<div class="widget-meta">' + (card.checklistExists ? 'Checklist ✓' : 'Checklist ○') + ' · <code>/blueprint-checklist</code></div>',
-			'<div class="widget-meta">' + esc(card.gateLabel) + '</div>',
+			'<div class="widget-state">' + esc(card.gateLabel) + '</div>',
 			'<div class="widget-meta">' + esc(card.coverageLabel) + '</div>',
 			'<div class="widget-meta">' + esc(card.alignmentLabel) + '</div>',
-			'<div class="widget-meta">' + esc(card.effortLabel) + '</div>',
+			'<div class="widget-detail">' + esc(card.effortLabel) + '</div>',
 			'<div class="widget-meta">' + esc(card.revisionLabel) + '</div>',
-			'<div class="widget-meta">Open mode: ' + esc(card.openMode || 'browser') + '</div>',
 			revisionSummary,
-			actions,
 		].join('');
 	}
 
 	function renderInfoWidget(card) {
-		if (!card) return '<div class="widget-title">Alignment Review</div><div class="muted">No alignment review yet.</div>';
+		if (!card) return '<div class="widget-title">Alignment Review</div><div class="empty-state">No alignment review yet.</div>';
 		return [
 			'<div class="widget-title">' + esc(card.title) + '</div>',
+			'<div class="widget-subtitle">Transcript-backed decision verification.</div>',
 			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(String(card.score)) + '/100 · ' + esc(card.statusText) + '</div>',
 			'<div class="widget-detail">' + esc(card.summary) + '</div>',
 			'<div class="widget-meta">Evidence: ' + esc(card.evidence) + '</div>',
-			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
 		].join('');
 	}
 
 	function renderAssetWidget(card) {
-		if (!card) return '<div class="widget-title">Local Assets</div><div class="muted">No asset sync data.</div>';
+		if (!card) return '<div class="widget-title">Local Assets</div><div class="empty-state">No asset sync data.</div>';
 		return [
 			'<div class="widget-title">' + esc(card.title) + '</div>',
+			'<div class="widget-subtitle">Repo-sourced agents and skills needed for blueprint work.</div>',
 			'<div class="widget-state ' + toneClass(card.tone) + '">' + esc(card.statusText) + '</div>',
 			'<div class="widget-meta">' + esc(card.stateText) + '</div>',
-			'<div class="widget-meta">' + esc(card.sourceLine) + '</div>',
 			'<div class="widget-detail">' + esc(card.warning) + '</div>',
-			'<div class="widget-actions"><code>' + esc(card.commandLine).replace(/ · /g, '</code> · <code>') + '</code></div>',
 		].join('');
 	}
 
-	function renderState(state) {
-		if (!state) return;
-		currentState = state;
+	function renderArtifactWidget(state) {
+		const meta = state.dashboardMeta || {};
+		const tone = state.prdPath && state.checklistPath ? 'success' : 'warning';
+		return [
+			'<div class="widget-title">Artifacts</div>',
+			'<div class="widget-subtitle">Project trust and artifact presence.</div>',
+			'<div class="widget-state ' + toneClass(tone) + '">' + esc(state.prdPath && state.checklistPath ? 'Planning handoff is populated' : 'Artifact set is incomplete') + '</div>',
+			'<div class="widget-meta">Project: ' + esc(meta.projectName || PROJECT_NAME) + '</div>',
+			'<div class="widget-meta">PRD: ' + esc(state.prdPath ? 'ready' : 'missing') + '</div>',
+			'<div class="widget-meta">Checklist: ' + esc(state.checklistPath ? 'ready' : 'missing') + '</div>',
+			'<div class="widget-detail">Live session: ' + esc(meta.liveSessionConnected ? 'connected' : 'waiting for agent') + '</div>',
+		].join('');
+	}
+
+	function renderSessionContext(state) {
+		const meta = state.dashboardMeta || {};
+		const agents = Array.isArray(meta.registeredAgents) && meta.registeredAgents.length > 0 ? meta.registeredAgents.join(', ') : 'none';
+		sessionContextPanel.innerHTML = [
+			'<div class="widget-card">' +
+				'<div class="widget-title">Project binding</div>' +
+				'<div class="widget-meta">Project: <code>' + esc(meta.projectDir || PROJECT_DIR) + '</code></div>' +
+				'<div class="widget-meta">Project label: <code>' + esc(meta.projectName || PROJECT_NAME) + '</code></div>' +
+				'<div class="widget-meta">Phase: <code>' + esc(humanizePhase(state.phase || 'idle')) + '</code></div>' +
+				'<div class="widget-meta">Updated: <code>' + esc(formatTimestamp(state.updatedAt || Date.now())) + '</code></div>' +
+			'</div>',
+			'<div class="widget-card">' +
+				'<div class="widget-title">Runtime context</div>' +
+				'<div class="widget-meta">State file: <code>' + esc(meta.stateFile || STATE_FILE) + '</code></div>' +
+				'<div class="widget-meta">Web URL: <code>' + esc(state.webUrl || window.location.href) + '</code></div>' +
+				'<div class="widget-meta">Control port: <code>' + esc(String(meta.controlPort || CONTROL_PORT)) + '</code></div>' +
+				'<div class="widget-meta">Registered agents: <code>' + esc(agents) + '</code></div>' +
+			'</div>',
+			'<div class="widget-card">' +
+				'<div class="widget-title">Transcript view</div>' +
+				'<div class="widget-meta">Current filter: <code>' + esc(activeFilterLabel()) + '</code></div>' +
+				'<div class="widget-meta">Visible messages: <code>' + esc(String(filteredChatHistory().length)) + '</code></div>' +
+				'<div class="widget-meta">Stored messages: <code>' + esc(String(cumulativeChatHistory.length)) + '</code></div>' +
+				'<div class="widget-detail">Live session: ' + esc(meta.liveSessionConnected ? 'connected' : 'waiting for agent') + '</div>' +
+			'</div>',
+		].join('');
+	}
+
+	function renderTranscript() {
 		const distanceFromBottom = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
 		const wasNearBottom = distanceFromBottom <= 40 || shouldStickChatToBottom;
-		el('statusDot').className = 'status-dot ' + (state.phase === 'idle' ? 'idle' : 'running');
-		el('statusLine').textContent = state.phase || 'connected';
-		el('urlLine').textContent = state.webUrl || window.location.href;
-		el('activityLine').textContent = state.widgetMirror?.phaseLabel || 'Waiting for state...';
-		if (state.widgetMirror) {
-			specialistGrid.innerHTML = (state.widgetMirror.specialists || []).map(renderSpecialistWidget).join('');
-			scoreCard.innerHTML = renderScoreWidget(state.widgetMirror.scoreCard);
-			alignmentCard.innerHTML = renderInfoWidget(state.widgetMirror.alignmentCard);
-			assetCard.innerHTML = renderAssetWidget(state.widgetMirror.assetCard);
-			widgetFooter.textContent = state.widgetMirror.consultationCount + ' consultation' + (state.widgetMirror.consultationCount === 1 ? '' : 's') + ' · ' + state.widgetMirror.specialistsCovered + '/' + state.widgetMirror.totalSpecialists + ' specialists consulted';
-		}
-		decisionList.innerHTML = '';
-		const decisions = (state.chatHistory || []).slice(-6);
-		if (!decisions.length) {
-			decisionList.innerHTML = '<div class="muted">No transcript segments yet.</div>';
-		} else {
-			for (const item of decisions) {
-				const row = document.createElement('div');
-				row.className = 'decision-item';
-				row.textContent = '[' + item.role + '] ' + String(item.content || '').slice(0, 180);
-				decisionList.appendChild(row);
-			}
-		}
-		mergeChatHistory(state.chatHistory || []);
+		const messages = filteredChatHistory();
+		transcriptCountPill.textContent = messages.length + (messages.length === 1 ? ' entry' : ' entries');
+		transcriptSummary.textContent = buildTranscriptSummaryText();
 		chat.innerHTML = '';
-		const renderedChat = cumulativeChatHistory.slice(-60);
-		for (const item of renderedChat) {
+		if (!messages.length) {
+			chat.innerHTML = '<div class="empty-state">No transcript entries for this filter yet.</div>';
+			syncTranscriptDrawerChrome();
+			return;
+		}
+		for (const item of messages) {
+			const collapsed = shouldCollapseMessage(item) && !expandedMessages.has(item._key);
+			const body = collapsed ? collapsedMessageText(item) : String(item.content || '');
 			const div = document.createElement('div');
 			div.className = 'msg ' + item.role;
-			div.innerHTML = '<div class="msg-title">' + esc(item.title || item.role || 'message') + '</div><div class="msg-body">' + renderMessageContent(item.content) + '</div>';
+			div.innerHTML = [
+				'<div class="msg-head">',
+					'<div><div class="msg-role">' + esc(item.role) + '</div><div class="msg-title">' + esc(item.title || item.role || 'message') + '</div></div>',
+					'<div class="msg-time">' + esc(formatTimestamp(item.timestamp)) + '</div>',
+				'</div>',
+				'<div class="msg-body">' + renderMessageContent(body) + '</div>',
+				(shouldCollapseMessage(item)
+					? '<div class="msg-actions"><button class="link-btn msg-toggle" type="button" data-msg-key="' + esc(item._key) + '">' + esc(collapsed ? 'Expand' : 'Collapse') + '</button></div>'
+					: ''),
+			].join('');
 			chat.appendChild(div);
 		}
 		if (wasNearBottom) {
 			chat.scrollTop = chat.scrollHeight;
 			shouldStickChatToBottom = true;
 		}
-		el('updated').textContent = 'updated ' + new Date(state.updatedAt || Date.now()).toLocaleTimeString();
+		syncTranscriptDrawerChrome();
+	}
+
+	function updateChatStatus() {
+		const parts = [];
+		if (dashboardConnection === 'connected') parts.push('Dashboard connected');
+		else if (dashboardConnection === 'reconnecting') parts.push('Reconnecting to dashboard');
+		else if (dashboardConnection === 'offline') parts.push('Dashboard offline');
+		else parts.push('Connecting to dashboard');
+		if (currentState?.dashboardMeta?.liveSessionConnected) parts.push('Live blueprint session attached');
+		else if (currentState) parts.push('Waiting for a live blueprint session');
+		if (chatSending) parts.push('Sending message…');
+		else if (chatFeedback) parts.push(chatFeedback);
+		chatStatus.textContent = parts.join(' • ');
+		const tone = chatSending
+			? 'info'
+			: chatFeedback
+				? chatFeedbackTone
+				: (currentState?.dashboardMeta?.liveSessionConnected ? 'success' : (dashboardConnection === 'connected' ? 'warning' : 'info'));
+		chatStatus.className = 'chat-status ' + toneClass(tone);
+		chatSendButton.disabled = chatSending;
+		chatSendButton.textContent = chatSending ? 'Sending…' : 'Send';
+		renderUsefulCommands(!!currentState?.dashboardMeta?.liveSessionConnected);
+		transcriptSummary.textContent = buildTranscriptSummaryText();
+	}
+
+	async function sendDashboardMessage(message) {
+		const text = String(message || '').trim();
+		if (!text) return;
+		chatSending = true;
+		chatFeedback = '';
+		chatFeedbackTone = 'info';
+		updateChatStatus();
+		try {
+			const res = await fetch('/api/chat', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ message: text }),
+			});
+			const payload = await res.json().catch(() => ({}));
+			if (!res.ok || !payload.success) throw new Error(payload.error || 'Failed to send message.');
+			chatFeedback = payload.delivered === 1 ? 'Delivered to the live blueprint session.' : 'Delivered to ' + payload.delivered + ' live sessions.';
+			chatFeedbackTone = 'success';
+		} catch (error) {
+			chatFeedback = error?.message || 'Failed to send message.';
+			chatFeedbackTone = 'error';
+		} finally {
+			chatSending = false;
+			updateChatStatus();
+		}
+	}
+
+	function renderState(state) {
+		if (!state) return;
+		currentState = state;
+		const meta = state.dashboardMeta || {};
+		const action = buildSuggestedAction(state);
+		statusDot.className = 'status-dot ' + (state.phase === 'idle' ? 'idle' : 'running');
+		statusLine.textContent = humanizePhase(state.phase || 'connected');
+		heroTitle.textContent = action.title;
+		heroCopy.textContent = action.reason;
+		projectBadge.textContent = meta.projectName || PROJECT_NAME;
+		projectBadge.title = meta.projectDir || PROJECT_DIR;
+		projectPill.textContent = 'Project: ' + (meta.projectName || PROJECT_NAME);
+		projectPill.title = meta.projectDir || PROJECT_DIR;
+		boundPill.textContent = 'Bound to ' + shortenPath(meta.projectDir || PROJECT_DIR);
+		boundPill.title = meta.projectDir || PROJECT_DIR;
+		sessionPill.textContent = meta.liveSessionConnected ? 'Live session connected' : 'Waiting for live session';
+		sessionPill.className = 'pill ' + (meta.liveSessionConnected ? 'success' : 'warning');
+		renderConnectionPill();
+		renderActionButtons(action, !!meta.liveSessionConnected);
+		renderActivity(buildActivityFeed(state));
+		if (state.widgetMirror) {
+			specialistSubtitle.textContent = state.widgetMirror.specialistsCovered + '/' + state.widgetMirror.totalSpecialists + ' specialists consulted. Browser-first summaries replace raw question text in the main grid.';
+			specialistGrid.innerHTML = (state.widgetMirror.specialists || []).map(renderSpecialistWidget).join('');
+			scoreCard.innerHTML = renderScoreWidget(state.widgetMirror.scoreCard);
+			alignmentCard.innerHTML = renderInfoWidget(state.widgetMirror.alignmentCard);
+			assetCard.innerHTML = renderAssetWidget(state.widgetMirror.assetCard);
+			artifactCard.innerHTML = renderArtifactWidget(state);
+			widgetFooter.textContent = state.widgetMirror.consultationCount + ' consultation' + (state.widgetMirror.consultationCount === 1 ? '' : 's') + ' · ' + state.widgetMirror.specialistsCovered + '/' + state.widgetMirror.totalSpecialists + ' specialists consulted';
+		}
+		mergeChatHistory(state.chatHistory || []);
+		renderTranscript();
+		renderSessionContext(state);
+		el('updated').textContent = 'updated ' + formatTimestamp(state.updatedAt || Date.now());
+		updateChatStatus();
 	}
 
 	async function refresh() {
 		try {
 			const res = await fetch('/api/state');
 			renderState(await res.json());
-		} catch {}
+			dashboardConnection = 'connected';
+			renderConnectionPill();
+			updateChatStatus();
+		} catch {
+			dashboardConnection = 'offline';
+			renderConnectionPill();
+			updateChatStatus();
+		}
 	}
 
-	new EventSource('/events').onmessage = (event) => {
-		try { renderState(JSON.parse(event.data)); } catch {}
+	const eventSource = new EventSource('/events');
+	eventSource.onopen = () => {
+		dashboardConnection = 'connected';
+		renderConnectionPill();
+		updateChatStatus();
+	};
+	eventSource.onmessage = (event) => {
+		try {
+			renderState(JSON.parse(event.data));
+			dashboardConnection = 'connected';
+			renderConnectionPill();
+			updateChatStatus();
+		} catch {}
+	};
+	eventSource.onerror = () => {
+		dashboardConnection = 'reconnecting';
+		renderConnectionPill();
+		updateChatStatus();
 	};
 
-	el('chatForm').addEventListener('submit', async (event) => {
+	chatForm.addEventListener('submit', async (event) => {
 		event.preventDefault();
-		const input = el('chatInput');
-		const message = input.value.trim();
+		const message = chatInput.value.trim();
 		if (!message) return;
-		await fetch('/api/chat', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ message }),
-		});
-		input.value = '';
+		await sendDashboardMessage(message);
+		if (chatFeedbackTone === 'success') chatInput.value = '';
 	});
 
 	chat.addEventListener('scroll', () => {
@@ -852,15 +1619,58 @@ const DASHBOARD_HTML = String.raw`<!doctype html>
 		shouldStickChatToBottom = distanceFromBottom <= 40;
 	});
 
-	document.addEventListener('click', (event) => {
+	transcriptToggle.addEventListener('click', () => {
+		setTranscriptDrawerOpen(!transcriptDrawerOpen);
+	});
+
+	transcriptInfoButton.addEventListener('click', () => {
+		openSessionDrawer();
+	});
+
+	el('jumpLatest').addEventListener('click', () => {
+		shouldStickChatToBottom = true;
+		if (!transcriptDrawerOpen) setTranscriptDrawerOpen(true);
+		chat.scrollTop = chat.scrollHeight;
+	});
+
+	sessionDrawerClose.addEventListener('click', closeSessionDrawer);
+	sessionDrawerScrim.addEventListener('click', closeSessionDrawer);
+
+	document.addEventListener('click', async (event) => {
 		const target = event.target;
-		if (target instanceof HTMLElement && target.classList.contains('specialist-info')) openSpecialistSummaryOverlay(target.dataset.specialistId);
-		if (target instanceof HTMLElement && target.classList.contains('specialist-search')) openSpecialistOverlay(target.dataset.specialistId);
+		if (!(target instanceof HTMLElement)) return;
+		if (target.classList.contains('specialist-info')) openSpecialistSummaryOverlay(target.dataset.specialistId);
+		if (target.classList.contains('specialist-search')) openSpecialistOverlay(target.dataset.specialistId);
+		if (target.classList.contains('action-btn')) await sendDashboardMessage(target.dataset.command);
+		if (target.classList.contains('command-chip')) await sendDashboardMessage(target.dataset.command);
+		if (target.classList.contains('filter-pill')) {
+			transcriptFilter = target.dataset.filter || 'all';
+			localStorage.setItem('pi-blueprint-filter', transcriptFilter);
+			renderFilters();
+			renderTranscript();
+		}
+		if (target.classList.contains('msg-toggle')) {
+			const key = target.dataset.msgKey;
+			if (!key) return;
+			if (expandedMessages.has(key)) expandedMessages.delete(key);
+			else expandedMessages.add(key);
+			renderTranscript();
+		}
 	});
 
 	el('overlayClose').addEventListener('click', closeSpecialistOverlay);
 	detailOverlay.addEventListener('click', (event) => { if (event.target === detailOverlay) closeSpecialistOverlay(); });
-	document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && detailOverlay.classList.contains('open')) closeSpecialistOverlay(); });
+	document.addEventListener('keydown', (event) => {
+		if (event.key !== 'Escape') return;
+		if (detailOverlay.classList.contains('open')) return closeSpecialistOverlay();
+		if (sessionDrawerOpen) return closeSessionDrawer();
+		if (transcriptDrawerOpen) setTranscriptDrawerOpen(false);
+	});
+	renderFilters();
+	renderUsefulCommands(false);
+	syncTranscriptDrawerChrome();
+	renderConnectionPill();
+	updateChatStatus();
 	refresh();
 })();
 </script>
@@ -878,8 +1688,16 @@ const server = http.createServer((req, res) => {
 		res.end();
 		return;
 	}
+	if (req.url === "/favicon.ico") {
+		res.writeHead(204, {
+			"Access-Control-Allow-Origin": "*",
+			"Cache-Control": "no-cache",
+		});
+		res.end();
+		return;
+	}
 
-	if (req.url === "/api/version") return sendJson(res, 200, { version: SCRIPT_VERSION });
+	if (req.url === "/api/version") return sendJson(res, 200, { version: SCRIPT_VERSION, projectDir, projectName });
 	if (req.url === "/api/state") return sendJson(res, 200, readState());
 	if (req.url === "/events") {
 		res.writeHead(200, {
@@ -904,6 +1722,7 @@ const server = http.createServer((req, res) => {
 				const targets = registeredAgents.has("blueprint-main")
 					? [["blueprint-main", registeredAgents.get("blueprint-main")]]
 					: [...registeredAgents.entries()];
+				if (targets.length === 0) return sendJson(res, 409, { success: false, error: "No live blueprint session is connected." });
 				for (const [, agent] of targets) {
 					try {
 						agent.socket.write(JSON.stringify({ forward: true, type: "chat", message }) + "\n");
