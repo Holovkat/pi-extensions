@@ -211,27 +211,41 @@ function getOpenIssues(repo: RepoInfo): IssueCard[] {
   return (data.repository.issues.nodes || []).map(normalizeIssueNode);
 }
 
-function findExistingProject(repo: RepoInfo): { id: string; number: number; title: string; url: string } | null {
-  const data = graphql<{
-    user: { projectsV2: { nodes: any[] } } | null;
-    organization: { projectsV2: { nodes: any[] } } | null;
-  }>(
-    `query($owner:String!,$title:String!){
-      user(login:$owner){
-        projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
-          nodes { id number title url closed }
-        }
-      }
-      organization(login:$owner){
-        projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
-          nodes { id number title url closed }
-        }
-      }
-    }`,
-    { owner: repo.owner, title: PROJECT_TITLE },
-  );
+function getActiveProjectNode<T extends { user?: unknown | null; organization?: unknown | null }>(repo: RepoInfo, data: T) {
+  return repo.ownerType === "Organization" ? data.organization ?? null : data.user ?? null;
+}
 
-  const nodes = [...(data.user?.projectsV2?.nodes || []), ...(data.organization?.projectsV2?.nodes || [])];
+function findExistingProject(repo: RepoInfo): { id: string; number: number; title: string; url: string } | null {
+  const data = repo.ownerType === "Organization"
+    ? graphql<{
+      organization: { projectsV2: { nodes: any[] } } | null;
+    }>(
+      `query($owner:String!,$title:String!){
+        organization(login:$owner){
+          projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
+            nodes { id number title url closed }
+          }
+        }
+      }`,
+      { owner: repo.owner, title: PROJECT_TITLE },
+    )
+    : graphql<{
+      user: { projectsV2: { nodes: any[] } } | null;
+    }>(
+      `query($owner:String!,$title:String!){
+        user(login:$owner){
+          projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
+            nodes { id number title url closed }
+          }
+        }
+      }`,
+      { owner: repo.owner, title: PROJECT_TITLE },
+    );
+
+  const activeOwner = getActiveProjectNode(repo, data as { user?: { projectsV2?: { nodes?: any[] } } | null; organization?: { projectsV2?: { nodes?: any[] } } | null });
+  const nodes = activeOwner && typeof activeOwner === "object" && "projectsV2" in activeOwner
+    ? ((activeOwner as { projectsV2?: { nodes?: any[] } }).projectsV2?.nodes || [])
+    : [];
   const match = nodes.find((node) => String(node.title).trim().toLowerCase() === PROJECT_TITLE.toLowerCase() && !node.closed);
   return match ? { id: String(match.id), number: Number(match.number), title: String(match.title), url: String(match.url) } : null;
 }
@@ -258,113 +272,118 @@ function createProject(repo: RepoInfo): { id: string; number: number; title: str
 }
 
 function getProjectDetails(repo: RepoInfo, projectNumber: number) {
-  return graphql<{
-    user: { projectV2: any } | null;
-    organization: { projectV2: any } | null;
-  }>(
-    `query($owner:String!,$number:Int!){
-      user(login:$owner){
-        projectV2(number:$number){
-          id
-          number
-          title
-          shortDescription
-          url
-          fields(first:50){
-            nodes{
-              ... on ProjectV2FieldCommon { id name dataType }
-              ... on ProjectV2SingleSelectField {
-                id
-                name
-                options { id name }
-              }
-            }
-          }
-          items(first:100){
-            nodes{
-              id
-              content{
-                ... on Issue {
+  return repo.ownerType === "Organization"
+    ? graphql<{
+      organization: { projectV2: any } | null;
+    }>(
+      `query($owner:String!,$number:Int!){
+        organization(login:$owner){
+          projectV2(number:$number){
+            id
+            number
+            title
+            shortDescription
+            url
+            fields(first:50){
+              nodes{
+                ... on ProjectV2FieldCommon { id name dataType }
+                ... on ProjectV2SingleSelectField {
                   id
-                  number
-                  title
-                  url
-                  state
-                  updatedAt
-                  body
-                  labels(first:20){ nodes { name color } }
-                  assignees(first:10){ nodes { login name avatarUrl url } }
+                  name
+                  options { id name }
                 }
               }
-              fieldValues(first:20){
-                nodes{
-                  ... on ProjectV2ItemFieldSingleSelectValue {
-                    name
-                    optionId
-                    field { ... on ProjectV2SingleSelectField { id name } }
+            }
+            items(first:100){
+              nodes{
+                id
+                content{
+                  ... on Issue {
+                    id
+                    number
+                    title
+                    url
+                    state
+                    updatedAt
+                    body
+                    labels(first:20){ nodes { name color } }
+                    assignees(first:10){ nodes { login name avatarUrl url } }
+                  }
+                }
+                fieldValues(first:20){
+                  nodes{
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                      optionId
+                      field { ... on ProjectV2SingleSelectField { id name } }
+                    }
                   }
                 }
               }
             }
           }
         }
-      }
-      organization(login:$owner){
-        projectV2(number:$number){
-          id
-          number
-          title
-          shortDescription
-          url
-          fields(first:50){
-            nodes{
-              ... on ProjectV2FieldCommon { id name dataType }
-              ... on ProjectV2SingleSelectField {
-                id
-                name
-                options { id name }
-              }
-            }
-          }
-          items(first:100){
-            nodes{
-              id
-              content{
-                ... on Issue {
+      }`,
+      { owner: repo.owner, number: projectNumber },
+    )
+    : graphql<{
+      user: { projectV2: any } | null;
+    }>(
+      `query($owner:String!,$number:Int!){
+        user(login:$owner){
+          projectV2(number:$number){
+            id
+            number
+            title
+            shortDescription
+            url
+            fields(first:50){
+              nodes{
+                ... on ProjectV2FieldCommon { id name dataType }
+                ... on ProjectV2SingleSelectField {
                   id
-                  number
-                  title
-                  url
-                  state
-                  updatedAt
-                  body
-                  labels(first:20){ nodes { name color } }
-                  assignees(first:10){ nodes { login name avatarUrl url } }
+                  name
+                  options { id name }
                 }
               }
-              fieldValues(first:20){
-                nodes{
-                  ... on ProjectV2ItemFieldSingleSelectValue {
-                    name
-                    optionId
-                    field { ... on ProjectV2SingleSelectField { id name } }
+            }
+            items(first:100){
+              nodes{
+                id
+                content{
+                  ... on Issue {
+                    id
+                    number
+                    title
+                    url
+                    state
+                    updatedAt
+                    body
+                    labels(first:20){ nodes { name color } }
+                    assignees(first:10){ nodes { login name avatarUrl url } }
+                  }
+                }
+                fieldValues(first:20){
+                  nodes{
+                    ... on ProjectV2ItemFieldSingleSelectValue {
+                      name
+                      optionId
+                      field { ... on ProjectV2SingleSelectField { id name } }
+                    }
                   }
                 }
               }
             }
           }
         }
-      }
-    }`,
-    { owner: repo.owner, number: projectNumber },
-  );
+      }`,
+      { owner: repo.owner, number: projectNumber },
+    );
 }
 
 function ensureStatusField(repo: RepoInfo, projectNumber: number, details: any): ProjectField {
-  const fields = [
-    ...(details.user?.projectV2?.fields?.nodes || []),
-    ...(details.organization?.projectV2?.fields?.nodes || []),
-  ];
+  const activeOwner = getActiveProjectNode(repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null });
+  const fields = activeOwner?.projectV2?.fields?.nodes || [];
   const existing = fields.find((field: any) => String(field?.name || "").toLowerCase() === STATUS_FIELD_NAME.toLowerCase() && Array.isArray(field?.options));
   if (existing) {
     return {
@@ -391,10 +410,8 @@ function ensureStatusField(repo: RepoInfo, projectNumber: number, details: any):
   ]);
 
   const refreshed = getProjectDetails(repo, projectNumber);
-  const refreshedFields = [
-    ...(refreshed.user?.projectV2?.fields?.nodes || []),
-    ...(refreshed.organization?.projectV2?.fields?.nodes || []),
-  ];
+  const refreshedOwner = getActiveProjectNode(repo, refreshed as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null });
+  const refreshedFields = refreshedOwner?.projectV2?.fields?.nodes || [];
   const created = refreshedFields.find((field: any) => String(field?.name || "").toLowerCase() === STATUS_FIELD_NAME.toLowerCase() && Array.isArray(field?.options));
   if (!created) throw new Error(`Created ${STATUS_FIELD_NAME} field but could not load it.`);
   return {
@@ -428,6 +445,28 @@ function setItemColumn(projectId: string, itemId: string, fieldId: string, optio
   );
 }
 
+function setItemPosition(projectId: string, itemId: string, afterId?: string | null) {
+  if (afterId) {
+    graphql(
+      `mutation($projectId:ID!,$itemId:ID!,$afterId:ID!){
+        updateProjectV2ItemPosition(input:{projectId:$projectId,itemId:$itemId,afterId:$afterId}){
+          items(first:1) { nodes { id } }
+        }
+      }`,
+      { projectId, itemId, afterId },
+    );
+    return;
+  }
+  graphql(
+    `mutation($projectId:ID!,$itemId:ID!){
+      updateProjectV2ItemPosition(input:{projectId:$projectId,itemId:$itemId}){
+        items(first:1) { nodes { id } }
+      }
+    }`,
+    { projectId, itemId },
+  );
+}
+
 function addIssueToProject(projectId: string, issueId: string): string {
   const data = graphql<{
     addProjectV2ItemById: { item: { id: string } };
@@ -458,12 +497,12 @@ function ensureProjectAndSync(repo: RepoInfo): { project: ProjectInfo; cards: Is
   if (!project) project = createProject(repo);
 
   let details = getProjectDetails(repo, project.number);
-  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  const activeProject = getActiveProjectNode(repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null })?.projectV2;
   if (!activeProject) throw new Error(`Unable to load project ${PROJECT_TITLE}.`);
 
   const field = ensureStatusField(repo, project.number, details);
   details = getProjectDetails(repo, project.number);
-  const fullProject = details.user?.projectV2 || details.organization?.projectV2;
+  const fullProject = getActiveProjectNode(repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null })?.projectV2;
   if (!fullProject) throw new Error(`Unable to refresh project ${PROJECT_TITLE}.`);
 
   const issueMap = new Map<number, IssueCard>();
@@ -490,10 +529,8 @@ function ensureProjectAndSync(repo: RepoInfo): { project: ProjectInfo; cards: Is
     issueMap.set(issue.number, { ...issue, itemId, column: defaultColumn });
   }
 
-  const cards = Array.from(issueMap.values()).sort((a, b) => {
-    if (a.column !== b.column) return COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column);
-    return b.number - a.number;
-  });
+  const orderedCards = Array.from(issueMap.values());
+  const cards = COLUMN_ORDER.flatMap((column) => orderedCards.filter((card) => card.column === column));
 
   return {
     project: {
@@ -506,6 +543,43 @@ function ensureProjectAndSync(repo: RepoInfo): { project: ProjectInfo; cards: Is
     },
     cards,
     warnings,
+  };
+}
+
+function buildProjectStateFromDetails(
+  repo: RepoInfo,
+  details: { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null },
+  fallbackField?: ProjectField | null,
+): { project: ProjectInfo; cards: IssueCard[] } {
+  const fullProject = getActiveProjectNode(repo, details)?.projectV2;
+  if (!fullProject) throw new Error(`Unable to refresh project ${PROJECT_TITLE}.`);
+
+  const fields = Array.isArray(fullProject.fields?.nodes) ? fullProject.fields.nodes : [];
+  const existing = fields.find((field: any) => String(field?.name || "").toLowerCase() === STATUS_FIELD_NAME.toLowerCase() && Array.isArray(field?.options));
+  const field = existing
+    ? {
+        id: String(existing.id),
+        name: String(existing.name),
+        options: (existing.options || []).map((option: any) => ({ id: String(option.id), name: String(option.name) })),
+      }
+    : fallbackField || null;
+  if (!field) throw new Error(`Project ${PROJECT_TITLE} is missing the ${STATUS_FIELD_NAME} field.`);
+
+  const projectCards = (fullProject.items?.nodes || [])
+    .map((node: any) => buildItemCard(node, field.id))
+    .filter(Boolean) as IssueCard[];
+  const cards = COLUMN_ORDER.flatMap((column) => projectCards.filter((card) => card.column === column));
+
+  return {
+    project: {
+      id: String(fullProject.id),
+      number: Number(fullProject.number),
+      title: String(fullProject.title),
+      url: String(fullProject.url),
+      shortDescription: String(fullProject.shortDescription || ""),
+      field,
+    },
+    cards,
   };
 }
 
@@ -592,6 +666,16 @@ function refreshBoard(sessionId?: string, renderInline: boolean = false): BoardS
   }
 }
 
+function refreshProjectOnly(sessionId: string, renderInline: boolean = false): BoardSnapshot {
+  const session = getSessionProject(sessionId);
+  const details = getProjectDetails(session.repo, session.project!.number);
+  const next = buildProjectStateFromDetails(session.repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null }, session.project?.field || null);
+  session.project = next.project;
+  session.projectScopeReady = true;
+  saveSession(session);
+  return buildSnapshot(session, next.cards, [], renderInline);
+}
+
 function getSessionProject(sessionId: string) {
   const session = loadOrCreateSession(sessionId);
   if (!session.project) {
@@ -603,30 +687,37 @@ function getSessionProject(sessionId: string) {
   return updated;
 }
 
-function moveIssue(sessionId: string, issueNumber: number, toColumn: ColumnName): BoardSnapshot {
+function moveIssue(sessionId: string, issueNumber: number, toColumn: ColumnName, afterIssueNumber?: number | null): BoardSnapshot {
   const session = getSessionProject(sessionId);
   const project = session.project;
   if (!project) throw new Error("Project is not available.");
   const details = getProjectDetails(session.repo, project.number);
-  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  const activeProject = getActiveProjectNode(session.repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null })?.projectV2;
   if (!activeProject) throw new Error("Unable to reload project before move.");
   const item = (activeProject.items?.nodes || []).find((node: any) => Number(node?.content?.number) === issueNumber);
   if (!item?.id) throw new Error(`Issue #${issueNumber} is not on the project board yet.`);
   const option = (project.field.options || []).find((entry) => entry.name === toColumn);
   if (!option) throw new Error(`Column ${toColumn} is not configured on ${project.field.name}.`);
   setItemColumn(project.id, String(item.id), project.field.id, option.id);
-  return refreshBoard(sessionId, false);
+  if (typeof afterIssueNumber === "number") {
+    const afterItem = (activeProject.items?.nodes || []).find((node: any) => Number(node?.content?.number) === afterIssueNumber);
+    if (!afterItem?.id) throw new Error(`Issue #${afterIssueNumber} is not on the project board yet.`);
+    setItemPosition(project.id, String(item.id), String(afterItem.id));
+  } else {
+    setItemPosition(project.id, String(item.id), null);
+  }
+  return refreshProjectOnly(sessionId, false);
 }
 
 function closeIssue(sessionId: string, issueNumber: number): BoardSnapshot {
   const session = getSessionProject(sessionId);
   const details = getProjectDetails(session.repo, session.project!.number);
-  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  const activeProject = getActiveProjectNode(session.repo, details as { user?: { projectV2?: any } | null; organization?: { projectV2?: any } | null })?.projectV2;
   const item = (activeProject?.items?.nodes || []).find((node: any) => Number(node?.content?.number) === issueNumber);
   const issueId = item?.content?.id;
   if (!issueId) throw new Error(`Unable to find issue #${issueNumber} to close.`);
   closeIssueById(String(issueId));
-  return refreshBoard(sessionId, false);
+  return refreshProjectOnly(sessionId, false);
 }
 
 const server = new McpServer({
@@ -693,6 +784,7 @@ server.registerTool(
       sessionId: z.string(),
       issueNumber: z.number(),
       toColumn: z.enum(COLUMN_ORDER),
+      afterIssueNumber: z.number().nullable().optional(),
     }),
     _meta: {
       ui: {
@@ -700,10 +792,10 @@ server.registerTool(
       },
     },
   },
-  async ({ sessionId, issueNumber, toColumn }) => {
-    const snapshot = moveIssue(sessionId, issueNumber, toColumn);
+  async ({ sessionId, issueNumber, toColumn, afterIssueNumber }) => {
+    const snapshot = moveIssue(sessionId, issueNumber, toColumn, afterIssueNumber);
     return {
-      content: [{ type: "text", text: `Moved #${issueNumber} to ${toColumn}.` }],
+      content: [{ type: "text", text: `Moved #${issueNumber} to ${toColumn}${typeof afterIssueNumber === "number" ? ` after #${afterIssueNumber}` : " at the top"}.` }],
       structuredContent: snapshot,
     };
   },

@@ -159,6 +159,11 @@ function generatedAppInstanceKey(cardId, itemId) {
 	return String(itemId || cardId || "").trim();
 }
 
+function generatedRuntimeVersion(runtime) {
+	if (!runtime || typeof runtime !== "object") return "";
+	return String(runtime.versionTag || runtime.fingerprint || "").trim();
+}
+
 function createJsonRpcClient(serverConfig) {
 	const child = spawn(serverConfig.command, serverConfig.args || [], {
 		cwd: projectDir,
@@ -266,7 +271,13 @@ function createJsonRpcClient(serverConfig) {
 async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 	const key = generatedAppInstanceKey(cardId, itemId);
 	const existing = generatedAppInstances.get(key);
-	if (existing && existing.client && existing.client.child && existing.client.child.exitCode == null && !existing.client.child.killed) return existing;
+	if (existing && existing.client && existing.client.child && existing.client.child.exitCode == null && !existing.client.child.killed) {
+		const nextVersion = generatedRuntimeVersion(runtime);
+		const currentVersion = generatedRuntimeVersion(existing.runtime);
+		if ((nextVersion && currentVersion && nextVersion === currentVersion) || (!nextVersion && !currentVersion)) {
+			return existing;
+		}
+	}
 	if (existing && existing.client) existing.client.close();
 	generatedAppInstances.delete(key);
 	if (!runtime || !runtime.serverId) throw new Error("Generated app runtime is missing a server id.");
@@ -1318,6 +1329,23 @@ function findRuntimeWidget(cardId) {
 	}) || null;
 }
 
+function generatedRuntimeVersion(runtime) {
+	if (!runtime || typeof runtime !== 'object') return '';
+	return String(runtime.versionTag || runtime.fingerprint || '').trim();
+}
+
+function closeGeneratedAppInstance(cardId, itemId) {
+	const safeCardId = String(cardId || '').trim();
+	const safeItemId = String(itemId || '').trim();
+	if (!safeCardId && !safeItemId) return false;
+	fetch('/api/generated-app-close', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ cardId: safeCardId, itemId: safeItemId }),
+	}).catch(function(){});
+	return true;
+}
+
 function calculatorSessionId(seed) {
 	return 'calc-' + String(seed || Date.now()).replace(/[^a-z0-9]+/gi, '').toLowerCase().slice(-12);
 }
@@ -1377,6 +1405,38 @@ function generatedAppState(item) {
 	};
 }
 
+function syncGeneratedAppLaneItemsFromState() {
+	if (!currentState || !Array.isArray(currentState.widgets) || !Array.isArray(localLaneItems) || localLaneItems.length === 0) return false;
+	let changed = false;
+	localLaneItems = localLaneItems.map(function(item) {
+		if (!item || item.meta !== 'Generated MCP app' || !item.cardId) return item;
+		const widget = findRuntimeWidget(item.cardId);
+		if (!widget || !widget.appRuntime) return item;
+		const nextRuntime = widget.appRuntime;
+		const previousVersion = generatedRuntimeVersion(item.appRuntime);
+		const nextVersion = generatedRuntimeVersion(nextRuntime);
+		const runtimeChanged = previousVersion !== nextVersion
+			|| String((item.appRuntime && item.appRuntime.ready) ? '1' : '0') !== String(nextRuntime.ready ? '1' : '0')
+			|| String((item.appRuntime && item.appRuntime.viewFile) || '') !== String(nextRuntime.viewFile || '')
+			|| String((item.appRuntime && item.appRuntime.toolName) || '') !== String(nextRuntime.toolName || '');
+		const nextTitle = String(nextRuntime.title || widget.title || item.title || 'Generated MCP app');
+		const nextSummary = nextRuntime.ready ? 'Generated MCP app opened inline.' : 'Build the app before opening it inline.';
+		if (!runtimeChanged && item.title === nextTitle && item.summary === nextSummary) return item;
+		changed = true;
+		if (runtimeChanged) closeGeneratedAppInstance(String(item.cardId || ''), String(item.id || ''));
+		return {
+			...item,
+			title: nextTitle,
+			summary: nextSummary,
+			tone: nextRuntime.ready ? 'success' : 'warning',
+			appRuntime: nextRuntime,
+			timestamp: new Date().toISOString(),
+		};
+	});
+	if (changed) saveLocalLaneItems();
+	return changed;
+}
+
 function addGeneratedAppToLocalLane(cardId) {
 	const widget = findRuntimeWidget(cardId);
 	if (!widget || !widget.appRuntime) return false;
@@ -1384,6 +1444,9 @@ function addGeneratedAppToLocalLane(cardId) {
 	const existingId = 'generated-app-' + cardId;
 	const existing = findLocalLaneItem(existingId);
 	if (existing) {
+		const previousVersion = generatedRuntimeVersion(existing.appRuntime);
+		const nextVersion = generatedRuntimeVersion(runtime);
+		if (previousVersion !== nextVersion) closeGeneratedAppInstance(cardId, existingId);
 		updateLocalLaneItem(existingId, function(item) {
 			item.title = String(runtime.title || widget.title || item.title || 'Generated MCP app');
 			item.summary = runtime.ready ? 'Generated MCP app opened inline.' : 'Build the app before opening it inline.';
@@ -2471,7 +2534,8 @@ function renderGeneratedCalculatorApp(item) {
 function renderGeneratedGenericApp(item) {
 	const runtime = item && item.appRuntime ? item.appRuntime : {};
 	const frameTheme = document.body.classList.contains('light') ? 'light' : 'dark';
-	const frameSrc = '/generated-app-frame?cardId=' + encodeURIComponent(String(item.cardId || runtime.cardId || '')) + '&itemId=' + encodeURIComponent(String(item.id || '')) + '&theme=' + encodeURIComponent(frameTheme);
+	const frameVersion = generatedRuntimeVersion(runtime);
+	const frameSrc = '/generated-app-frame?cardId=' + encodeURIComponent(String(item.cardId || runtime.cardId || '')) + '&itemId=' + encodeURIComponent(String(item.id || '')) + '&theme=' + encodeURIComponent(frameTheme) + (frameVersion ? '&v=' + encodeURIComponent(frameVersion) : '');
 	return [
 		'<div class="generated-app-stage">',
 			'<div class="generated-app-frame-wrap">',
@@ -2798,6 +2862,7 @@ function renderDrawer() {
 
 function renderState(state) {
 	currentState = state;
+	syncGeneratedAppLaneItemsFromState();
 	renderHeader();
 	renderContextFilters();
 	renderWidgets();

@@ -152,6 +152,8 @@ interface ToolshedWidgetCardState extends ToolshedWidgetDefinition {
 		toolName?: string;
 		resourceUri?: string;
 		viewFile?: string;
+		fingerprint?: string;
+		versionTag?: string;
 	};
 }
 
@@ -3531,8 +3533,11 @@ export default function (pi: ExtensionAPI) {
 		const registered = card.kind === "mcp-app" ? isTrackedMcpCardRegistered(card, mcp) : false;
 		const fileState = card.kind === "mcp-app" ? getTrackedCardFileState(card, ctx) : { serverExists: false, viewExists: false, serverPath: "", viewPath: "" };
 		const trackedFilesPresent = Boolean(card.kind === "mcp-app" && fileState.serverExists && fileState.viewExists);
-		const liveState = card.kind === "mcp-app" ? getTrackedMcpLiveState(card, ctx, mcp) : null;
-		const verificationStatus = card.verificationStatus || "idle";
+			const liveState = card.kind === "mcp-app" ? getTrackedMcpLiveState(card, ctx, mcp) : null;
+			const runtimeFingerprint = card.kind === "mcp-app"
+				? buildTrackedMcpDeploymentFingerprint(card, ctx, mcp)
+				: "";
+			const verificationStatus = card.verificationStatus || "idle";
 		const verificationSummary = card.verificationSummary || (verificationStatus === "passed"
 			? "Verified build ready."
 			: verificationStatus === "failed"
@@ -3609,21 +3614,27 @@ export default function (pi: ExtensionAPI) {
 				],
 				runLabel: card.kind === "mcp-app" ? (waiting ? "Building…" : builtReady ? "Refactor app" : latestFailed ? "Repair app" : "Build app") : "Run in lane",
 				cardKind: card.kind || "workflow",
-				appRuntime: card.kind === "mcp-app"
-					? {
-						kind: "generated-mcp-app",
-						adapter: runtimeAdapter,
-						cardId: card.id,
+					appRuntime: card.kind === "mcp-app"
+						? {
+							kind: "generated-mcp-app",
+							adapter: runtimeAdapter,
+							cardId: card.id,
 						title: card.title,
 						brief: card.appBrief || card.description || "",
 						ready: inlineReady,
-						serverId: card.serverId,
-						toolName: card.toolName,
-						resourceUri: card.resourceUri,
-						viewFile: card.viewFile,
-					}
-					: undefined,
-			});
+							serverId: card.serverId,
+							toolName: card.toolName,
+							resourceUri: card.resourceUri,
+							viewFile: card.viewFile,
+							fingerprint: runtimeFingerprint,
+							versionTag: [
+								card.verificationUpdatedAt || "",
+								card.liveDeployedAt || "",
+								runtimeFingerprint,
+							].filter(Boolean).join("|") || runtimeFingerprint,
+						}
+						: undefined,
+				});
 	}
 
 	function buildToolshedRegistryState(ctx: ExtensionContext, lane: ToolshedLaneItem[], mcp: ToolshedMcpState): ToolshedRegistryState {
