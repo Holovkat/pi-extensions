@@ -24,6 +24,35 @@
       "env": {
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
       }
+    },
+    "toolshed-skeuomorphic-calculator-toolbox-app": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "tsx",
+        "-p",
+        "zod",
+        "-p",
+        "@modelcontextprotocol/sdk",
+        "tsx",
+        "features/toolshed-mcp-apps/skeuomorphic-calculator-toolbox-app/server.ts"
+      ]
+    },
+    "toolshed-github-project-kanban-board-app": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "tsx",
+        "tsx",
+        "features/toolshed-mcp-apps/github-project-kanban-board-app/server.ts"
+      ],
+      "env": {
+        "NODE_PATH": "/Users/tonyholovka/.nvm/versions/node/v22.22.0/lib/node_modules/pi-mcp-adapter/node_modules"
+      }
     }
   }
 }

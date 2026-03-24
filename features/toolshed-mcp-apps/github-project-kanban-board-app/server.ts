@@ -1,0 +1,757 @@
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { html } from "./mcp-app.tsx";
+
+const COLUMN_ORDER = ["Backlog", "In Progress", "Review", "Done"] as const;
+type ColumnName = typeof COLUMN_ORDER[number];
+
+type LabelInfo = { name: string; color?: string };
+type AssigneeInfo = { login: string; name?: string; avatarUrl?: string; url?: string };
+
+type IssueCard = {
+  id: string;
+  itemId?: string;
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  updatedAt?: string;
+  body?: string;
+  labels: LabelInfo[];
+  assignees: AssigneeInfo[];
+  column: ColumnName;
+  isClosed: boolean;
+};
+
+type ProjectFieldOption = { id: string; name: string };
+type ProjectField = { id: string; name: string; options: ProjectFieldOption[] };
+type ProjectInfo = {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  shortDescription?: string;
+  field: ProjectField;
+};
+
+type RepoInfo = {
+  owner: string;
+  repo: string;
+  nameWithOwner: string;
+  description: string;
+  url: string;
+  ownerType: "User" | "Organization";
+  ownerId: string;
+};
+
+type BoardSnapshot = {
+  sessionId: string;
+  repo: RepoInfo;
+  project: ProjectInfo | null;
+  columns: Array<{ id: ColumnName; title: ColumnName; cards: IssueCard[] }>;
+  cards: IssueCard[];
+  counts: Record<ColumnName, number>;
+  updatedAt: string;
+  renderInline: boolean;
+  projectScopeReady: boolean;
+  warnings: string[];
+  error?: string;
+};
+
+type SessionState = {
+  sessionId: string;
+  repo: RepoInfo;
+  project: ProjectInfo | null;
+  projectScopeReady: boolean;
+  updatedAt: string;
+};
+
+const RESOURCE_MIME_TYPE = "text/html+skybridge";
+const resourceUri = "ui://toolshed/github-project-kanban-board-app/mcp-app.html";
+const toolName = "open_github_project_kanban_board_app";
+const PROJECT_TITLE = "pi-toolshed";
+const STATUS_FIELD_NAME = "Kanban Status";
+const sessions = new Map<string, SessionState>();
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function runGh(args: string[]): string {
+  return execFileSync("gh", args, {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+function runGhJson<T>(args: string[]): T {
+  const output = runGh(args);
+  return output ? JSON.parse(output) as T : ({} as T);
+}
+
+function graphql<T>(query: string, variables: Record<string, string | number | boolean>): T {
+  const args = ["api", "graphql", "-f", `query=${query}`];
+  for (const [key, value] of Object.entries(variables)) {
+    args.push(typeof value === "number" ? "-F" : "-f", `${key}=${String(value)}`);
+  }
+  const payload = runGhJson<{ data?: T } & T>(args);
+  return payload && typeof payload === "object" && "data" in payload && payload.data
+    ? payload.data
+    : (payload as T);
+}
+
+function detectRepoFromGit(): { owner: string; repo: string } {
+  const remote = runGh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]);
+  const [owner, repo] = remote.split("/");
+  if (!owner || !repo) throw new Error(`Unable to detect current GitHub repo from gh repo view: ${remote}`);
+  return { owner, repo };
+}
+
+function getRepoInfo(): RepoInfo {
+  const { owner, repo } = detectRepoFromGit();
+  const data = graphql<{
+    repository: {
+      nameWithOwner: string;
+      description: string | null;
+      url: string;
+      owner: { __typename: "User" | "Organization"; id: string };
+    };
+  }>(
+    `query($owner:String!,$repo:String!){
+      repository(owner:$owner,name:$repo){
+        nameWithOwner
+        description
+        url
+        owner { __typename id }
+      }
+    }`,
+    { owner, repo },
+  );
+
+  return {
+    owner,
+    repo,
+    nameWithOwner: data.repository.nameWithOwner,
+    description: data.repository.description || "GitHub project board for this repository.",
+    url: data.repository.url,
+    ownerType: data.repository.owner.__typename,
+    ownerId: data.repository.owner.id,
+  };
+}
+
+function summarizeBoardError(error: unknown): string {
+  const message = String((error as any)?.message || error || "Unable to load GitHub project board.");
+  if (/required scopes|read:project|project scopes?/i.test(message)) {
+    return "GitHub project scopes are missing for `gh`. Showing repo issues fallback until `gh auth refresh -s read:project -s project` is run.";
+  }
+  return message;
+}
+
+function mapColumnFromLabels(labels: LabelInfo[] = []): ColumnName {
+  const names = labels.map((label) => label.name.toLowerCase());
+  if (names.some((name) => /\bdone\b|\bcomplete\b|\bcompleted\b/.test(name))) return "Done";
+  if (names.some((name) => /\breview\b|qa|uat|approval/.test(name))) return "Review";
+  if (names.some((name) => /in[ -]?progress|active|doing|working/.test(name))) return "In Progress";
+  return "Backlog";
+}
+
+function normalizeIssueNode(node: any): IssueCard {
+  const labels = Array.isArray(node?.labels?.nodes) ? node.labels.nodes.map((label: any) => ({ name: label.name, color: label.color })) : [];
+  const assignees = Array.isArray(node?.assignees?.nodes)
+    ? node.assignees.nodes.map((assignee: any) => ({ login: assignee.login, name: assignee.name, avatarUrl: assignee.avatarUrl, url: assignee.url }))
+    : [];
+
+  return {
+    id: String(node.id),
+    number: Number(node.number),
+    title: String(node.title || `Issue #${node.number}`),
+    url: String(node.url || ""),
+    state: String(node.state || "OPEN"),
+    updatedAt: String(node.updatedAt || ""),
+    body: String(node.body || ""),
+    labels,
+    assignees,
+    column: mapColumnFromLabels(labels),
+    isClosed: String(node.state || "").toUpperCase() === "CLOSED",
+  };
+}
+
+function getOpenIssues(repo: RepoInfo): IssueCard[] {
+  const data = graphql<{
+    repository: {
+      issues: {
+        nodes: any[];
+      };
+    };
+  }>(
+    `query($owner:String!,$repo:String!){
+      repository(owner:$owner,name:$repo){
+        issues(first:100, states:OPEN, orderBy:{field:UPDATED_AT,direction:DESC}){
+          nodes{
+            id
+            number
+            title
+            url
+            state
+            updatedAt
+            body
+            labels(first:20){ nodes { name color } }
+            assignees(first:10){ nodes { login name avatarUrl url } }
+          }
+        }
+      }
+    }`,
+    { owner: repo.owner, repo: repo.repo },
+  );
+
+  return (data.repository.issues.nodes || []).map(normalizeIssueNode);
+}
+
+function findExistingProject(repo: RepoInfo): { id: string; number: number; title: string; url: string } | null {
+  const data = graphql<{
+    user: { projectsV2: { nodes: any[] } } | null;
+    organization: { projectsV2: { nodes: any[] } } | null;
+  }>(
+    `query($owner:String!,$title:String!){
+      user(login:$owner){
+        projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
+          nodes { id number title url closed }
+        }
+      }
+      organization(login:$owner){
+        projectsV2(first:20, query:$title, orderBy:{field:UPDATED_AT,direction:DESC}){
+          nodes { id number title url closed }
+        }
+      }
+    }`,
+    { owner: repo.owner, title: PROJECT_TITLE },
+  );
+
+  const nodes = [...(data.user?.projectsV2?.nodes || []), ...(data.organization?.projectsV2?.nodes || [])];
+  const match = nodes.find((node) => String(node.title).trim().toLowerCase() === PROJECT_TITLE.toLowerCase() && !node.closed);
+  return match ? { id: String(match.id), number: Number(match.number), title: String(match.title), url: String(match.url) } : null;
+}
+
+function createProject(repo: RepoInfo): { id: string; number: number; title: string; url: string } {
+  const data = graphql<{
+    createProjectV2: { projectV2: { id: string; number: number; title: string; url: string } };
+  }>(
+    `mutation($ownerId:ID!,$title:String!){
+      createProjectV2(input:{ownerId:$ownerId,title:$title}){
+        projectV2 { id number title url }
+      }
+    }`,
+    { ownerId: repo.ownerId, title: PROJECT_TITLE },
+  );
+
+  try {
+    runGh(["project", "link", String(data.createProjectV2.projectV2.number), "--owner", repo.owner, "--repo", repo.nameWithOwner]);
+  } catch {
+    // Non-fatal. Project creation is still useful even if link metadata cannot be applied.
+  }
+
+  return data.createProjectV2.projectV2;
+}
+
+function getProjectDetails(repo: RepoInfo, projectNumber: number) {
+  return graphql<{
+    user: { projectV2: any } | null;
+    organization: { projectV2: any } | null;
+  }>(
+    `query($owner:String!,$number:Int!){
+      user(login:$owner){
+        projectV2(number:$number){
+          id
+          number
+          title
+          shortDescription
+          url
+          fields(first:50){
+            nodes{
+              ... on ProjectV2FieldCommon { id name dataType }
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options { id name }
+              }
+            }
+          }
+          items(first:100){
+            nodes{
+              id
+              content{
+                ... on Issue {
+                  id
+                  number
+                  title
+                  url
+                  state
+                  updatedAt
+                  body
+                  labels(first:20){ nodes { name color } }
+                  assignees(first:10){ nodes { login name avatarUrl url } }
+                }
+              }
+              fieldValues(first:20){
+                nodes{
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    optionId
+                    field { ... on ProjectV2SingleSelectField { id name } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      organization(login:$owner){
+        projectV2(number:$number){
+          id
+          number
+          title
+          shortDescription
+          url
+          fields(first:50){
+            nodes{
+              ... on ProjectV2FieldCommon { id name dataType }
+              ... on ProjectV2SingleSelectField {
+                id
+                name
+                options { id name }
+              }
+            }
+          }
+          items(first:100){
+            nodes{
+              id
+              content{
+                ... on Issue {
+                  id
+                  number
+                  title
+                  url
+                  state
+                  updatedAt
+                  body
+                  labels(first:20){ nodes { name color } }
+                  assignees(first:10){ nodes { login name avatarUrl url } }
+                }
+              }
+              fieldValues(first:20){
+                nodes{
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    optionId
+                    field { ... on ProjectV2SingleSelectField { id name } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }`,
+    { owner: repo.owner, number: projectNumber },
+  );
+}
+
+function ensureStatusField(repo: RepoInfo, projectNumber: number, details: any): ProjectField {
+  const fields = [
+    ...(details.user?.projectV2?.fields?.nodes || []),
+    ...(details.organization?.projectV2?.fields?.nodes || []),
+  ];
+  const existing = fields.find((field: any) => String(field?.name || "").toLowerCase() === STATUS_FIELD_NAME.toLowerCase() && Array.isArray(field?.options));
+  if (existing) {
+    return {
+      id: String(existing.id),
+      name: String(existing.name),
+      options: (existing.options || []).map((option: any) => ({ id: String(option.id), name: String(option.name) })),
+    };
+  }
+
+  runGhJson<any>([
+    "project",
+    "field-create",
+    String(projectNumber),
+    "--owner",
+    repo.owner,
+    "--name",
+    STATUS_FIELD_NAME,
+    "--data-type",
+    "SINGLE_SELECT",
+    "--single-select-options",
+    COLUMN_ORDER.join(","),
+    "--format",
+    "json",
+  ]);
+
+  const refreshed = getProjectDetails(repo, projectNumber);
+  const refreshedFields = [
+    ...(refreshed.user?.projectV2?.fields?.nodes || []),
+    ...(refreshed.organization?.projectV2?.fields?.nodes || []),
+  ];
+  const created = refreshedFields.find((field: any) => String(field?.name || "").toLowerCase() === STATUS_FIELD_NAME.toLowerCase() && Array.isArray(field?.options));
+  if (!created) throw new Error(`Created ${STATUS_FIELD_NAME} field but could not load it.`);
+  return {
+    id: String(created.id),
+    name: String(created.name),
+    options: (created.options || []).map((option: any) => ({ id: String(option.id), name: String(option.name) })),
+  };
+}
+
+function buildItemCard(node: any, statusFieldId: string): IssueCard | null {
+  if (!node?.content?.number) return null;
+  const card = normalizeIssueNode(node.content);
+  card.itemId = String(node.id);
+  const fieldValue = Array.isArray(node.fieldValues?.nodes)
+    ? node.fieldValues.nodes.find((entry: any) => String(entry?.field?.id || "") === statusFieldId)
+    : null;
+  if (fieldValue?.name && COLUMN_ORDER.includes(fieldValue.name)) {
+    card.column = fieldValue.name;
+  }
+  return card;
+}
+
+function setItemColumn(projectId: string, itemId: string, fieldId: string, optionId: string) {
+  graphql(
+    `mutation($projectId:ID!,$itemId:ID!,$fieldId:ID!,$optionId:String!){
+      updateProjectV2ItemFieldValue(input:{projectId:$projectId,itemId:$itemId,fieldId:$fieldId,value:{singleSelectOptionId:$optionId}}){
+        projectV2Item { id }
+      }
+    }`,
+    { projectId, itemId, fieldId, optionId },
+  );
+}
+
+function addIssueToProject(projectId: string, issueId: string): string {
+  const data = graphql<{
+    addProjectV2ItemById: { item: { id: string } };
+  }>(
+    `mutation($projectId:ID!,$contentId:ID!){
+      addProjectV2ItemById(input:{projectId:$projectId,contentId:$contentId}){
+        item { id }
+      }
+    }`,
+    { projectId, contentId: issueId },
+  );
+  return String(data.addProjectV2ItemById.item.id);
+}
+
+function closeIssueById(issueId: string) {
+  graphql(
+    `mutation($issueId:ID!){
+      closeIssue(input:{issueId:$issueId}){
+        issue { id state }
+      }
+    }`,
+    { issueId },
+  );
+}
+
+function ensureProjectAndSync(repo: RepoInfo): { project: ProjectInfo; cards: IssueCard[]; warnings: string[] } {
+  let project = findExistingProject(repo);
+  if (!project) project = createProject(repo);
+
+  let details = getProjectDetails(repo, project.number);
+  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  if (!activeProject) throw new Error(`Unable to load project ${PROJECT_TITLE}.`);
+
+  const field = ensureStatusField(repo, project.number, details);
+  details = getProjectDetails(repo, project.number);
+  const fullProject = details.user?.projectV2 || details.organization?.projectV2;
+  if (!fullProject) throw new Error(`Unable to refresh project ${PROJECT_TITLE}.`);
+
+  const issueMap = new Map<number, IssueCard>();
+  const projectCards = (fullProject.items?.nodes || [])
+    .map((node: any) => buildItemCard(node, field.id))
+    .filter(Boolean) as IssueCard[];
+  for (const card of projectCards) issueMap.set(card.number, card);
+
+  const openIssues = getOpenIssues(repo);
+  const optionMap = new Map(field.options.map((option) => [option.name, option.id]));
+  const warnings: string[] = [];
+
+  for (const issue of openIssues) {
+    if (issueMap.has(issue.number)) continue;
+    const itemId = addIssueToProject(fullProject.id, issue.id);
+    const defaultColumn = issue.column || "Backlog";
+    const optionId = optionMap.get(defaultColumn);
+    if (!optionId) {
+      warnings.push(`Missing option for column ${defaultColumn}. Added issue #${issue.number} without a status value.`);
+      issueMap.set(issue.number, { ...issue, itemId, column: defaultColumn });
+      continue;
+    }
+    setItemColumn(fullProject.id, itemId, field.id, optionId);
+    issueMap.set(issue.number, { ...issue, itemId, column: defaultColumn });
+  }
+
+  const cards = Array.from(issueMap.values()).sort((a, b) => {
+    if (a.column !== b.column) return COLUMN_ORDER.indexOf(a.column) - COLUMN_ORDER.indexOf(b.column);
+    return b.number - a.number;
+  });
+
+  return {
+    project: {
+      id: String(fullProject.id),
+      number: Number(fullProject.number),
+      title: String(fullProject.title),
+      url: String(fullProject.url),
+      shortDescription: String(fullProject.shortDescription || ""),
+      field,
+    },
+    cards,
+    warnings,
+  };
+}
+
+function columnize(cards: IssueCard[]) {
+  return COLUMN_ORDER.map((column) => ({
+    id: column,
+    title: column,
+    cards: cards.filter((card) => card.column === column),
+  }));
+}
+
+function countsFromColumns(columns: Array<{ id: ColumnName; cards: IssueCard[] }>): Record<ColumnName, number> {
+  return {
+    Backlog: columns.find((column) => column.id === "Backlog")?.cards.length || 0,
+    "In Progress": columns.find((column) => column.id === "In Progress")?.cards.length || 0,
+    Review: columns.find((column) => column.id === "Review")?.cards.length || 0,
+    Done: columns.find((column) => column.id === "Done")?.cards.length || 0,
+  };
+}
+
+function buildSnapshot(session: SessionState, cards: IssueCard[], warnings: string[], renderInline: boolean, error?: string): BoardSnapshot {
+  const columns = columnize(cards);
+  return {
+    sessionId: session.sessionId,
+    repo: session.repo,
+    project: session.project,
+    columns,
+    cards,
+    counts: countsFromColumns(columns),
+    updatedAt: session.updatedAt,
+    renderInline,
+    projectScopeReady: session.projectScopeReady,
+    warnings,
+    error,
+  };
+}
+
+function saveSession(session: SessionState) {
+  session.updatedAt = nowIso();
+  sessions.set(session.sessionId, session);
+  return session;
+}
+
+function loadOrCreateSession(sessionId?: string) {
+  const id = String(sessionId || "").trim() || randomUUID();
+  const existing = sessions.get(id);
+  if (existing) return existing;
+  const created: SessionState = {
+    sessionId: id,
+    repo: getRepoInfo(),
+    project: null,
+    projectScopeReady: true,
+    updatedAt: nowIso(),
+  };
+  sessions.set(id, created);
+  return created;
+}
+
+function refreshBoard(sessionId?: string, renderInline: boolean = false): BoardSnapshot {
+  const session = loadOrCreateSession(sessionId);
+  const warnings: string[] = [];
+  try {
+    const synced = ensureProjectAndSync(session.repo);
+    session.project = synced.project;
+    session.projectScopeReady = true;
+    saveSession(session);
+    return buildSnapshot(session, synced.cards, warnings.concat(synced.warnings), renderInline);
+  } catch (error: any) {
+    session.projectScopeReady = false;
+    saveSession(session);
+    const message = summarizeBoardError(error);
+    const scopeLimited = /gh auth refresh -s read:project -s project/i.test(message);
+    const openIssues = (() => {
+      try {
+        return getOpenIssues(session.repo);
+      } catch {
+        return [] as IssueCard[];
+      }
+    })();
+    if (!scopeLimited) {
+      warnings.push("GitHub project access needs the `project` + `read:project` scopes for gh auth. Repo issues can still be previewed, but project sync is unavailable until scopes are refreshed.");
+    }
+    return buildSnapshot(session, openIssues, warnings, renderInline, message);
+  }
+}
+
+function getSessionProject(sessionId: string) {
+  const session = loadOrCreateSession(sessionId);
+  if (!session.project) {
+    const refreshed = refreshBoard(sessionId, false);
+    if (!refreshed.project) throw new Error(refreshed.error || "Project is not ready yet.");
+  }
+  const updated = sessions.get(sessionId);
+  if (!updated?.project) throw new Error("Project is not available for this session.");
+  return updated;
+}
+
+function moveIssue(sessionId: string, issueNumber: number, toColumn: ColumnName): BoardSnapshot {
+  const session = getSessionProject(sessionId);
+  const project = session.project;
+  if (!project) throw new Error("Project is not available.");
+  const details = getProjectDetails(session.repo, project.number);
+  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  if (!activeProject) throw new Error("Unable to reload project before move.");
+  const item = (activeProject.items?.nodes || []).find((node: any) => Number(node?.content?.number) === issueNumber);
+  if (!item?.id) throw new Error(`Issue #${issueNumber} is not on the project board yet.`);
+  const option = (project.field.options || []).find((entry) => entry.name === toColumn);
+  if (!option) throw new Error(`Column ${toColumn} is not configured on ${project.field.name}.`);
+  setItemColumn(project.id, String(item.id), project.field.id, option.id);
+  return refreshBoard(sessionId, false);
+}
+
+function closeIssue(sessionId: string, issueNumber: number): BoardSnapshot {
+  const session = getSessionProject(sessionId);
+  const details = getProjectDetails(session.repo, session.project!.number);
+  const activeProject = details.user?.projectV2 || details.organization?.projectV2;
+  const item = (activeProject?.items?.nodes || []).find((node: any) => Number(node?.content?.number) === issueNumber);
+  const issueId = item?.content?.id;
+  if (!issueId) throw new Error(`Unable to find issue #${issueNumber} to close.`);
+  closeIssueById(String(issueId));
+  return refreshBoard(sessionId, false);
+}
+
+const server = new McpServer({
+  name: "toolshed-github-project-kanban-board-app",
+  version: "0.1.0",
+});
+
+server.registerTool(
+  toolName,
+  {
+    title: "Open GitHub Project Kanban Board",
+    description: "Open an inline-first GitHub project kanban board for the current repo and sync open issues into Backlog, In Progress, Review, and Done.",
+    inputSchema: z.object({
+      sessionId: z.string().optional(),
+      renderInline: z.boolean().optional(),
+      prompt: z.string().optional(),
+    }),
+    _meta: {
+      ui: {
+        resourceUri,
+        inlinePreferred: true,
+        toolbox: true,
+      },
+    },
+  },
+  async ({ sessionId, renderInline }) => {
+    const snapshot = refreshBoard(sessionId, Boolean(renderInline));
+    return {
+      content: [{ type: "text", text: `Opened GitHub Project Kanban Board for ${snapshot.repo.nameWithOwner}.` }],
+      structuredContent: snapshot,
+    };
+  },
+);
+
+server.registerTool(
+  "github_project_kanban_refresh",
+  {
+    title: "Refresh GitHub Project Kanban Board",
+    description: "Reload the board state from GitHub and re-sync open repo issues into the project.",
+    inputSchema: z.object({
+      sessionId: z.string(),
+    }),
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  async ({ sessionId }) => {
+    const snapshot = refreshBoard(sessionId, false);
+    return {
+      content: [{ type: "text", text: `Refreshed ${snapshot.project?.title || PROJECT_TITLE} for ${snapshot.repo.nameWithOwner}.` }],
+      structuredContent: snapshot,
+    };
+  },
+);
+
+server.registerTool(
+  "github_project_kanban_move_issue",
+  {
+    title: "Move GitHub Project Kanban Card",
+    description: "Move a project card to another kanban column by updating the project's single-select status field.",
+    inputSchema: z.object({
+      sessionId: z.string(),
+      issueNumber: z.number(),
+      toColumn: z.enum(COLUMN_ORDER),
+    }),
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  async ({ sessionId, issueNumber, toColumn }) => {
+    const snapshot = moveIssue(sessionId, issueNumber, toColumn);
+    return {
+      content: [{ type: "text", text: `Moved #${issueNumber} to ${toColumn}.` }],
+      structuredContent: snapshot,
+    };
+  },
+);
+
+server.registerTool(
+  "github_project_kanban_close_issue",
+  {
+    title: "Close GitHub Issue From Kanban",
+    description: "Close a GitHub issue after the user approves a move to Done.",
+    inputSchema: z.object({
+      sessionId: z.string(),
+      issueNumber: z.number(),
+    }),
+    _meta: {
+      ui: {
+        visibility: ["app"],
+      },
+    },
+  },
+  async ({ sessionId, issueNumber }) => {
+    const snapshot = closeIssue(sessionId, issueNumber);
+    return {
+      content: [{ type: "text", text: `Closed issue #${issueNumber}.` }],
+      structuredContent: snapshot,
+    };
+  },
+);
+
+server.registerResource(
+  "github-project-kanban-board-ui",
+  resourceUri,
+  {
+    title: "GitHub Project Kanban Board UI",
+    description: "Inline-first board view with fullscreen expansion and drag-drop status updates.",
+    mimeType: RESOURCE_MIME_TYPE,
+  },
+  async () => ({
+    contents: [{ uri: resourceUri, mimeType: RESOURCE_MIME_TYPE, text: html }],
+  }),
+);
+
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
