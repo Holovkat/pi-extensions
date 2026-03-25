@@ -35,6 +35,9 @@ const registeredAgents = new Map();
 const actionLog = [];
 const generatedAppInstances = new Map();
 const hostedMcpServers = new Map();
+const externalMcpSessions = new Map();
+const EXTERNAL_MCP_SESSION_TTL_MS = 15 * 60 * 1000;
+const MCP_TRACKED_BODY_LIMIT_BYTES = 512 * 1024;
 let lastMtime = 0;
 
 function escapeHtml(value) {
@@ -87,6 +90,7 @@ function forwardCommand(cmd) {
 	for (const [, agent] of targets) {
 		try {
 			agent.socket.write(JSON.stringify(payload) + "\n");
+			agent.lastTouchedAt = Date.now();
 			delivered++;
 		} catch {}
 	}
@@ -99,6 +103,385 @@ function forwardCommand(cmd) {
 	return delivered > 0
 		? { success: true, delivered }
 		: { success: false, error: "Unable to forward the action to the live Toolshed session." };
+}
+
+function touchRegisteredAgent(agentId) {
+	const agent = registeredAgents.get(agentId);
+	if (agent) agent.lastTouchedAt = Date.now();
+}
+
+function getRequestSource(req) {
+	const forwardedHost = String(req.headers["x-forwarded-host"] || "").trim().toLowerCase();
+	const forwardedFor = String(req.headers["x-forwarded-for"] || "").trim().toLowerCase();
+	const host = String(req.headers.host || "").trim().toLowerCase();
+	if (forwardedHost || forwardedFor || host.includes("ngrok") || forwardedHost.includes("ngrok") || forwardedFor.includes("ngrok")) {
+		return "public";
+	}
+	return "local";
+}
+
+function getRequestClientIdentity(req, source) {
+	const forwardedFor = String(req.headers["x-forwarded-for"] || "").trim().split(",")[0].trim();
+	const trueClientIp = String(req.headers["true-client-ip"] || req.headers["cf-connecting-ip"] || "").trim();
+	const remoteAddress = String((req.socket && req.socket.remoteAddress) || "").trim();
+	const userAgent = String(req.headers["user-agent"] || "").trim();
+	const origin = String(req.headers.origin || req.headers.referer || "").trim();
+	const host = String(req.headers.host || "").trim();
+	const ip = forwardedFor || trueClientIp || remoteAddress || "unknown";
+	const normalizedUserAgent = userAgent.toLowerCase();
+	let label = source === "public" ? "Public client" : "Local client";
+	if (normalizedUserAgent.includes("openai") || normalizedUserAgent.includes("chatgpt")) label = "ChatGPT connector";
+	else if (origin) label = origin;
+	else if (host) label = host;
+	return {
+		fingerprint: [String(source || "local"), ip || "unknown", userAgent || "unknown"].join("::"),
+		label,
+		ip,
+		userAgent,
+	};
+}
+
+function collectMcpAppSessionIds(target, value) {
+	if (!value) return;
+	if (Array.isArray(value)) {
+		for (const entry of value) collectMcpAppSessionIds(target, entry);
+		return;
+	}
+	if (typeof value === "string") {
+		const trimmed = value.trim();
+		if (trimmed) target.add(trimmed);
+		return;
+	}
+	if (typeof value !== "object") return;
+	if (value.params && value.params.arguments && value.params.arguments.sessionId) {
+		collectMcpAppSessionIds(target, value.params.arguments.sessionId);
+	}
+	if (value.arguments && value.arguments.sessionId) {
+		collectMcpAppSessionIds(target, value.arguments.sessionId);
+	}
+	if (value.result && value.result.structuredContent) {
+		collectMcpAppSessionIds(target, value.result.structuredContent);
+	}
+	if (value.structuredContent) {
+		collectMcpAppSessionIds(target, value.structuredContent);
+	}
+	if (value.session && value.session.sessionId) {
+		collectMcpAppSessionIds(target, value.session.sessionId);
+	}
+	if (Object.prototype.hasOwnProperty.call(value, "sessionId")) {
+		collectMcpAppSessionIds(target, value.sessionId);
+	}
+}
+
+function extractMcpAppSessionIdsFromJson(raw) {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(String(raw));
+		const found = new Set();
+		collectMcpAppSessionIds(found, parsed);
+		return [...found];
+	} catch {
+		return [];
+	}
+}
+
+function extractMcpAppSessionIdsFromEventStream(raw) {
+	const found = new Set();
+	const lines = String(raw || "").split(/\r?\n/);
+	for (const line of lines) {
+		if (!line.startsWith("data:")) continue;
+		const payload = line.slice(5).trim();
+		if (!payload || payload === "[DONE]") continue;
+		for (const sessionId of extractMcpAppSessionIdsFromJson(payload)) found.add(sessionId);
+	}
+	return [...found];
+}
+
+function extractMcpAppSessionIdsFromBody(body, contentType) {
+	if (!body || body.length === 0) return [];
+	const raw = Buffer.isBuffer(body) ? body.toString("utf-8") : String(body || "");
+	const type = String(contentType || "").toLowerCase();
+	if (type.includes("event-stream")) return extractMcpAppSessionIdsFromEventStream(raw);
+	if (type.includes("json") || raw.trim().startsWith("{") || raw.trim().startsWith("[")) {
+		return extractMcpAppSessionIdsFromJson(raw);
+	}
+	return [];
+}
+
+function externalMcpSessionKey(serverId, sessionId) {
+	return `${String(serverId || "").trim()}::${String(sessionId || "").trim()}`;
+}
+
+function recordExternalMcpSession(serverId, sessionId, source, route, method, client, details) {
+	const key = externalMcpSessionKey(serverId, sessionId);
+	if (!key || key === "::") return null;
+	const now = Date.now();
+	const normalizedServerId = String(serverId || "").trim();
+	const normalizedSessionId = String(sessionId || "").trim();
+	const normalizedSource = String(source || "local").trim();
+	const normalizedAppSessionId = details && details.appSessionId ? String(details.appSessionId).trim() : "";
+	const existing = externalMcpSessions.get(key);
+	if (existing) {
+		existing.lastSeenAt = now;
+		existing.route = route || existing.route;
+		existing.method = method || existing.method;
+		existing.source = source || existing.source;
+		existing.clientFingerprint = client && client.fingerprint ? client.fingerprint : existing.clientFingerprint;
+		existing.clientLabel = client && client.label ? client.label : existing.clientLabel;
+		existing.clientIp = client && client.ip ? client.ip : existing.clientIp;
+		existing.userAgent = client && client.userAgent ? client.userAgent : existing.userAgent;
+		if (normalizedAppSessionId) existing.appSessionId = normalizedAppSessionId;
+		return existing;
+	}
+	let preservedAppSessionId = normalizedAppSessionId;
+	for (const [existingKey, session] of externalMcpSessions.entries()) {
+		if (!session) continue;
+		if (String(session.serverId || "") !== normalizedServerId) continue;
+		if (String(session.source || "local") !== normalizedSource) continue;
+		if (String(session.sessionId || "") === normalizedSessionId) continue;
+		if (!preservedAppSessionId && session.appSessionId) preservedAppSessionId = String(session.appSessionId);
+		externalMcpSessions.delete(existingKey);
+	}
+	for (const [existingKey, session] of externalMcpSessions.entries()) {
+		if (!session) continue;
+		if (String(session.serverId || "") !== normalizedServerId) continue;
+		if (String(session.clientFingerprint || "") !== String(client && client.fingerprint ? client.fingerprint : "")) continue;
+		if (String(session.sessionId || "") === normalizedSessionId) continue;
+		if (!preservedAppSessionId && session.appSessionId) preservedAppSessionId = String(session.appSessionId);
+		externalMcpSessions.delete(existingKey);
+	}
+	const entry = {
+		key,
+		serverId: normalizedServerId,
+		sessionId: normalizedSessionId,
+		appSessionId: preservedAppSessionId,
+		source: normalizedSource,
+		route: route || "/mcp",
+		method: method || "POST",
+		openedAt: now,
+		lastSeenAt: now,
+		clientFingerprint: client && client.fingerprint ? client.fingerprint : source || "local",
+		clientLabel: client && client.label ? client.label : (source || "local"),
+		clientIp: client && client.ip ? client.ip : "",
+		userAgent: client && client.userAgent ? client.userAgent : "",
+	};
+	externalMcpSessions.set(key, entry);
+	return entry;
+}
+
+function removeExternalMcpSession(serverId, sessionId) {
+	const key = externalMcpSessionKey(serverId, sessionId);
+	if (!key || key === "::") return false;
+	return externalMcpSessions.delete(key);
+}
+
+function pruneExternalMcpSessions() {
+	const now = Date.now();
+	let changed = false;
+	for (const [key, session] of externalMcpSessions.entries()) {
+		if (!session || now - Number(session.lastSeenAt || session.openedAt || now) > EXTERNAL_MCP_SESSION_TTL_MS) {
+			externalMcpSessions.delete(key);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+function cleanupHostedMcpServers() {
+	let changed = false;
+	for (const [serverId, hosted] of hostedMcpServers.entries()) {
+		if (!hosted) continue;
+		if (hosted.mode === "managed") continue;
+		const hasActiveSession = [...externalMcpSessions.values()].some((session) => String(session.serverId || "") === String(serverId || ""));
+		if (!hasActiveSession) {
+			hostedMcpServers.delete(serverId);
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+function serverRelativeTime(value) {
+	const date = new Date(value || Date.now());
+	if (Number.isNaN(date.getTime())) return "unknown";
+	const ms = Date.now() - date.getTime();
+	const minutes = Math.round(ms / 60000);
+	if (minutes <= 1) return "just now";
+	if (minutes < 60) return minutes + "m ago";
+	const hours = Math.round(minutes / 60);
+	if (hours < 24) return hours + "h ago";
+	const days = Math.round(hours / 24);
+	return days + "d ago";
+}
+
+function serverFormatTime(value) {
+	const date = new Date(value || Date.now());
+	if (Number.isNaN(date.getTime())) return "unknown";
+	return date.toLocaleString([], {
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+	});
+}
+
+function emptyConnectionsState(now = Date.now()) {
+	return {
+		updatedAt: new Date(now).toISOString(),
+		summary: "0 agents · 0 inline apps · 0 hosted servers · 0 external sessions",
+		counts: {
+			agents: 0,
+			inlineApps: 0,
+			hostedServers: 0,
+			externalSessions: 0,
+			total: 0,
+		},
+		sections: [
+			{
+				id: "agents",
+				title: "PI Agents",
+				brief: "Control-socket sessions currently registered with Toolshed.",
+				entries: [],
+				emptyText: "No PI agents are connected right now.",
+			},
+			{
+				id: "inline-apps",
+				title: "Inline App Runtimes",
+				brief: "Generated MCP app instances currently running inside PI.",
+				entries: [],
+				emptyText: "No inline app runtimes are active right now.",
+			},
+			{
+				id: "hosted-servers",
+				title: "Hosted MCP Servers",
+				brief: "PI-managed or remote MCP servers currently being hosted through Toolshed.",
+				entries: [],
+				emptyText: "No hosted MCP servers are active right now.",
+			},
+			{
+				id: "external-sessions",
+				title: "External MCP Sessions",
+				brief: "Currently active external MCP sessions hitting the PI-hosted routes.",
+				entries: [],
+				emptyText: "No external MCP sessions are active right now.",
+			},
+		],
+	};
+}
+
+function buildConnectionsState() {
+	pruneExternalMcpSessions();
+	cleanupHostedMcpServers();
+	const now = Date.now();
+	const activeExternalSessions = [...externalMcpSessions.values()].sort((a, b) => Number(b.lastSeenAt || b.openedAt || 0) - Number(a.lastSeenAt || a.openedAt || 0));
+	const agentEntries = [...registeredAgents.entries()].map(([agentId, agent]) => ({
+		id: agentId,
+		title: agentId,
+		brief: [agent.info && agent.info.name, agent.info && agent.info.version].filter(Boolean).join(" · ") || "PI control session",
+		statusLabel: "Connected",
+		statusTone: "success",
+		openedAt: agent.registeredAt,
+		lastTouchedAt: agent.lastTouchedAt || agent.registeredAt,
+		meta: [
+			{ label: `Registered ${serverRelativeTime(agent.registeredAt)}`, tone: "info" },
+			{ label: `Touched ${serverRelativeTime(agent.lastTouchedAt || agent.registeredAt)}`, tone: "neutral" },
+		],
+		cells: [
+			{ label: "Session key", value: agent.sessionKey || agentId },
+			{ label: "Registered", value: serverFormatTime(agent.registeredAt) },
+			{ label: "Last touch", value: serverFormatTime(agent.lastTouchedAt || agent.registeredAt) },
+		],
+	}));
+	const inlineAppEntries = [...generatedAppInstances.entries()].map(([key, instance]) => ({
+		id: key,
+		title: (instance.runtime && instance.runtime.title) || "Inline MCP app",
+		brief: (instance.runtime && instance.runtime.brief) || "Generated MCP app runtime connected to PI.",
+		statusLabel: "Inline",
+		statusTone: "success",
+		cardId: instance.cardId || key,
+		itemId: instance.itemId || key,
+		serverId: instance.runtime && instance.runtime.serverId ? instance.runtime.serverId : "",
+		sessionId: instance.sessionId || "",
+		openedAt: instance.openedAt || instance.lastTouchedAt || now,
+		lastTouchedAt: instance.lastTouchedAt || instance.openedAt || now,
+		meta: [
+			{ label: `Opened ${serverRelativeTime(instance.openedAt || instance.lastTouchedAt || now)}`, tone: "info" },
+			{ label: `Touched ${serverRelativeTime(instance.lastTouchedAt || instance.openedAt || now)}`, tone: "neutral" },
+		],
+		cells: [
+			{ label: "Card", value: instance.cardId || key },
+			{ label: "Session", value: instance.sessionId || "pending" },
+			{ label: "Server", value: instance.runtime && instance.runtime.serverId ? instance.runtime.serverId : "unknown" },
+		],
+	}));
+	const hostedEntries = [...hostedMcpServers.entries()].map(([serverId, hosted]) => {
+		const activeSessions = activeExternalSessions.filter((session) => String(session.serverId || "") === String(serverId || ""));
+		const route = `/mcp/servers/${encodeURIComponent(String(serverId || ""))}`;
+		return {
+			id: serverId,
+			title: serverId,
+			brief: hosted.mode === "managed"
+				? "PI-managed local MCP server process."
+				: hosted.url || "Remote MCP endpoint.",
+			statusLabel: hosted.mode === "managed" ? "Managed" : "Remote",
+			statusTone: "success",
+			serverId,
+			route,
+			mode: hosted.mode,
+			openedAt: hosted.startedAt || hosted.lastTouchedAt || now,
+			lastTouchedAt: hosted.lastTouchedAt || hosted.startedAt || now,
+			meta: [
+				{ label: `Active sessions ${activeSessions.length}`, tone: activeSessions.length > 0 ? "success" : "neutral" },
+				{ label: `Touched ${serverRelativeTime(hosted.lastTouchedAt || hosted.startedAt || now)}`, tone: "info" },
+			],
+			cells: [
+				{ label: "Route", value: route },
+				{ label: "Started", value: serverFormatTime(hosted.startedAt || hosted.lastTouchedAt || now) },
+				{ label: "Last touch", value: serverFormatTime(hosted.lastTouchedAt || hosted.startedAt || now) },
+			],
+		};
+	});
+	const externalEntries = activeExternalSessions.map((session) => ({
+		id: session.key,
+		title: session.serverId,
+		brief: session.route || "/mcp",
+		statusLabel: String(session.source || "local").toUpperCase(),
+		statusTone: "success",
+		serverId: session.serverId,
+		sessionId: session.appSessionId || session.sessionId,
+		transportSessionId: session.sessionId,
+		appSessionId: session.appSessionId || "",
+		source: session.source || "local",
+		route: session.route || "/mcp",
+		openedAt: session.openedAt || now,
+		lastTouchedAt: session.lastSeenAt || session.openedAt || now,
+		meta: [
+			{ label: `Last active ${serverRelativeTime(session.lastSeenAt || session.openedAt || now)}`, tone: "info" },
+		],
+		cells: [
+			{ label: "Session", value: session.appSessionId || session.sessionId },
+			{ label: "Last active", value: serverFormatTime(session.lastSeenAt || session.openedAt || now) },
+		],
+	}));
+	const counts = {
+		agents: agentEntries.length,
+		inlineApps: inlineAppEntries.length,
+		hostedServers: hostedEntries.length,
+		externalSessions: externalEntries.length,
+		total: agentEntries.length + inlineAppEntries.length + hostedEntries.length + externalEntries.length,
+	};
+	return {
+		updatedAt: new Date(now).toISOString(),
+		summary: `${counts.agents} agent${counts.agents === 1 ? "" : "s"} · ${counts.inlineApps} inline app${counts.inlineApps === 1 ? "" : "s"} · ${counts.hostedServers} hosted server${counts.hostedServers === 1 ? "" : "s"} · ${counts.externalSessions} external session${counts.externalSessions === 1 ? "" : "s"}`,
+		counts,
+		sections: emptyConnectionsState(now).sections.map((section) => {
+			if (section.id === "agents") return { ...section, entries: agentEntries };
+			if (section.id === "inline-apps") return { ...section, entries: inlineAppEntries };
+			if (section.id === "hosted-servers") return { ...section, entries: hostedEntries };
+			if (section.id === "external-sessions") return { ...section, entries: externalEntries };
+			return section;
+		}),
+	};
 }
 
 function readMcpConfig() {
@@ -253,11 +636,14 @@ async function ensureHostedMcpServer(serverId) {
 	const serverConfig = getGeneratedAppServerConfig(key);
 	if (!serverConfig) throw new Error("No project MCP server config found for " + key);
 	if (serverConfig.url) {
+		const startedAt = Date.now();
 		const remote = {
 			serverId: key,
 			mode: "remote",
 			url: serverConfig.url,
-			lastTouchedAt: Date.now(),
+			route: `/mcp/servers/${encodeURIComponent(key)}`,
+			startedAt,
+			lastTouchedAt: startedAt,
 		};
 		hostedMcpServers.set(key, remote);
 		return remote;
@@ -278,13 +664,16 @@ async function ensureHostedMcpServer(serverId) {
 	child.stderr.setEncoding("utf-8");
 	child.stdout.on("data", appendLog);
 	child.stderr.on("data", appendLog);
+	const startedAt = Date.now();
 	const hosted = {
 		serverId: key,
 		mode: "managed",
+		route: `/mcp/servers/${encodeURIComponent(key)}`,
+		startedAt,
 		port: nextPort,
 		child,
 		logs: function() { return logs; },
-		lastTouchedAt: Date.now(),
+		lastTouchedAt: startedAt,
 	};
 	child.on("close", function() {
 		if (hostedMcpServers.get(key) === hosted) hostedMcpServers.delete(key);
@@ -322,7 +711,13 @@ async function proxyHostedMcpRequest(req, res, route) {
 		? new URL(route.upstreamPath, hosted.url)
 		: new URL(route.upstreamPath, "http://127.0.0.1:" + hosted.port);
 	hosted.lastTouchedAt = Date.now();
+	const requestSessionId = String(req.headers["mcp-session-id"] || "").trim();
+	const requestSource = getRequestSource(req);
+	const requestClient = getRequestClientIdentity(req, requestSource);
+	const requestMethod = String(req.method || "GET").toUpperCase();
 	const body = await readRequestBody(req);
+	const requestAppSessionIds = extractMcpAppSessionIdsFromBody(body, req.headers["content-type"]);
+	const requestAppSessionId = requestAppSessionIds.length > 0 ? requestAppSessionIds[requestAppSessionIds.length - 1] : "";
 	const headers = {
 		...req.headers,
 		host: targetUrl.host,
@@ -335,6 +730,42 @@ async function proxyHostedMcpRequest(req, res, route) {
 		method: req.method || "GET",
 		headers,
 	}, function(proxyRes) {
+		const responseSessionId = String(proxyRes.headers["mcp-session-id"] || "").trim();
+		const responseChunks = [];
+		let responseBytes = 0;
+		proxyRes.on("data", function(chunk) {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			responseBytes += buffer.length;
+			if (responseBytes <= MCP_TRACKED_BODY_LIMIT_BYTES) responseChunks.push(buffer);
+		});
+		proxyRes.on("end", function() {
+			const responseAppSessionIds = extractMcpAppSessionIdsFromBody(Buffer.concat(responseChunks), proxyRes.headers["content-type"]);
+			const responseAppSessionId = responseAppSessionIds.length > 0 ? responseAppSessionIds[responseAppSessionIds.length - 1] : "";
+			const preferredAppSessionId = responseAppSessionId || requestAppSessionId;
+			const trackedSessionId = responseSessionId || requestSessionId;
+			if (trackedSessionId && preferredAppSessionId) {
+				recordExternalMcpSession(route.serverId, trackedSessionId, requestSource, route.upstreamPath, requestMethod, requestClient, {
+					appSessionId: preferredAppSessionId,
+				});
+			}
+		});
+		if (requestSessionId) {
+			recordExternalMcpSession(route.serverId, requestSessionId, requestSource, route.upstreamPath, requestMethod, requestClient, {
+				appSessionId: requestAppSessionId,
+			});
+		}
+		if (responseSessionId) {
+			recordExternalMcpSession(route.serverId, responseSessionId, requestSource, route.upstreamPath, requestMethod, requestClient, {
+				appSessionId: requestAppSessionId,
+			});
+		}
+		if (requestMethod === "DELETE" && requestSessionId) {
+			removeExternalMcpSession(route.serverId, requestSessionId);
+		}
+		if (requestMethod === "DELETE" && responseSessionId && responseSessionId !== requestSessionId) {
+			removeExternalMcpSession(route.serverId, responseSessionId);
+		}
+		if (requestMethod === "DELETE") cleanupHostedMcpServers();
 		const responseHeaders = { ...proxyRes.headers, "access-control-allow-origin": "*" };
 		res.writeHead(proxyRes.statusCode || 502, responseHeaders);
 		proxyRes.pipe(res);
@@ -489,6 +920,7 @@ async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 	const serverConfig = getGeneratedAppServerConfig(runtime.serverId);
 	if (!serverConfig || !serverConfig.command) throw new Error("No project MCP server config found for " + runtime.serverId);
 	const client = createJsonRpcClient(serverConfig);
+	const openedAt = Date.now();
 	await client.request("initialize", {
 		protocolVersion: "2025-06-18",
 		capabilities: {},
@@ -505,9 +937,13 @@ async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 		runtime,
 		client,
 		sessionId: "",
+		openedAt,
 		lastResult: null,
-		lastTouchedAt: Date.now(),
+		lastTouchedAt: openedAt,
 	};
+	client.child.on("close", function() {
+		if (generatedAppInstances.get(key) === instance) generatedAppInstances.delete(key);
+	});
 	generatedAppInstances.set(key, instance);
 	return instance;
 }
@@ -680,8 +1116,15 @@ function readState() {
 	try {
 		const raw = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
 		const meta = raw.dashboardMeta && typeof raw.dashboardMeta === "object" ? raw.dashboardMeta : {};
+		let connections = emptyConnectionsState();
+		try {
+			connections = buildConnectionsState();
+		} catch (error) {
+			console.warn("[toolshed] failed to build connections state:", error && error.message ? error.message : error);
+		}
 		return {
 			...raw,
+			connections,
 			dashboardMeta: {
 				...meta,
 				projectDir,
@@ -749,6 +1192,7 @@ function handleControlCommand(cmd, socket) {
 				socket,
 				info: cmd.info || {},
 				registeredAt: Date.now(),
+				lastTouchedAt: Date.now(),
 			});
 			pushActionLog({ type: "register", status: "success", detail: cmd.agentId });
 			broadcastState();
@@ -891,6 +1335,33 @@ body.light .registry-cell{border-color:color-mix(in oklch,var(--foreground) 8%,t
 .registry-actions{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap}
 .registry-empty{padding:18px;border:1px dashed rgba(255,255,255,.1);border-radius:16px;color:var(--muted);text-align:center}
 body.light .registry-empty{border-color:rgba(15,23,42,.12)}
+.connections-view{display:flex;flex-direction:column;gap:16px;margin-top:24px;padding:4px 2px 0}
+.connections-summary{padding:16px 18px;border:1px solid color-mix(in oklch,var(--foreground) 5%,transparent);border-radius:18px;background:color-mix(in oklch,var(--foreground) 2%,transparent)}
+body.light .connections-summary{border-color:color-mix(in oklch,var(--foreground) 8%,transparent);background:color-mix(in oklch,var(--foreground) 3%,transparent)}
+.connections-summary-copy{margin-top:8px;font-size:12px;line-height:1.6;color:color-mix(in srgb,var(--text) 80%, var(--muted))}
+.connections-list{display:flex;flex-direction:column;gap:14px}
+.connections-section{padding:16px 18px;border:1px solid color-mix(in oklch,var(--foreground) 5%,transparent);border-radius:20px;background:color-mix(in oklch,var(--card) 78%,transparent)}
+body.light .connections-section{border-color:color-mix(in oklch,var(--foreground) 8%,transparent);background:color-mix(in oklch,var(--card) 90%,transparent)}
+.connections-section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.connections-section-title-block{display:flex;flex-direction:column;gap:6px;min-width:0}
+.connections-section-title{font-size:16px;font-weight:700;line-height:1.25}
+.connections-section-brief{font-size:13px;line-height:1.6;color:color-mix(in srgb,var(--text) 82%, var(--muted))}
+.connections-section-entries{display:flex;flex-direction:column;gap:12px;margin-top:14px}
+.connections-entry{padding:16px 18px;border:1px solid color-mix(in oklch,var(--foreground) 5%,transparent);border-radius:20px;background:color-mix(in oklch,var(--foreground) 1.8%,transparent)}
+body.light .connections-entry{border-color:color-mix(in oklch,var(--foreground) 8%,transparent);background:color-mix(in oklch,var(--foreground) 3%,transparent)}
+.connections-entry-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+.connections-entry-title-block{display:flex;flex-direction:column;gap:6px;min-width:0}
+.connections-entry-title{font-size:15px;font-weight:700;line-height:1.25}
+.connections-entry-brief{font-size:13px;line-height:1.6;color:color-mix(in srgb,var(--text) 82%, var(--muted))}
+.connections-entry-statuses{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.connections-entry-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:14px}
+.connections-entry-cell{padding:11px 12px;border:1px solid color-mix(in oklch,var(--foreground) 5%,transparent);border-radius:14px;background:color-mix(in oklch,var(--foreground) 1.8%,transparent)}
+body.light .connections-entry-cell{border-color:color-mix(in oklch,var(--foreground) 8%,transparent);background:color-mix(in oklch,var(--foreground) 3%,transparent)}
+.connections-entry-cell-label{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.connections-entry-cell-value{margin-top:6px;font-size:12px;line-height:1.55;color:color-mix(in srgb,var(--text) 84%, var(--muted))}
+.connections-entry-meta{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
+.connections-empty{padding:18px;border:1px dashed rgba(255,255,255,.1);border-radius:16px;color:var(--muted);text-align:center}
+body.light .connections-empty{border-color:rgba(15,23,42,.12)}
 .generated-app-frame{display:block;width:100%;min-height:820px;border:1px solid rgba(255,255,255,.05);border-radius:20px;background:linear-gradient(180deg,color-mix(in oklch,var(--background) 92%, black 8%),var(--background))}
 body.light .generated-app-frame{border-color:rgba(15,23,42,.08);background:linear-gradient(180deg,color-mix(in oklch,var(--background) 96%, white 4%),var(--background))}
 body.generated-app-viewport-open{overflow:hidden}
@@ -1259,7 +1730,7 @@ body.light .composer-foot .context-filter.open .context-input{background:rgba(15
 .empty-state{color:var(--muted);font-size:13px}
 .section-label,.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 @media (max-width: 1340px){.float-layer{right:14px;bottom:calc(var(--footer-offset,280px) + 16px)}}
-@media (max-width: 1040px){.header-row{grid-template-columns:1fr;justify-items:center}.header-balance{display:none}.header-controls{justify-self:center}.layout{grid-template-columns:1fr}.dock{position:static}.float-layer{position:static;display:flex;align-items:stretch;margin-top:14px}.float-layer .widget-card{width:100%}.hero-card,.lane-item.assistant .lane-card,.lane-item.system .lane-card,.lane-item.tool .lane-card,.lane-item.packet .lane-card{max-width:100%}.page{padding-bottom:calc(var(--footer-offset,220px) + 36px)}.toolbar-right{justify-content:flex-end}.context-filter.open .context-filter-field{min-width:248px}.composer-foot{grid-template-columns:1fr}.composer-actions{justify-content:flex-start}.registry-grid{grid-template-columns:1fr}}
+@media (max-width: 1040px){.header-row{grid-template-columns:1fr;justify-items:center}.header-balance{display:none}.header-controls{justify-self:center}.layout{grid-template-columns:1fr}.dock{position:static}.float-layer{position:static;display:flex;align-items:stretch;margin-top:14px}.float-layer .widget-card{width:100%}.hero-card,.lane-item.assistant .lane-card,.lane-item.system .lane-card,.lane-item.tool .lane-card,.lane-item.packet .lane-card{max-width:100%}.page{padding-bottom:calc(var(--footer-offset,220px) + 36px)}.toolbar-right{justify-content:flex-end}.context-filter.open .context-filter-field{min-width:248px}.composer-foot{grid-template-columns:1fr}.composer-actions{justify-content:flex-start}.registry-grid,.connections-entry-grid{grid-template-columns:1fr}}
 @media (max-width: 720px){.header-controls{width:100%;justify-content:center}.header-controls .select{width:100%;max-width:none}.composer-foot .toolbar-left,.composer-actions{width:100%;justify-content:space-between}.composer-actions .ghost-btn{flex:0 0 auto}.composer-foot .context-filter.open .context-filter-field{min-width:min(260px,calc(100vw - 32px));max-width:min(320px,calc(100vw - 32px))}.page-nav{flex-wrap:wrap}}
 `;
 
@@ -1288,6 +1759,7 @@ const floatLayer = el('floatLayer');
 const floatingHeader = el('floatingHeader');
 const lane = el('lane');
 const registryView = el('registryView');
+const connectionsView = el('connectionsView');
 const composerShell = el('composerShell');
 const composerInput = el('composerInput');
 const composerStatus = el('composerStatus');
@@ -2812,7 +3284,7 @@ function widgetMarkup(widget) {
 }
 
 function renderWidgets() {
-	if (PAGE_MODE === 'registry') {
+	if (PAGE_MODE !== 'lane') {
 		inlineWidgets.innerHTML = '';
 		leftDock.innerHTML = '';
 		rightDock.innerHTML = '';
@@ -3170,6 +3642,79 @@ function renderRegistry() {
 	].join('');
 }
 
+function connectionCellMarkup(cell) {
+	return [
+		'<div class="connections-entry-cell">',
+			'<div class="connections-entry-cell-label">' + escapeHtml(cell && cell.label ? cell.label : 'Value') + '</div>',
+			'<div class="connections-entry-cell-value">' + renderMultiline(cell && cell.value ? cell.value : '—') + '</div>',
+		'</div>',
+	].join('');
+}
+
+function connectionEntryMarkup(entry) {
+	const meta = Array.isArray(entry && entry.meta) ? entry.meta : [];
+	const cells = Array.isArray(entry && entry.cells) ? entry.cells : [];
+	return [
+		'<article class="connections-entry">',
+			'<div class="connections-entry-head">',
+				'<div class="connections-entry-title-block">',
+					'<div class="connections-entry-title">' + escapeHtml(entry && entry.title ? entry.title : 'Connection') + '</div>',
+					'<div class="connections-entry-brief">' + escapeHtml(entry && entry.brief ? entry.brief : 'No brief available.') + '</div>',
+				'</div>',
+				'<div class="connections-entry-statuses">',
+					pillMarkup({ label: entry && entry.statusLabel ? entry.statusLabel : 'Active', tone: entry && entry.statusTone ? entry.statusTone : 'neutral' }),
+				'</div>',
+			'</div>',
+			'<div class="connections-entry-grid">' + (cells.length > 0 ? cells.map(connectionCellMarkup).join('') : '<div class="connections-empty">No details available.</div>') + '</div>',
+			(meta.length > 0 ? '<div class="connections-entry-meta">' + meta.map(function(item) { return pillMarkup(item); }).join('') + '</div>' : ''),
+		'</article>',
+	].join('');
+}
+
+function connectionSectionMarkup(section) {
+	const entries = Array.isArray(section && section.entries) ? section.entries : [];
+	return [
+		'<section class="connections-section">',
+			'<div class="connections-section-head">',
+				'<div class="connections-section-title-block">',
+					'<div class="connections-section-title">' + escapeHtml(section && section.title ? section.title : 'Connections') + '</div>',
+					'<div class="connections-section-brief">' + escapeHtml(section && section.brief ? section.brief : 'No section brief available.') + '</div>',
+				'</div>',
+				'<div class="connections-entry-statuses">',
+					pillMarkup({ label: String(entries.length) + ' active', tone: entries.length > 0 ? 'success' : 'neutral' }),
+				'</div>',
+			'</div>',
+			'<div class="connections-section-entries">' + (entries.length > 0 ? entries.map(connectionEntryMarkup).join('') : '<div class="connections-empty">' + escapeHtml(section && section.emptyText ? section.emptyText : 'No active entries.') + '</div>') + '</div>',
+		'</section>',
+	].join('');
+}
+
+function renderConnections() {
+	if (!connectionsView) return;
+	if (!currentState || !currentState.connections) {
+		connectionsView.innerHTML = '<div class="connections-empty">Waiting for live connection state…</div>';
+		return;
+	}
+	const connections = currentState.connections || {};
+	const counts = connections.counts || {};
+	const sections = Array.isArray(connections.sections) ? connections.sections : [];
+	connectionsView.innerHTML = [
+		'<section class="connections-summary">',
+			'<div class="section-label">Connections</div>',
+			'<div class="widget-title">Who and what is connected right now</div>',
+			'<div class="connections-summary-copy">' + escapeHtml(connections.summary || 'No active connections right now.') + '</div>',
+			'<div class="registry-meta">'
+				+ pillMarkup({ label: String(counts.agents || 0) + ' agents', tone: (counts.agents || 0) > 0 ? 'success' : 'neutral' })
+				+ pillMarkup({ label: String(counts.inlineApps || 0) + ' inline apps', tone: (counts.inlineApps || 0) > 0 ? 'info' : 'neutral' })
+				+ pillMarkup({ label: String(counts.hostedServers || 0) + ' hosted servers', tone: (counts.hostedServers || 0) > 0 ? 'warning' : 'neutral' })
+				+ pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'success' : 'neutral' }),
+			'</div>',
+			'<div class="connections-summary-copy">Use this page to confirm PI agents, inline apps, hosted servers, and external MCP clients are live. The slash command prints the same roster in the terminal.</div>',
+		'</section>',
+		'<section class="connections-list">' + (sections.length > 0 ? sections.map(connectionSectionMarkup).join('') : '<div class="connections-empty">No active connections right now.</div>') + '</section>',
+	].join('');
+}
+
 function renderHeader() {
 	const workspace = currentWorkspace();
 	const connection = connectionLabel();
@@ -3178,9 +3723,11 @@ function renderHeader() {
 	if (!currentState) {
 		if (headerTitle) headerTitle.textContent = 'Waiting for Pi Toolshed state';
 		if (headerMeta) headerMeta.textContent = PROJECT_NAME + ' · open /toolshed-web inside Pi to connect this lane.';
-		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : 'Hi, I’m Pi Toolshed';
+		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : PAGE_MODE === 'connections' ? 'Connections' : 'Hi, I’m Pi Toolshed';
 		heroCopy.textContent = PAGE_MODE === 'registry'
 			? 'Open /toolshed-web inside Pi to connect the registry, verify tracked apps, and see what is actually live in the current Toolshed catalog.'
+			: PAGE_MODE === 'connections'
+				? 'Open /toolshed-web inside Pi to inspect which agents, inline apps, hosted servers, and external MCP clients are currently connected.'
 			: 'Open /toolshed-web inside Pi to bind this browser, keep the live lane centered, and run cards from the right rail without replacing the conversation.';
 		heroMeta.textContent = PROJECT_NAME + ' · ' + PROJECT_DIR;
 		headerPills.innerHTML = '';
@@ -3197,12 +3744,27 @@ function renderHeader() {
 	(currentState.status && currentState.status.chips || []).forEach(function(chip){ headerChips.push(pillMarkup(chip)); });
 	if (repo) headerChips.push(pillMarkup({ label: repo.branch + (repo.dirty ? ' · ' + repo.changed + ' dirty' : ' · clean'), tone: repo.dirty ? 'warning' : 'success' }));
 	if (currentState.status && currentState.status.provider && currentState.status.model) headerChips.push(pillMarkup({ label: currentState.status.provider + '/' + currentState.status.model, tone: 'neutral' }));
-	headerPills.innerHTML = PAGE_MODE === 'registry' ? headerChips.join('') : '';
+	if (PAGE_MODE === 'registry') {
+		headerPills.innerHTML = headerChips.join('');
+	} else if (PAGE_MODE === 'connections') {
+		const connections = currentState.connections || {};
+		const counts = connections.counts || {};
+		headerPills.innerHTML = [
+			pillMarkup({ label: String(counts.agents || 0) + ' agents', tone: (counts.agents || 0) > 0 ? 'success' : 'neutral' }),
+			pillMarkup({ label: String(counts.inlineApps || 0) + ' inline apps', tone: (counts.inlineApps || 0) > 0 ? 'info' : 'neutral' }),
+			pillMarkup({ label: String(counts.hostedServers || 0) + ' hosted servers', tone: (counts.hostedServers || 0) > 0 ? 'warning' : 'neutral' }),
+			pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'success' : 'neutral' }),
+		].join('');
+	} else {
+		headerPills.innerHTML = '';
+	}
 	if (headerTitle) headerTitle.textContent = workspace ? workspace.title : 'Pi Toolshed';
 	if (workspace) {
-		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : workspace.title;
+		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : PAGE_MODE === 'connections' ? 'Connections' : workspace.title;
 		heroCopy.textContent = PAGE_MODE === 'registry'
 			? 'Rebuild, redeploy, and verify tracked MCP apps here. When you go back to the lane, the live Toolshed catalog reflects what this page marked as live.'
+			: PAGE_MODE === 'connections'
+				? 'Inspect which PI agents, inline apps, hosted servers, and external MCP clients are connected right now. The view stays live as Toolshed changes.'
 			: workspace.description;
 			if (PAGE_MODE === 'registry') {
 				const registry = currentState.registry || {};
@@ -3211,19 +3773,33 @@ function renderHeader() {
 					pillMarkup({ label: String(registry.liveCount || 0) + ' live', tone: (registry.liveCount || 0) > 0 ? 'success' : 'neutral' }),
 					pillMarkup({ label: String(registry.staleCount || 0) + ' stale', tone: (registry.staleCount || 0) > 0 ? 'warning' : 'neutral' }),
 				].join('');
+				quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a><a class="btn card-pill-btn" href="/connections">Connections</a>';
+			} else if (PAGE_MODE === 'connections') {
+				const connections = currentState.connections || {};
+				const counts = connections.counts || {};
+				heroPills.innerHTML = [
+					pillMarkup({ label: String(counts.total || 0) + ' active', tone: (counts.total || 0) > 0 ? 'success' : 'neutral' }),
+					pillMarkup({ label: String(counts.agents || 0) + ' agents', tone: (counts.agents || 0) > 0 ? 'info' : 'neutral' }),
+					pillMarkup({ label: String(counts.inlineApps || 0) + ' inline apps', tone: (counts.inlineApps || 0) > 0 ? 'info' : 'neutral' }),
+					pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'warning' : 'neutral' }),
+				].join('');
 				quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a>';
 			} else {
 				heroPills.innerHTML = '';
-				quickActions.innerHTML = (workspace.quickActions || []).map(function(action){ return actionButtonMarkup(action); }).join('');
+				const actions = ['<a class="btn card-pill-btn" href="/connections">Connections</a>']
+					.concat((workspace.quickActions || []).map(function(action){ return actionButtonMarkup(action); }));
+				quickActions.innerHTML = actions.join('');
 			}
 		}
 	const updated = currentState.updatedAt ? 'Updated ' + relativeTime(currentState.updatedAt) : 'No timestamp';
 	const frontier = currentState.frontier && currentState.frontier.summary ? currentState.frontier.summary : 'No frontier yet.';
 		if (headerMeta) headerMeta.textContent = PROJECT_NAME + ' · ' + updated;
 		heroMeta.textContent = PROJECT_NAME + ' · ' + updated + ' · Frontier: ' + frontier;
-		if (composerTitle) composerTitle.textContent = PAGE_MODE === 'registry' ? 'Registry actions' : (workspace ? workspace.title + ' deck' : 'Toolshed cards');
+		if (composerTitle) composerTitle.textContent = PAGE_MODE === 'registry' ? 'Registry actions' : PAGE_MODE === 'connections' ? 'Connection roster' : (workspace ? workspace.title + ' deck' : 'Toolshed cards');
 		if (composerSubtitle) composerSubtitle.textContent = PAGE_MODE === 'registry'
 			? 'Use registry actions above to rebuild or redeploy tracked apps. Return to the lane when you want to use the live catalog.'
+			: PAGE_MODE === 'connections'
+				? 'Use the roster to see which PI agents, inline apps, hosted servers, and external MCP clients are active right now.'
 			: 'The composer stays primary. Cards mirror and extend the lane; they do not replace it.';
 }
 
@@ -3298,9 +3874,17 @@ function renderState(state) {
 		if (lane) lane.hidden = true;
 		if (floatLayer) floatLayer.hidden = true;
 		if (registryView) registryView.hidden = false;
+		if (connectionsView) connectionsView.hidden = true;
 		renderRegistry();
+	} else if (PAGE_MODE === 'connections') {
+		if (lane) lane.hidden = true;
+		if (floatLayer) floatLayer.hidden = true;
+		if (registryView) registryView.hidden = true;
+		if (connectionsView) connectionsView.hidden = false;
+		renderConnections();
 	} else {
 		if (registryView) registryView.hidden = true;
+		if (connectionsView) connectionsView.hidden = true;
 		if (lane) lane.hidden = false;
 		if (floatLayer) floatLayer.hidden = false;
 		renderLane();
@@ -3579,7 +4163,7 @@ document.addEventListener('click', function(event) {
 	const openInlineAppButton = event.target.closest('[data-open-inline-app]');
 	if (openInlineAppButton) {
 		addGeneratedAppToLocalLane(openInlineAppButton.getAttribute('data-open-inline-app') || '');
-		if (PAGE_MODE === 'registry') window.location.href = '/';
+		if (PAGE_MODE !== 'lane') window.location.href = '/';
 		return;
 	}
 	const registryActionButton = event.target.closest('[data-registry-action][data-card-id]');
@@ -3898,6 +4482,7 @@ function renderPage(pageMode = "lane") {
 						"<nav class=\"page-nav\" aria-label=\"Toolshed views\">",
 							"<a class=\"page-nav-link" + (pageMode === "lane" ? " active" : "") + "\" href=\"/\">Lane</a>",
 							"<a class=\"page-nav-link" + (pageMode === "registry" ? " active" : "") + "\" href=\"/registry\">Registry</a>",
+							"<a class=\"page-nav-link" + (pageMode === "connections" ? " active" : "") + "\" href=\"/connections\">Connections</a>",
 						"</nav>",
 						"<div id=\"headerPills\" class=\"header-pills\"></div>",
 					"</section>",
@@ -3917,6 +4502,7 @@ function renderPage(pageMode = "lane") {
 					"</section>",
 					"<section id=\"lane\" class=\"lane\"></section>",
 					"<section id=\"registryView\" class=\"registry-view\"" + (pageMode === "registry" ? "" : " hidden") + "></section>",
+					"<section id=\"connectionsView\" class=\"connections-view\"" + (pageMode === "connections" ? "" : " hidden") + "></section>",
 					"<div id=\"floatLayer\" class=\"float-layer\"></div>",
 				"</section>",
 				"<aside id=\"rightDock\" class=\"dock right-dock\"><div class=\"dock-empty\">Waiting for telemetry widgets…</div></aside>",
@@ -3997,6 +4583,14 @@ const server = http.createServer((req, res) => {
 		return;
 	}
 	if (requestUrl.pathname === "/api/version") return sendJson(res, 200, { version: SCRIPT_VERSION, projectDir, projectName });
+	if (requestUrl.pathname === "/api/connections") {
+		try {
+			return sendJson(res, 200, buildConnectionsState());
+		} catch (error) {
+			console.warn("[toolshed] failed to serve connections state:", error && error.message ? error.message : error);
+			return sendJson(res, 500, { success: false, error: "Failed to build connections state", connections: emptyConnectionsState() });
+		}
+	}
 	if (requestUrl.pathname === "/api/state") return sendJson(res, 200, readState());
 	if (requestUrl.pathname === "/events") {
 		res.writeHead(200, {
@@ -4120,6 +4714,7 @@ const server = http.createServer((req, res) => {
 	}
 	if (requestUrl.pathname === "/") return sendText(res, 200, renderPage("lane"));
 	if (requestUrl.pathname === "/registry") return sendText(res, 200, renderPage("registry"));
+	if (requestUrl.pathname === "/connections") return sendText(res, 200, renderPage("connections"));
 	if (requestUrl.pathname === "/favicon.ico") return sendText(res, 204, "", "text/plain");
 	return sendJson(res, 404, { success: false, error: "Not found" });
 });

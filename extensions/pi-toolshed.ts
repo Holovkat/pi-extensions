@@ -532,6 +532,7 @@ const STATIC_SLASH_COMMANDS: ToolshedSlashCommand[] = [
 	{ id: "blueprint-prd", label: "/blueprint-prd", command: "/blueprint-prd", description: "Open the current PRD from Blueprint.", category: "toolshed" },
 	{ id: "toolshed-web", label: "/toolshed-web", command: "/toolshed-web", description: "Open the Toolshed web workspace.", category: "toolshed" },
 	{ id: "toolshed-status", label: "/toolshed-status", command: "/toolshed-status", description: "Show Toolshed session status in the terminal.", category: "toolshed" },
+	{ id: "toolshed-connections", label: "/toolshed-connections", command: "/toolshed-connections", description: "Show the live PI connection roster.", category: "toolshed" },
 	{ id: "toolshed-app", label: "/toolshed-app", command: "/toolshed-app", description: "Create or update a tracked MCP app through a guided wizard.", category: "toolshed" },
 	{ id: "toolshed-freeze", label: "/toolshed-freeze", command: "/toolshed-freeze", description: "Freeze the current frontier into a packet.", category: "toolshed" },
 	{ id: "toolshed-packets", label: "/toolshed-packets", command: "/toolshed-packets", description: "List the current packet queue.", category: "toolshed" },
@@ -1174,7 +1175,7 @@ function resolveInlineGithubBoardMatchedCards(
 			? getGithubBoardColumnCards(session, targetColumn)
 			: getGithubBoardAllCards(session);
 	if (requestedTypes.length > 0) {
-		return scopeCards.filter((card) => requestedTypes.includes(inferGithubBoardCardType(card)));
+		return scopeCards.filter((card) => requestedTypes.includes(inferGithubBoardCardType(card) as "task" | "epic" | "sprint"));
 	}
 	if (options?.matchedIssueNumbers && options.matchedIssueNumbers.length > 0) return scopeCards;
 	if (targetColumn) return scopeCards;
@@ -3921,6 +3922,65 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(lines.join("\n"), "info");
 	}
 
+	function readToolshedConnections(ctx: ExtensionContext): any | null {
+		ensureToolshedWebServer(ctx);
+		if (!toolshedWebUrl) return null;
+		try {
+			const raw = execSync(`curl -fsS '${toolshedWebUrl}/api/connections'`, { encoding: "utf-8" }).trim();
+			if (!raw) return null;
+			return JSON.parse(raw);
+		} catch {
+			return null;
+		}
+	}
+
+	function relativeClock(value: any): string {
+		const when = value ? new Date(value) : null;
+		if (!when || Number.isNaN(when.getTime())) return "unknown";
+		const ms = Date.now() - when.getTime();
+		const abs = Math.abs(ms);
+		const suffix = ms >= 0 ? "ago" : "from now";
+		if (abs < 60_000) return "just now";
+		if (abs < 3_600_000) return `${Math.round(abs / 60_000)}m ${suffix}`;
+		if (abs < 86_400_000) return `${Math.round(abs / 3_600_000)}h ${suffix}`;
+		return `${Math.round(abs / 86_400_000)}d ${suffix}`;
+	}
+
+	function formatConnectionLine(section: any): string {
+		const entries = Array.isArray(section?.entries) ? section.entries : [];
+		if (entries.length === 0) return `${section?.title || "Connections"}: none`;
+		const shown = entries.slice(0, 3).map((entry: any) => {
+			const title = String(entry?.title || entry?.id || "connection").trim();
+			const brief = String(entry?.brief || "").trim();
+			const status = String(entry?.statusLabel || "").trim();
+			const touched = relativeClock(entry?.lastTouchedAt || entry?.openedAt);
+			const statusPart = status ? ` (${status})` : "";
+			const briefPart = brief ? ` — ${brief}` : "";
+			const timePart = touched ? ` · ${touched}` : "";
+			return `${title}${statusPart}${briefPart}${timePart}`;
+		});
+		const suffix = entries.length > 3 ? ` +${entries.length - 3} more` : "";
+		return `${section?.title || "Connections"}: ${shown.join(" · ")}${suffix}`;
+	}
+
+	function showToolshedConnections(ctx: ExtensionContext) {
+		const connections = readToolshedConnections(ctx);
+		if (!connections) {
+			ctx.ui.notify("Unable to read the live Toolshed connections roster right now.", "warning");
+			return;
+		}
+		const rosterUrl = toolshedWebUrl || `http://127.0.0.1:${TOOLSHED_WEB_PORT}`;
+		const counts = connections.counts || {};
+		const sections = Array.isArray(connections.sections) ? connections.sections : [];
+		const lines = [
+			`Connections: ${connections.summary || "No active connections right now."}`,
+			`Agents: ${String(counts.agents || 0)} · Inline apps: ${String(counts.inlineApps || 0)} · Hosted servers: ${String(counts.hostedServers || 0)} · External sessions: ${String(counts.externalSessions || 0)}`,
+			`Roster: ${rosterUrl}/connections`,
+		];
+		for (const section of sections) lines.push(formatConnectionLine(section));
+		ctx.ui.notify(lines.join("\n"), "info");
+	}
+
 	function showToolshedPackets(ctx: ExtensionContext) {
 		if (persistedState.packets.length === 0) {
 			ctx.ui.notify("No Toolshed packets are staged yet.", "info");
@@ -4013,6 +4073,9 @@ export default function (pi: ExtensionAPI) {
 				return true;
 			case "toolshed-status":
 				showToolshedStatus(ctx);
+				return true;
+			case "toolshed-connections":
+				showToolshedConnections(ctx);
 				return true;
 			case "toolshed-app":
 				if (source === "web" && !parsed.args) {
@@ -5214,6 +5277,13 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("toolshed-connections", {
+		description: "Show the live PI connection roster",
+		handler: async (_args, ctx) => {
+			showToolshedConnections(ctx);
+		},
+	});
+
 	pi.registerCommand("toolshed-app", {
 		description: "Create or update a tracked MCP app through a guided wizard",
 		handler: async (args, ctx) => {
@@ -5276,6 +5346,7 @@ export default function (pi: ExtensionAPI) {
 				"Commands:",
 				"  /toolshed-web          Open the web workspace",
 				"  /toolshed-status       Show current Toolshed state",
+				"  /toolshed-connections  Show the live PI connection roster",
 				"  /toolshed-app          Create or update a tracked MCP app through a guided wizard",
 				"  /toolshed-workspace    Switch card decks",
 				"  /toolshed-freeze       Freeze the current frontier into a packet",
