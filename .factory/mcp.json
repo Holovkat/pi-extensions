@@ -1,8 +1,4 @@
 {
-  "settings": {
-    "toolPrefix": "server",
-    "idleTimeout": 10
-  },
   "mcpServers": {
     "jcodemunch": {
       "type": "stdio",

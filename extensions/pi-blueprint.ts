@@ -983,15 +983,21 @@ function getExtensionRepoRoot(): string {
 }
 
 function getProjectMcpSummary(cwd: string): { configured: boolean; count: number } {
-	const path = join(cwd, ".mcp.json");
-	if (!existsSync(path)) return { configured: false, count: 0 };
-	try {
-		const raw = JSON.parse(readFileSync(path, "utf-8"));
-		const servers = raw?.mcpServers && typeof raw.mcpServers === "object" ? Object.keys(raw.mcpServers) : [];
-		return { configured: servers.length > 0, count: servers.length };
-	} catch {
-		return { configured: true, count: 0 };
+	const paths = [join(cwd, ".mcp.json"), join(cwd, ".factory", "mcp.json")];
+	const servers = new Set<string>();
+	let foundConfig = false;
+	for (const path of paths) {
+		if (!existsSync(path)) continue;
+		foundConfig = true;
+		try {
+			const raw = JSON.parse(readFileSync(path, "utf-8"));
+			const source = raw?.mcpServers && typeof raw.mcpServers === "object" ? Object.keys(raw.mcpServers) : [];
+			for (const server of source) servers.add(server);
+		} catch {
+			return { configured: true, count: servers.size };
+		}
 	}
+	return { configured: foundConfig, count: servers.size };
 }
 
 function getBlueprintWebScriptPath(sourceRoot: string): string {
@@ -4910,7 +4916,7 @@ ONLY when the user explicitly says they're happy / ready / "looks good" / "gener
 		const mcpSummary = getProjectMcpSummary(ctx.cwd);
 		ctx.ui.notify(
 			`Commands:\n` +
-			`  /mcp                    Show MCP servers and tools${mcpSummary.configured ? ` (${mcpSummary.count} configured in .mcp.json)` : ""}\n` +
+			`  /mcp                    Show MCP servers and tools${mcpSummary.configured ? ` (${mcpSummary.count} configured in project MCP config)` : ""}\n` +
 			`  /blueprint-status       Current session status\n` +
 			`  /blueprint-history      Consultation history\n` +
 			`  /blueprint-logs         Open all specialist logs in tmux\n` +

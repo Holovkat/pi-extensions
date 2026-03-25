@@ -1627,53 +1627,102 @@ function scanSkillCatalog(cwd: string, extensionRepoRoot: string): ToolshedSkill
 	return [...skills.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
 
+const PROJECT_MCP_CONFIG_RELATIVE_PATH = join(".factory", "mcp.json").replace(/\\/g, "/");
+const LEGACY_PROJECT_MCP_CONFIG_RELATIVE_PATH = ".mcp.json";
+
+function getProjectMcpConfigSources(cwd: string): Array<{
+	filePath: string;
+	relativePath: string;
+	exists: boolean;
+	raw: any;
+	servers: Record<string, any>;
+	parseError: boolean;
+}> {
+	return [
+		{ filePath: join(cwd, LEGACY_PROJECT_MCP_CONFIG_RELATIVE_PATH), relativePath: LEGACY_PROJECT_MCP_CONFIG_RELATIVE_PATH },
+		{ filePath: join(cwd, PROJECT_MCP_CONFIG_RELATIVE_PATH), relativePath: PROJECT_MCP_CONFIG_RELATIVE_PATH },
+	].map((candidate) => {
+		if (!existsSync(candidate.filePath)) {
+			return {
+				...candidate,
+				exists: false,
+				raw: null,
+				servers: {},
+				parseError: false,
+			};
+		}
+		try {
+			const raw = JSON.parse(readFileSync(candidate.filePath, "utf-8"));
+			const servers = raw?.mcpServers && typeof raw.mcpServers === "object" ? { ...raw.mcpServers } : {};
+			return {
+				...candidate,
+				exists: true,
+				raw,
+				servers,
+				parseError: false,
+			};
+		} catch {
+			return {
+				...candidate,
+				exists: true,
+				raw: null,
+				servers: {},
+				parseError: true,
+			};
+		}
+	});
+}
+
+function writeProjectMcpConfigFile(filePath: string, raw: any) {
+	mkdirSync(dirname(filePath), { recursive: true });
+	writeFileSync(filePath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+}
+
 function readProjectMcpState(cwd: string): ToolshedMcpState {
-	const filePath = join(cwd, ".mcp.json");
-	if (!existsSync(filePath)) {
+	const sources = getProjectMcpConfigSources(cwd);
+	const preferredFilePath = join(cwd, PROJECT_MCP_CONFIG_RELATIVE_PATH);
+	const mergedSource = Object.assign({}, ...sources.map((source) => source.servers));
+	const servers = Object.entries(mergedSource).map(([id, config]: [string, any]) => {
+		const transport = config?.url ? "remote-http" : config?.command ? "stdio" : "configured";
+		const detail = config?.url || [config?.command, ...(Array.isArray(config?.args) ? config.args : [])].filter(Boolean).join(" ") || "Configured";
+		const authConfigured = Boolean(config?.env || config?.headers || config?.bearerToken || config?.apiKey);
+		const toolHints = Array.isArray(config?.tools) ? config.tools.map((tool: any) => String(tool)) : [];
+		const status = authConfigured || transport === "stdio" ? "ready" : "configured";
+		return {
+			id,
+			label: humanize(id),
+			transport,
+			detail: excerptText(detail, 120),
+			status,
+			tone: status === "ready" ? "success" : "info",
+			authConfigured,
+			toolHints,
+		} as ToolshedMcpServerState;
+	});
+	const parseErrors = sources.filter((source) => source.parseError).map((source) => source.relativePath);
+	if (!sources.some((source) => source.exists)) {
 		return {
 			configured: false,
 			count: 0,
 			summary: "No project MCP configuration detected.",
-			filePath,
+			filePath: preferredFilePath,
 			servers: [],
 		};
 	}
-	try {
-		const raw = JSON.parse(readFileSync(filePath, "utf-8"));
-		const source = raw?.mcpServers && typeof raw.mcpServers === "object" ? raw.mcpServers : {};
-		const servers = Object.entries(source).map(([id, config]: [string, any]) => {
-			const transport = config?.url ? "remote-http" : config?.command ? "stdio" : "configured";
-			const detail = config?.url || [config?.command, ...(Array.isArray(config?.args) ? config.args : [])].filter(Boolean).join(" ") || "Configured";
-			const authConfigured = Boolean(config?.env || config?.headers || config?.bearerToken || config?.apiKey);
-			const toolHints = Array.isArray(config?.tools) ? config.tools.map((tool: any) => String(tool)) : [];
-			const status = authConfigured || transport === "stdio" ? "ready" : "configured";
-			return {
-				id,
-				label: humanize(id),
-				transport,
-				detail: excerptText(detail, 120),
-				status,
-				tone: status === "ready" ? "success" : "info",
-				authConfigured,
-				toolHints,
-			} as ToolshedMcpServerState;
-		});
-		return {
-			configured: servers.length > 0,
-			count: servers.length,
-			summary: servers.length > 0 ? `${servers.length} MCP server${servers.length === 1 ? "" : "s"} configured.` : "MCP file found but no servers were configured.",
-			filePath,
-			servers: servers.sort((a, b) => a.label.localeCompare(b.label)),
-		};
-	} catch {
-		return {
-			configured: true,
-			count: 0,
-			summary: "Unable to parse .mcp.json.",
-			filePath,
-			servers: [],
-		};
-	}
+	const hasProjectConfig = sources.some((source) => source.exists);
+	return {
+		configured: hasProjectConfig,
+		count: servers.length,
+		summary: parseErrors.length > 0
+			? servers.length > 0
+				? `${servers.length} MCP server${servers.length === 1 ? "" : "s"} configured. Unable to parse ${parseErrors.join(" and ")}.`
+				: `Unable to parse ${parseErrors.join(" and ")}.`
+			: servers.length > 0
+				? `${servers.length} MCP server${servers.length === 1 ? "" : "s"} configured in project MCP config.`
+				: "Project MCP config found but no servers were configured.",
+		filePath: preferredFilePath,
+		servers: servers.sort((a, b) => a.label.localeCompare(b.label)),
+	};
 }
 
 function buildTrackedMcpServerRegistration(card: ToolshedGeneratedCard): Record<string, any> | null {
@@ -1709,36 +1758,59 @@ function upsertTrackedMcpAppRegistration(card: ToolshedGeneratedCard, cwd: strin
 	if (!serverFile || !existsSync(join(cwd, serverFile))) {
 		return { changed: false, summary: `Tracked server file is missing: ${serverFile || "not configured"}.` };
 	}
-	const filePath = join(cwd, ".mcp.json");
-	let raw: any = {};
-	if (existsSync(filePath)) {
-		try {
-			raw = JSON.parse(readFileSync(filePath, "utf-8"));
-		} catch {
-			return { changed: false, summary: "Unable to parse .mcp.json." };
-		}
+	const sources = getProjectMcpConfigSources(cwd);
+	const legacySource = sources.find((source) => source.relativePath === LEGACY_PROJECT_MCP_CONFIG_RELATIVE_PATH);
+	const preferredSource = sources.find((source) => source.relativePath === PROJECT_MCP_CONFIG_RELATIVE_PATH);
+	if (!legacySource || !preferredSource) {
+		return { changed: false, summary: "Project MCP config locations are unavailable." };
 	}
-	const next = raw && typeof raw === "object" ? { ...raw } : {};
-	const existingSettings = next.settings && typeof next.settings === "object" ? next.settings : {};
-	const nextServers = next.mcpServers && typeof next.mcpServers === "object" ? { ...next.mcpServers } : {};
-	const previous = nextServers[serverId];
-	const previousJson = JSON.stringify(previous || null);
-	next.settings = {
-		toolPrefix: "server",
-		idleTimeout: 10,
-		...existingSettings,
-	};
-	next.mcpServers = {
-		...nextServers,
+	if (preferredSource.parseError) {
+		return { changed: false, summary: `Unable to parse ${preferredSource.relativePath}.` };
+	}
+	if (!preferredSource.exists && legacySource.parseError) {
+		return { changed: false, summary: `Unable to parse ${legacySource.relativePath}.` };
+	}
+	const nextPreferred = preferredSource.exists
+		? preferredSource.raw && typeof preferredSource.raw === "object" ? { ...preferredSource.raw } : {}
+		: { mcpServers: { ...legacySource.servers } };
+	const nextPreferredServers = nextPreferred.mcpServers && typeof nextPreferred.mcpServers === "object" ? { ...nextPreferred.mcpServers } : {};
+	const preferredPreviousJson = JSON.stringify(nextPreferredServers[serverId] || null);
+	nextPreferred.mcpServers = {
+		...nextPreferredServers,
 		[serverId]: registration,
 	};
-	const changed = previousJson !== JSON.stringify(registration);
-	if (changed || !existsSync(filePath)) {
-		writeFileSync(filePath, JSON.stringify(next, null, 2) + "\n", "utf-8");
+	const preferredChanged = preferredPreviousJson !== JSON.stringify(registration) || !preferredSource.exists;
+	if (preferredChanged) writeProjectMcpConfigFile(preferredSource.filePath, nextPreferred);
+	let legacyChanged = false;
+	if (legacySource.exists) {
+		if (legacySource.parseError) {
+			return {
+				changed: preferredChanged,
+				summary: preferredChanged
+					? `Updated ${preferredSource.relativePath} registration for ${serverId}, but ${legacySource.relativePath} could not be parsed.`
+					: `Unable to parse ${legacySource.relativePath}.`,
+			};
+		}
+		const nextLegacy = legacySource.raw && typeof legacySource.raw === "object" ? { ...legacySource.raw } : {};
+		const existingSettings = nextLegacy.settings && typeof nextLegacy.settings === "object" ? nextLegacy.settings : {};
+		const nextLegacyServers = nextLegacy.mcpServers && typeof nextLegacy.mcpServers === "object" ? { ...nextLegacy.mcpServers } : {};
+		const legacyPreviousJson = JSON.stringify(nextLegacyServers[serverId] || null);
+		nextLegacy.settings = {
+			toolPrefix: "server",
+			idleTimeout: 10,
+			...existingSettings,
+		};
+		nextLegacy.mcpServers = {
+			...nextLegacyServers,
+			[serverId]: registration,
+		};
+		legacyChanged = legacyPreviousJson !== JSON.stringify(registration);
+		if (legacyChanged) writeProjectMcpConfigFile(legacySource.filePath, nextLegacy);
 	}
+	const changed = preferredChanged || legacyChanged;
 	return {
-		changed: changed || !existsSync(filePath),
-		summary: changed ? `Updated .mcp.json registration for ${serverId}.` : `MCP registration already matches ${serverId}.`,
+		changed,
+		summary: changed ? `Updated project MCP registration for ${serverId}.` : `Project MCP registration already matches ${serverId}.`,
 	};
 }
 
@@ -2852,7 +2924,7 @@ export default function (pi: ExtensionAPI) {
 			"- {{viewFile}}",
 			"- {{artifactDir}}",
 			"Keep the experience inline-first and extend the existing app instead of rebuilding it.",
-			"If runtime wiring is ready, register server id {{serverId}} in .mcp.json.",
+			"If runtime wiring is ready, register server id {{serverId}} in the project MCP config (.factory/mcp.json).",
 			"Project:",
 			"{{projectName}} ({{projectDir}})",
 			"Return:",
@@ -3222,8 +3294,8 @@ export default function (pi: ExtensionAPI) {
 			if (viewCheckError) failures.push(`View syntax check failed: ${viewCheckError}`);
 			else details.push(`View syntax check passed: ${card.viewFile}`);
 		}
-		if (registered) details.push(`Registered in .mcp.json as ${card.serverId || "tracked server"}`);
-		else failures.push(`Missing MCP registration for ${card.serverId || "tracked server"} in .mcp.json`);
+		if (registered) details.push(`Registered in project MCP config as ${card.serverId || "tracked server"}`);
+		else failures.push(`Missing project MCP registration for ${card.serverId || "tracked server"}`);
 
 		const anyArtifactsPresent = fileState.serverExists || fileState.viewExists || registered;
 		if (card.pendingBuildAt && !latestResult) {
@@ -3377,7 +3449,7 @@ export default function (pi: ExtensionAPI) {
 				"Toolshed marked this app as live for the current workspace catalog.",
 				`Server: ${deployed.serverId || "not configured"}`,
 				`Tool: ${deployed.toolName || "not configured"}`,
-				`Published: ${isTrackedMcpCardRegistered(deployed, mcp) ? "registered in .mcp.json" : "missing .mcp.json registration"}`,
+				`Published: ${isTrackedMcpCardRegistered(deployed, mcp) ? "registered in project MCP config" : "missing project MCP registration"}`,
 			].join("\n"),
 			summary: `${deployed.title} is now live in the Toolshed registry.`,
 			tone: "success",
@@ -4544,8 +4616,8 @@ export default function (pi: ExtensionAPI) {
 				publishedStatus: published ? "published" : "missing",
 				publishedLabel: published ? "Published" : "Not published",
 				publishedSummary: published
-					? `Registered in .mcp.json as ${card.serverId || "tracked server"}.`
-					: `Missing .mcp.json registration for ${card.serverId || "tracked server"}.`,
+					? `Registered in project MCP config as ${card.serverId || "tracked server"}.`
+					: `Missing project MCP registration for ${card.serverId || "tracked server"}.`,
 				updatedAt: card.updatedAt,
 				lastRunAt: card.lastRunAt || null,
 				lastRunInput: card.lastRunInput || null,

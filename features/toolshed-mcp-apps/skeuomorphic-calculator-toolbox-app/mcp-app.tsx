@@ -174,6 +174,25 @@ export const html = String.raw`<!doctype html>
         gap: 8px;
       }
 
+      .screen-banner-badge {
+        align-self: flex-start;
+        padding: 4px 10px;
+        border-radius: 999px;
+        font-size: 10px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        background: color-mix(in oklch, var(--foreground) 12%, transparent);
+        color: color-mix(in oklch, var(--screen-foreground) 72%, white 28%);
+        border: 1px solid color-mix(in oklch, var(--foreground) 16%, transparent);
+      }
+
+      .screen-banner {
+        font-size: 13px;
+        line-height: 1.5;
+        color: color-mix(in oklch, var(--screen-foreground) 80%, white 20%);
+        text-wrap: balance;
+      }
+
       .expression {
         min-height: 20px;
         font-size: 14px;
@@ -378,6 +397,8 @@ export const html = String.raw`<!doctype html>
           </div>
 
           <div class="screen">
+            <div id="panelBadge" class="screen-banner-badge" hidden></div>
+            <div id="panelMessage" class="screen-banner" hidden></div>
             <div id="expression" class="expression"></div>
             <div id="display" class="display">0</div>
             <div id="subdisplay" class="subdisplay">Ready</div>
@@ -442,11 +463,15 @@ export const html = String.raw`<!doctype html>
         sessionId: "",
         display: "0",
         expression: "",
+        panelLabel: "",
+        panelMessage: "",
         history: [],
         steps: [],
         updatedAt: "",
       };
 
+      const $panelBadge = document.getElementById("panelBadge");
+      const $panelMessage = document.getElementById("panelMessage");
       const $display = document.getElementById("display");
       const $expression = document.getElementById("expression");
       const $subdisplay = document.getElementById("subdisplay");
@@ -454,32 +479,26 @@ export const html = String.raw`<!doctype html>
       const $steps = document.getElementById("steps");
       const $status = document.getElementById("status");
       const $sessionId = document.getElementById("sessionId");
-      const app = window.openai || window.app || window.mcp?.app;
-      const initialTheme = new URLSearchParams(window.location.search).get('theme');
-      if (initialTheme === 'light') {
-        document.body.classList.add('light');
+      const initialTheme = new URLSearchParams(window.location.search).get("theme");
+      let toolshedBridgeAttached = false;
+
+      if (initialTheme === "light") {
+        document.body.classList.add("light");
       }
 
-      function render() {
-        $display.textContent = state.display || "0";
-        $expression.textContent = state.expression || "";
-        $subdisplay.textContent = state.updatedAt ? "Updated " + new Date(state.updatedAt).toLocaleTimeString() : "Ready";
-        $sessionId.textContent = state.sessionId ? "Session: " + state.sessionId : "Waiting for session…";
-
-        if (!Array.isArray(state.steps) || state.steps.length === 0) {
-          $steps.innerHTML = '<div class="hint muted">No calculation steps yet.</div>';
-        } else {
-          $steps.innerHTML = state.steps.map((entry) => {
-            return '<div class="history-item"><strong>' + escapeHtml(entry.label || entry.key || '') + '</strong><div>' + escapeHtml(entry.expression || entry.display || '') + '</div><div>= ' + escapeHtml(entry.display || '') + '</div></div>';
-          }).join("");
+      function getOpenAI() {
+        try {
+          return window.openai || null;
+        } catch {
+          return null;
         }
+      }
 
-        if (!Array.isArray(state.history) || state.history.length === 0) {
-          $history.innerHTML = '<div class="hint muted">No completed calculations yet.</div>';
-        } else {
-          $history.innerHTML = state.history.map((entry) => {
-            return '<div class="history-item"><strong>' + escapeHtml(entry.expression) + '</strong><div>= ' + escapeHtml(entry.result) + '</div></div>';
-          }).join("");
+      function getToolshedApp() {
+        try {
+          return window.app || window.mcp?.app || null;
+        } catch {
+          return null;
         }
       }
 
@@ -492,90 +511,240 @@ export const html = String.raw`<!doctype html>
           .replace(/'/g, "&#39;");
       }
 
+      function updateTheme(theme) {
+        if (theme === "light") document.body.classList.add("light");
+        else if (theme === "dark") document.body.classList.remove("light");
+      }
+
+      function setOkStatus(label, detail) {
+        const suffix = detail ? " · " + escapeHtml(detail) : "";
+        $status.innerHTML = '<span class="status-ok">' + escapeHtml(label) + "</span>" + suffix;
+      }
+
+      function renderList(container, items, emptyText, buildItem) {
+        if (!Array.isArray(items) || items.length === 0) {
+          container.innerHTML = '<div class="hint muted">' + escapeHtml(emptyText) + "</div>";
+          return;
+        }
+        container.innerHTML = items.map(buildItem).join("");
+      }
+
+      function render() {
+        if (state.panelLabel) {
+          $panelBadge.hidden = false;
+          $panelBadge.textContent = state.panelLabel;
+        } else {
+          $panelBadge.hidden = true;
+          $panelBadge.textContent = "";
+        }
+
+        if (state.panelMessage) {
+          $panelMessage.hidden = false;
+          $panelMessage.textContent = state.panelMessage;
+        } else {
+          $panelMessage.hidden = true;
+          $panelMessage.textContent = "";
+        }
+
+        $display.textContent = state.display || "0";
+        $expression.textContent = state.expression || "";
+        $subdisplay.textContent = state.updatedAt ? "Updated " + new Date(state.updatedAt).toLocaleTimeString() : "Ready";
+        $sessionId.textContent = state.sessionId ? "Session: " + state.sessionId : "Waiting for session…";
+
+        renderList($steps, state.steps, "No calculation steps yet.", (entry) => {
+          return '<div class="history-item"><strong>' + escapeHtml(entry?.label || entry?.key || "") + "</strong><div>" + escapeHtml(entry?.expression || entry?.display || "") + "</div><div>= " + escapeHtml(entry?.display || "") + "</div></div>";
+        });
+
+        renderList($history, state.history, "No completed calculations yet.", (entry) => {
+          return '<div class="history-item"><strong>' + escapeHtml(entry?.expression || "") + "</strong><div>= " + escapeHtml(entry?.result || "") + "</div></div>";
+        });
+      }
+
+      function normalizePayload(payload) {
+        const source = payload?.structuredContent || payload || null;
+        if (!source || typeof source !== "object") return null;
+        if (source.session && typeof source.session === "object") {
+          return source.session;
+        }
+        return source;
+      }
+
       function applyPayload(payload) {
-        const next = payload?.structuredContent || payload || {};
-        if (!next || typeof next !== "object") return;
-        state.sessionId = next.sessionId || state.sessionId;
-        state.display = next.display || state.display;
-        state.expression = next.expression || "";
-        state.history = Array.isArray(next.history) ? next.history : [];
-        state.steps = Array.isArray(next.steps) ? next.steps : [];
-        state.updatedAt = next.updatedAt || "";
+        const next = normalizePayload(payload);
+        if (!next) return false;
+
+        if (typeof next.sessionId === "string" && next.sessionId) {
+          state.sessionId = next.sessionId;
+        }
+        if (Object.prototype.hasOwnProperty.call(next, "display")) {
+          state.display = String(next.display ?? "0");
+        }
+        if (Object.prototype.hasOwnProperty.call(next, "expression")) {
+          state.expression = next.expression ? String(next.expression) : "";
+        }
+        if (Object.prototype.hasOwnProperty.call(next, "panelLabel")) {
+          state.panelLabel = next.panelLabel ? String(next.panelLabel) : "";
+        }
+        if (Object.prototype.hasOwnProperty.call(next, "panelMessage")) {
+          state.panelMessage = next.panelMessage ? String(next.panelMessage) : "";
+        }
+        if (Array.isArray(next.history)) {
+          state.history = next.history;
+        }
+        if (Array.isArray(next.steps)) {
+          state.steps = next.steps;
+        }
+        if (typeof next.updatedAt === "string") {
+          state.updatedAt = next.updatedAt;
+        }
+
         render();
+        return true;
       }
 
-      async function syncModelContext() {
-        if (!app?.updateModelContext || !state.sessionId) return;
-        try {
-          const latest = state.history && state.history[0];
-          const latestStep = state.steps && state.steps[0];
-          const summary = latest
-            ? 'Calculator display: ' + state.display + '. Recent calculation: ' + latest.expression + ' = ' + latest.result + '.' + (latestStep ? ' Latest step: ' + latestStep.label + '.' : '')
-            : 'Calculator display: ' + state.display + '.' + (latestStep ? ' Latest step: ' + latestStep.label + '.' : ' No completed calculations yet.');
-          await app.updateModelContext({ text: summary });
-        } catch {}
-      }
+      function hydrateFromGlobals(globals) {
+        if (!globals || typeof globals !== "object") return false;
+        updateTheme(globals.theme);
 
-      async function press(key) {
-        if (!app?.callServerTool || !state.sessionId) return;
-        $status.textContent = 'Applying ' + key + '…';
-        try {
-          const result = await app.callServerTool({
-            name: 'calculator_press_key',
-            arguments: { sessionId: state.sessionId, key },
-          });
-          applyPayload(result);
-          $status.innerHTML = '<span class="status-ok">Ready</span> · ' + escapeHtml(key) + ' applied';
-          await syncModelContext();
-        } catch (error) {
-          $status.textContent = 'Unable to apply key: ' + (error?.message || String(error));
+        let updated = false;
+        if (globals.widgetState) {
+          updated = applyPayload(globals.widgetState) || updated;
         }
-      }
-
-      async function sendQuestion(text) {
-        if (!app?.sendMessage) return;
-        try {
-          await app.sendMessage({
-            role: 'user',
-            content: [{ type: 'text', text }],
-          });
-        } catch (error) {
-          $status.textContent = 'Unable to message chat: ' + (error?.message || String(error));
+        if (globals.toolInput && !globals.toolOutput) {
+          updated = applyPayload(globals.toolInput) || updated;
+          setOkStatus("Host attached", "waiting for result");
         }
+        if (globals.toolOutput) {
+          updated = applyPayload({ structuredContent: globals.toolOutput }) || updated;
+          setOkStatus("Ready", "calculator connected");
+        }
+        return updated;
       }
 
-      document.getElementById('keypad').addEventListener('click', (event) => {
-        const target = event.target.closest('button[data-key]');
-        if (!target) return;
-        press(target.getAttribute('data-key'));
-      });
+      function attachToolshedBridge() {
+        const app = getToolshedApp();
+        if (!app || toolshedBridgeAttached) return Boolean(app);
+        toolshedBridgeAttached = true;
 
-      document.getElementById('sendCurrent').addEventListener('click', () => {
-        if (!state.sessionId) return;
-        sendQuestion('Using calculator session ' + state.sessionId + ', what value is currently displayed?');
-      });
-
-      document.getElementById('sendRecent').addEventListener('click', () => {
-        if (!state.sessionId) return;
-        sendQuestion('Using calculator session ' + state.sessionId + ', what is the most recent completed calculation and result?');
-      });
-
-      if (app) {
         app.ontoolinput = async (input) => {
           applyPayload(input);
-          $status.innerHTML = '<span class="status-ok">Host attached</span> · waiting for result';
+          setOkStatus("Host attached", "waiting for result");
         };
 
         app.ontoolresult = async (result) => {
           applyPayload(result);
-          $status.innerHTML = '<span class="status-ok">Ready</span> · calculator connected';
-          await syncModelContext();
+          setOkStatus("Ready", "calculator connected");
         };
-      } else {
-        $status.textContent = 'Host bridge unavailable. Open this from Pi Toolshed.';
+
+        return true;
       }
 
+      async function callHostTool(name, args) {
+        const openai = getOpenAI();
+        if (openai?.callTool) {
+          return await openai.callTool(name, args);
+        }
+
+        const app = getToolshedApp();
+        if (app?.callServerTool) {
+          return await app.callServerTool({ name, arguments: args });
+        }
+
+        throw new Error("No host tool bridge is available.");
+      }
+
+      async function press(key) {
+        if (!state.sessionId) return;
+        $status.textContent = "Applying " + key + "…";
+
+        try {
+          const result = await callHostTool("calculator_press_key", { sessionId: state.sessionId, key });
+          applyPayload(result);
+          setOkStatus("Ready", key + " applied");
+        } catch (error) {
+          $status.textContent = "Unable to apply key: " + (error?.message || String(error));
+        }
+      }
+
+      async function sendQuestion(text) {
+        try {
+          const openai = getOpenAI();
+          if (openai?.sendFollowUpMessage) {
+            await openai.sendFollowUpMessage({ prompt: text, scrollToBottom: true });
+            return;
+          }
+
+          const app = getToolshedApp();
+          if (app?.sendMessage) {
+            await app.sendMessage({
+              role: "user",
+              content: [{ type: "text", text }],
+            });
+            return;
+          }
+
+          throw new Error("No host messaging bridge is available.");
+        } catch (error) {
+          $status.textContent = "Unable to message chat: " + (error?.message || String(error));
+        }
+      }
+
+      function hydrateCurrentHostState() {
+        const openai = getOpenAI();
+        if (openai) {
+          const updated = hydrateFromGlobals({
+            theme: openai.theme,
+            widgetState: openai.widgetState,
+            toolInput: openai.toolInput,
+            toolOutput: openai.toolOutput,
+          });
+          return updated || Boolean(openai.toolInput || openai.toolOutput || openai.widgetState);
+        }
+
+        if (attachToolshedBridge()) {
+          return true;
+        }
+
+        return false;
+      }
+
+      document.getElementById("keypad").addEventListener("click", (event) => {
+        const target = event.target.closest("button[data-key]");
+        if (!target) return;
+        press(target.getAttribute("data-key"));
+      });
+
+      document.getElementById("sendCurrent").addEventListener("click", () => {
+        if (!state.sessionId) return;
+        sendQuestion("Using calculator session " + state.sessionId + ", what value is currently displayed?");
+      });
+
+      document.getElementById("sendRecent").addEventListener("click", () => {
+        if (!state.sessionId) return;
+        sendQuestion("Using calculator session " + state.sessionId + ", what is the most recent completed calculation and result?");
+      });
+
+      window.addEventListener("openai:set_globals", (event) => {
+        hydrateFromGlobals(event.detail?.globals || {});
+      }, { passive: true });
+
       render();
+
+      const ready = hydrateCurrentHostState();
+      if (!ready) {
+        $status.textContent = "Waiting for host bridge…";
+      }
+
+      let bootstrapAttempts = 0;
+      const bootstrapTimer = setInterval(() => {
+        bootstrapAttempts += 1;
+        if (hydrateCurrentHostState() || bootstrapAttempts >= 20) {
+          clearInterval(bootstrapTimer);
+          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
+            $status.textContent = "Host bridge unavailable.";
+          }
+        }
+      }, 100);
     </script>
   </body>
 </html>`;

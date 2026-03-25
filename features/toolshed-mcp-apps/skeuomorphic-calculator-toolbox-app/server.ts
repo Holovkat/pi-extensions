@@ -1,8 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { html } from "./mcp-app.tsx";
+import { helloHtml } from "./hello-app.tsx";
 
 type Operator = "+" | "-" | "×" | "÷" | null;
 
@@ -24,6 +29,8 @@ type CalculatorSession = {
   sessionId: string;
   display: string;
   expression: string;
+  panelLabel: string | null;
+  panelMessage: string | null;
   accumulator: number | null;
   pendingOperator: Operator;
   waitingForOperand: boolean;
@@ -32,9 +39,13 @@ type CalculatorSession = {
   updatedAt: string;
 };
 
-const RESOURCE_MIME_TYPE = "text/html+skybridge";
-const resourceUri = "ui://toolshed/skeuomorphic-calculator-toolbox-app/mcp-app.html";
+const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
+const resourceUri = "ui://widget/toolshed-analog-math-console-v4.html";
+const helloWorldResourceUri = "ui://widget/toolshed-hello-world-v1.html";
 const toolName = "open_skeuomorphic_calculator_toolbox_app";
+const chatgptToolName = "open_toolshed_analog_math_console";
+const helloWorldToolName = "open_toolshed_hello_world_demo";
+const helloWorldCalculatorToolName = "open_toolshed_hello_world_calculator_panel";
 const sessions = new Map<string, CalculatorSession>();
 
 function nowIso() {
@@ -46,6 +57,8 @@ function createSession(sessionId: string = randomUUID()): CalculatorSession {
     sessionId,
     display: "0",
     expression: "",
+    panelLabel: null,
+    panelMessage: null,
     accumulator: null,
     pendingOperator: null,
     waitingForOperand: false,
@@ -120,6 +133,8 @@ function snapshot(session: CalculatorSession) {
     sessionId: session.sessionId,
     display: session.display,
     expression: visibleExpression,
+    panelLabel: session.panelLabel,
+    panelMessage: session.panelMessage,
     history: session.history,
     steps: session.steps,
     updatedAt: session.updatedAt,
@@ -129,6 +144,28 @@ function snapshot(session: CalculatorSession) {
     lastExpression: session.history[0]?.expression || visibleExpression || session.display,
     lastStep: session.steps[0] || null,
   };
+}
+
+function buildWidgetState(session: CalculatorSession) {
+  return {
+    widgetKind: "toolshed-analog-math-console",
+    session: snapshot(session),
+  };
+}
+
+function buildHelloWorldState(message?: string) {
+  return {
+    widgetKind: "toolshed-hello-world",
+    message: String(message || "Hello world from Toolshed. This widget is coming from your MCP server."),
+    openedAt: nowIso(),
+    source: "toolshed-skeuomorphic-calculator-toolbox-app",
+  };
+}
+
+function setPanelContent(session: CalculatorSession, label?: string | null, message?: string | null) {
+  session.panelLabel = label ? String(label) : null;
+  session.panelMessage = message ? String(message) : null;
+  return session;
 }
 
 function recordStep(session: CalculatorSession, key: string, label: string) {
@@ -290,130 +327,541 @@ function pressKey(session: CalculatorSession, key: string) {
   return persist(session);
 }
 
-const server = new McpServer({
-  name: "toolshed-skeuomorphic-calculator-toolbox-app",
-  version: "0.1.0",
-});
+type ActiveTransport =
+  | { kind: "streamable"; server: McpServer; transport: StreamableHTTPServerTransport }
+  | { kind: "sse"; server: McpServer; transport: SSEServerTransport };
 
-server.registerTool(
-  toolName,
-  {
-    title: "Open Skeuomorphic Calculator",
-    description: "Open a skeuomorphic calculator in the toolbox or inline lane with session-only state.",
-    inputSchema: z.object({
-      sessionId: z.string().optional(),
-      renderInline: z.boolean().optional(),
-      prompt: z.string().optional(),
-    }),
-    _meta: {
-      ui: {
-        resourceUri,
-        inlinePreferred: true,
-        toolbox: true,
+const activeTransports = new Map<string, ActiveTransport>();
+
+function createCalculatorServer() {
+  const server = new McpServer({
+    name: "toolshed-skeuomorphic-calculator-toolbox-app",
+    version: "0.1.0",
+  });
+
+  server.registerTool(
+    helloWorldToolName,
+    {
+      title: "Open Toolshed Hello World Demo",
+      description: "Open a very obvious hello-world widget from the Toolshed MCP server so the user can verify that a custom widget rendered.",
+      inputSchema: z.object({
+        message: z.string().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      securitySchemes: [{ type: "noauth" }],
+      _meta: {
+        securitySchemes: [{ type: "noauth" }],
+        ui: {
+          resourceUri: helloWorldResourceUri,
+          inlinePreferred: true,
+          toolbox: true,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": helloWorldResourceUri,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening hello world demo…",
+        "openai/toolInvocation/invoked": "Hello world demo ready.",
       },
     },
-  },
-  async ({ sessionId, renderInline, prompt }) => {
-    const session = persist(getSession(sessionId));
-    return {
-      content: [
+    async ({ message }) => {
+      const payload = buildHelloWorldState(message);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `${payload.message} If the custom widget rendered correctly, you should see a large Toolshed hello-world panel rather than a native ChatGPT instrument.`,
+          },
+        ],
+        structuredContent: payload,
+      };
+    },
+  );
+
+  server.registerTool(
+    helloWorldCalculatorToolName,
+    {
+      title: "Open Toolshed Hello World Calculator Panel",
+      description: "Open the analog math console and stamp a hello-world message inside the calculator panel so the user can verify the calculator widget itself rendered.",
+      inputSchema: z.object({
+        sessionId: z.string().optional(),
+        renderInline: z.boolean().optional(),
+        message: z.string().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      securitySchemes: [{ type: "noauth" }],
+      _meta: {
+        securitySchemes: [{ type: "noauth" }],
+        ui: {
+          resourceUri,
+          inlinePreferred: true,
+          toolbox: true,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": resourceUri,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening hello-world calculator panel…",
+        "openai/toolInvocation/invoked": "Hello-world calculator panel ready.",
+      },
+    },
+    async ({ sessionId, renderInline, message }) => {
+      const session = persist(setPanelContent(
+        getSession(sessionId),
+        "Hello World",
+        message || "Hello world from Toolshed. This text is being rendered inside the calculator panel from your MCP server.",
+      ));
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Opened the calculator widget with a hello-world banner inside the panel. If this renders, the calculator surface is coming from your MCP server.",
+          },
+        ],
+        structuredContent: {
+          ...buildWidgetState(session),
+          renderInline: Boolean(renderInline),
+        },
+      };
+    },
+  );
+
+  server.registerTool(
+    toolName,
+    {
+      title: "Open Toolshed Skeuomorphic Calculator (Local)",
+      description: "Open the local Toolshed skeuomorphic calculator session for the inline Toolshed host.",
+      inputSchema: z.object({
+        sessionId: z.string().optional(),
+        renderInline: z.boolean().optional(),
+        prompt: z.string().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      _meta: {
+        ui: {
+          resourceUri,
+          inlinePreferred: true,
+          toolbox: true,
+          visibility: ["app"],
+        },
+        "openai/outputTemplate": resourceUri,
+        "openai/toolInvocation/invoking": "Opening calculator…",
+        "openai/toolInvocation/invoked": "Calculator ready.",
+      },
+    },
+    async ({ sessionId, renderInline, prompt }) => {
+      const session = persist(setPanelContent(getSession(sessionId), null, null));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Opened the custom Toolshed skeuomorphic calculator${renderInline ? " inline" : " in the toolbox"}. Current display: ${session.display}.`,
+          },
+        ],
+        structuredContent: {
+          ...snapshot(session),
+          renderInline: Boolean(renderInline),
+          prompt: prompt || "",
+        },
+      };
+    },
+  );
+
+  server.registerTool(
+    chatgptToolName,
+    {
+      title: "Open Toolshed Analog Math Console",
+      description: "Use this when the user wants the custom Toolshed calculator experience or metallic analog math console widget. Open the distinctive custom widget instead of any generic built-in calculator or instrument.",
+      inputSchema: z.object({
+        sessionId: z.string().optional(),
+        renderInline: z.boolean().optional(),
+        prompt: z.string().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      securitySchemes: [{ type: "noauth" }],
+      _meta: {
+        securitySchemes: [{ type: "noauth" }],
+        ui: {
+          resourceUri,
+          inlinePreferred: true,
+          toolbox: true,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": resourceUri,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening math console…",
+        "openai/toolInvocation/invoked": "Math console ready.",
+      },
+    },
+    async ({ sessionId, renderInline, prompt }) => {
+      const session = persist(setPanelContent(getSession(sessionId), null, null));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Opened the custom Toolshed analog math console${renderInline ? " inline" : ""}. Current display: ${session.display}.`,
+          },
+        ],
+        structuredContent: {
+          ...buildWidgetState(session),
+          renderInline: Boolean(renderInline),
+          prompt: prompt || "",
+        },
+      };
+    },
+  );
+
+  server.registerTool(
+    "calculator_press_key",
+    {
+      title: "Calculator Press Key",
+      description: "Apply a calculator key press and return the updated session state.",
+      inputSchema: z.object({
+        sessionId: z.string(),
+        key: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"],
+        },
+      },
+    },
+    async ({ sessionId, key }) => {
+      const session = pressKey(getSession(sessionId), key);
+      return {
+        content: [{ type: "text", text: `Key ${key} applied. Display now shows ${session.display}.` }],
+        structuredContent: buildWidgetState(session),
+      };
+    },
+  );
+
+  server.registerTool(
+    "get_calculator_session_state",
+    {
+      title: "Get Calculator Session State",
+      description: "Return the calculator's current display and recent results for chat follow-up questions.",
+      inputSchema: z.object({
+        sessionId: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+    },
+    async ({ sessionId }) => {
+      const session = persist(getSession(sessionId));
+      return {
+        content: [{ type: "text", text: buildAnswer("", session) }],
+        structuredContent: buildWidgetState(session),
+      };
+    },
+  );
+
+  server.registerTool(
+    "answer_calculator_question",
+    {
+      title: "Answer Calculator Question",
+      description: "Answer a natural-language question using the calculator's current display and recent session history.",
+      inputSchema: z.object({
+        sessionId: z.string(),
+        question: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+    },
+    async ({ sessionId, question }) => {
+      const session = persist(getSession(sessionId));
+      return {
+        content: [{ type: "text", text: buildAnswer(question, session) }],
+        structuredContent: buildWidgetState(session),
+      };
+    },
+  );
+
+  server.registerResource(
+    "hello-world-ui",
+    helloWorldResourceUri,
+    {
+      title: "Toolshed Hello World UI",
+      description: "Highly visible hello-world widget used to verify custom MCP widget rendering.",
+      mimeType: RESOURCE_MIME_TYPE,
+    },
+    async () => ({
+      contents: [
         {
-          type: "text",
-          text: `Opened the skeuomorphic calculator${renderInline ? " inline" : " in the toolbox"}. Current display: ${session.display}.`,
+          uri: helloWorldResourceUri,
+          mimeType: RESOURCE_MIME_TYPE,
+          text: helloHtml,
+          _meta: {
+            ui: {
+              prefersBorder: true,
+            },
+            "openai/widgetDescription": "A loud hello-world demo panel used to verify that ChatGPT rendered a custom Toolshed widget.",
+            "openai/widgetPrefersBorder": true,
+          },
         },
       ],
-      structuredContent: {
-        ...snapshot(session),
-        renderInline: Boolean(renderInline),
-        prompt: prompt || "",
-      },
-    };
-  },
-);
-
-server.registerTool(
-  "calculator_press_key",
-  {
-    title: "Calculator Press Key",
-    description: "Apply a calculator key press and return the updated session state.",
-    inputSchema: z.object({
-      sessionId: z.string(),
-      key: z.string(),
     }),
-    _meta: {
-      ui: {
-        visibility: ["app"],
-      },
+  );
+
+  server.registerResource(
+    "calculator-ui",
+    resourceUri,
+    {
+      title: "Skeuomorphic Calculator UI",
+      description: "Inline-ready calculator interface for toolbox and lane rendering.",
+      mimeType: RESOURCE_MIME_TYPE,
     },
-  },
-  async ({ sessionId, key }) => {
-    const session = pressKey(getSession(sessionId), key);
-    return {
-      content: [{ type: "text", text: `Key ${key} applied. Display now shows ${session.display}.` }],
-      structuredContent: snapshot(session),
-    };
-  },
-);
-
-server.registerTool(
-  "get_calculator_session_state",
-  {
-    title: "Get Calculator Session State",
-    description: "Return the calculator's current display and recent results for chat follow-up questions.",
-    inputSchema: z.object({
-      sessionId: z.string(),
+    async () => ({
+      contents: [
+        {
+          uri: resourceUri,
+          mimeType: RESOURCE_MIME_TYPE,
+          text: html,
+          _meta: {
+            ui: {
+              prefersBorder: true,
+            },
+            "openai/widgetDescription": "Interactive metallic Toolshed math console with a live display, step memory, and recent history.",
+            "openai/widgetPrefersBorder": true,
+          },
+        },
+      ],
     }),
-  },
-  async ({ sessionId }) => {
-    const session = persist(getSession(sessionId));
-    return {
-      content: [{ type: "text", text: buildAnswer("", session) }],
-      structuredContent: snapshot(session),
-    };
-  },
-);
+  );
 
-server.registerTool(
-  "answer_calculator_question",
-  {
-    title: "Answer Calculator Question",
-    description: "Answer a natural-language question using the calculator's current display and recent session history.",
-    inputSchema: z.object({
-      sessionId: z.string(),
-      question: z.string(),
-    }),
-  },
-  async ({ sessionId, question }) => {
-    const session = persist(getSession(sessionId));
-    return {
-      content: [{ type: "text", text: buildAnswer(question, session) }],
-      structuredContent: snapshot(session),
-    };
-  },
-);
+  return server;
+}
 
-server.registerResource(
-  "calculator-ui",
-  resourceUri,
-  {
-    title: "Skeuomorphic Calculator UI",
-    description: "Inline-ready calculator interface for toolbox and lane rendering.",
-    mimeType: RESOURCE_MIME_TYPE,
-  },
-  async () => ({
-    contents: [
-      {
-        uri: resourceUri,
-        mimeType: RESOURCE_MIME_TYPE,
-        text: html,
-      },
-    ],
-  }),
-);
+function getStringArg(name: string): string | null {
+  const flag = `--${name}`;
+  const prefix = `${flag}=`;
+  for (const arg of process.argv.slice(2)) {
+    if (arg.startsWith(prefix)) return arg.slice(prefix.length);
+  }
+  return null;
+}
 
-async function main() {
+function isHttpMode() {
+  const transportMode = String(process.env.MCP_TRANSPORT || "").trim().toLowerCase();
+  return process.argv.includes("--http")
+    || process.argv.includes("--streamable-http")
+    || transportMode === "http"
+    || transportMode === "streamable-http";
+}
+
+function getHttpHost() {
+  return String(process.env.MCP_HOST || getStringArg("host") || "127.0.0.1").trim() || "127.0.0.1";
+}
+
+function getHttpPort() {
+  const value = String(process.env.MCP_PORT || process.env.PORT || getStringArg("port") || "3000").trim();
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3000;
+}
+
+function getHeaderValue(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name];
+  if (Array.isArray(raw)) return raw[0];
+  return typeof raw === "string" ? raw : undefined;
+}
+
+async function readJsonBody(req: IncomingMessage) {
+  if (req.method !== "POST") return undefined;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  if (!raw) return undefined;
+  return JSON.parse(raw);
+}
+
+function writeJson(res: ServerResponse, statusCode: number, payload: unknown) {
+  if (res.headersSent) return;
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(payload));
+}
+
+function writeJsonRpcError(res: ServerResponse, statusCode: number, message: string) {
+  writeJson(res, statusCode, {
+    jsonrpc: "2.0",
+    error: {
+      code: statusCode === 400 ? -32000 : -32603,
+      message,
+    },
+    id: null,
+  });
+}
+
+function writeText(res: ServerResponse, statusCode: number, content: string) {
+  if (res.headersSent) return;
+  res.statusCode = statusCode;
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.end(content);
+}
+
+async function closeActiveTransports() {
+  const entries = [...activeTransports.entries()];
+  activeTransports.clear();
+  for (const [, entry] of entries) {
+    try {
+      await entry.transport.close();
+    } catch {}
+  }
+}
+
+function registerActiveTransport(sessionId: string, entry: ActiveTransport) {
+  activeTransports.set(sessionId, entry);
+}
+
+async function createStreamableTransport() {
+  const server = createCalculatorServer();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+    onsessioninitialized: (sessionId) => {
+      registerActiveTransport(sessionId, { kind: "streamable", server, transport });
+    },
+  });
+  transport.onclose = () => {
+    if (transport.sessionId) activeTransports.delete(transport.sessionId);
+  };
+  await server.connect(transport);
+  return transport;
+}
+
+async function handleStreamableRequest(req: IncomingMessage, res: ServerResponse, body: unknown) {
+  const sessionId = getHeaderValue(req, "mcp-session-id");
+  const existing = sessionId ? activeTransports.get(sessionId) : null;
+  if (existing) {
+    if (existing.kind !== "streamable") {
+      writeJsonRpcError(res, 400, "Bad Request: Session exists but uses a different transport protocol.");
+      return;
+    }
+    await existing.transport.handleRequest(req, res, body);
+    return;
+  }
+  if (req.method !== "POST" || !body || !isInitializeRequest(body)) {
+    writeJsonRpcError(res, 400, "Bad Request: No valid session ID provided.");
+    return;
+  }
+  const transport = await createStreamableTransport();
+  await transport.handleRequest(req, res, body);
+}
+
+async function handleLegacySseStart(req: IncomingMessage, res: ServerResponse) {
+  const server = createCalculatorServer();
+  const transport = new SSEServerTransport("/messages", res);
+  registerActiveTransport(transport.sessionId, { kind: "sse", server, transport });
+  res.on("close", () => {
+    activeTransports.delete(transport.sessionId);
+  });
+  await server.connect(transport);
+}
+
+async function handleLegacySseMessage(req: IncomingMessage, res: ServerResponse, body: unknown) {
+  const requestUrl = new URL(req.url || "/", `http://${getHeaderValue(req, "host") || "localhost"}`);
+  const sessionId = String(requestUrl.searchParams.get("sessionId") || "").trim();
+  const existing = sessionId ? activeTransports.get(sessionId) : null;
+  if (!existing || existing.kind !== "sse") {
+    writeJsonRpcError(res, 400, "Bad Request: No SSE session found for that session ID.");
+    return;
+  }
+  await existing.transport.handlePostMessage(req, res, body);
+}
+
+async function runHttpServer() {
+  const host = getHttpHost();
+  const port = getHttpPort();
+  const httpServer = createServer(async (req, res) => {
+    try {
+      const requestUrl = new URL(req.url || "/", `http://${getHeaderValue(req, "host") || "localhost"}`);
+      const body = await readJsonBody(req);
+      if (requestUrl.pathname === "/mcp" && ["GET", "POST", "DELETE"].includes(req.method || "")) {
+        await handleStreamableRequest(req, res, body);
+        return;
+      }
+      if (requestUrl.pathname === "/sse" && req.method === "GET") {
+        await handleLegacySseStart(req, res);
+        return;
+      }
+      if (requestUrl.pathname === "/messages" && req.method === "POST") {
+        await handleLegacySseMessage(req, res, body);
+        return;
+      }
+      if (requestUrl.pathname === "/" && req.method === "GET") {
+        writeJson(res, 200, {
+          name: "toolshed-skeuomorphic-calculator-toolbox-app",
+          streamableHttpUrl: "/mcp",
+          legacySseUrl: "/sse",
+        });
+        return;
+      }
+      writeText(res, 404, "Not found.");
+    } catch (error) {
+      console.error(error);
+      writeJsonRpcError(res, 500, "Internal server error.");
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port, host, () => resolve());
+  });
+
+  console.log(`Calculator MCP server listening on http://${host}:${port}/mcp`);
+  console.log(`Legacy SSE compatibility is available at http://${host}:${port}/sse`);
+
+  const shutdown = async () => {
+    await closeActiveTransports();
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    process.exit(0);
+  };
+
+  process.once("SIGINT", () => {
+    void shutdown();
+  });
+  process.once("SIGTERM", () => {
+    void shutdown();
+  });
+}
+
+async function runStdioServer() {
+  const server = createCalculatorServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
+}
+
+async function main() {
+  if (isHttpMode()) {
+    await runHttpServer();
+    return;
+  }
+  await runStdioServer();
 }
 
 main().catch((error) => {

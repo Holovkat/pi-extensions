@@ -34,6 +34,7 @@ const sseClients = new Set();
 const registeredAgents = new Map();
 const actionLog = [];
 const generatedAppInstances = new Map();
+const hostedMcpServers = new Map();
 let lastMtime = 0;
 
 function escapeHtml(value) {
@@ -101,14 +102,19 @@ function forwardCommand(cmd) {
 }
 
 function readMcpConfig() {
-	try {
-		const filePath = path.join(projectDir, ".mcp.json");
-		if (!fs.existsSync(filePath)) return {};
-		const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
-		return raw && raw.mcpServers && typeof raw.mcpServers === "object" ? raw.mcpServers : {};
-	} catch {
-		return {};
+	const merged = {};
+	for (const filePath of [
+		path.join(projectDir, ".mcp.json"),
+		path.join(projectDir, ".factory", "mcp.json"),
+	]) {
+		try {
+			if (!fs.existsSync(filePath)) continue;
+			const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+			const source = raw && raw.mcpServers && typeof raw.mcpServers === "object" ? raw.mcpServers : {};
+			Object.assign(merged, source);
+		} catch {}
 	}
+	return merged;
 }
 
 function resolveGeneratedRuntime(cardId) {
@@ -131,6 +137,7 @@ function getGeneratedAppServerConfig(serverId) {
 	const config = serverId && servers[serverId];
 	if (!config || typeof config !== "object") return null;
 	return {
+		url: String(config.url || "").trim(),
 		command: String(config.command || "").trim(),
 		args: Array.isArray(config.args) ? config.args.map(function(arg) { return String(arg); }) : [],
 		env: config.env && typeof config.env === "object"
@@ -139,6 +146,204 @@ function getGeneratedAppServerConfig(serverId) {
 			}))
 			: {},
 	};
+}
+
+function quoteShellArg(value) {
+	return "'" + String(value == null ? "" : value).replace(/'/g, "'\\''") + "'";
+}
+
+function reserveOpenPort() {
+	return new Promise(function(resolve, reject) {
+		const probe = net.createServer();
+		probe.on("error", reject);
+		probe.listen(0, "127.0.0.1", function() {
+			const address = probe.address();
+			const nextPort = address && typeof address === "object" ? address.port : 0;
+			probe.close(function(closeError) {
+				if (closeError) reject(closeError);
+				else resolve(nextPort);
+			});
+		});
+	});
+}
+
+function isChildRunning(child) {
+	return Boolean(child && child.exitCode == null && !child.killed);
+}
+
+function buildHostedMcpLaunch(serverConfig, nextPort) {
+	if (!serverConfig || !serverConfig.command) return null;
+	const env = {
+		...(serverConfig.env || {}),
+		MCP_TRANSPORT: "http",
+		MCP_HOST: "127.0.0.1",
+		MCP_PORT: String(nextPort),
+		PORT: String(nextPort),
+	};
+	const args = Array.isArray(serverConfig.args) ? serverConfig.args.slice() : [];
+	const scriptIndex = (() => {
+		for (let i = args.length - 1; i >= 0; i--) {
+			if (/\.(?:[cm]?[jt]sx?)$/i.test(String(args[i] || ""))) return i;
+		}
+		return -1;
+	})();
+	const tsxIndex = scriptIndex > 0 ? args.lastIndexOf("tsx", scriptIndex) : -1;
+	if (serverConfig.command === "npx" && tsxIndex !== -1 && scriptIndex === tsxIndex + 1) {
+		const packageArgs = args.slice(0, tsxIndex);
+		const runtimeArgs = args.slice(scriptIndex + 1).map(quoteShellArg).join(" ");
+		const shellParts = [
+			'NODE_PATH="$(cd "$(dirname "$(command -v tsx)")/.." && pwd)"',
+			"exec tsx " + quoteShellArg(args[scriptIndex]) + (runtimeArgs ? " " + runtimeArgs : ""),
+		];
+		return {
+			command: "npx",
+			args: packageArgs.concat(["sh", "-c", shellParts.join(" ")]),
+			env,
+		};
+	}
+	return {
+		command: serverConfig.command,
+		args,
+		env,
+	};
+}
+
+function waitForHostedMcpServer(portNumber, child, timeoutMs) {
+	const startedAt = Date.now();
+	return new Promise(function(resolve, reject) {
+		function attempt() {
+			if (child && !isChildRunning(child)) {
+				reject(new Error("Hosted MCP server exited before it became ready."));
+				return;
+			}
+			const socket = net.createConnection({ host: "127.0.0.1", port: portNumber });
+			let settled = false;
+			socket.once("connect", function() {
+				settled = true;
+				socket.end();
+				resolve();
+			});
+			socket.once("error", function(error) {
+				socket.destroy();
+				if (settled) return;
+				if (Date.now() - startedAt >= timeoutMs) reject(error);
+				else setTimeout(attempt, 100);
+			});
+		}
+		attempt();
+	});
+}
+
+async function readRequestBody(req) {
+	const chunks = [];
+	for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+	return Buffer.concat(chunks);
+}
+
+async function ensureHostedMcpServer(serverId) {
+	const key = String(serverId || "").trim();
+	if (!key) throw new Error("Hosted MCP server id is required.");
+	const existing = hostedMcpServers.get(key);
+	if (existing && existing.mode === "remote" && existing.url) return existing;
+	if (existing && existing.child && isChildRunning(existing.child)) return existing;
+	if (existing && existing.child) {
+		try { existing.child.kill(); } catch {}
+		hostedMcpServers.delete(key);
+	}
+	const serverConfig = getGeneratedAppServerConfig(key);
+	if (!serverConfig) throw new Error("No project MCP server config found for " + key);
+	if (serverConfig.url) {
+		const remote = {
+			serverId: key,
+			mode: "remote",
+			url: serverConfig.url,
+			lastTouchedAt: Date.now(),
+		};
+		hostedMcpServers.set(key, remote);
+		return remote;
+	}
+	const nextPort = await reserveOpenPort();
+	const launch = buildHostedMcpLaunch(serverConfig, nextPort);
+	if (!launch) throw new Error("Unable to build hosted MCP launch command for " + key);
+	const child = spawn(launch.command, launch.args || [], {
+		cwd: projectDir,
+		env: { ...process.env, ...(launch.env || {}) },
+		stdio: ["ignore", "pipe", "pipe"],
+	});
+	let logs = "";
+	const appendLog = function(chunk) {
+		logs = (logs + String(chunk || "")).slice(-8000);
+	};
+	child.stdout.setEncoding("utf-8");
+	child.stderr.setEncoding("utf-8");
+	child.stdout.on("data", appendLog);
+	child.stderr.on("data", appendLog);
+	const hosted = {
+		serverId: key,
+		mode: "managed",
+		port: nextPort,
+		child,
+		logs: function() { return logs; },
+		lastTouchedAt: Date.now(),
+	};
+	child.on("close", function() {
+		if (hostedMcpServers.get(key) === hosted) hostedMcpServers.delete(key);
+	});
+	hostedMcpServers.set(key, hosted);
+	try {
+		await waitForHostedMcpServer(nextPort, child, 10000);
+		hosted.lastTouchedAt = Date.now();
+		return hosted;
+	} catch (error) {
+		try { child.kill(); } catch {}
+		hostedMcpServers.delete(key);
+		const suffix = logs.trim() ? " " + logs.trim() : "";
+		throw new Error("Unable to start hosted MCP server for " + key + ": " + error.message + suffix);
+	}
+}
+
+function parseHostedMcpRoute(pathname) {
+	const prefix = "/mcp/servers/";
+	if (!String(pathname || "").startsWith(prefix)) return null;
+	const rest = String(pathname || "").slice(prefix.length);
+	const segments = rest.split("/").filter(Boolean);
+	if (segments.length === 0) return null;
+	const serverId = decodeURIComponent(segments[0]);
+	const tail = segments.length > 1 ? "/" + segments.slice(1).join("/") : "";
+	return {
+		serverId,
+		upstreamPath: tail || "/mcp",
+	};
+}
+
+async function proxyHostedMcpRequest(req, res, route) {
+	const hosted = await ensureHostedMcpServer(route.serverId);
+	const targetUrl = hosted.mode === "remote" && hosted.url
+		? new URL(route.upstreamPath, hosted.url)
+		: new URL(route.upstreamPath, "http://127.0.0.1:" + hosted.port);
+	hosted.lastTouchedAt = Date.now();
+	const body = await readRequestBody(req);
+	const headers = {
+		...req.headers,
+		host: targetUrl.host,
+	};
+	delete headers.connection;
+	delete headers["transfer-encoding"];
+	if (body.length > 0) headers["content-length"] = String(body.length);
+	else delete headers["content-length"];
+	const proxyReq = http.request(targetUrl, {
+		method: req.method || "GET",
+		headers,
+	}, function(proxyRes) {
+		const responseHeaders = { ...proxyRes.headers, "access-control-allow-origin": "*" };
+		res.writeHead(proxyRes.statusCode || 502, responseHeaders);
+		proxyRes.pipe(res);
+	});
+	proxyReq.on("error", function(error) {
+		if (res.headersSent) res.destroy(error);
+		else sendJson(res, 502, { success: false, error: error.message });
+	});
+	proxyReq.end(body);
 }
 
 function extractGeneratedAppHtml(viewFile) {
@@ -282,7 +487,7 @@ async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 	generatedAppInstances.delete(key);
 	if (!runtime || !runtime.serverId) throw new Error("Generated app runtime is missing a server id.");
 	const serverConfig = getGeneratedAppServerConfig(runtime.serverId);
-	if (!serverConfig || !serverConfig.command) throw new Error("No .mcp.json server config found for " + runtime.serverId);
+	if (!serverConfig || !serverConfig.command) throw new Error("No project MCP server config found for " + runtime.serverId);
 	const client = createJsonRpcClient(serverConfig);
 	await client.request("initialize", {
 		protocolVersion: "2025-06-18",
@@ -3773,6 +3978,24 @@ function renderPage(pageMode = "lane") {
 
 const server = http.createServer((req, res) => {
 	const requestUrl = new URL(req.url || "/", "http://127.0.0.1");
+	const hostedRoute = parseHostedMcpRoute(requestUrl.pathname);
+	if (hostedRoute) {
+		hostedRoute.upstreamPath += requestUrl.search || "";
+		if (req.method === "OPTIONS") {
+			res.writeHead(204, {
+				"Access-Control-Allow-Origin": "*",
+				"Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+				"Access-Control-Allow-Headers": req.headers["access-control-request-headers"] || "*",
+				"Access-Control-Max-Age": "86400",
+			});
+			res.end();
+			return;
+		}
+		void proxyHostedMcpRequest(req, res, hostedRoute).catch(function(error) {
+			sendJson(res, 500, { success: false, error: error.message });
+		});
+		return;
+	}
 	if (requestUrl.pathname === "/api/version") return sendJson(res, 200, { version: SCRIPT_VERSION, projectDir, projectName });
 	if (requestUrl.pathname === "/api/state") return sendJson(res, 200, readState());
 	if (requestUrl.pathname === "/events") {
@@ -3900,6 +4123,19 @@ const server = http.createServer((req, res) => {
 	if (requestUrl.pathname === "/favicon.ico") return sendText(res, 204, "", "text/plain");
 	return sendJson(res, 404, { success: false, error: "Not found" });
 });
+
+function closeHostedMcpServers() {
+	for (const hosted of hostedMcpServers.values()) {
+		if (hosted && hosted.child) {
+			try { hosted.child.kill(); } catch {}
+		}
+	}
+	hostedMcpServers.clear();
+}
+
+process.once("SIGINT", closeHostedMcpServers);
+process.once("SIGTERM", closeHostedMcpServers);
+process.once("exit", closeHostedMcpServers);
 
 server.listen(port, "127.0.0.1", () => {
 	console.log("Pi Toolshed listening on http://127.0.0.1:" + port);
