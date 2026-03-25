@@ -534,6 +534,8 @@ const STATIC_SLASH_COMMANDS: ToolshedSlashCommand[] = [
 	{ id: "toolshed-status", label: "/toolshed-status", command: "/toolshed-status", description: "Show Toolshed session status in the terminal.", category: "toolshed" },
 	{ id: "toolshed-connections", label: "/toolshed-connections", command: "/toolshed-connections", description: "Show the live PI connection roster.", category: "toolshed" },
 	{ id: "toolshed-app", label: "/toolshed-app", command: "/toolshed-app", description: "Create or update a tracked MCP app through a guided wizard.", category: "toolshed" },
+	{ id: "toolshed-app-new", label: "/toolshed-app-new", command: "/toolshed-app-new", description: "Launch the MCP app greenfield skill for a new app or widget.", category: "toolshed" },
+	{ id: "toolshed-app-fix", label: "/toolshed-app-fix", command: "/toolshed-app-fix", description: "Launch the MCP app maintainer skill for enhancements or bug fixes.", category: "toolshed" },
 	{ id: "toolshed-freeze", label: "/toolshed-freeze", command: "/toolshed-freeze", description: "Freeze the current frontier into a packet.", category: "toolshed" },
 	{ id: "toolshed-packets", label: "/toolshed-packets", command: "/toolshed-packets", description: "List the current packet queue.", category: "toolshed" },
 	{ id: "toolshed-workspace", label: "/toolshed-workspace", command: "/toolshed-workspace", description: "Switch the active Toolshed workspace preset.", category: "toolshed" },
@@ -4064,6 +4066,42 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 	}
 
+	function startToolshedMcpAppGreenfieldSkill(ctx: ExtensionContext, seedBrief?: string) {
+		const brief = String(seedBrief || "").trim();
+		const prompt = brief
+			? [
+				'Use the skill "mcp-app-greenfield".',
+				"Help me create a new MCP-style app or widget for this workspace.",
+				"Keep the first version small, real, and ready to validate.",
+				"Define the endpoint shape, transport, session model, widget/resource plan, and validation flow before implementation when they matter.",
+				`Seed brief: ${brief}`,
+				"Ask only the minimum clarifying questions needed, then implement once the plan is approved.",
+			].join(" ")
+			: 'Use the skill "mcp-app-greenfield". Help me create a new MCP-style app or widget for this workspace. Keep the first version small, real, and ready to validate. Define the endpoint shape, transport, session model, widget/resource plan, and validation flow before implementation when they matter. Ask only the minimum clarifying questions needed, then implement once the plan is approved.';
+		if (launchSkillIntoLane(ctx, "mcp-app-greenfield", prompt)) return;
+		pi.sendUserMessage(prompt);
+		ctx.ui.notify("Started the MCP app greenfield skill in the lane.", "info");
+		updateWidget();
+	}
+
+	function startToolshedMcpAppMaintainerSkill(ctx: ExtensionContext, seedBrief?: string) {
+		const brief = String(seedBrief || "").trim();
+		const prompt = brief
+			? [
+				'Use the skill "mcp-app-maintainer".',
+				"Help me enhance, debug, or bug-fix an existing MCP-style app or widget in this workspace.",
+				"Reproduce the issue on the real runtime first, identify the owning layer, and patch the smallest correct layer.",
+				"Check server, transport, widget hydration, session alignment, config, and stale-runtime risks before concluding.",
+				`Issue brief: ${brief}`,
+				"Validate the served runtime after the fix or enhancement is in place.",
+			].join(" ")
+			: 'Use the skill "mcp-app-maintainer". Help me enhance, debug, or bug-fix an existing MCP-style app or widget in this workspace. Reproduce the issue on the real runtime first, identify the owning layer, and patch the smallest correct layer. Check server, transport, widget hydration, session alignment, config, and stale-runtime risks before concluding. Validate the served runtime after the fix or enhancement is in place.';
+		if (launchSkillIntoLane(ctx, "mcp-app-maintainer", prompt)) return;
+		pi.sendUserMessage(prompt);
+		ctx.ui.notify("Started the MCP app maintainer skill in the lane.", "info");
+		updateWidget();
+	}
+
 	async function dispatchLocalSlashCommand(commandLine: string, ctx: ExtensionContext, source: "terminal" | "web" = "terminal"): Promise<boolean> {
 		const parsed = parseSlashCommandLine(commandLine);
 		if (!parsed) return false;
@@ -4095,6 +4133,12 @@ export default function (pi: ExtensionAPI) {
 				}
 				await runToolshedAppWizard(ctx, parsed.args);
 				updateWidget();
+				return true;
+			case "toolshed-app-new":
+				startToolshedMcpAppGreenfieldSkill(ctx, parsed.args);
+				return true;
+			case "toolshed-app-fix":
+				startToolshedMcpAppMaintainerSkill(ctx, parsed.args);
 				return true;
 			case "toolshed-workspace":
 				await handleToolshedWorkspaceCommand(parsed.args, ctx);
@@ -4737,8 +4781,9 @@ export default function (pi: ExtensionAPI) {
 			lines: [
 				`Library: ${persistedState.sessionCards.length} session · ${projectCards.length} project`,
 				"App flow: /toolshed-app asks a few questions, then creates or updates tracked apps.",
+				"Skill flow: /toolshed-app-new starts greenfield and /toolshed-app-fix starts enhancement or bug-fix mode.",
 			],
-			footer: "Use the app wizard or app-builder skill for MCP apps. Open the custom-card fields only when you need a pure workflow template.",
+			footer: "Use the app wizard for tracked cards, /toolshed-app-new for new MCP apps/widgets, or /toolshed-app-fix for enhancement and bug-fix work.",
 			actions: [
 				{ ...actionSeedMermaidCard("Seed Mermaid", "secondary"), display: "pill" },
 				{ ...actionOpenBlueprintWeb("Open Blueprint", "ghost"), display: "pill" },
@@ -5293,6 +5338,22 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("toolshed-app-new", {
+		description: "Launch the MCP app greenfield skill for a new app or widget",
+		handler: async (args, ctx) => {
+			widgetCtx = ctx;
+			startToolshedMcpAppGreenfieldSkill(ctx, String(args || "").trim());
+		},
+	});
+
+	pi.registerCommand("toolshed-app-fix", {
+		description: "Launch the MCP app maintainer skill for enhancements or bug fixes",
+		handler: async (args, ctx) => {
+			widgetCtx = ctx;
+			startToolshedMcpAppMaintainerSkill(ctx, String(args || "").trim());
+		},
+	});
+
 	pi.registerCommand("toolshed-workspace", {
 		description: "Switch the active Toolshed workspace: /toolshed-workspace or /toolshed-workspace <id>",
 		handler: async (args, ctx) => {
@@ -5348,6 +5409,8 @@ export default function (pi: ExtensionAPI) {
 				"  /toolshed-status       Show current Toolshed state",
 				"  /toolshed-connections  Show the live PI connection roster",
 				"  /toolshed-app          Create or update a tracked MCP app through a guided wizard",
+				"  /toolshed-app-new      Launch the MCP app greenfield skill for a new app or widget",
+				"  /toolshed-app-fix      Launch the MCP app maintainer skill for enhancement or bug fixing",
 				"  /toolshed-workspace    Switch card decks",
 				"  /toolshed-freeze       Freeze the current frontier into a packet",
 				"  /toolshed-packets      Inspect the packet queue",

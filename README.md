@@ -80,6 +80,7 @@ graph TD
 ```
 
 Each agent subprocess:
+
 - Runs `pi` in RPC mode (`--mode rpc`) with stdin/stdout piped
 - Receives its task via stdin as `{"type": "prompt", "message": "..."}` — not as a positional arg
 - Can be steered mid-execution via `{"type": "steer", "message": "..."}` on stdin
@@ -97,16 +98,17 @@ Each agent subprocess:
 
 ## Documentation Hub
 
-| Path | Purpose |
-|------|---------|
-| [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md) | Current rollout checklist and repo alignment tracker |
-| [docs/walkthrough-fasttrack.md](docs/walkthrough-fasttrack.md) | Fast Track workflow walkthrough |
-| [docs/research-diffusion-llm-code-generation.md](docs/research-diffusion-llm-code-generation.md) | Research context behind the pipeline design |
-| [PRD-PI-TOOLSHED.md](PRD-PI-TOOLSHED.md) | Toolshed product direction |
-| [TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md](TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md) | Current toolshed implementation notes |
-| [.mcp.json](.mcp.json) | Project-local MCP server wiring |
-| [agents/pi-blueprint/](agents/pi-blueprint/) | Repo-managed blueprint agents |
-| [skills/pi-blueprint/](skills/pi-blueprint/) | Repo-managed blueprint skills |
+| Path                                                                                                         | Purpose                                                                                                |
+| ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md)                                             | Current rollout checklist and repo alignment tracker                                                   |
+| [docs/walkthrough-fasttrack.md](docs/walkthrough-fasttrack.md)                                               | Fast Track workflow walkthrough                                                                        |
+| [docs/research-diffusion-llm-code-generation.md](docs/research-diffusion-llm-code-generation.md)             | Research context behind the pipeline design                                                            |
+| [docs/designs/pi-toolshed-retrospective-2026-03-26.md](docs/designs/pi-toolshed-retrospective-2026-03-26.md) | Retrospective summary of the Blueprint + Toolshed buildout, issues, lessons, and external-app guidance |
+| [PRD-PI-TOOLSHED.md](PRD-PI-TOOLSHED.md)                                                                     | Toolshed product direction                                                                             |
+| [TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md](TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md)                           | Current toolshed implementation notes                                                                  |
+| [.mcp.json](.mcp.json)                                                                                       | Project-local MCP server wiring                                                                        |
+| [agents/pi-blueprint/](agents/pi-blueprint/)                                                                 | Repo-managed blueprint agents                                                                          |
+| [skills/pi-blueprint/](skills/pi-blueprint/)                                                                 | Repo-managed blueprint skills                                                                          |
 
 ## Current Repo State
 
@@ -203,20 +205,20 @@ sequenceDiagram
 
 #### Tools
 
-| Tool | Purpose | Subprocess? |
-|------|---------|-------------|
+| Tool                 | Purpose                                      | Subprocess?                   |
+| -------------------- | -------------------------------------------- | ----------------------------- |
 | `consult_specialist` | Call a specialist agent for focused analysis | Yes — spawns agent subprocess |
-| `generate_artifacts` | Produce PRD + checklist after user sign-off | Yes — spawns prd-writer |
+| `generate_artifacts` | Produce PRD + checklist after user sign-off  | Yes — spawns prd-writer       |
 
 #### Specialist Agents
 
-| Agent | Focus | Tools | Output Format |
-|-------|-------|-------|---------------|
-| `req-analyst` | Functional/non-functional requirements, gaps, assumptions | read, bash, grep, find, ls | JSON: requirements, open questions, risks |
-| `tech-analyst` | Technical feasibility, stack analysis, deployment | read, bash, grep, find, ls | JSON: tech stack, constraints, data models |
-| `ux-analyst` | User journeys, workflows, edge cases, navigation | read, grep, find, ls | JSON: personas, stories, workflows |
-| `scenario-analyst` | Stress tests, failure modes, real-world validation | read, bash, grep, find, ls | JSON: scenarios, failure modes, stress points |
-| `prd-writer` | Synthesize all analysis into PRD + checklist | read, write, grep, find, ls | Markdown files (PRD.md + checklist) |
+| Agent              | Focus                                                     | Tools                       | Output Format                                 |
+| ------------------ | --------------------------------------------------------- | --------------------------- | --------------------------------------------- |
+| `req-analyst`      | Functional/non-functional requirements, gaps, assumptions | read, bash, grep, find, ls  | JSON: requirements, open questions, risks     |
+| `tech-analyst`     | Technical feasibility, stack analysis, deployment         | read, bash, grep, find, ls  | JSON: tech stack, constraints, data models    |
+| `ux-analyst`       | User journeys, workflows, edge cases, navigation          | read, grep, find, ls        | JSON: personas, stories, workflows            |
+| `scenario-analyst` | Stress tests, failure modes, real-world validation        | read, bash, grep, find, ls  | JSON: scenarios, failure modes, stress points |
+| `prd-writer`       | Synthesize all analysis into PRD + checklist              | read, write, grep, find, ls | Markdown files (PRD.md + checklist)           |
 
 #### Consultation Modes
 
@@ -245,6 +247,7 @@ State is saved to `req-qa-state.json` after every consultation and phase change:
 ```
 
 On session startup, the extension auto-detects:
+
 - **Has consultation history** → Resume: inject history into system prompt
 - **Has existing PRD** → Enhance: inject PRD content for refinement
 - **Neither** → Fresh start
@@ -254,6 +257,7 @@ The `before_agent_start` hook dynamically injects consultation history and PRD c
 #### GitHub Integration
 
 After `generate_artifacts` runs, the extension:
+
 1. Parses the implementation checklist for epics and tasks
 2. Creates GitHub issues for each epic (as tracking issues)
 3. Creates GitHub issues for each task (linked to epic via `Part of #N` reference)
@@ -428,6 +432,7 @@ At **T-30 seconds**, the watchdog steers the agent: "TIMEOUT WARNING: yield NOW 
 | `skip` | Skips for now — records conditions under which to retry |
 
 **Learnings flow:**
+
 - Each fix attempt records an `AgentLearning` (blockers, attempted approaches, suggestion, analyst decision)
 - Learnings are posted as structured comments on the task's GitHub issue
 - Subsequent fix agents receive all prior learnings in their prompt with "DO NOT repeat approaches that have already been tried"
@@ -439,6 +444,7 @@ When a fix agent yields or an analyst makes a decision, a structured comment is 
 
 ```markdown
 ## Agent Learning (depth 2, fix, claude-sonnet-4-6)
+
 **Yielded:** yes (timeout after 612s)
 **Blockers:** collision detection not triggering at maze boundaries; tile cost array index off-by-one
 **Attempted:** adjusted hitbox calculations; rewrote boundary detection with BFS
@@ -481,15 +487,15 @@ UAT Epic #101: "UAT Test Suite"                          [uat]
 
 ##### Model Assignments (Fast Track)
 
-| Role | Model | Purpose |
-|------|-------|---------|
-| Builder | Gemini 3 Pro Preview | Build entire epic in one shot |
-| Evaluator | Claude Opus 4.6 | Per-task scoring + UAT scenario generation |
-| Fixer | Qwen 3.5 Plus (Bailian) | Surgical subtask fixes (depth 1) |
-| Fix Escalation 1 | Claude Sonnet 4.6 | Stronger model for depth 2+ |
-| Fix Escalation 2 | Claude Opus 4.6 (xhigh) | Maximum capability for deep escalation |
-| Analyst | Claude Opus 4.6 (xhigh) | Reviews yielded agents, decomposes/deprecates stuck tasks |
-| UAT Tester | Gemini 3 Pro Preview | Playwright browser automation |
+| Role             | Model                   | Purpose                                                   |
+| ---------------- | ----------------------- | --------------------------------------------------------- |
+| Builder          | Gemini 3 Pro Preview    | Build entire epic in one shot                             |
+| Evaluator        | Claude Opus 4.6         | Per-task scoring + UAT scenario generation                |
+| Fixer            | Qwen 3.5 Plus (Bailian) | Surgical subtask fixes (depth 1)                          |
+| Fix Escalation 1 | Claude Sonnet 4.6       | Stronger model for depth 2+                               |
+| Fix Escalation 2 | Claude Opus 4.6 (xhigh) | Maximum capability for deep escalation                    |
+| Analyst          | Claude Opus 4.6 (xhigh) | Reviews yielded agents, decomposes/deprecates stuck tasks |
+| UAT Tester       | Gemini 3 Pro Preview    | Playwright browser automation                             |
 
 ##### Dashboard — Approval State
 
@@ -575,15 +581,15 @@ sequenceDiagram
 
 ##### Model Assignments (3-Wave)
 
-| Role | Model | Purpose |
-|------|-------|---------|
-| Council Architects | Opus, Qwen 3.5+, Gemini 3 Pro | 3 independent design briefs |
-| Prototype Step 1 | Gemini 3 Pro Preview | Full one-shot build |
-| Prototype Step 2 | Claude Haiku 4.5 | Enhancement pass |
-| Prototype Step 3 | Qwen 3.5 Plus | Fine-tuning pass |
-| Dev Agent | Claude Haiku 4.5 | Task implementation |
-| Compliance | Qwen 3.5 Plus | Per-task scoring |
-| Orchestrator Override | Claude Opus 4.6 | Review pedantic deductions |
+| Role                  | Model                         | Purpose                     |
+| --------------------- | ----------------------------- | --------------------------- |
+| Council Architects    | Opus, Qwen 3.5+, Gemini 3 Pro | 3 independent design briefs |
+| Prototype Step 1      | Gemini 3 Pro Preview          | Full one-shot build         |
+| Prototype Step 2      | Claude Haiku 4.5              | Enhancement pass            |
+| Prototype Step 3      | Qwen 3.5 Plus                 | Fine-tuning pass            |
+| Dev Agent             | Claude Haiku 4.5              | Task implementation         |
+| Compliance            | Qwen 3.5 Plus                 | Per-task scoring            |
+| Orchestrator Override | Claude Opus 4.6               | Review pedantic deductions  |
 
 ---
 
@@ -713,13 +719,34 @@ Written to `.pi/pipeline-logs/pipeline-state.json` on every state change:
       "total": 6,
       "gate": "wave2-parallel",
       "tasks": [
-        { "id": "4.1", "title": "Ghost entity class", "status": "passed", "complianceScore": 98, "attempts": 1, "yields": 0 },
-        { "id": "4.2", "title": "A* pathfinding", "status": "building", "complianceScore": 0, "attempts": 2, "yields": 1, "lastAnalystAction": "decompose" }
+        {
+          "id": "4.1",
+          "title": "Ghost entity class",
+          "status": "passed",
+          "complianceScore": 98,
+          "attempts": 1,
+          "yields": 0
+        },
+        {
+          "id": "4.2",
+          "title": "A* pathfinding",
+          "status": "building",
+          "complianceScore": 0,
+          "attempts": 2,
+          "yields": 1,
+          "lastAnalystAction": "decompose"
+        }
       ]
     }
   ],
-  "log": ["[08:05:13] [FAST] BUILD: gemini-3-pro-preview building entire epic..."],
-  "activeAgent": { "name": "dev", "model": "gemini-3-pro-preview", "hint": "Build entire epic..." }
+  "log": [
+    "[08:05:13] [FAST] BUILD: gemini-3-pro-preview building entire epic..."
+  ],
+  "activeAgent": {
+    "name": "dev",
+    "model": "gemini-3-pro-preview",
+    "hint": "Build entire epic..."
+  }
 }
 ```
 
@@ -752,6 +779,7 @@ A multi-page web application for monitoring and steering agents from a browser.
 **Dashboard** (`/dashboard`) — live SSE-powered view of pipeline state, same data as the terminal dashboard but rendered in HTML with the Claude/shadcn oklch theme (dark/light toggle).
 
 **Steer** (`/steer`) — interactive agent steering page:
+
 - Active agent list (auto-refreshes every 3s)
 - Message textarea with Steer / Follow-up / Abort buttons
 - Live steer log via SSE showing command history
@@ -782,14 +810,15 @@ The extension auto-connects to the control socket on startup and re-registers ag
 
 Pi's native RPC mode enables mid-execution steering of any running agent:
 
-| RPC Command | Effect |
-|-------------|--------|
-| `{"type": "prompt", "message": "..."}` | Send initial task (on spawn) |
-| `{"type": "steer", "message": "..."}` | Interrupt agent, deliver new instructions |
+| RPC Command                               | Effect                                                 |
+| ----------------------------------------- | ------------------------------------------------------ |
+| `{"type": "prompt", "message": "..."}`    | Send initial task (on spawn)                           |
+| `{"type": "steer", "message": "..."}`     | Interrupt agent, deliver new instructions              |
 | `{"type": "follow_up", "message": "..."}` | Continue conversation after `agent_end` (if keepAlive) |
-| `{"type": "abort"}` | Cancel current execution |
+| `{"type": "abort"}`                       | Cancel current execution                               |
 
 Steering sources:
+
 1. **Watchdog timer** — automatic yield summary request at timeout
 2. **Web UI** — user types a message on the `/steer` page
 3. **Control socket** — programmatic steering from any TCP client
@@ -811,14 +840,14 @@ Current repo surfaces tied to blueprint:
 
 Key commands:
 
-| Command | Description |
-|---------|-------------|
-| `/blueprint-status` | Show current planning status |
-| `/blueprint-web` | Open the live Blueprint web mirror |
-| `/blueprint-details` | Open the detailed Blueprint overlay |
-| `/blueprint-sync-assets` | Sync repo-managed agents/skills into local `.pi` |
-| `/blueprint-check-alignment` | Validate transcript-backed decisions |
-| `/blueprint-rebuild-issues` | Recover or rebuild GitHub issues from artifacts |
+| Command                      | Description                                      |
+| ---------------------------- | ------------------------------------------------ |
+| `/blueprint-status`          | Show current planning status                     |
+| `/blueprint-web`             | Open the live Blueprint web mirror               |
+| `/blueprint-details`         | Open the detailed Blueprint overlay              |
+| `/blueprint-sync-assets`     | Sync repo-managed agents/skills into local `.pi` |
+| `/blueprint-check-alignment` | Validate transcript-backed decisions             |
+| `/blueprint-rebuild-issues`  | Recover or rebuild GitHub issues from artifacts  |
 
 ---
 
@@ -836,23 +865,23 @@ Current repo surfaces tied to toolshed:
 
 Key commands:
 
-| Command | Description |
-|---------|-------------|
-| `/toolshed-web` | Open the toolshed web workspace |
-| `/toolshed-status` | Show current toolshed state |
-| `/toolshed-workspace` | Switch workspace/card deck |
-| `/toolshed-freeze` | Freeze the current frontier into a packet |
-| `/toolshed-packets` | Inspect queued packets |
-| `/toolshed-reset-layout` | Reset card layout/collapse state |
+| Command                  | Description                               |
+| ------------------------ | ----------------------------------------- |
+| `/toolshed-web`          | Open the toolshed web workspace           |
+| `/toolshed-status`       | Show current toolshed state               |
+| `/toolshed-workspace`    | Switch workspace/card deck                |
+| `/toolshed-freeze`       | Freeze the current frontier into a packet |
+| `/toolshed-packets`      | Inspect queued packets                    |
+| `/toolshed-reset-layout` | Reset card layout/collapse state          |
 
 ---
 
 ### Supporting Extensions
 
-| Extension | Purpose |
-|-----------|---------|
-| `themeMap.ts` | Maps each extension to a default theme. Called on session start to auto-apply visual styling. |
-| `theme-cycler.ts` | Registers `/theme` command for cycling between installed themes at runtime. |
+| Extension         | Purpose                                                                                       |
+| ----------------- | --------------------------------------------------------------------------------------------- |
+| `themeMap.ts`     | Maps each extension to a default theme. Called on session start to auto-apply visual styling. |
+| `theme-cycler.ts` | Registers `/theme` command for cycling between installed themes at runtime.                   |
 
 ---
 
@@ -866,10 +895,12 @@ name: dev
 description: Autonomous development agent
 tools: read,write,edit,bash,grep,find,ls
 ---
+
 System prompt content here...
 ```
 
 The extensions scan three directories for agents (first match wins):
+
 1. `<project>/.pi/agents/` — project-specific overrides
 2. `~/.pi/agent/agents/` — pi global agents
 3. `~/.pi-init/agents/` — custom agents (this repo)
@@ -940,13 +971,13 @@ brew install glow
 
 ## Shell Aliases
 
-| Alias | Purpose |
-|-------|---------|
-| `pi-req` | Launch requirements discovery session |
-| `pi-dev` | Launch sprint development pipeline |
-| `pi-blueprint` | Launch the Blueprint planning cockpit |
-| `pi-dash` | Launch standalone terminal dashboard |
-| `pi-web` | Launch Pipeline Control Center (web, port 3141) |
+| Alias          | Purpose                                         |
+| -------------- | ----------------------------------------------- |
+| `pi-req`       | Launch requirements discovery session           |
+| `pi-dev`       | Launch sprint development pipeline              |
+| `pi-blueprint` | Launch the Blueprint planning cockpit           |
+| `pi-dash`      | Launch standalone terminal dashboard            |
+| `pi-web`       | Launch Pipeline Control Center (web, port 3141) |
 
 ---
 
@@ -954,58 +985,58 @@ brew install glow
 
 ### req-qa Commands
 
-| Command | Description |
-|---------|-------------|
-| `/req-status` | Show current phase and consultation count |
-| `/req-history` | Show all specialist consultations |
-| `/req-logs` | Open all specialist logs in tmux panes |
-| `/req-watch <name>` | Tail a specific specialist's log |
-| `/req-close-panes` | Close all tmux log panes |
-| `/req-prd` | View PRD in glow (rendered markdown) |
+| Command               | Description                                 |
+| --------------------- | ------------------------------------------- |
+| `/req-status`         | Show current phase and consultation count   |
+| `/req-history`        | Show all specialist consultations           |
+| `/req-logs`           | Open all specialist logs in tmux panes      |
+| `/req-watch <name>`   | Tail a specific specialist's log            |
+| `/req-close-panes`    | Close all tmux log panes                    |
+| `/req-prd`            | View PRD in glow (rendered markdown)        |
 | `/req-rebuild-issues` | Re-publish all GitHub issues from checklist |
-| `/req-reset` | Clear session state and start fresh |
+| `/req-reset`          | Clear session state and start fresh         |
 
 ### dev-pipeline Commands
 
-| Command | Description |
-|---------|-------------|
-| `/pipeline-start` | Initialize pipeline in Fast Track mode (default) |
-| `/pipeline-start --multiwave` | Initialize pipeline in 3-Wave mode |
-| `/pipeline-next` | Run next phase (uses active mode) |
-| `/pipeline-approve` | Approve UAT results (Fast Track) |
-| `/pipeline-reject` | Reject UAT with notes, loop back (Fast Track) |
-| `/pipeline-reset` | Full reset — checkout main, delete branches, uncheck checklist, reopen issues |
-| `/pipeline-end` | UAT sign-off, squash merge to main, push, clean up |
-| `/pipeline-config` | Configure model assignments for each pipeline role |
-| `/pipeline-status` | Show current pipeline progress |
-| `/pipeline-dashboard` | Open live dashboard in tmux pane |
-| `/pipeline-logs` | Open all agent logs in tmux panes |
-| `/pipeline-watch <name>` | Tail a specific agent's log |
-| `/pipeline-close-panes` | Close all tmux/dashboard panes |
+| Command                       | Description                                                                   |
+| ----------------------------- | ----------------------------------------------------------------------------- |
+| `/pipeline-start`             | Initialize pipeline in Fast Track mode (default)                              |
+| `/pipeline-start --multiwave` | Initialize pipeline in 3-Wave mode                                            |
+| `/pipeline-next`              | Run next phase (uses active mode)                                             |
+| `/pipeline-approve`           | Approve UAT results (Fast Track)                                              |
+| `/pipeline-reject`            | Reject UAT with notes, loop back (Fast Track)                                 |
+| `/pipeline-reset`             | Full reset — checkout main, delete branches, uncheck checklist, reopen issues |
+| `/pipeline-end`               | UAT sign-off, squash merge to main, push, clean up                            |
+| `/pipeline-config`            | Configure model assignments for each pipeline role                            |
+| `/pipeline-status`            | Show current pipeline progress                                                |
+| `/pipeline-dashboard`         | Open live dashboard in tmux pane                                              |
+| `/pipeline-logs`              | Open all agent logs in tmux panes                                             |
+| `/pipeline-watch <name>`      | Tail a specific agent's log                                                   |
+| `/pipeline-close-panes`       | Close all tmux/dashboard panes                                                |
 
 ### pi-blueprint Commands
 
-| Command | Description |
-|---------|-------------|
-| `/blueprint-status` | Show current planning phase and readiness |
-| `/blueprint-history` | Show consultation history |
-| `/blueprint-prd` | Open the generated PRD |
-| `/blueprint-checklist` | Open the generated checklist |
-| `/blueprint-web` | Open the live Blueprint web mirror |
-| `/blueprint-sync-assets` | Sync repo-managed agents and skills into local `.pi` |
-| `/blueprint-check-alignment` | Verify transcript-backed alignment |
-| `/blueprint-rebuild-issues` | Rebuild or recover GitHub issues |
+| Command                      | Description                                          |
+| ---------------------------- | ---------------------------------------------------- |
+| `/blueprint-status`          | Show current planning phase and readiness            |
+| `/blueprint-history`         | Show consultation history                            |
+| `/blueprint-prd`             | Open the generated PRD                               |
+| `/blueprint-checklist`       | Open the generated checklist                         |
+| `/blueprint-web`             | Open the live Blueprint web mirror                   |
+| `/blueprint-sync-assets`     | Sync repo-managed agents and skills into local `.pi` |
+| `/blueprint-check-alignment` | Verify transcript-backed alignment                   |
+| `/blueprint-rebuild-issues`  | Rebuild or recover GitHub issues                     |
 
 ### pi-toolshed Commands
 
-| Command | Description |
-|---------|-------------|
-| `/toolshed-web` | Open the toolshed web workspace |
-| `/toolshed-status` | Show current toolshed state |
-| `/toolshed-workspace` | Switch active workspace preset |
-| `/toolshed-freeze` | Freeze the active frontier into a packet |
-| `/toolshed-packets` | Inspect the packet queue |
-| `/toolshed-reset-layout` | Reset card collapse state |
+| Command                  | Description                              |
+| ------------------------ | ---------------------------------------- |
+| `/toolshed-web`          | Open the toolshed web workspace          |
+| `/toolshed-status`       | Show current toolshed state              |
+| `/toolshed-workspace`    | Switch active workspace preset           |
+| `/toolshed-freeze`       | Freeze the active frontier into a packet |
+| `/toolshed-packets`      | Inspect the packet queue                 |
+| `/toolshed-reset-layout` | Reset card collapse state                |
 
 ---
 
@@ -1061,38 +1092,38 @@ pi-extensions/
 
 ### 3-Wave Mode
 
-| Step | Duration | Notes |
-|------|----------|-------|
-| Foundations Council (3 parallel) | ~60-90s | 3 architect models in parallel |
-| Wave 0 Prototype (3 sequential) | ~3-5 min | Gemini → Haiku → Qwen |
-| Wave 1 Review + TODOs | ~60-90s | Review + TODO placement |
-| Wave 2 Dev (per task) | ~35-75s | Sequential implementation |
-| Wave 2 Compliance (per task) | ~30-40s | Per-task scoring |
-| Wave 2 Fix attempt | ~35-75s | Targeted gap fixes |
-| Orchestrator Override | ~30-45s | Opus reviews pedantic deductions |
+| Step                             | Duration | Notes                            |
+| -------------------------------- | -------- | -------------------------------- |
+| Foundations Council (3 parallel) | ~60-90s  | 3 architect models in parallel   |
+| Wave 0 Prototype (3 sequential)  | ~3-5 min | Gemini → Haiku → Qwen            |
+| Wave 1 Review + TODOs            | ~60-90s  | Review + TODO placement          |
+| Wave 2 Dev (per task)            | ~35-75s  | Sequential implementation        |
+| Wave 2 Compliance (per task)     | ~30-40s  | Per-task scoring                 |
+| Wave 2 Fix attempt               | ~35-75s  | Targeted gap fixes               |
+| Orchestrator Override            | ~30-45s  | Opus reviews pedantic deductions |
 
 A 7-task epic with fix attempts typically takes 15-25 minutes.
 
 ### Fast Track Mode
 
-| Step | Duration | Notes |
-|------|----------|-------|
-| Build (entire epic) | ~2-4 min | Single model, all tasks at once |
-| Evaluate (per-task scoring) | ~60-90s | Single pass |
-| Fix depth (per failed task) | ~1-10 min | Surgical edit + re-score (watchdog: 10m + 5m/depth) |
-| Analyst review (if yielded) | ~1-3 min | Analyzes learnings, decides next action |
-| UAT scenario generation | ~60-90s | Per-epic, runs in parallel with compliance |
-| UAT execution (per scenario) | ~30-60s | Playwright browser automation |
+| Step                         | Duration  | Notes                                               |
+| ---------------------------- | --------- | --------------------------------------------------- |
+| Build (entire epic)          | ~2-4 min  | Single model, all tasks at once                     |
+| Evaluate (per-task scoring)  | ~60-90s   | Single pass                                         |
+| Fix depth (per failed task)  | ~1-10 min | Surgical edit + re-score (watchdog: 10m + 5m/depth) |
+| Analyst review (if yielded)  | ~1-3 min  | Analyzes learnings, decides next action             |
+| UAT scenario generation      | ~60-90s   | Per-epic, runs in parallel with compliance          |
+| UAT execution (per scenario) | ~30-60s   | Playwright browser automation                       |
 
 A 7-task epic with 2 fix depths typically takes 5-10 minutes. If agents yield and analyst intervention is needed, fix stages can take longer (up to 30 min for deep escalation). Full UAT execution across all epics adds 5-15 minutes depending on scenario count.
 
 ### Comparison
 
-| | 3-Wave | Fast Track |
-|---|--------|------------|
-| **LLM calls per epic** | 15-30+ | 3-8 |
-| **Time per epic** | 15-25 min | 5-10 min |
-| **Quality approach** | Multi-model consensus | Single builder + strong evaluator |
-| **Fix strategy** | Re-attempt with gap feedback | Surgical subtask decomposition |
-| **UAT** | Manual sign-off | Automated Playwright + approval gate |
-| **Best for** | Complex architectures, first builds | Iteration, known patterns, speed |
+|                        | 3-Wave                              | Fast Track                           |
+| ---------------------- | ----------------------------------- | ------------------------------------ |
+| **LLM calls per epic** | 15-30+                              | 3-8                                  |
+| **Time per epic**      | 15-25 min                           | 5-10 min                             |
+| **Quality approach**   | Multi-model consensus               | Single builder + strong evaluator    |
+| **Fix strategy**       | Re-attempt with gap feedback        | Surgical subtask decomposition       |
+| **UAT**                | Manual sign-off                     | Automated Playwright + approval gate |
+| **Best for**           | Complex architectures, first builds | Iteration, known patterns, speed     |
