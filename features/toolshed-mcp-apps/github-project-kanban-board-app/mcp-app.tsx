@@ -712,18 +712,35 @@ export const html = String.raw`<!doctype html>
       let dragFrameHandle = 0;
       let queuedPointerPoint = null;
       let sessionSyncTimer = 0;
+      let toolshedBridgeAttached = false;
 
-      const app = window.openai || window.app || window.mcp?.app;
       const initialTheme = new URLSearchParams(window.location.search).get('theme');
-      if (initialTheme === 'light') {
-        document.body.classList.add('light');
-      }
       const $title = document.getElementById("title");
       const $meta = document.getElementById("meta");
       const $notices = document.getElementById("notices");
       const $board = document.getElementById("board");
       const $refreshBtn = document.getElementById("refreshBtn");
       const $fullscreenBtn = document.getElementById("fullscreenBtn");
+
+      function getOpenAI() {
+        try {
+          return window.openai || null;
+        } catch {
+          return null;
+        }
+      }
+
+      function getToolshedApp() {
+        try {
+          return window.app || window.mcp?.app || null;
+        } catch {
+          return null;
+        }
+      }
+
+      function getHostApp() {
+        return getOpenAI() || getToolshedApp();
+      }
 
       function escapeHtml(value) {
         return String(value || "")
@@ -733,6 +750,13 @@ export const html = String.raw`<!doctype html>
           .replace(/\"/g, "&quot;")
           .replace(/'/g, "&#39;");
       }
+
+      function updateTheme(theme) {
+        if (theme === 'light') document.body.classList.add('light');
+        else if (theme === 'dark') document.body.classList.remove('light');
+      }
+
+      updateTheme(initialTheme);
 
       function refreshIcon() {
         return [
@@ -824,6 +848,57 @@ export const html = String.raw`<!doctype html>
         }
         render();
         scheduleSessionSync();
+      }
+
+      function hydrateFromGlobals(globals) {
+        if (!globals || typeof globals !== "object") return false;
+        updateTheme(globals.theme);
+
+        let updated = false;
+        if (globals.widgetState) {
+          applyPayload(globals.widgetState);
+          updated = true;
+        }
+        if (globals.toolInput && !globals.toolOutput) {
+          applyPayload(globals.toolInput);
+          setStatus('Host attached');
+          updated = true;
+        }
+        if (globals.toolOutput) {
+          applyPayload({ structuredContent: globals.toolOutput });
+          if (!hasPendingMoves()) setStatus('Board ready');
+          updated = true;
+        }
+        return updated;
+      }
+
+      function attachToolshedBridge() {
+        const app = getToolshedApp();
+        if (!app || toolshedBridgeAttached) return Boolean(app);
+        toolshedBridgeAttached = true;
+
+        app.ondisplaymodechange = (detail) => {
+          applyDisplayMode(detail?.mode);
+        };
+        app.ontoolinput = async (input) => {
+          applyPayload(input);
+          if (!hasPendingMoves()) setStatus('Board attached');
+          attachDragHandlers();
+        };
+
+        app.ontoolresult = async (result) => {
+          applyPayload(result);
+          if (hasPendingMoves()) {
+            setStatus('Saving board changes…');
+            schedulePendingRefresh();
+          } else {
+            setStatus('Board ready');
+          }
+          attachDragHandlers();
+          await syncModelContext();
+        };
+
+        return true;
       }
 
       function cloneColumns(columns) {
@@ -1021,6 +1096,7 @@ export const html = String.raw`<!doctype html>
 	      }
 
       function scheduleSessionSync() {
+        const app = getToolshedApp();
         if (!app?.syncToolshedSession) return;
         if (sessionSyncTimer) clearTimeout(sessionSyncTimer);
         sessionSyncTimer = window.setTimeout(async () => {
@@ -1073,8 +1149,15 @@ export const html = String.raw`<!doctype html>
       }
 
       async function requestTool(name, args) {
-        if (!app?.callServerTool) return null;
-        const result = await app.callServerTool({ name, arguments: args });
+        const openai = getOpenAI();
+        let result = null;
+        if (openai?.callTool) {
+          result = await openai.callTool(name, args);
+        } else {
+          const app = getToolshedApp();
+          if (!app?.callServerTool) return null;
+          result = await app.callServerTool({ name, arguments: args });
+        }
         applyPayload(result);
         await syncModelContext();
         return result;
@@ -1435,6 +1518,7 @@ export const html = String.raw`<!doctype html>
       }
 
       async function syncModelContext() {
+        const app = getHostApp();
         if (!app?.updateModelContext) return;
         try {
           const summary = state.columns.map((column) => column.title + ': ' + (column.cards?.length || 0)).join(' · ');
@@ -1515,6 +1599,7 @@ export const html = String.raw`<!doctype html>
 
       $refreshBtn.addEventListener('click', refreshBoard);
       $fullscreenBtn.addEventListener('click', async () => {
+        const app = getHostApp();
         if (!app?.requestDisplayMode) return;
         const previousMode = state.displayMode;
         const nextMode = previousMode === 'fullscreen' ? 'inline' : 'fullscreen';
@@ -1533,6 +1618,7 @@ export const html = String.raw`<!doctype html>
         const href = link.getAttribute('data-open-link');
         if (!href) return;
         event.preventDefault();
+        const app = getHostApp();
         if (app?.openLink) {
           try {
             await app.openLink({ url: href });
@@ -1556,38 +1642,54 @@ export const html = String.raw`<!doctype html>
         }
       });
 
-      if (app) {
-        app.ondisplaymodechange = (detail) => {
-          applyDisplayMode(detail?.mode);
-        };
-        app.ontoolinput = async (input) => {
-          applyPayload(input);
-          if (!hasPendingMoves()) setStatus('Board attached');
-          attachDragHandlers();
-        };
+      function hydrateCurrentHostState() {
+        const openai = getOpenAI();
+        if (openai) {
+          const updated = hydrateFromGlobals({
+            theme: openai.theme,
+            widgetState: openai.widgetState,
+            toolInput: openai.toolInput,
+            toolOutput: openai.toolOutput,
+          });
+          if (updated) attachDragHandlers();
+          return updated || Boolean(openai.toolInput || openai.toolOutput || openai.widgetState);
+        }
 
-        app.ontoolresult = async (result) => {
-          applyPayload(result);
-          if (hasPendingMoves()) {
-            setStatus('Saving board changes…');
-            schedulePendingRefresh();
-          } else {
-            setStatus('Board ready');
-          }
-          attachDragHandlers();
-          await syncModelContext();
-        };
-      } else {
-        setStatus('Host bridge unavailable. Open this from Pi Toolshed.');
+        if (attachToolshedBridge()) {
+          return true;
+        }
+
+        return false;
       }
 
       window.addEventListener('toolshed-display-mode', (event) => {
         applyDisplayMode(event?.detail?.mode);
       });
 
+      window.addEventListener('openai:set_globals', (event) => {
+        const updated = hydrateFromGlobals(event.detail?.globals || {});
+        if (updated) attachDragHandlers();
+      }, { passive: true });
+
       const observer = new MutationObserver(() => attachDragHandlers());
       observer.observe($board, { childList: true, subtree: true });
       render();
+
+      const ready = hydrateCurrentHostState();
+      if (!ready) {
+        setStatus('Waiting for host bridge…');
+      }
+
+      let bootstrapAttempts = 0;
+      const bootstrapTimer = setInterval(() => {
+        bootstrapAttempts += 1;
+        if (hydrateCurrentHostState() || bootstrapAttempts >= 20) {
+          clearInterval(bootstrapTimer);
+          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
+            setStatus('Host bridge unavailable.');
+          }
+        }
+      }, 100);
     </script>
   </body>
 </html>`;

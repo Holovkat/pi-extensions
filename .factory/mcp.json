@@ -33,7 +33,7 @@
         "-p",
         "@modelcontextprotocol/sdk",
         "tsx",
-        "features/toolshed-mcp-apps/skeuomorphic-calculator-toolbox-app/server.ts"
+        "features/toolshed-mcp-apps/toolshed-app/server.ts"
       ]
     },
     "toolshed-github-project-kanban-board-app": {

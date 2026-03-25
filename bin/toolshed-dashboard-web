@@ -739,11 +739,12 @@ async function proxyHostedMcpRequest(req, res, route) {
 			if (responseBytes <= MCP_TRACKED_BODY_LIMIT_BYTES) responseChunks.push(buffer);
 		});
 		proxyRes.on("end", function() {
+			if (requestMethod === "DELETE") return;
 			const responseAppSessionIds = extractMcpAppSessionIdsFromBody(Buffer.concat(responseChunks), proxyRes.headers["content-type"]);
 			const responseAppSessionId = responseAppSessionIds.length > 0 ? responseAppSessionIds[responseAppSessionIds.length - 1] : "";
 			const preferredAppSessionId = responseAppSessionId || requestAppSessionId;
-			const trackedSessionId = responseSessionId || requestSessionId;
-			if (trackedSessionId && preferredAppSessionId) {
+			const trackedSessionId = responseSessionId || requestSessionId || preferredAppSessionId;
+			if (trackedSessionId) {
 				recordExternalMcpSession(route.serverId, trackedSessionId, requestSource, route.upstreamPath, requestMethod, requestClient, {
 					appSessionId: preferredAppSessionId,
 				});

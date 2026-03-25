@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -333,12 +335,7 @@ type ActiveTransport =
 
 const activeTransports = new Map<string, ActiveTransport>();
 
-function createCalculatorServer() {
-  const server = new McpServer({
-    name: "toolshed-skeuomorphic-calculator-toolbox-app",
-    version: "0.1.0",
-  });
-
+export function registerCalculatorFeatures(server: McpServer) {
   server.registerTool(
     helloWorldToolName,
     {
@@ -656,6 +653,15 @@ function createCalculatorServer() {
   return server;
 }
 
+export function createCalculatorServer() {
+  const server = new McpServer({
+    name: "toolshed-skeuomorphic-calculator-toolbox-app",
+    version: "0.1.0",
+  });
+  registerCalculatorFeatures(server);
+  return server;
+}
+
 function getStringArg(name: string): string | null {
   const flag = `--${name}`;
   const prefix = `${flag}=`;
@@ -864,7 +870,19 @@ async function main() {
   await runStdioServer();
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+const isMainModule = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return fileURLToPath(import.meta.url) === resolve(entry);
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
