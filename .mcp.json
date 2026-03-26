@@ -25,6 +25,22 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
       }
     },
+    "toolshed-app": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "tsx",
+        "-p",
+        "zod",
+        "-p",
+        "@modelcontextprotocol/sdk",
+        "sh",
+        "-c",
+        "NODE_PATH=\"$(cd \"$(dirname \"$(command -v tsx)\")/..\" && pwd)\" exec tsx features/toolshed-mcp-apps/toolshed-app/server.ts"
+      ]
+    },
     "toolshed-skeuomorphic-calculator-toolbox-app": {
       "type": "stdio",
       "command": "npx",

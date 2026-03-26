@@ -707,6 +707,16 @@ function readMcpConfig() {
 	return merged;
 }
 
+function resolveHostedMcpServerAlias(serverId) {
+	const key = String(serverId || "").trim();
+	if (!key) return key;
+	if (key === "toolshed-skeuomorphic-calculator-toolbox-app") {
+		const config = readMcpConfig();
+		if (config && config["toolshed-app"]) return "toolshed-app";
+	}
+	return key;
+}
+
 function readLegacyToolshedState() {
 	try {
 		return JSON.parse(fs.readFileSync(stateFile, "utf-8"));
@@ -1026,7 +1036,7 @@ async function readRequestBody(req) {
 }
 
 async function ensureHostedMcpServer(serverId) {
-	const key = String(serverId || "").trim();
+	const key = resolveHostedMcpServerAlias(serverId);
 	if (!key) throw new Error("Hosted MCP server id is required.");
 	ensureMcpConfigWatchers();
 	const reloadVersion = getMcpReloadVersion(key);

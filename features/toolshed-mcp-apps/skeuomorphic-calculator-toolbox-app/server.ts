@@ -44,11 +44,37 @@ type CalculatorSession = {
 const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const resourceUri = "ui://widget/toolshed-analog-math-console-v4.html";
 const helloWorldResourceUri = "ui://widget/toolshed-hello-world-v1.html";
+const DEFAULT_WIDGET_DOMAIN = "https://advanced-petra-uncorrelatively.ngrok-free.dev";
 const toolName = "open_skeuomorphic_calculator_toolbox_app";
 const chatgptToolName = "open_toolshed_analog_math_console";
 const helloWorldToolName = "open_toolshed_hello_world_demo";
 const helloWorldCalculatorToolName = "open_toolshed_hello_world_calculator_panel";
 const sessions = new Map<string, CalculatorSession>();
+
+function getWidgetDomain() {
+  return String(
+    process.env.OPENAI_WIDGET_DOMAIN
+      || process.env.TOOLSHED_PUBLIC_BASE_URL
+      || process.env.PUBLIC_BASE_URL
+      || DEFAULT_WIDGET_DOMAIN,
+  ).trim().replace(/\/+$/, "") || DEFAULT_WIDGET_DOMAIN;
+}
+
+function buildWidgetMeta(description: string) {
+  const widgetDomain = getWidgetDomain();
+  return {
+    ui: {
+      prefersBorder: true,
+    },
+    "openai/widgetDescription": description,
+    "openai/widgetPrefersBorder": true,
+    "openai/widgetDomain": widgetDomain,
+    "openai/widgetCSP": {
+      connect_domains: [widgetDomain],
+      resource_domains: [widgetDomain],
+    },
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -677,13 +703,7 @@ export function registerCalculatorFeatures(server: McpServer) {
           uri: helloWorldResourceUri,
           mimeType: RESOURCE_MIME_TYPE,
           text: helloHtml,
-          _meta: {
-            ui: {
-              prefersBorder: true,
-            },
-            "openai/widgetDescription": "A loud hello-world demo panel used to verify that ChatGPT rendered a custom Toolshed widget.",
-            "openai/widgetPrefersBorder": true,
-          },
+          _meta: buildWidgetMeta("A loud hello-world demo panel used to verify that ChatGPT rendered a custom Toolshed widget."),
         },
       ],
     }),
@@ -703,13 +723,109 @@ export function registerCalculatorFeatures(server: McpServer) {
           uri: resourceUri,
           mimeType: RESOURCE_MIME_TYPE,
           text: html,
-          _meta: {
-            ui: {
-              prefersBorder: true,
-            },
-            "openai/widgetDescription": "Interactive metallic Toolshed math console with a live display, step memory, and recent history.",
-            "openai/widgetPrefersBorder": true,
+          _meta: buildWidgetMeta("Interactive metallic Toolshed math console with a live display, step memory, and recent history."),
+        },
+      ],
+    }),
+  );
+
+  return server;
+}
+
+export function registerCalculatorAggregateFeatures(server: McpServer) {
+  server.registerTool(
+    toolName,
+    {
+      title: "Open Toolshed Skeuomorphic Calculator",
+      description: "Open the custom Toolshed skeuomorphic calculator session.",
+      inputSchema: z.object({
+        sessionId: z.string().optional(),
+        renderInline: z.boolean().optional(),
+        prompt: z.string().optional(),
+        sessionState: z.any().optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      securitySchemes: [{ type: "noauth" }],
+      _meta: {
+        securitySchemes: [{ type: "noauth" }],
+        ui: {
+          resourceUri,
+          inlinePreferred: true,
+          toolbox: true,
+          visibility: ["model", "app"],
+        },
+        "openai/outputTemplate": resourceUri,
+        "openai/widgetAccessible": true,
+        "openai/toolInvocation/invoking": "Opening calculator…",
+        "openai/toolInvocation/invoked": "Calculator ready.",
+      },
+    },
+    async ({ sessionId, renderInline, prompt, sessionState }) => {
+      const session = persist(setPanelContent(hydrateSession(getSession(sessionId || sessionState?.sessionId), sessionState), null, null));
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Opened the custom Toolshed skeuomorphic calculator${renderInline ? " inline" : ""}. Current display: ${session.display}.`,
           },
+        ],
+        structuredContent: {
+          ...buildWidgetState(session),
+          renderInline: Boolean(renderInline),
+          prompt: prompt || "",
+        },
+      };
+    },
+  );
+
+  server.registerTool(
+    "calculator_press_key",
+    {
+      title: "Calculator Press Key",
+      description: "Apply a calculator key press and return the updated session state.",
+      inputSchema: z.object({
+        sessionId: z.string(),
+        key: z.string(),
+      }),
+      annotations: {
+        readOnlyHint: false,
+        openWorldHint: false,
+        destructiveHint: false,
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"],
+        },
+      },
+    },
+    async ({ sessionId, key }) => {
+      const session = pressKey(getSession(sessionId), key);
+      return {
+        content: [{ type: "text", text: `Key ${key} applied. Display now shows ${session.display}.` }],
+        structuredContent: buildWidgetState(session),
+      };
+    },
+  );
+
+  server.registerResource(
+    "calculator-ui",
+    resourceUri,
+    {
+      title: "Skeuomorphic Calculator UI",
+      description: "Inline-ready calculator interface for toolbox and lane rendering.",
+      mimeType: RESOURCE_MIME_TYPE,
+    },
+    async () => ({
+      contents: [
+        {
+          uri: resourceUri,
+          mimeType: RESOURCE_MIME_TYPE,
+          text: html,
+          _meta: buildWidgetMeta("Interactive metallic Toolshed math console with a live display, step memory, and recent history."),
         },
       ],
     }),

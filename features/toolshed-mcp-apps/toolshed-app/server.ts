@@ -7,7 +7,7 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { registerCalculatorFeatures } from "../skeuomorphic-calculator-toolbox-app/server.ts";
+import { registerCalculatorAggregateFeatures } from "../skeuomorphic-calculator-toolbox-app/server.ts";
 import { registerGithubProjectKanbanBoardFeatures } from "../github-project-kanban-board-app/server.ts";
 
 type ActiveTransport =
@@ -21,7 +21,7 @@ export function createToolshedAppServer() {
     name: "toolshed-app",
     version: "0.1.0",
   });
-  registerCalculatorFeatures(server);
+  registerCalculatorAggregateFeatures(server);
   registerGithubProjectKanbanBoardFeatures(server);
   return server;
 }

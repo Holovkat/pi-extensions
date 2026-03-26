@@ -80,10 +80,36 @@ type SessionState = {
 
 const RESOURCE_MIME_TYPE = "text/html;profile=mcp-app";
 const resourceUri = "ui://widget/toolshed-github-project-kanban-board-v2.html";
+const DEFAULT_WIDGET_DOMAIN = "https://advanced-petra-uncorrelatively.ngrok-free.dev";
 const toolName = "open_github_project_kanban_board_app";
 const PROJECT_TITLE = "pi-toolshed";
 const STATUS_FIELD_NAME = "Kanban Status";
 const sessions = new Map<string, SessionState>();
+
+function getWidgetDomain() {
+  return String(
+    process.env.OPENAI_WIDGET_DOMAIN
+      || process.env.TOOLSHED_PUBLIC_BASE_URL
+      || process.env.PUBLIC_BASE_URL
+      || DEFAULT_WIDGET_DOMAIN,
+  ).trim().replace(/\/+$/, "") || DEFAULT_WIDGET_DOMAIN;
+}
+
+function buildWidgetMeta(description: string) {
+  const widgetDomain = getWidgetDomain();
+  return {
+    ui: {
+      prefersBorder: true,
+    },
+    "openai/widgetDescription": description,
+    "openai/widgetPrefersBorder": true,
+    "openai/widgetDomain": widgetDomain,
+    "openai/widgetCSP": {
+      connect_domains: [widgetDomain],
+      resource_domains: [widgetDomain],
+    },
+  };
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -866,13 +892,7 @@ export function registerGithubProjectKanbanBoardFeatures(server: McpServer) {
         uri: resourceUri,
         mimeType: RESOURCE_MIME_TYPE,
         text: html,
-        _meta: {
-          ui: {
-            prefersBorder: true,
-          },
-          "openai/widgetDescription": "An interactive GitHub project kanban board for the current repository with drag-drop moves and refresh actions.",
-          "openai/widgetPrefersBorder": true,
-        },
+        _meta: buildWidgetMeta("An interactive GitHub project kanban board for the current repository with drag-drop moves and refresh actions."),
       }],
     }),
   );
