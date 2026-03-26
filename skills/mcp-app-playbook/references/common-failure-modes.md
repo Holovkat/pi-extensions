@@ -9,3 +9,4 @@
 | Fix exists on disk but behavior is unchanged | stale runtime process | compare file mtime/version to live version | restart the real serving process |
 | Public route works but widget actions fail | host bridge method mismatch | inspect whether host is `window.openai` or local app bridge | support both bridge surfaces explicitly |
 | Board/tool opens but shows fallback mode | backend returned fallback data or widget never applied payload | inspect structured content counts, warnings, and error fields | fix server payload or hydration path depending on where data disappears |
+| Lane/model context gets flooded with huge payloads | missing data contract or overly broad tool response | inspect default output shape and raw collection sizes | move bulk data server-side and return summaries, filters, or targeted queries |

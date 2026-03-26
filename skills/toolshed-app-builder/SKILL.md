@@ -26,6 +26,8 @@ Shape the smallest useful first version of the app through conversation, then mo
 - Do not dump code, file paths, or implementation detail before the app shape is agreed.
 - Treat later requests as app extensions, not full rebuilds.
 - Prefer the smallest version that is still genuinely useful.
+- Define the data contract early: what enters the app, what stays server-side, what leaves the app, and who can mutate it.
+- Keep lane-facing outputs compact; prefer summaries, narrow queries, and targeted computations over bulk raw state dumps.
 - For app chrome and operator controls, prefer shared semantic button primitives and tokenized sizing/variants.
 - Reuse the active Toolshed theme tokens for backgrounds, borders, text, and controls instead of inventing a local palette for each app, unless the app's core visual identity explicitly requires it.
 - Treat [`next-app/app/globals.css`](/Users/tonyholovka/workspace/pi-extensions/next-app/app/globals.css) as the canonical shadcn theme source and mirror its token values when building inline app chrome.

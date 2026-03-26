@@ -56,16 +56,44 @@ For externally hosted apps, add:
 - tool-list verification
 - payload/session tracing where safe
 
+### 6. Design the data contract before code
+
+Define these explicitly:
+
+- what data enters the app
+- what data stays server-side
+- what data can leave the app
+- who owns each shape
+- who is allowed to mutate it
+- what the lane/model gets by default vs only on demand
+
+Large raw datasets should stay behind query tools, cached state, and targeted computations rather than being pushed wholesale into the lane.
+
+### 7. Treat token economy as a product requirement
+
+The best integration is not the one that returns the most data. It is the one that returns the smallest useful data shape for the current action.
+
+Prefer:
+
+- narrow queries
+- summaries
+- derived answers
+- paged or filtered results
+- compact structured payloads
+
+Avoid flooding the lane or model context with thousands of elements unless the user explicitly asked for raw bulk output.
+
 ## Recommended Build Sequence
 
 1. capture product shape
 2. define external contract
-3. define session model
-4. build server tools and resources
-5. build widget hydration
-6. expose through intended runtime
-7. run smoke tests
-8. verify live/public route
+3. define data contract
+4. define session model
+5. build server tools and resources
+6. build widget hydration
+7. expose through intended runtime
+8. run smoke tests
+9. verify live/public route
 
 ## Minimal Done Criteria
 
@@ -78,3 +106,4 @@ An MCP app should not be considered done until all of these are true:
 - widget can act back through the host bridge if applicable
 - app-visible session IDs align with operator-visible diagnostics
 - delete/close behavior leaves no misleading active session state
+- lane-facing outputs stay compact, scoped, and intentional

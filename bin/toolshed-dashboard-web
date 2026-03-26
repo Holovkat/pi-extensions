@@ -36,8 +36,12 @@ const actionLog = [];
 const generatedAppInstances = new Map();
 const hostedMcpServers = new Map();
 const externalMcpSessions = new Map();
+const mcpConfigWatchers = new Map();
+const mcpSourceWatchers = new Map();
+const mcpReloadState = new Map();
 const EXTERNAL_MCP_SESSION_TTL_MS = 15 * 60 * 1000;
 const MCP_TRACKED_BODY_LIMIT_BYTES = 512 * 1024;
+const MCP_HOT_RELOAD_DEBOUNCE_MS = 180;
 let lastMtime = 0;
 
 function escapeHtml(value) {
@@ -301,6 +305,194 @@ function cleanupHostedMcpServers() {
 	return changed;
 }
 
+function getMcpReloadEntry(serverId) {
+	const key = String(serverId || "").trim();
+	if (!key) return null;
+	const existing = mcpReloadState.get(key);
+	if (existing) return existing;
+	const created = { serverId: key, version: 0, pending: false, changedAt: 0, appliedAt: 0, reason: "" };
+	mcpReloadState.set(key, created);
+	return created;
+}
+
+function getMcpReloadVersion(serverId) {
+	const entry = getMcpReloadEntry(serverId);
+	return entry ? Number(entry.version || 0) : 0;
+}
+
+function readMcpReloadState(serverId) {
+	const entry = getMcpReloadEntry(serverId);
+	return entry ? { ...entry } : null;
+}
+
+function markMcpServerDirty(serverId, reason) {
+	const entry = getMcpReloadEntry(serverId);
+	if (!entry) return null;
+	entry.version = Number(entry.version || 0) + 1;
+	entry.pending = true;
+	entry.changedAt = Date.now();
+	entry.reason = String(reason || "MCP app source changed.").trim() || "MCP app source changed.";
+	pushActionLog({
+		type: "mcp-hot-reload",
+		status: "pending",
+		detail: `${entry.serverId} · ${clipText(entry.reason, 120)}`,
+	});
+	return { ...entry };
+}
+
+function acknowledgeMcpServerReload(serverId, version) {
+	const entry = getMcpReloadEntry(serverId);
+	if (!entry) return;
+	if (Number(entry.version || 0) !== Number(version || 0)) return;
+	entry.pending = false;
+	entry.appliedAt = Date.now();
+}
+
+function getActiveMcpServerIds() {
+	const ids = new Set();
+	for (const serverId of hostedMcpServers.keys()) {
+		const key = String(serverId || "").trim();
+		if (key) ids.add(key);
+	}
+	for (const instance of generatedAppInstances.values()) {
+		const key = instance && instance.runtime && instance.runtime.serverId ? String(instance.runtime.serverId).trim() : "";
+		if (key) ids.add(key);
+	}
+	return [...ids];
+}
+
+function markAllActiveMcpServersDirty(reason) {
+	let changed = 0;
+	for (const serverId of getActiveMcpServerIds()) {
+		if (markMcpServerDirty(serverId, reason)) changed++;
+	}
+	return changed;
+}
+
+function closeWatcherEntry(entry) {
+	if (!entry) return;
+	try { if (entry.timer) clearTimeout(entry.timer); } catch {}
+	try { if (entry.close) entry.close(); } catch {}
+}
+
+function closeWatcherMap(watchers) {
+	for (const entry of watchers.values()) closeWatcherEntry(entry);
+	watchers.clear();
+}
+
+function watchPath(targetPath, recursive, onChange) {
+	if (!targetPath || !fs.existsSync(targetPath)) return null;
+	try {
+		const watcher = fs.watch(targetPath, { recursive }, onChange);
+		return function close() { watcher.close(); };
+	} catch (error) {
+		if (!recursive) return null;
+		try {
+			const watcher = fs.watch(targetPath, onChange);
+			return function close() { watcher.close(); };
+		} catch {
+			return null;
+		}
+	}
+}
+
+function ensureMcpConfigWatchers() {
+	if (!mcpConfigWatchers.has("project-root")) {
+		const close = watchPath(projectDir, false, function(_eventType, fileName) {
+			const normalized = String(fileName || "").trim();
+			if (!normalized) return;
+			if (normalized === ".mcp.json") {
+				markAllActiveMcpServersDirty("Project MCP config changed.");
+				return;
+			}
+			if (normalized === ".factory") {
+				ensureMcpConfigWatchers();
+			}
+		});
+		if (close) mcpConfigWatchers.set("project-root", { close });
+	}
+
+	const factoryDir = path.join(projectDir, ".factory");
+	if (!fs.existsSync(factoryDir)) {
+		if (mcpConfigWatchers.has("factory-dir")) {
+			closeWatcherEntry(mcpConfigWatchers.get("factory-dir"));
+			mcpConfigWatchers.delete("factory-dir");
+		}
+		return;
+	}
+	if (mcpConfigWatchers.has("factory-dir")) return;
+	const close = watchPath(factoryDir, false, function(_eventType, fileName) {
+		const normalized = String(fileName || "").trim();
+		if (normalized === "mcp.json") markAllActiveMcpServersDirty("Factory MCP config changed.");
+	});
+	if (close) mcpConfigWatchers.set("factory-dir", { close });
+}
+
+function shouldTriggerMcpSourceReload(fileName) {
+	const normalized = String(fileName || "").trim().toLowerCase();
+	if (!normalized) return true;
+	if (normalized.includes("__pycache__")) return false;
+	if (normalized.endsWith(".pyc")) return false;
+	const basename = path.basename(normalized);
+	if (!basename) return true;
+	if (basename.startsWith(".#")) return false;
+	if (basename === ".ds_store") return false;
+	if (basename === "package.json") return true;
+	return /\.(?:[cm]?[jt]sx?|json|css|html|svg|md|yml|yaml)$/i.test(basename);
+}
+
+function resolveMcpSourceWatchPath(serverConfig) {
+	if (!serverConfig || typeof serverConfig !== "object") return null;
+	const candidates = [];
+	if (serverConfig.command && /\.(?:[cm]?[jt]sx?)$/i.test(String(serverConfig.command || ""))) {
+		candidates.push(String(serverConfig.command || ""));
+	}
+	const args = Array.isArray(serverConfig.args) ? serverConfig.args : [];
+	for (let i = args.length - 1; i >= 0; i--) {
+		if (/\.(?:[cm]?[jt]sx?)$/i.test(String(args[i] || ""))) {
+			candidates.push(String(args[i] || ""));
+			break;
+		}
+	}
+	const scriptPath = candidates.find(Boolean);
+	if (!scriptPath) return null;
+	const absolute = path.isAbsolute(scriptPath) ? scriptPath : path.join(projectDir, scriptPath);
+	const existingPath = fs.existsSync(absolute) ? absolute : null;
+	if (existingPath) {
+		try {
+			const stat = fs.statSync(existingPath);
+			return stat.isDirectory() ? existingPath : path.dirname(existingPath);
+		} catch {}
+	}
+	return path.dirname(absolute);
+}
+
+function ensureMcpSourceWatcher(serverId, serverConfig) {
+	const key = String(serverId || "").trim();
+	if (!key) return;
+	const watchPathValue = resolveMcpSourceWatchPath(serverConfig);
+	if (!watchPathValue) return;
+	const signature = String(watchPathValue);
+	const existing = mcpSourceWatchers.get(key);
+	if (existing && existing.signature === signature) return;
+	if (existing) {
+		closeWatcherEntry(existing);
+		mcpSourceWatchers.delete(key);
+	}
+	const watcherState = { signature, timer: null, close: null };
+	const close = watchPath(watchPathValue, true, function(_eventType, fileName) {
+		if (!shouldTriggerMcpSourceReload(fileName)) return;
+		if (watcherState.timer) clearTimeout(watcherState.timer);
+		const detail = String(fileName || "").trim();
+		watcherState.timer = setTimeout(function() {
+			markMcpServerDirty(key, detail ? `MCP app source changed: ${detail}` : "MCP app source changed.");
+		}, MCP_HOT_RELOAD_DEBOUNCE_MS);
+	});
+	if (!close) return;
+	watcherState.close = close;
+	mcpSourceWatchers.set(key, watcherState);
+}
+
 function serverRelativeTime(value) {
 	const date = new Date(value || Date.now());
 	if (Number.isNaN(date.getTime())) return "unknown";
@@ -392,45 +584,60 @@ function buildConnectionsState() {
 			{ label: "Last touch", value: serverFormatTime(agent.lastTouchedAt || agent.registeredAt) },
 		],
 	}));
-	const inlineAppEntries = [...generatedAppInstances.entries()].map(([key, instance]) => ({
-		id: key,
-		title: (instance.runtime && instance.runtime.title) || "Inline MCP app",
-		brief: (instance.runtime && instance.runtime.brief) || "Generated MCP app runtime connected to PI.",
-		statusLabel: "Inline",
-		statusTone: "success",
-		cardId: instance.cardId || key,
-		itemId: instance.itemId || key,
-		serverId: instance.runtime && instance.runtime.serverId ? instance.runtime.serverId : "",
-		sessionId: instance.sessionId || "",
-		openedAt: instance.openedAt || instance.lastTouchedAt || now,
-		lastTouchedAt: instance.lastTouchedAt || instance.openedAt || now,
-		meta: [
-			{ label: `Opened ${serverRelativeTime(instance.openedAt || instance.lastTouchedAt || now)}`, tone: "info" },
-			{ label: `Touched ${serverRelativeTime(instance.lastTouchedAt || instance.openedAt || now)}`, tone: "neutral" },
-		],
-		cells: [
-			{ label: "Card", value: instance.cardId || key },
-			{ label: "Session", value: instance.sessionId || "pending" },
-			{ label: "Server", value: instance.runtime && instance.runtime.serverId ? instance.runtime.serverId : "unknown" },
-		],
-	}));
+	const inlineAppEntries = [...generatedAppInstances.entries()].map(([key, instance]) => {
+		const serverId = instance.runtime && instance.runtime.serverId ? instance.runtime.serverId : "";
+		const reload = readMcpReloadState(serverId);
+		return {
+			id: key,
+			title: (instance.runtime && instance.runtime.title) || "Inline MCP app",
+			brief: reload && reload.pending
+				? "Source change detected. The runtime will refresh on the next MCP app request."
+				: (instance.runtime && instance.runtime.brief) || "Generated MCP app runtime connected to PI.",
+			statusLabel: reload && reload.pending ? "Reload pending" : "Inline",
+			statusTone: reload && reload.pending ? "warning" : "success",
+			cardId: instance.cardId || key,
+			itemId: instance.itemId || key,
+			serverId,
+			sessionId: instance.sessionId || "",
+			openedAt: instance.openedAt || instance.lastTouchedAt || now,
+			lastTouchedAt: instance.lastTouchedAt || instance.openedAt || now,
+			meta: [
+				...(reload && reload.pending
+					? [{ label: `Reload pending ${serverRelativeTime(reload.changedAt || now)}`, tone: "warning" }]
+					: []),
+				{ label: `Opened ${serverRelativeTime(instance.openedAt || instance.lastTouchedAt || now)}`, tone: "info" },
+				{ label: `Touched ${serverRelativeTime(instance.lastTouchedAt || instance.openedAt || now)}`, tone: "neutral" },
+			],
+			cells: [
+				{ label: "Card", value: instance.cardId || key },
+				{ label: "Session", value: instance.sessionId || "pending" },
+				{ label: "Server", value: serverId || "unknown" },
+			],
+		};
+	});
 	const hostedEntries = [...hostedMcpServers.entries()].map(([serverId, hosted]) => {
 		const activeSessions = activeExternalSessions.filter((session) => String(session.serverId || "") === String(serverId || ""));
 		const route = `/mcp/servers/${encodeURIComponent(String(serverId || ""))}`;
+		const reload = readMcpReloadState(serverId);
 		return {
 			id: serverId,
 			title: serverId,
-			brief: hosted.mode === "managed"
-				? "PI-managed local MCP server process."
-				: hosted.url || "Remote MCP endpoint.",
-			statusLabel: hosted.mode === "managed" ? "Managed" : "Remote",
-			statusTone: "success",
+			brief: reload && reload.pending
+				? "Source or config change detected. This server will restart on the next request."
+				: hosted.mode === "managed"
+					? "PI-managed local MCP server process."
+					: hosted.url || "Remote MCP endpoint.",
+			statusLabel: reload && reload.pending ? "Reload pending" : (hosted.mode === "managed" ? "Managed" : "Remote"),
+			statusTone: reload && reload.pending ? "warning" : "success",
 			serverId,
 			route,
 			mode: hosted.mode,
 			openedAt: hosted.startedAt || hosted.lastTouchedAt || now,
 			lastTouchedAt: hosted.lastTouchedAt || hosted.startedAt || now,
 			meta: [
+				...(reload && reload.pending
+					? [{ label: `Reload pending ${serverRelativeTime(reload.changedAt || now)}`, tone: "warning" }]
+					: []),
 				{ label: `Active sessions ${activeSessions.length}`, tone: activeSessions.length > 0 ? "success" : "neutral" },
 				{ label: `Touched ${serverRelativeTime(hosted.lastTouchedAt || hosted.startedAt || now)}`, tone: "info" },
 			],
@@ -500,13 +707,208 @@ function readMcpConfig() {
 	return merged;
 }
 
-function resolveGeneratedRuntime(cardId) {
-	const state = readState();
+function readLegacyToolshedState() {
+	try {
+		return JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+	} catch {
+		return null;
+	}
+}
+
+function readCurrentToolshedState() {
+	return readLegacyToolshedState();
+}
+
+function readToolshedSessionSnapshots() {
+	const snapshots = new Map();
+	const stateDir = path.dirname(stateFile);
+	try {
+		if (fs.existsSync(stateDir)) {
+			for (const entry of fs.readdirSync(stateDir)) {
+				if (!/^toolshed-state\..+\.json$/i.test(String(entry || ""))) continue;
+				const filePath = path.join(stateDir, entry);
+				try {
+					const raw = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+					const sessionId = String(raw && raw.sessionId || "").trim();
+					if (!sessionId) continue;
+					snapshots.set(sessionId, raw);
+				} catch {}
+			}
+		}
+	} catch {}
+	if (snapshots.size === 0) {
+		const legacy = readLegacyToolshedState();
+		const sessionId = String(legacy && legacy.sessionId || "").trim();
+		if (legacy && sessionId) snapshots.set(sessionId, legacy);
+	}
+	return snapshots;
+}
+
+function resolveSessionSnapshot(sessionKey, sessionSnapshots, fallbackState) {
+	const key = String(sessionKey || "").trim();
+	if (!key) return fallbackState;
+	for (const snapshot of sessionSnapshots.values()) {
+		if (!snapshot || typeof snapshot !== "object") continue;
+		const snapshotSessionId = String(snapshot.currentSessionId || snapshot.sessionId || "").trim();
+		const snapshotSessionFile = String(snapshot.currentSessionFile || "").trim();
+		if (key === snapshotSessionId || (snapshotSessionFile && key === snapshotSessionFile)) {
+			return snapshot;
+		}
+	}
+	return fallbackState;
+}
+
+function buildToolshedSessionCatalog(sessionSnapshots) {
+	return [...registeredAgents.entries()]
+		.map(function([agentId, agent]) {
+			const sessionId = String(agent && agent.sessionKey ? agent.sessionKey : agentId).trim();
+			if (!sessionId) return null;
+			const snapshot = sessionSnapshots.get(sessionId);
+			const lastTouchedAt = Math.max(
+				Number(agent && agent.lastTouchedAt || 0),
+				Number(snapshot && snapshot.updatedAt ? Date.parse(String(snapshot.updatedAt)) : 0) || 0,
+			);
+			const label = "PI session · " + sessionId.slice(-8);
+			const brief = snapshot && snapshot.frontier && snapshot.frontier.summary
+				? clipText(snapshot.frontier.summary, 96)
+				: snapshot && snapshot.workspaceId
+					? clipText(String(snapshot.workspaceId || "").replace(/-/g, " "), 96)
+					: "Live PI lane session.";
+			return {
+				agentId,
+				sessionId,
+				path: snapshot && snapshot.currentSessionFile ? snapshot.currentSessionFile : "",
+				label,
+				brief,
+				workspaceId: snapshot && snapshot.workspaceId ? snapshot.workspaceId : "",
+				registeredAt: agent && agent.registeredAt ? agent.registeredAt : 0,
+				lastTouchedAt,
+				updatedAt: snapshot && snapshot.updatedAt ? snapshot.updatedAt : "",
+			};
+		})
+		.filter(Boolean)
+		.sort(function(a, b) {
+			return Number(b.lastTouchedAt || 0) - Number(a.lastTouchedAt || 0);
+		});
+}
+
+function buildLiveAppCatalogFromState(state) {
 	const widgets = state && Array.isArray(state.widgets) ? state.widgets : [];
+	const currentSessionId = String(state && state.currentSessionId || state && state.sessionId || "").trim();
+	return widgets
+		.map(function(widget) {
+			const runtime = widget && widget.appRuntime && typeof widget.appRuntime === "object" ? widget.appRuntime : null;
+			if (!runtime || !runtime.ready || (!runtime.serverId && !runtime.toolName)) return null;
+			return {
+				key: [
+					String(runtime.serverId || "").trim(),
+					String(runtime.toolName || "").trim(),
+					String(widget && widget.id || runtime.cardId || "").trim(),
+				].join("::"),
+				cardId: String(widget && widget.id || runtime.cardId || "").trim(),
+				title: String(widget && widget.title || runtime.title || runtime.serverId || "MCP app").trim(),
+				brief: String(runtime.brief || widget && widget.summary || "").trim(),
+				serverId: String(runtime.serverId || "").trim(),
+				toolName: String(runtime.toolName || "").trim(),
+				sessionId: currentSessionId,
+				sessionLabel: String(state && state.projectName || projectName).trim(),
+			};
+		})
+		.filter(Boolean);
+}
+
+function createEmptyToolshedState(sessionCatalog, currentSessionId) {
+	return {
+		sessionId: currentSessionId || "",
+		currentSessionId: currentSessionId || "",
+		currentSessionFile: "",
+		sessionDir: "",
+		projectDir,
+		projectName,
+		workspaceId: "all-cards",
+		workspaces: [],
+		status: {
+			connection: "offline",
+			session: "idle",
+			chips: [],
+		},
+		frontier: {
+			id: null,
+			title: "",
+			summary: "",
+			kind: null,
+			timestamp: null,
+		},
+		lane: [],
+		packets: [],
+		widgets: [],
+		mcp: {
+			configured: false,
+			count: 0,
+			summary: "No project MCP configuration detected.",
+			filePath: path.join(projectDir, ".factory", "mcp.json"),
+			servers: [],
+		},
+		skills: [],
+		slashCommands: [],
+		documents: [],
+		repository: null,
+		registry: {
+			summary: "No tracked MCP apps are in the registry yet.",
+			liveCount: 0,
+			staleCount: 0,
+			publishedCount: 0,
+			entries: [],
+		},
+		appCatalog: [],
+		dashboardMeta: {
+			projectDir,
+			projectName,
+			stateFile,
+			sessionStateFile: "",
+			controlPort,
+			liveSessionConnected: registeredAgents.size > 0,
+			registeredAgents: [...registeredAgents.keys()],
+			actionLog: actionLog.slice(-16),
+		},
+		connections: emptyConnectionsState(),
+		sessionCatalog: Array.isArray(sessionCatalog) ? sessionCatalog : [],
+		updatedAt: new Date().toISOString(),
+	};
+}
+
+function resolveGeneratedRuntime(cardId) {
+	for (const snapshot of readToolshedSessionSnapshots().values()) {
+		const widgets = snapshot && Array.isArray(snapshot.widgets) ? snapshot.widgets : [];
+		const widget = widgets.find(function(item) {
+			return item && item.id === cardId && item.appRuntime;
+		});
+		if (widget && widget.appRuntime) return widget.appRuntime;
+	}
+	const legacy = readLegacyToolshedState();
+	const widgets = legacy && Array.isArray(legacy.widgets) ? legacy.widgets : [];
 	const widget = widgets.find(function(item) {
 		return item && item.id === cardId && item.appRuntime;
 	});
 	return widget && widget.appRuntime ? widget.appRuntime : null;
+}
+
+function readGeneratedAppPersistedState(cardId, itemId) {
+	const state = readState();
+	const lane = state && Array.isArray(state.lane) ? state.lane : [];
+	const safeCardId = String(cardId || "").trim();
+	const safeItemId = String(itemId || "").trim();
+	const match = lane.find(function(item) {
+		if (!item || item.meta !== "Generated MCP app") return false;
+		if (safeItemId && String(item.id || "").trim() === safeItemId) return true;
+		return safeCardId && String(item.cardId || "").trim() === safeCardId;
+	});
+	if (!match || !match.appState || typeof match.appState !== "object") return null;
+	try {
+		return JSON.parse(JSON.stringify(match.appState));
+	} catch {
+		return null;
+	}
 }
 
 function expandConfigEnv(value) {
@@ -626,15 +1028,25 @@ async function readRequestBody(req) {
 async function ensureHostedMcpServer(serverId) {
 	const key = String(serverId || "").trim();
 	if (!key) throw new Error("Hosted MCP server id is required.");
+	ensureMcpConfigWatchers();
+	const reloadVersion = getMcpReloadVersion(key);
 	const existing = hostedMcpServers.get(key);
-	if (existing && existing.mode === "remote" && existing.url) return existing;
-	if (existing && existing.child && isChildRunning(existing.child)) return existing;
+	if (existing && existing.mode === "remote" && existing.url && Number(existing.reloadVersion || 0) === reloadVersion) return existing;
+	if (existing && existing.child && isChildRunning(existing.child) && Number(existing.reloadVersion || 0) === reloadVersion) return existing;
+	if (existing && Number(existing.reloadVersion || 0) !== reloadVersion) {
+		pushActionLog({
+			type: "mcp-hot-reload",
+			status: "restarting",
+			detail: `${key} · applying latest source/config changes`,
+		});
+	}
 	if (existing && existing.child) {
 		try { existing.child.kill(); } catch {}
 		hostedMcpServers.delete(key);
 	}
 	const serverConfig = getGeneratedAppServerConfig(key);
 	if (!serverConfig) throw new Error("No project MCP server config found for " + key);
+	ensureMcpSourceWatcher(key, serverConfig);
 	if (serverConfig.url) {
 		const startedAt = Date.now();
 		const remote = {
@@ -644,8 +1056,10 @@ async function ensureHostedMcpServer(serverId) {
 			route: `/mcp/servers/${encodeURIComponent(key)}`,
 			startedAt,
 			lastTouchedAt: startedAt,
+			reloadVersion,
 		};
 		hostedMcpServers.set(key, remote);
+		acknowledgeMcpServerReload(key, reloadVersion);
 		return remote;
 	}
 	const nextPort = await reserveOpenPort();
@@ -674,6 +1088,7 @@ async function ensureHostedMcpServer(serverId) {
 		child,
 		logs: function() { return logs; },
 		lastTouchedAt: startedAt,
+		reloadVersion,
 	};
 	child.on("close", function() {
 		if (hostedMcpServers.get(key) === hosted) hostedMcpServers.delete(key);
@@ -682,6 +1097,7 @@ async function ensureHostedMcpServer(serverId) {
 	try {
 		await waitForHostedMcpServer(nextPort, child, 10000);
 		hosted.lastTouchedAt = Date.now();
+		acknowledgeMcpServerReload(key, reloadVersion);
 		return hosted;
 	} catch (error) {
 		try { child.kill(); } catch {}
@@ -907,19 +1323,24 @@ function createJsonRpcClient(serverConfig) {
 
 async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 	const key = generatedAppInstanceKey(cardId, itemId);
+	const serverId = runtime && runtime.serverId ? String(runtime.serverId).trim() : "";
+	const reloadVersion = getMcpReloadVersion(serverId);
 	const existing = generatedAppInstances.get(key);
 	if (existing && existing.client && existing.client.child && existing.client.child.exitCode == null && !existing.client.child.killed) {
 		const nextVersion = generatedRuntimeVersion(runtime);
 		const currentVersion = generatedRuntimeVersion(existing.runtime);
-		if ((nextVersion && currentVersion && nextVersion === currentVersion) || (!nextVersion && !currentVersion)) {
+		const sameRuntimeVersion = (nextVersion && currentVersion && nextVersion === currentVersion) || (!nextVersion && !currentVersion);
+		if (sameRuntimeVersion && Number(existing.reloadVersion || 0) === reloadVersion) {
 			return existing;
 		}
 	}
 	if (existing && existing.client) existing.client.close();
 	generatedAppInstances.delete(key);
 	if (!runtime || !runtime.serverId) throw new Error("Generated app runtime is missing a server id.");
+	ensureMcpConfigWatchers();
 	const serverConfig = getGeneratedAppServerConfig(runtime.serverId);
 	if (!serverConfig || !serverConfig.command) throw new Error("No project MCP server config found for " + runtime.serverId);
+	ensureMcpSourceWatcher(runtime.serverId, serverConfig);
 	const client = createJsonRpcClient(serverConfig);
 	const openedAt = Date.now();
 	await client.request("initialize", {
@@ -941,11 +1362,13 @@ async function ensureGeneratedAppInstance(cardId, itemId, runtime) {
 		openedAt,
 		lastResult: null,
 		lastTouchedAt: openedAt,
+		reloadVersion,
 	};
 	client.child.on("close", function() {
 		if (generatedAppInstances.get(key) === instance) generatedAppInstances.delete(key);
 	});
 	generatedAppInstances.set(key, instance);
+	acknowledgeMcpServerReload(runtime.serverId, reloadVersion);
 	return instance;
 }
 
@@ -1113,34 +1536,41 @@ function buildGeneratedAppFrameHtml(cardId, itemId) {
 	return bridgeScript + html;
 }
 
-function readState() {
+function readState(selectedSession) {
+	const sessionSnapshots = readToolshedSessionSnapshots();
+	const raw = resolveSessionSnapshot(selectedSession, sessionSnapshots, readCurrentToolshedState());
+	const sessionCatalog = raw && Array.isArray(raw.sessionCatalog) && raw.sessionCatalog.length > 0
+		? raw.sessionCatalog
+		: buildToolshedSessionCatalog(sessionSnapshots);
+	const currentSessionId = String(raw && raw.currentSessionId || raw && raw.sessionId || "").trim();
+	const appCatalog = buildLiveAppCatalogFromState(raw);
+	const fallback = createEmptyToolshedState(sessionCatalog, currentSessionId);
+	const meta = raw && raw.dashboardMeta && typeof raw.dashboardMeta === "object" ? raw.dashboardMeta : {};
+	let connections = emptyConnectionsState();
 	try {
-		const raw = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
-		const meta = raw.dashboardMeta && typeof raw.dashboardMeta === "object" ? raw.dashboardMeta : {};
-		let connections = emptyConnectionsState();
-		try {
-			connections = buildConnectionsState();
-		} catch (error) {
-			console.warn("[toolshed] failed to build connections state:", error && error.message ? error.message : error);
-		}
-		return {
-			...raw,
-			connections,
-			dashboardMeta: {
-				...meta,
-				projectDir,
-				projectName,
-				stateFile,
-				sessionStateFile,
-				controlPort,
-				liveSessionConnected: registeredAgents.size > 0,
-				registeredAgents: [...registeredAgents.keys()],
-				actionLog: actionLog.slice(-16),
-			},
-		};
-	} catch {
-		return null;
+		connections = buildConnectionsState();
+	} catch (error) {
+		console.warn("[toolshed] failed to build connections state:", error && error.message ? error.message : error);
 	}
+	return {
+		...fallback,
+		...(raw && typeof raw === "object" ? raw : {}),
+		connections,
+		sessionCatalog,
+		appCatalog,
+		dashboardMeta: {
+			...fallback.dashboardMeta,
+			...meta,
+			projectDir,
+			projectName,
+			stateFile,
+			controlPort,
+			liveSessionConnected: registeredAgents.size > 0,
+			registeredAgents: [...registeredAgents.keys()],
+			actionLog: actionLog.slice(-16),
+		},
+		updatedAt: raw && raw.updatedAt ? raw.updatedAt : new Date().toISOString(),
+	};
 }
 
 function broadcastState() {
@@ -1188,6 +1618,9 @@ const controlServer = net.createServer((socket) => {
 function handleControlCommand(cmd, socket) {
 	switch (cmd.type) {
 		case "register": {
+			for (const [id, agent] of registeredAgents.entries()) {
+				if (agent.socket === socket && id !== cmd.agentId) registeredAgents.delete(id);
+			}
 			registeredAgents.set(cmd.agentId, {
 				sessionKey: cmd.sessionKey || cmd.agentId,
 				socket,
@@ -1255,6 +1688,7 @@ function sendText(res, status, text, type = "text/html; charset=utf-8") {
 
 const PAGE_CSS = `
 *{box-sizing:border-box}
+[hidden]{display:none !important}
 :root{color-scheme:dark;--background:oklch(0.145 0 0);--foreground:oklch(0.985 0 0);--card:oklch(0.205 0 0);--card-foreground:oklch(0.985 0 0);--popover:oklch(0.205 0 0);--popover-foreground:oklch(0.985 0 0);--primary:oklch(0.922 0 0);--primary-foreground:oklch(0.205 0 0);--secondary:oklch(0.269 0 0);--secondary-foreground:oklch(0.985 0 0);--muted:oklch(0.269 0 0);--muted-foreground:oklch(0.708 0 0);--accent:oklch(0.269 0 0);--accent-foreground:oklch(0.985 0 0);--destructive:oklch(0.704 0.191 22.216);--destructive-foreground:oklch(1 0 0);--border:oklch(1 0 0 / 10%);--input:oklch(1 0 0 / 15%);--ring:oklch(0.556 0 0);--chart-1:oklch(0.87 0 0);--chart-2:oklch(0.556 0 0);--chart-3:oklch(0.439 0 0);--chart-4:oklch(0.371 0 0);--chart-5:oklch(0.269 0 0);--success:var(--chart-2);--warning:var(--chart-4);--neutral:var(--muted-foreground);--sidebar:oklch(0.205 0 0);--sidebar-foreground:oklch(0.985 0 0);--sidebar-primary:oklch(0.488 0.243 264.376);--sidebar-primary-foreground:oklch(0.985 0 0);--sidebar-accent:oklch(0.269 0 0);--sidebar-accent-foreground:oklch(0.985 0 0);--sidebar-border:oklch(1 0 0 / 10%);--sidebar-ring:oklch(0.556 0 0);--bg:var(--background);--panel:var(--card);--panel-strong:color-mix(in oklch,var(--card) 88%, white 12%);--panel-soft:var(--popover);--line:var(--border);--text:var(--foreground);--shadow-color:#95a0ce;--shadow-opacity:0.21;--shadow-blur:50px;--shadow-spread:0px;--shadow-offset-x:0px;--shadow-offset-y:9px;--spacing:0.2rem;--letter-spacing:-0.025em;--tracking-normal:-0.025em;--shadow-2xs:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.10);--shadow-xs:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.10);--shadow-sm:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.21),0px 1px 2px -1px hsl(228.4211 36.7742% 69.6078% / 0.21);--shadow:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.21),0px 1px 2px -1px hsl(228.4211 36.7742% 69.6078% / 0.21);--shadow-md:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.21),0px 2px 4px -1px hsl(228.4211 36.7742% 69.6078% / 0.21);--shadow-lg:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.21),0px 4px 6px -1px hsl(228.4211 36.7742% 69.6078% / 0.21);--shadow-xl:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.21),0px 8px 10px -1px hsl(228.4211 36.7742% 69.6078% / 0.21);--shadow-2xl:0px 9px 50px 0px hsl(228.4211 36.7742% 69.6078% / 0.53);--font-sans:Geist,ui-sans-serif,sans-serif,system-ui;--font-serif:"Playfair Display",ui-serif,serif;--font-mono:"IBM Plex Mono",ui-monospace,monospace;--radius:0.05rem;--radius-md:max(calc(var(--radius) + 8px),0.5rem);--stage-width:980px;--ui-button-height:32px;--ui-button-height-sm:28px;--ui-button-height-xs:24px;--ui-button-pad-x:10px;--ui-button-pad-x-sm:8px;--ui-button-radius:max(calc(var(--radius) + 8px),0.5rem);--ui-button-radius-sm:max(calc(var(--radius) + 6px),0.45rem);--ui-button-radius-tab:max(calc(var(--radius) + 4px),0.4rem);--ui-button-radius-pill:999px;--ui-button-pill-min-inline:0px;--ui-button-pill-pad-x:10px}
 body.light{color-scheme:light;--background:oklch(1 0 0);--foreground:oklch(0.145 0 0);--card:oklch(1 0 0);--card-foreground:oklch(0.145 0 0);--popover:oklch(1 0 0);--popover-foreground:oklch(0.145 0 0);--primary:oklch(0.205 0 0);--primary-foreground:oklch(0.985 0 0);--secondary:oklch(0.97 0 0);--secondary-foreground:oklch(0.205 0 0);--muted:oklch(0.97 0 0);--muted-foreground:oklch(0.556 0 0);--accent:oklch(0.97 0 0);--accent-foreground:oklch(0.205 0 0);--destructive:oklch(0.577 0.245 27.325);--destructive-foreground:oklch(1 0 0);--border:oklch(0.922 0 0);--input:oklch(0.922 0 0);--ring:oklch(0.708 0 0);--chart-1:oklch(0.87 0 0);--chart-2:oklch(0.556 0 0);--chart-3:oklch(0.439 0 0);--chart-4:oklch(0.371 0 0);--chart-5:oklch(0.269 0 0);--success:var(--chart-2);--warning:var(--chart-4);--neutral:var(--muted-foreground);--sidebar:oklch(0.985 0 0);--sidebar-foreground:oklch(0.145 0 0);--sidebar-primary:oklch(0.205 0 0);--sidebar-primary-foreground:oklch(0.985 0 0);--sidebar-accent:oklch(0.97 0 0);--sidebar-accent-foreground:oklch(0.205 0 0);--sidebar-border:oklch(0.922 0 0);--sidebar-ring:oklch(0.708 0 0);--bg:var(--background);--panel:var(--card);--panel-strong:color-mix(in oklch,var(--card) 94%, black 6%);--panel-soft:var(--popover);--line:var(--border);--text:var(--foreground);--shadow-color:oklch(0.374 0.01 67.558);--shadow-opacity:0.21;--shadow-blur:50px;--shadow-spread:0px;--shadow-offset-x:0px;--shadow-offset-y:9px;--spacing:0.2rem;--letter-spacing:-0.025em;--tracking-normal:-0.025em;--shadow-2xs:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.10);--shadow-xs:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.10);--shadow-sm:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.21),0px 1px 2px -1px hsl(30.0231 7.2195% 25.0410% / 0.21);--shadow:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.21),0px 1px 2px -1px hsl(30.0231 7.2195% 25.0410% / 0.21);--shadow-md:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.21),0px 2px 4px -1px hsl(30.0231 7.2195% 25.0410% / 0.21);--shadow-lg:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.21),0px 4px 6px -1px hsl(30.0231 7.2195% 25.0410% / 0.21);--shadow-xl:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.21),0px 8px 10px -1px hsl(30.0231 7.2195% 25.0410% / 0.21);--shadow-2xl:0px 9px 50px 0px hsl(30.0231 7.2195% 25.0410% / 0.53);--font-sans:Geist,ui-sans-serif,sans-serif,system-ui;--font-serif:"Playfair Display",ui-serif,serif;--font-mono:"IBM Plex Mono",ui-monospace,monospace;--radius:0.625rem}
 html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font:14px/1.55 var(--font-sans)}
@@ -1275,7 +1709,7 @@ body.light .hero-card,body.light .widget-card,body.light .lane-card,body.light .
 .header-row{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center}
 .header-balance{min-height:1px}
 .brand-block{justify-self:center;text-align:center}
-.brand-eyebrow{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.brand-eyebrow{font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--foreground)}
 .brand-title{font-size:15px;font-weight:700;line-height:1.2;margin-top:4px}
 .brand-meta{margin-top:4px;color:var(--muted);font-size:12px}
 .header-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-self:end;justify-content:flex-end}
@@ -1286,6 +1720,7 @@ body.light .hero-card,body.light .widget-card,body.light .lane-card,body.light .
 .select,.btn,.ghost-btn,.mini-btn,.composer-chip,.toolbar-chip{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid transparent;border-radius:var(--ui-button-radius);padding:0 var(--ui-button-pad-x);min-height:var(--ui-button-height);background:transparent;color:var(--foreground);font-size:14px;font-weight:500;line-height:1;white-space:nowrap;transition:background .16s ease,border-color .16s ease,color .16s ease,box-shadow .16s ease,transform .16s ease,opacity .16s ease;box-shadow:none}
 .select{appearance:none;-webkit-appearance:none;padding-right:32px}
 .header-controls .select{min-width:220px;max-width:320px;border-radius:var(--ui-button-radius);text-align-last:center;font-weight:500;border-color:var(--border);background:var(--background)}
+.header-controls #themeBtn{min-width:var(--ui-button-height);width:var(--ui-button-height);padding:0;font-size:15px}
 .btn{border-color:var(--border);background:var(--background)}
 .btn.primary{background:var(--primary);color:var(--primary-foreground)}
 .btn.ghost,.ghost-btn{background:transparent}
@@ -1741,13 +2176,15 @@ const PROJECT_NAME = ${JSON.stringify(projectName)};
 const STATE_FILE = ${JSON.stringify(stateFile)};
 const CONTROL_PORT = ${JSON.stringify(controlPort)};
 const PAGE_MODE = ${JSON.stringify("lane")};
+const SESSION_SELECTION_STORAGE_KEY = 'pi-toolshed-session-selection::' + PROJECT_DIR;
 
 const el = function(id){ return document.getElementById(id); };
-const workspaceSelect = el('workspaceSelect');
+const sessionSelect = el('sessionSelect');
 const connectionPill = el('connectionPill');
 const headerPills = el('headerPills');
 const headerTitle = el('headerTitle');
 const headerMeta = el('headerMeta');
+const heroCard = el('heroCard');
 const heroTitle = el('heroTitle');
 const heroCopy = el('heroCopy');
 const heroMeta = el('heroMeta');
@@ -1766,6 +2203,9 @@ const composerInput = el('composerInput');
 const composerStatus = el('composerStatus');
 const composerTitle = el('composerTitle');
 const composerSubtitle = el('composerSubtitle');
+const appFilter = el('appFilter');
+const appHint = el('appHint');
+const appList = el('appList');
 const slashFilter = el('slashFilter');
 const slashHint = el('slashHint');
 const slashList = el('slashList');
@@ -1785,10 +2225,17 @@ let expandedLaneItems = new Set();
 let viewportGeneratedAppItemId = '';
 let connectionState = 'connecting';
 let shouldStickToBottom = true;
+let selectedSessionChoice = '';
 const inlineSyncTimers = new Map();
-const LOCAL_LANE_STORAGE_KEY = 'pi-toolshed-local-lane-v4::' + PROJECT_DIR;
-let localLaneItems = loadLocalLaneItems();
+let sessionTransitionState = null;
 const contextPickers = {
+	app: {
+		root: appFilter ? appFilter.closest('.context-filter') : null,
+		input: appFilter,
+		hint: appHint,
+		list: appList,
+		baseHint: 'Select a live MCP app. Enter launches it.',
+	},
 	slash: {
 		root: slashFilter ? slashFilter.closest('.context-filter') : null,
 		input: slashFilter,
@@ -1813,37 +2260,130 @@ const contextPickers = {
 };
 
 function loadLocalLaneItems() {
-	try {
-		const raw = JSON.parse(localStorage.getItem(LOCAL_LANE_STORAGE_KEY) || '[]');
-		if (!Array.isArray(raw)) return [];
-		return raw.map(function(item) {
-			return {
-				id: String(item.id || ''),
-				kind: item.kind || 'card',
-				title: String(item.title || ''),
-				content: String(item.content || ''),
-				summary: String(item.summary || ''),
-				timestamp: String(item.timestamp || new Date().toISOString()),
-				state: 'historical',
-				tone: item.tone || 'info',
-				exampleId: item.exampleId || undefined,
-				example: item.example && typeof item.example === 'object' ? item.example : undefined,
-				appRuntime: item.appRuntime && typeof item.appRuntime === 'object' ? item.appRuntime : undefined,
-				appState: item.appState && typeof item.appState === 'object' ? item.appState : undefined,
-				appPlaceholder: Boolean(item.appPlaceholder),
-				cardId: item.cardId || undefined,
-				meta: item.meta || (item.appRuntime ? 'Generated MCP app' : 'MCP example'),
-			};
-		}).filter(function(item) { return item.id; });
-	} catch {
-		return [];
-	}
+	return [];
+}
+
+function loadStoredSessionChoice() {
+	return '';
+}
+
+function storeSessionChoice(value) {
+	selectedSessionChoice = String(value || '').trim();
 }
 
 function saveLocalLaneItems() {
-	try {
-		localStorage.setItem(LOCAL_LANE_STORAGE_KEY, JSON.stringify(localLaneItems));
-	} catch {}
+	return;
+}
+
+function clearInlineSyncTimers() {
+	inlineSyncTimers.forEach(function(timer) {
+		clearTimeout(timer);
+	});
+	inlineSyncTimers.clear();
+}
+
+function sessionTransitionActive() {
+	return Boolean(sessionTransitionState);
+}
+
+function buildSessionTransitionLaneItem(title, content) {
+	return {
+		id: 'toolshed-session-transition',
+		kind: 'system',
+		title: String(title || 'Switching Pi session'),
+		content: String(content || 'Waiting for the selected Pi session to initialize.'),
+		summary: String(content || 'Waiting for the selected Pi session to initialize.'),
+		timestamp: new Date().toISOString(),
+		state: 'active',
+		tone: 'info',
+	};
+}
+
+function closeInlineAppsForSessionTransition() {
+	const items = currentState && Array.isArray(currentState.lane) ? currentState.lane.slice() : [];
+	items.forEach(function(item) {
+		if (!item || !item.appRuntime) return;
+		closeGeneratedAppInstance(String(item.cardId || ''), String(item.id || ''));
+	});
+	clearInlineSyncTimers();
+	viewportGeneratedAppItemId = '';
+	applyGeneratedAppViewportState();
+}
+
+function beginSessionTransition(kind, detail) {
+	sessionTransitionState = {
+		kind: String(kind || '').trim(),
+		startedAt: Date.now(),
+	};
+	closeInlineAppsForSessionTransition();
+	if (!currentState) return;
+	let title = 'Switching Pi session';
+	let content = 'Waiting for the selected Pi session to initialize.';
+	if (kind === 'session-new') {
+		title = 'Starting new Pi session';
+		content = 'Preparing a blank Pi session lane.';
+	} else if (kind === 'session-fork') {
+		title = 'Forking Pi session';
+		content = 'Preparing the forked Pi session lane.';
+	} else if (kind === 'session-switch') {
+		title = 'Switching Pi session';
+		content = detail
+			? ('Loading ' + String(detail || '').trim() + '.')
+			: 'Loading the selected Pi session.';
+	}
+	renderState({
+		...currentState,
+		lane: [buildSessionTransitionLaneItem(title, content)],
+		frontier: {
+			id: 'toolshed-session-transition',
+			title: title,
+			summary: content,
+			kind: 'system',
+			timestamp: new Date().toISOString(),
+		},
+	});
+}
+
+function endSessionTransition() {
+	sessionTransitionState = null;
+}
+
+async function fetchStateRaw() {
+	const res = await fetch(sessionStateUrl());
+	return res.json();
+}
+
+function sessionTransitionResolved(state, payload, previousSessionId, previousSessionFile) {
+	if (!state || !payload) return false;
+	const nextSessionId = String(state.currentSessionId || state.sessionId || '').trim();
+	const nextSessionFile = String(state.currentSessionFile || '').trim();
+	const actionType = String(payload.type || '').trim();
+	if (actionType === 'session-switch') {
+		const targetPath = String(payload.sessionPath || '').trim();
+		if (targetPath) return nextSessionFile === targetPath;
+		return Boolean(nextSessionId && nextSessionId !== previousSessionId);
+	}
+	if (actionType === 'session-new' || actionType === 'session-fork') {
+		return Boolean(nextSessionId && nextSessionId !== previousSessionId);
+	}
+	return Boolean(
+		(nextSessionId && nextSessionId !== previousSessionId)
+		|| (nextSessionFile && nextSessionFile !== previousSessionFile)
+	);
+}
+
+async function waitForSessionTransitionState(payload, previousSessionId, previousSessionFile) {
+	const deadline = Date.now() + 5000;
+	let lastState = null;
+	while (Date.now() < deadline) {
+		try {
+			const state = await fetchStateRaw();
+			lastState = state;
+			if (sessionTransitionResolved(state, payload, previousSessionId, previousSessionFile)) return state;
+		} catch {}
+		await new Promise(function(resolve) { setTimeout(resolve, 120); });
+	}
+	return lastState;
 }
 
 function setGeneratedAppViewportMode(itemId, mode) {
@@ -1886,7 +2426,7 @@ function generatedConversationAdapter(item) {
 		runtime.viewFile || '',
 	].join(' ').toLowerCase();
 	if (/github project kanban board|github.*kanban|kanban board/.test(text)) return 'github-project-kanban';
-	return '';
+	return item && item.appRuntime ? 'generic' : '';
 }
 
 function buildInlineAppSyncAction(item) {
@@ -1973,9 +2513,10 @@ function buildLaneItemNode(item, preservedGeneratedApps) {
 }
 
 function syncInlineAppsNow(itemId) {
+	const laneItems = currentState && Array.isArray(currentState.lane) ? currentState.lane.slice() : [];
 	const items = itemId
-		? localLaneItems.filter(function(item) { return item && item.id === itemId; })
-		: localLaneItems.slice();
+		? laneItems.filter(function(item) { return item && item.id === itemId; })
+		: laneItems;
 	const payloads = items
 		.map(buildInlineAppSyncAction)
 		.filter(Boolean);
@@ -2001,9 +2542,7 @@ function clearInlineAppSync(item) {
 }
 
 function syncInlineAppsFromLocalLane() {
-	localLaneItems.forEach(function(item) {
-		if (item && item.appRuntime && item.appRuntime.adapter === 'calculator') scheduleInlineAppSync(item, 0);
-	});
+	return false;
 }
 
 function getBuilderExampleById(exampleId) {
@@ -2068,10 +2607,7 @@ function seedBuilderExampleCardFromUi(exampleId) {
 }
 
 function laneItemsWithLocal() {
-	const base = currentState && Array.isArray(currentState.lane) ? currentState.lane.slice() : [];
-	return base.concat(localLaneItems).sort(function(a, b) {
-		return String(a.timestamp || '').localeCompare(String(b.timestamp || ''));
-	});
+	return currentState && Array.isArray(currentState.lane) ? currentState.lane.slice() : [];
 }
 
 function initialMcpExampleState(exampleId) {
@@ -2181,35 +2717,7 @@ function generatedAppState(item) {
 }
 
 function syncGeneratedAppLaneItemsFromState() {
-	if (!currentState || !Array.isArray(currentState.widgets) || !Array.isArray(localLaneItems) || localLaneItems.length === 0) return false;
-	let changed = false;
-	localLaneItems = localLaneItems.map(function(item) {
-		if (!item || item.meta !== 'Generated MCP app' || item.appPlaceholder || !item.cardId) return item;
-		const widget = findRuntimeWidget(item.cardId);
-		if (!widget || !widget.appRuntime) return item;
-		const nextRuntime = widget.appRuntime;
-		const previousVersion = generatedRuntimeVersion(item.appRuntime);
-		const nextVersion = generatedRuntimeVersion(nextRuntime);
-		const runtimeChanged = previousVersion !== nextVersion
-			|| String((item.appRuntime && item.appRuntime.ready) ? '1' : '0') !== String(nextRuntime.ready ? '1' : '0')
-			|| String((item.appRuntime && item.appRuntime.viewFile) || '') !== String(nextRuntime.viewFile || '')
-			|| String((item.appRuntime && item.appRuntime.toolName) || '') !== String(nextRuntime.toolName || '');
-		const nextTitle = String(nextRuntime.title || widget.title || item.title || 'Generated MCP app');
-		const nextSummary = nextRuntime.ready ? 'Generated MCP app opened inline.' : 'Build the app before opening it inline.';
-		if (!runtimeChanged && item.title === nextTitle && item.summary === nextSummary) return item;
-		changed = true;
-		if (runtimeChanged) closeGeneratedAppInstance(String(item.cardId || ''), String(item.id || ''));
-		return {
-			...item,
-			title: nextTitle,
-			summary: nextSummary,
-			tone: nextRuntime.ready ? 'success' : 'warning',
-			appRuntime: nextRuntime,
-			timestamp: item.timestamp,
-		};
-	});
-	if (changed) saveLocalLaneItems();
-	return changed;
+	return false;
 }
 
 function nextGeneratedAppLaneItemId(cardId) {
@@ -2244,7 +2752,7 @@ function addGeneratedAppToLocalLane(cardId) {
 	const widget = findRuntimeWidget(cardId);
 	if (!widget || !widget.appRuntime) return false;
 	const runtime = widget.appRuntime;
-	const relatedItems = localLaneItems
+	const relatedItems = ((currentState && Array.isArray(currentState.lane)) ? currentState.lane : [])
 		.filter(function(item) {
 			return item && item.cardId === cardId && item.meta === 'Generated MCP app' && item.appRuntime;
 		})
@@ -2255,38 +2763,23 @@ function addGeneratedAppToLocalLane(cardId) {
 	const previousVersion = previousItem ? generatedRuntimeVersion(previousItem.appRuntime) : '';
 	const nextVersion = generatedRuntimeVersion(runtime);
 	const nextId = nextGeneratedAppLaneItemId(cardId);
-	localLaneItems = localLaneItems.map(function(item) {
-		if (!item || item.cardId !== cardId || item.meta !== 'Generated MCP app' || !item.appRuntime || item.appPlaceholder) return item;
-		closeGeneratedAppInstance(String(item.cardId || ''), String(item.id || ''));
-		return {
-			...item,
-			appPlaceholder: true,
-			summary: 'This inline app was reopened later in the lane. The active instance continues below.',
-			tone: 'neutral',
-		};
-	});
-	localLaneItems.push({
-		id: nextId,
-		kind: 'card',
+	if (previousItem && viewportGeneratedAppItemId === String(previousItem.id || '')) viewportGeneratedAppItemId = '';
+	postBackgroundAction({
+		type: 'sync-inline-app-state',
+		itemId: nextId,
+		cardId: String(cardId || ''),
 		title: String(runtime.title || widget.title || 'Generated MCP app'),
-		content: '',
-		summary: runtime.ready ? 'Generated MCP app opened inline.' : 'Build the app before opening it inline.',
-		timestamp: new Date().toISOString(),
-		state: 'historical',
-		tone: runtime.ready ? 'success' : 'warning',
-		cardId: cardId,
-		meta: 'Generated MCP app',
+		adapter: String(generatedConversationAdapter({ appRuntime: runtime, title: widget.title }) || runtime.adapter || 'generic'),
 		appRuntime: runtime,
 		appState: previousItem && previousVersion === nextVersion && previousItem.appState && typeof previousItem.appState === 'object'
 			? Object.assign(JSON.parse(JSON.stringify(previousItem.appState)), { updatedAt: new Date().toISOString() })
 			: initialGeneratedAppState(runtime, nextId),
-	});
-	if (previousItem && viewportGeneratedAppItemId === String(previousItem.id || '')) viewportGeneratedAppItemId = '';
-	saveLocalLaneItems();
-	syncInlineAppsFromLocalLane();
-	scheduleInlineAppSyncById(nextId, 0);
-	renderLane();
-	requestAnimationFrame(function(){ window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); });
+		sessionId: previousItem && previousItem.appState ? String(previousItem.appState.sessionId || '') : '',
+	}).then(function() {
+		return fetchState();
+	}).then(function() {
+		requestAnimationFrame(function(){ window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); });
+	}).catch(function(){});
 	return true;
 }
 
@@ -2394,36 +2887,47 @@ function buildCalculatorChatPrompt(item, mode) {
 }
 
 function findLocalLaneItem(itemId) {
-	return localLaneItems.find(function(item) { return item.id === itemId; }) || null;
+	const items = currentState && Array.isArray(currentState.lane) ? currentState.lane : [];
+	return items.find(function(item) { return item && item.id === itemId; }) || null;
 }
 
 function updateLocalLaneItem(itemId, mutator) {
-	let changed = false;
-	localLaneItems = localLaneItems.map(function(item) {
-		if (item.id !== itemId) return item;
-		const next = { ...item, appState: { ...(item.appState || initialMcpExampleState(item.exampleId || '')) } };
-		mutator(next);
-		changed = true;
-		return next;
-	});
-	if (!changed) return false;
-	saveLocalLaneItems();
-	scheduleInlineAppSyncById(itemId, 0);
-	renderLane();
+	const item = findLocalLaneItem(itemId);
+	if (!item || !item.appRuntime) return false;
+	const next = {
+		...item,
+		appState: {
+			...generatedAppState(item),
+		},
+	};
+	mutator(next);
+	postBackgroundAction({
+		type: 'sync-inline-app-state',
+		itemId: String(next.id || ''),
+		cardId: String(next.cardId || ''),
+		title: String(next.title || next.appRuntime.title || 'Inline app'),
+		adapter: String(generatedConversationAdapter(next) || next.appRuntime.adapter || 'generic'),
+		appRuntime: next.appRuntime,
+		appState: next.appState && typeof next.appState === 'object' ? next.appState : {},
+		sessionId: String(next.appState && next.appState.sessionId || ''),
+	}).then(function() {
+		return fetchState();
+	}).catch(function(){});
 	return true;
 }
 
 function removeLocalLaneItem(itemId) {
 	const existing = findLocalLaneItem(itemId);
-	const before = localLaneItems.length;
-	localLaneItems = localLaneItems.filter(function(item) { return item.id !== itemId; });
-	if (localLaneItems.length === before) return false;
-	saveLocalLaneItems();
+	if (!existing || !existing.appRuntime) return false;
 	if (existing) {
 		if (viewportGeneratedAppItemId === itemId) viewportGeneratedAppItemId = '';
 		clearInlineAppSync(existing);
 		const clearPayload = buildInlineAppClearAction(existing);
-		if (clearPayload) postBackgroundAction(clearPayload);
+		if (clearPayload) {
+			postBackgroundAction(clearPayload).then(function() {
+				return fetchState();
+			}).catch(function(){});
+		}
 		if (existing.cardId && existing.appRuntime) {
 			fetch('/api/generated-app-close', {
 				method: 'POST',
@@ -2432,35 +2936,11 @@ function removeLocalLaneItem(itemId) {
 			}).catch(function(){});
 		}
 	}
-	renderLane();
 	return true;
 }
 
 function addBuilderExampleToLocalLane(exampleId) {
-	const example = getBuilderExampleById(exampleId);
-	if (!example) return false;
-	localLaneItems = localLaneItems.filter(function(item) {
-		return item.id !== 'builder-example-' + exampleId;
-	});
-	localLaneItems.push({
-		id: 'builder-example-' + exampleId,
-		kind: 'card',
-		title: String(example.laneTitle || ('MCP Example · ' + (example.title || 'Example'))),
-		content: '',
-		summary: String(example.summary || example.laneSummary || ''),
-		timestamp: new Date().toISOString(),
-		state: 'historical',
-		tone: 'info',
-		exampleId: example.id,
-		example: example,
-		appState: initialMcpExampleState(example.id),
-		cardId: example.preset && (example.preset.preferredId || example.id),
-		meta: 'MCP example',
-	});
-	saveLocalLaneItems();
-	renderLane();
-	requestAnimationFrame(function(){ window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); });
-	return true;
+	return false;
 }
 
 function mcpExampleState(item, exampleId) {
@@ -2669,6 +3149,7 @@ function renderMcpExampleApp(item, example) {
 	return '';
 }
 const contextPickerState = {
+	app: { query: '', open: false, selectedIndex: 0, filtered: [] },
 	slash: { query: '', open: false, selectedIndex: 0, filtered: [] },
 	skill: { query: '', open: false, selectedIndex: 0, filtered: [] },
 	packet: { query: '', open: false, selectedIndex: 0, filtered: [] },
@@ -2837,6 +3318,69 @@ function connectionLabel() {
 	return { label: 'Connecting…', tone: 'info' };
 }
 
+function activeSessionCatalog() {
+	return currentState && Array.isArray(currentState.sessionCatalog) ? currentState.sessionCatalog : [];
+}
+
+function resolvedSessionChoice() {
+	return String(
+		selectedSessionChoice
+		|| (currentState && currentState.currentSessionFile)
+		|| (currentState && (currentState.currentSessionId || currentState.sessionId))
+		|| ''
+	).trim();
+}
+
+function selectedSessionEntry() {
+	const catalog = activeSessionCatalog();
+	const choice = resolvedSessionChoice();
+	const currentPath = String(currentState && currentState.currentSessionFile || '').trim();
+	const currentId = String(currentState && currentState.currentSessionId || currentState && currentState.sessionId || '').trim();
+	return catalog.find(function(entry) {
+		return Boolean(entry && (
+			(choice && (String(entry.path || '').trim() === choice || String(entry.sessionId || '').trim() === choice))
+			|| entry.current
+			|| String(entry.path || '').trim() === currentPath
+			|| String(entry.sessionId || '').trim() === currentId
+		));
+	}) || null;
+}
+
+function sessionStateUrl() {
+	const choice = resolvedSessionChoice();
+	return choice
+		? ('/api/state?session=' + encodeURIComponent(choice))
+		: '/api/state';
+}
+
+let isCreatingLiveSession = false;
+
+async function createFreshLiveSession(trigger) {
+	if (isCreatingLiveSession) return '';
+	isCreatingLiveSession = true;
+	setComposerStatus(trigger === 'selector' ? 'Creating new Pi session…' : 'Starting new Pi session…', 'info');
+	try {
+		const result = await postAction({ type: 'session-new' }, false);
+		if (!result || !result.success) throw new Error((result && result.error) || 'Failed to create new Pi session.');
+		setComposerStatus('New Pi session ready.', 'success');
+		setTimeout(function(){ if (composerStatus.textContent === 'New Pi session ready.') setComposerStatus('Ready.', ''); }, 1400);
+		return String(currentState && currentState.currentSessionId || '');
+	} catch (error) {
+		setComposerStatus((error && error.message) || 'Failed to create new Pi session.', 'error');
+		return '';
+	} finally {
+		isCreatingLiveSession = false;
+	}
+}
+
+function syncThemeButton() {
+	if (!el('themeBtn')) return;
+	const light = document.body.classList.contains('light');
+	el('themeBtn').textContent = light ? '☀' : '☾';
+	el('themeBtn').setAttribute('title', light ? 'Switch to dark' : 'Switch to light');
+	el('themeBtn').setAttribute('aria-label', light ? 'Switch to dark theme' : 'Switch to light theme');
+}
+
 function setComposerStatus(message, tone) {
 	if (!composerStatus) return;
 	composerStatus.textContent = message || 'Ready.';
@@ -2865,8 +3409,9 @@ function positionOpenContextPickers() {
 }
 
 function syncFooterOffset() {
-	const height = composerShell ? Math.ceil(composerShell.getBoundingClientRect().height) : 0;
-	document.documentElement.style.setProperty('--footer-offset', Math.max(height, 160) + 'px');
+	const hidden = !composerShell || composerShell.hidden;
+	const height = hidden ? 0 : Math.ceil(composerShell.getBoundingClientRect().height);
+	document.documentElement.style.setProperty('--footer-offset', (hidden ? 0 : Math.max(height, 160)) + 'px');
 }
 
 function syncHeaderOffset() {
@@ -2892,6 +3437,29 @@ function filterScore(query, haystack) {
 
 function contextItems(kind) {
 	if (!currentState) return [];
+	if (kind === 'app') {
+		const apps = Array.isArray(currentState.appCatalog) ? currentState.appCatalog : [];
+		return apps
+			.map(function(app) {
+				const appTitle = app.title || app.serverId || 'MCP app';
+				const prompt = app.toolName
+					? 'Use the MCP server "' + app.serverId + '" tool "' + app.toolName + '" to open the ' + appTitle + ' app and continue from there.'
+					: 'Use the MCP server "' + app.serverId + '" to open the ' + appTitle + ' app and continue from there.';
+				return {
+					key: app.key || app.cardId || app.serverId || appTitle,
+					label: appTitle,
+					copy: [
+						app.serverId ? 'server ' + app.serverId : '',
+						app.toolName ? 'tool ' + app.toolName : '',
+						app.sessionLabel ? app.sessionLabel : '',
+					].filter(Boolean).join(' · '),
+					insertText: prompt,
+					action: { type: 'send-message', text: prompt, agentId: app.agentId || '' },
+					sessionId: app.sessionId || '',
+					searchable: searchableText([appTitle, app.serverId, app.toolName, app.brief, app.sessionLabel]),
+				};
+			});
+	}
 	if (kind === 'slash') {
 		return (currentState.slashCommands || []).map(function(command) {
 			return {
@@ -2974,6 +3542,7 @@ function refreshContextPicker(kind) {
 }
 
 function refreshContextPickers() {
+	refreshContextPicker('app');
 	refreshContextPicker('slash');
 	refreshContextPicker('skill');
 	refreshContextPicker('packet');
@@ -3013,6 +3582,15 @@ function submitContextPicker(kind) {
 	const item = selectedContextItem(kind);
 	if (!item) {
 		closeContextPicker(kind);
+		return;
+	}
+	if (kind === 'app') {
+		const text = item.insertText || item.label || '';
+		composerInput.value = text;
+		syncInlineAppsNow().finally(function() {
+			postAction(item.action || { type: 'send-message', text: text }, true);
+		});
+		resetContextPicker(kind);
 		return;
 	}
 	postAction(item.action, false);
@@ -3292,11 +3870,13 @@ function renderWidgets() {
 		floatLayer.innerHTML = '';
 		return;
 	}
-	const widgets = sortWidgets(visibleWidgets());
 	inlineWidgets.innerHTML = '';
 	leftDock.innerHTML = '';
 	rightDock.innerHTML = '';
-	floatLayer.innerHTML = widgets.length > 0 ? widgets.map(widgetMarkup).join('') : '<div class="dock-empty">No cards in this deck yet.</div>';
+	leftDock.hidden = true;
+	rightDock.hidden = true;
+	floatLayer.hidden = true;
+	floatLayer.innerHTML = '';
 }
 
 function mcpExampleLaneMarkup(item) {
@@ -3412,9 +3992,7 @@ function renderGeneratedGenericApp(item) {
 function generatedAppLaneMarkup(item) {
 	const runtime = item && item.appRuntime ? item.appRuntime : null;
 	if (!runtime) return '';
-	const body = runtime.adapter === 'calculator'
-		? renderGeneratedCalculatorApp(item)
-		: renderGeneratedGenericApp(item);
+	const body = renderGeneratedGenericApp(item);
 	const runtimeVersion = generatedRuntimeVersion(runtime);
 	return [
 		'<article class="lane-item card generated-app" data-lane-item-id="' + escapeHtml(item.id || '') + '" data-generated-app-item="' + escapeHtml(item.id || '') + '"' + (runtimeVersion ? ' data-generated-app-version="' + escapeHtml(runtimeVersion) + '"' : '') + '>',
@@ -3525,11 +4103,18 @@ function mergeToolRequestLaneItems(items) {
 }
 
 function renderLane() {
+	if (!selectedSessionEntry()) {
+		viewportGeneratedAppItemId = '';
+		applyGeneratedAppViewportState();
+		lane.replaceChildren();
+		return;
+	}
 	const items = laneItemsWithLocal();
 	if (items.length === 0) {
 		viewportGeneratedAppItemId = '';
 		applyGeneratedAppViewportState();
-		const emptyNode = nodeFromMarkup('<div class="lane-card"><div class="empty-state">Waiting for Toolshed lane items…</div></div>');
+		const emptyCopy = 'Waiting for lane items from the selected PI session…';
+		const emptyNode = nodeFromMarkup('<div class="lane-card"><div class="empty-state">' + escapeHtml(emptyCopy) + '</div></div>');
 		lane.replaceChildren(emptyNode || document.createTextNode(''));
 		return;
 	}
@@ -3717,34 +4302,47 @@ function renderConnections() {
 }
 
 function renderHeader() {
-	const workspace = currentWorkspace();
 	const connection = connectionLabel();
 	connectionPill.className = 'pill tone-' + connection.tone;
 	connectionPill.textContent = connection.label;
+	const sessionCatalog = activeSessionCatalog();
+	if (sessionSelect) {
+		const currentSessionChoice = resolvedSessionChoice();
+		sessionSelect.innerHTML = ['<option value="__toolshed_new__">New Pi session</option>']
+			.concat(sessionCatalog.map(function(entry) {
+				return '<option value="' + escapeHtml(entry.path || entry.sessionId || '') + '">' + escapeHtml(entry.label || entry.name || entry.sessionId || 'PI session') + '</option>';
+			}))
+			.join('');
+		sessionSelect.value = currentSessionChoice || '__toolshed_new__';
+	}
+	const sessionEntry = selectedSessionEntry();
+	const unboundLane = PAGE_MODE === 'lane' && !sessionEntry;
+	if (heroCard) heroCard.hidden = unboundLane;
+	if (headerPills) headerPills.hidden = unboundLane;
+	if (unboundLane) closeAllContextPickers();
+	syncFooterOffset();
 	if (!currentState) {
-		if (headerTitle) headerTitle.textContent = 'Waiting for Pi Toolshed state';
-		if (headerMeta) headerMeta.textContent = PROJECT_NAME + ' · open /toolshed-web inside Pi to connect this lane.';
-		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : PAGE_MODE === 'connections' ? 'Connections' : 'Hi, I’m Pi Toolshed';
+		if (headerTitle) headerTitle.textContent = 'Pi Toolshed';
+		if (headerMeta) headerMeta.textContent = PROJECT_NAME;
+		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : PAGE_MODE === 'connections' ? 'Connections' : 'Waiting for Pi';
 		heroCopy.textContent = PAGE_MODE === 'registry'
-			? 'Open /toolshed-web inside Pi to connect the registry, verify tracked apps, and see what is actually live in the current Toolshed catalog.'
+			? 'Open /toolshed-web inside Pi to connect the registry and verify what is actually live.'
 			: PAGE_MODE === 'connections'
 				? 'Open /toolshed-web inside Pi to inspect which agents, inline apps, hosted servers, and external MCP clients are currently connected.'
-			: 'Open /toolshed-web inside Pi to bind this browser, keep the live lane centered, and run cards from the right rail without replacing the conversation.';
-		heroMeta.textContent = PROJECT_NAME + ' · ' + PROJECT_DIR;
+				: 'Open /toolshed-web in Pi first. This browser becomes a read-only session viewer until a live Pi runtime connects.';
+		heroMeta.textContent = PROJECT_NAME;
 		headerPills.innerHTML = '';
 		heroPills.innerHTML = '';
 		quickActions.innerHTML = '';
+		if (composerTitle) composerTitle.textContent = 'Lane composer';
+		if (composerSubtitle) composerSubtitle.textContent = 'Use the footer app picker or type a request after a live PI session connects.';
 		return;
 	}
-	workspaceSelect.innerHTML = (currentState.workspaces || []).map(function(item){
-		return '<option value="' + escapeHtml(item.id) + '">' + escapeHtml(item.title) + '</option>';
-	}).join('');
-	workspaceSelect.value = currentState.workspaceId || '';
 	const repo = currentState.repository;
-	const headerChips = [];
-	(currentState.status && currentState.status.chips || []).forEach(function(chip){ headerChips.push(pillMarkup(chip)); });
+	const headerChips = [
+		pillMarkup({ label: String(sessionCatalog.length) + ' Pi session' + (sessionCatalog.length === 1 ? '' : 's'), tone: sessionCatalog.length > 0 ? 'success' : 'neutral' }),
+	];
 	if (repo) headerChips.push(pillMarkup({ label: repo.branch + (repo.dirty ? ' · ' + repo.changed + ' dirty' : ' · clean'), tone: repo.dirty ? 'warning' : 'success' }));
-	if (currentState.status && currentState.status.provider && currentState.status.model) headerChips.push(pillMarkup({ label: currentState.status.provider + '/' + currentState.status.model, tone: 'neutral' }));
 	if (PAGE_MODE === 'registry') {
 		headerPills.innerHTML = headerChips.join('');
 	} else if (PAGE_MODE === 'connections') {
@@ -3757,51 +4355,63 @@ function renderHeader() {
 			pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'success' : 'neutral' }),
 		].join('');
 	} else {
-		headerPills.innerHTML = '';
+		headerPills.innerHTML = headerChips.join('');
 	}
-	if (headerTitle) headerTitle.textContent = workspace ? workspace.title : 'Pi Toolshed';
-	if (workspace) {
-		heroTitle.textContent = PAGE_MODE === 'registry' ? 'Tools Registry' : PAGE_MODE === 'connections' ? 'Connections' : workspace.title;
-		heroCopy.textContent = PAGE_MODE === 'registry'
-			? 'Rebuild, redeploy, and verify tracked MCP apps here. When you go back to the lane, the live Toolshed catalog reflects what this page marked as live.'
-			: PAGE_MODE === 'connections'
-				? 'Inspect which PI agents, inline apps, hosted servers, and external MCP clients are connected right now. The view stays live as Toolshed changes.'
-			: workspace.description;
-			if (PAGE_MODE === 'registry') {
-				const registry = currentState.registry || {};
-				heroPills.innerHTML = [
-					pillMarkup({ label: String((registry.entries || []).length) + ' tracked', tone: 'neutral' }),
-					pillMarkup({ label: String(registry.liveCount || 0) + ' live', tone: (registry.liveCount || 0) > 0 ? 'success' : 'neutral' }),
-					pillMarkup({ label: String(registry.staleCount || 0) + ' stale', tone: (registry.staleCount || 0) > 0 ? 'warning' : 'neutral' }),
-				].join('');
-				quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a><a class="btn card-pill-btn" href="/connections">Connections</a>';
-			} else if (PAGE_MODE === 'connections') {
-				const connections = currentState.connections || {};
-				const counts = connections.counts || {};
-				heroPills.innerHTML = [
-					pillMarkup({ label: String(counts.total || 0) + ' active', tone: (counts.total || 0) > 0 ? 'success' : 'neutral' }),
-					pillMarkup({ label: String(counts.agents || 0) + ' agents', tone: (counts.agents || 0) > 0 ? 'info' : 'neutral' }),
-					pillMarkup({ label: String(counts.inlineApps || 0) + ' inline apps', tone: (counts.inlineApps || 0) > 0 ? 'info' : 'neutral' }),
-					pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'warning' : 'neutral' }),
-				].join('');
-				quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a>';
-			} else {
-				heroPills.innerHTML = '';
-				const actions = ['<a class="btn card-pill-btn" href="/connections">Connections</a>']
-					.concat((workspace.quickActions || []).map(function(action){ return actionButtonMarkup(action); }));
-				quickActions.innerHTML = actions.join('');
-			}
-		}
-	const updated = currentState.updatedAt ? 'Updated ' + relativeTime(currentState.updatedAt) : 'No timestamp';
-	const frontier = currentState.frontier && currentState.frontier.summary ? currentState.frontier.summary : 'No frontier yet.';
-		if (headerMeta) headerMeta.textContent = PROJECT_NAME + ' · ' + updated;
-		heroMeta.textContent = PROJECT_NAME + ' · ' + updated + ' · Frontier: ' + frontier;
-		if (composerTitle) composerTitle.textContent = PAGE_MODE === 'registry' ? 'Registry actions' : PAGE_MODE === 'connections' ? 'Connection roster' : (workspace ? workspace.title + ' deck' : 'Toolshed cards');
-		if (composerSubtitle) composerSubtitle.textContent = PAGE_MODE === 'registry'
-			? 'Use registry actions above to rebuild or redeploy tracked apps. Return to the lane when you want to use the live catalog.'
-			: PAGE_MODE === 'connections'
-				? 'Use the roster to see which PI agents, inline apps, hosted servers, and external MCP clients are active right now.'
-			: 'The composer stays primary. Cards mirror and extend the lane; they do not replace it.';
+	if (headerTitle) headerTitle.textContent = 'Pi Toolshed';
+	if (PAGE_MODE === 'registry') {
+		const registry = currentState.registry || {};
+		if (headerMeta) headerMeta.textContent = PROJECT_NAME;
+		heroTitle.textContent = 'Tools Registry';
+		heroCopy.textContent = 'Rebuild, redeploy, and verify tracked MCP apps here.';
+		heroMeta.textContent = PROJECT_NAME;
+		heroPills.innerHTML = [
+			pillMarkup({ label: String((registry.entries || []).length) + ' tracked', tone: 'neutral' }),
+			pillMarkup({ label: String(registry.liveCount || 0) + ' live', tone: (registry.liveCount || 0) > 0 ? 'success' : 'neutral' }),
+			pillMarkup({ label: String(registry.staleCount || 0) + ' stale', tone: (registry.staleCount || 0) > 0 ? 'warning' : 'neutral' }),
+		].join('');
+		quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a><a class="btn card-pill-btn" href="/connections">Connections</a>';
+		if (composerTitle) composerTitle.textContent = 'Registry actions';
+		if (composerSubtitle) composerSubtitle.textContent = 'Use registry actions above to rebuild or redeploy tracked apps.';
+		return;
+	}
+	if (PAGE_MODE === 'connections') {
+		const connections = currentState.connections || {};
+		const counts = connections.counts || {};
+		if (headerMeta) headerMeta.textContent = PROJECT_NAME;
+		heroTitle.textContent = 'Connections';
+		heroCopy.textContent = 'Inspect which PI agents, inline apps, hosted servers, and external MCP clients are connected right now.';
+		heroMeta.textContent = PROJECT_NAME;
+		heroPills.innerHTML = [
+			pillMarkup({ label: String(counts.total || 0) + ' active', tone: (counts.total || 0) > 0 ? 'success' : 'neutral' }),
+			pillMarkup({ label: String(counts.agents || 0) + ' agents', tone: (counts.agents || 0) > 0 ? 'info' : 'neutral' }),
+			pillMarkup({ label: String(counts.inlineApps || 0) + ' inline apps', tone: (counts.inlineApps || 0) > 0 ? 'info' : 'neutral' }),
+			pillMarkup({ label: String(counts.externalSessions || 0) + ' external sessions', tone: (counts.externalSessions || 0) > 0 ? 'warning' : 'neutral' }),
+		].join('');
+		quickActions.innerHTML = '<a class="btn card-pill-btn" href="/">Back to lane</a>';
+		if (composerTitle) composerTitle.textContent = 'Connection roster';
+		if (composerSubtitle) composerSubtitle.textContent = 'Use the roster to see which PI agents, inline apps, hosted servers, and external MCP clients are active right now.';
+		return;
+	}
+	if (headerMeta) headerMeta.textContent = PROJECT_NAME + (sessionEntry ? ' · ' + sessionEntry.label : '');
+	heroTitle.textContent = sessionEntry ? sessionEntry.label : 'Waiting for Pi';
+	heroCopy.textContent = sessionEntry
+		? (sessionEntry.brief || 'Current Pi session selected.')
+		: 'Open /toolshed-web in Pi first. This browser does not create its own sessions.';
+	heroMeta.textContent = PROJECT_NAME;
+	heroPills.innerHTML = [
+		pillMarkup({ label: String(sessionCatalog.length) + ' Pi session' + (sessionCatalog.length === 1 ? '' : 's'), tone: sessionCatalog.length > 0 ? 'success' : 'neutral' }),
+		(sessionEntry ? pillMarkup({ label: 'Bound to ' + sessionEntry.sessionId.slice(-8), tone: 'info' }) : ''),
+	].filter(Boolean).join('');
+	quickActions.innerHTML = [
+		'<button type="button" class="btn card-pill-btn" data-action-type="session-new">New Pi session</button>',
+		(sessionEntry ? '<button type="button" class="btn card-pill-btn" data-action-type="session-fork" data-action-payload="' + encodePayload({ sessionPath: sessionEntry.path || currentState.currentSessionFile || '' }) + '">Fork current</button>' : ''),
+		'<a class="btn card-pill-btn" href="/connections">Connections</a>',
+		'<a class="btn card-pill-btn" href="/registry">Registry</a>',
+	].filter(Boolean).join('');
+	if (composerTitle) composerTitle.textContent = 'Lane composer';
+	if (composerSubtitle) composerSubtitle.textContent = sessionEntry
+		? 'Bound to ' + sessionEntry.label + '. Session changes happen inside the connected Pi runtime.'
+		: 'Open /toolshed-web in Pi first, then use the session selector to create, switch, or fork real Pi sessions.';
 }
 
 function renderContextFilters() {
@@ -3827,7 +4437,8 @@ function renderDrawer() {
 			'<div class="drawer-list">',
 				'<div class="drawer-item"><div class="drawer-item-title">Project</div><div class="drawer-item-value"><code>' + escapeHtml(meta.projectDir || PROJECT_DIR) + '</code></div></div>',
 				'<div class="drawer-item"><div class="drawer-item-title">State file</div><div class="drawer-item-value"><code>' + escapeHtml(meta.stateFile || STATE_FILE) + '</code></div></div>',
-				'<div class="drawer-item"><div class="drawer-item-title">Session file</div><div class="drawer-item-value"><code>' + escapeHtml(meta.sessionStateFile || '') + '</code></div></div>',
+				'<div class="drawer-item"><div class="drawer-item-title">Pi session file</div><div class="drawer-item-value"><code>' + escapeHtml(currentState.currentSessionFile || '') + '</code></div></div>',
+				'<div class="drawer-item"><div class="drawer-item-title">Toolshed persist file</div><div class="drawer-item-value"><code>' + escapeHtml(meta.sessionStateFile || '') + '</code></div></div>',
 				'<div class="drawer-item"><div class="drawer-item-title">Web bridge</div><div class="drawer-item-value">' + escapeHtml(String(meta.controlPort || CONTROL_PORT)) + ' · ' + escapeHtml((meta.registeredAgents || []).join(', ') || 'waiting for session') + '</div></div>',
 			'</div>',
 		'</section>'
@@ -3887,7 +4498,7 @@ function renderState(state) {
 		if (registryView) registryView.hidden = true;
 		if (connectionsView) connectionsView.hidden = true;
 		if (lane) lane.hidden = false;
-		if (floatLayer) floatLayer.hidden = false;
+		if (floatLayer) floatLayer.hidden = true;
 		renderLane();
 	}
 	renderDrawer();
@@ -3895,24 +4506,39 @@ function renderState(state) {
 
 async function fetchState() {
 	try {
-		const res = await fetch('/api/state');
-		const state = await res.json();
-		if (state) renderState(state);
+		const state = await fetchStateRaw();
+		if (state) {
+			const sessionChoice = String(state.currentSessionFile || state.currentSessionId || state.sessionId || '').trim();
+			if (sessionChoice) storeSessionChoice(sessionChoice);
+			renderState(state);
+		}
 		connectionState = 'connected';
 		renderHeader();
+		return state;
 	} catch {
 		connectionState = 'offline';
 		renderHeader();
+		return null;
 	}
 }
 
 async function postAction(action, clearComposer) {
 	setComposerStatus('Sending action…', 'info');
 	try {
+		const liveConnected = Boolean(currentState && currentState.dashboardMeta && currentState.dashboardMeta.liveSessionConnected);
+		if (!liveConnected) {
+			setComposerStatus('Open /toolshed-web in Pi first.', 'error');
+			return { success: false, error: 'No live Pi runtime is connected.' };
+		}
+		const payload = { ...(action || {}) };
+		const isSessionAction = Boolean(payload && ['session-new', 'session-switch', 'session-fork'].includes(payload.type));
+		const previousSessionId = String(currentState && (currentState.currentSessionId || currentState.sessionId) || '').trim();
+		const previousSessionFile = String(currentState && currentState.currentSessionFile || '').trim();
+		if (isSessionAction) beginSessionTransition(payload.type, payload.sessionPath || '');
 		const res = await fetch('/api/action', {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(action || {}),
+			body: JSON.stringify(payload),
 		});
 		const data = await res.json();
 		if (!data.success) {
@@ -3921,12 +4547,28 @@ async function postAction(action, clearComposer) {
 		}
 		if (clearComposer) composerInput.value = '';
 		setComposerStatus('Action sent.', 'success');
-		if (action && ['send-message', 'run-card', 'create-custom-card', 'create-mcp-app-card', 'add-builder-example-to-lane', 'submit-slash-command', 'launch-skill'].includes(action.type) && shouldStickToBottom) {
+		if (isSessionAction) {
+			const nextState = await waitForSessionTransitionState(payload, previousSessionId, previousSessionFile);
+			if (nextState) {
+				const sessionChoice = String(nextState.currentSessionFile || nextState.currentSessionId || nextState.sessionId || '').trim();
+				if (sessionChoice) storeSessionChoice(sessionChoice);
+				renderState(nextState);
+			} else {
+				await fetchState();
+			}
+			setTimeout(function() {
+				endSessionTransition();
+			}, 250);
+		} else {
+			await fetchState();
+		}
+		if (payload && ['send-message', 'run-card', 'create-custom-card', 'create-mcp-app-card', 'add-builder-example-to-lane', 'submit-slash-command', 'launch-skill'].includes(payload.type) && shouldStickToBottom) {
 			requestAnimationFrame(function(){ window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); });
 		}
 		setTimeout(function(){ if (composerStatus.textContent === 'Action sent.') setComposerStatus('Ready.', ''); }, 1400);
 		return { success: true, data: data };
 	} catch (error) {
+		endSessionTransition();
 		setComposerStatus((error && error.message) || 'Action failed.', 'error');
 		return { success: false, error: error };
 	}
@@ -3965,13 +4607,9 @@ function connectEvents() {
 		connectionState = 'connected';
 		renderHeader();
 	};
-	eventSource.onmessage = function(event) {
-		try {
-			const state = JSON.parse(event.data);
-			renderState(state);
-			connectionState = 'connected';
-			renderHeader();
-		} catch {}
+	eventSource.onmessage = function() {
+		connectionState = 'connected';
+		fetchState();
 	};
 	eventSource.onerror = function() {
 		connectionState = 'reconnecting';
@@ -4260,24 +4898,20 @@ document.addEventListener('input', function(event) {
 	const itemId = event.target.getAttribute('data-mcp-example-item') || '';
 	const nextValue = typeof event.target.value === 'string' ? event.target.value : '';
 	const selectionStart = typeof event.target.selectionStart === 'number' ? event.target.selectionStart : nextValue.length;
-	localLaneItems = localLaneItems.map(function(item) {
-		if (item.id !== itemId) return item;
-		return {
-			...item,
-			appState: {
-				...(item.appState || initialMcpExampleState(item.exampleId || '')),
-				[field]: nextValue,
-			},
+	updateLocalLaneItem(itemId, function(item) {
+		item.appState = {
+			...(item.appState || initialMcpExampleState(item.exampleId || '')),
+			[field]: nextValue,
 		};
 	});
-	saveLocalLaneItems();
 	if (field === 'query') {
-		renderLane();
-		const refreshed = laneEl.querySelector('[data-mcp-example-input="query"][data-mcp-example-item="' + itemId + '"]');
-		if (refreshed) {
-			refreshed.focus();
-			if (typeof refreshed.setSelectionRange === 'function') refreshed.setSelectionRange(selectionStart, selectionStart);
-		}
+		setTimeout(function() {
+			const refreshed = lane && lane.querySelector ? lane.querySelector('[data-mcp-example-input="query"][data-mcp-example-item="' + itemId + '"]') : null;
+			if (refreshed) {
+				refreshed.focus();
+				if (typeof refreshed.setSelectionRange === 'function') refreshed.setSelectionRange(selectionStart, selectionStart);
+			}
+		}, 120);
 	}
 });
 
@@ -4290,19 +4924,10 @@ window.addEventListener('message', function(event) {
 		return;
 	}
 	if (data.type === 'toolshed-generated-app-session-sync') {
+		if (sessionTransitionActive()) return;
 		const itemId = String(data.itemId || '').trim();
 		const item = findLocalLaneItem(itemId);
 		if (!item || !item.appRuntime) return;
-		if (data.appState && typeof data.appState === 'object') {
-			localLaneItems = localLaneItems.map(function(entry) {
-				if (entry.id !== itemId) return entry;
-				return {
-					...entry,
-					appState: data.appState,
-				};
-			});
-			saveLocalLaneItems();
-		}
 		postBackgroundAction({
 			type: 'sync-inline-app-state',
 			itemId: itemId,
@@ -4312,7 +4937,9 @@ window.addEventListener('message', function(event) {
 			appRuntime: item.appRuntime,
 			appState: data.appState && typeof data.appState === 'object' ? data.appState : {},
 			sessionId: String(data.sessionId || ''),
-		});
+		}).then(function() {
+			return fetchState();
+		}).catch(function(){});
 	}
 });
 
@@ -4322,10 +4949,19 @@ document.addEventListener('keydown', function(event) {
 });
 
 drawerScrim.addEventListener('click', closeDrawer);
-workspaceSelect.addEventListener('change', function(){
-	if (!workspaceSelect.value) return;
-	postAction({ type: 'switch-workspace', workspaceId: workspaceSelect.value }, false);
-});
+if (sessionSelect) {
+	sessionSelect.addEventListener('change', function(){
+		const nextValue = sessionSelect.value || '__toolshed_new__';
+		if (nextValue === '__toolshed_new__') {
+			createFreshLiveSession('selector').then(function(sessionId) {
+				if (!sessionId) fetchState();
+			});
+			return;
+		}
+		storeSessionChoice(nextValue);
+		postAction({ type: 'session-switch', sessionPath: nextValue }, false);
+	});
+}
 Object.keys(contextPickers).forEach(function(kind) {
 	const config = contextPickers[kind];
 	const state = contextPickerState[kind];
@@ -4412,15 +5048,13 @@ el('themeBtn').addEventListener('click', function(){
 	document.body.classList.toggle('light');
 	const light = document.body.classList.contains('light');
 	localStorage.setItem('pi-toolshed-theme', light ? 'light' : 'dark');
-	el('themeBtn').textContent = light ? 'Dark' : 'Light';
+	syncThemeButton();
 	render();
 });
 	(function initTheme(){
 		const saved = localStorage.getItem('pi-toolshed-theme');
-		if (saved === 'light') {
-			document.body.classList.add('light');
-			el('themeBtn').textContent = 'Dark';
-		}
+		if (saved === 'light') document.body.classList.add('light');
+		syncThemeButton();
 	})();
 	if (window.ResizeObserver && composerShell) {
 		const footerObserver = new ResizeObserver(syncFooterOffset);
@@ -4443,7 +5077,6 @@ window.addEventListener('scroll', function(){
 
 fetchState();
 connectEvents();
-setTimeout(syncInlineAppsFromLocalLane, 120);
 syncHeaderOffset();
 syncFooterOffset();
 setComposerStatus('Ready.', '');
@@ -4469,14 +5102,12 @@ function renderPage(pageMode = "lane") {
 							"<div class=\"header-balance\"></div>",
 							"<div class=\"brand-block\">",
 								"<div class=\"brand-eyebrow\">Pi Toolshed</div>",
-								"<div id=\"headerTitle\" class=\"brand-title\">Waiting for Pi Toolshed state</div>",
-								"<div id=\"headerMeta\" class=\"brand-meta\">" + escapeHtml(projectName) + " · lane-first web workspace</div>",
+								"<div id=\"headerMeta\" class=\"brand-meta\">" + escapeHtml(projectName) + "</div>",
 							"</div>",
 							"<div class=\"header-controls\">",
-								"<label class=\"sr-only\" for=\"workspaceSelect\">Workspace preset</label>",
-								"<select id=\"workspaceSelect\" class=\"select\"><option>Waiting for state…</option></select>",
-								"<button id=\"themeBtn\" type=\"button\" class=\"ghost-btn\">Light</button>",
-								"<button type=\"button\" class=\"ghost-btn\" data-open-drawer>Session</button>",
+								"<label class=\"sr-only\" for=\"sessionSelect\">PI session</label>",
+								"<select id=\"sessionSelect\" class=\"select\"><option>New Pi session</option></select>",
+								"<button id=\"themeBtn\" type=\"button\" class=\"ghost-btn\" aria-label=\"Toggle theme\" title=\"Toggle theme\">☾</button>",
 								"<span id=\"connectionPill\" class=\"pill tone-info\">Connecting…</span>",
 							"</div>",
 						"</div>",
@@ -4485,14 +5116,14 @@ function renderPage(pageMode = "lane") {
 							"<a class=\"page-nav-link" + (pageMode === "registry" ? " active" : "") + "\" href=\"/registry\">Registry</a>",
 							"<a class=\"page-nav-link" + (pageMode === "connections" ? " active" : "") + "\" href=\"/connections\">Connections</a>",
 						"</nav>",
-						"<div id=\"headerPills\" class=\"header-pills\"></div>",
+						"<div id=\"headerPills\" class=\"header-pills\"" + (pageMode === "lane" ? " hidden" : "") + "></div>",
 					"</section>",
 				"</div>",
 			"</header>",
 			"<main class=\"layout\">",
 				"<aside id=\"leftDock\" class=\"dock left-dock\"><div class=\"dock-empty\">Waiting for workspace widgets…</div></aside>",
 				"<section class=\"lane-shell\">",
-					"<section class=\"hero-card\">",
+					"<section id=\"heroCard\" class=\"hero-card\"" + (pageMode === "lane" ? " hidden" : "") + ">",
 						"<div class=\"section-label\">Workspace preset</div>",
 						"<div id=\"heroTitle\" class=\"hero-title\">Waiting for Pi Toolshed state</div>",
 						"<div id=\"heroCopy\" class=\"hero-copy\">Open /toolshed-web in Pi to bind the lane to this browser workspace.</div>",
@@ -4512,8 +5143,8 @@ function renderPage(pageMode = "lane") {
 		"<div id=\"composerShell\" class=\"composer-shell\">",
 			"<section class=\"composer\">",
 				"<div class=\"composer-top\">",
-					"<div id=\"composerTitle\" class=\"composer-title\">Toolshed composer</div>",
-					"<div id=\"composerSubtitle\" class=\"composer-subtitle\">Widgets support the lane. They do not replace it.</div>",
+					"<div id=\"composerTitle\" class=\"composer-title\">Lane composer</div>",
+					"<div id=\"composerSubtitle\" class=\"composer-subtitle\">Launch a live MCP app from the footer, or type directly into the lane.</div>",
 				"</div>",
                 "<div class=\"composer-frame\">",
                     "<form id=\"composerForm\" class=\"composer-form\">",
@@ -4524,6 +5155,10 @@ function renderPage(pageMode = "lane") {
                                 "<button id=\"freezeBtn\" type=\"button\" class=\"ghost-btn\">Freeze</button>",
                                 "<button id=\"stopBtn\" type=\"button\" class=\"ghost-btn\">Stop</button>",
                                 "<button id=\"resetLayoutBtn\" type=\"button\" class=\"ghost-btn\">Layout</button>",
+                                "<div class=\"context-filter\">",
+                                    "<div class=\"context-filter-head\"><span class=\"context-filter-label\">App</span><span id=\"appHint\" class=\"context-filter-hint\">Enter launches</span></div>",
+                                    "<div class=\"context-filter-field\"><input id=\"appFilter\" class=\"context-input\" type=\"text\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"app\"><div id=\"appList\" class=\"context-menu\" hidden></div></div>",
+                                "</div>",
                                 "<div class=\"context-filter\">",
                                     "<div class=\"context-filter-head\"><span class=\"context-filter-label\">Slash</span><span id=\"slashHint\" class=\"context-filter-hint\">Enter runs · Tab inserts</span></div>",
                                     "<div class=\"context-filter-field\"><input id=\"slashFilter\" class=\"context-input\" type=\"text\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"/ cmd\"><div id=\"slashList\" class=\"context-menu\" hidden></div></div>",
@@ -4540,7 +5175,6 @@ function renderPage(pageMode = "lane") {
                             "</div>",
                             "<div class=\"composer-actions\">",
                                 "<div id=\"composerStatus\" class=\"toolbar-status composer-status\">Ready.</div>",
-                                "<button type=\"button\" class=\"toolbar-chip\" data-open-drawer>Info</button>",
                                 "<button type=\"submit\" class=\"btn primary send-btn\" aria-label=\"Send to Pi\">↑</button>",
                             "</div>",
                         "</div>",
@@ -4563,7 +5197,7 @@ function renderPage(pageMode = "lane") {
 	].join("");
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
 	const requestUrl = new URL(req.url || "/", "http://127.0.0.1");
 	const hostedRoute = parseHostedMcpRoute(requestUrl.pathname);
 	if (hostedRoute) {
@@ -4592,7 +5226,7 @@ const server = http.createServer((req, res) => {
 			return sendJson(res, 500, { success: false, error: "Failed to build connections state", connections: emptyConnectionsState() });
 		}
 	}
-	if (requestUrl.pathname === "/api/state") return sendJson(res, 200, readState());
+	if (requestUrl.pathname === "/api/state") return sendJson(res, 200, readState(String(requestUrl.searchParams.get("session") || "").trim() || undefined));
 	if (requestUrl.pathname === "/events") {
 		res.writeHead(200, {
 			"Content-Type": "text/event-stream",
@@ -4607,10 +5241,13 @@ const server = http.createServer((req, res) => {
 		req.on("close", () => sseClients.delete(res));
 		return;
 	}
+	if (requestUrl.pathname === "/api/new-live-session" && req.method === "POST") {
+		return sendJson(res, 410, { success: false, error: "Use /api/action with type=session-new. Dashboard-managed Pi spawning has been removed." });
+	}
 	if (requestUrl.pathname === "/api/action" && req.method === "POST") {
 		let body = "";
 		req.on("data", (chunk) => body += chunk);
-		req.on("end", () => {
+		req.on("end", async () => {
 			try {
 				const cmd = JSON.parse(body || "{}");
 				if (!cmd || typeof cmd !== "object" || !cmd.type) return sendJson(res, 400, { success: false, error: "Action type is required." });
@@ -4621,7 +5258,7 @@ const server = http.createServer((req, res) => {
 		});
 		return;
 	}
-		if (requestUrl.pathname === "/api/generated-app-open" && req.method === "POST") {
+	if (requestUrl.pathname === "/api/generated-app-open" && req.method === "POST") {
 			let body = "";
 			req.on("data", (chunk) => body += chunk);
 			req.on("end", async () => {
@@ -4631,7 +5268,11 @@ const server = http.createServer((req, res) => {
 				const itemId = String(payload.itemId || "").trim() || cardId;
 				const toolName = String(payload.toolName || "").trim();
 					if (!cardId || !toolName) return sendJson(res, 400, { success: false, error: "cardId and toolName are required." });
-					const data = await callGeneratedAppTool(cardId, itemId, toolName, { renderInline: true });
+					const sessionState = readGeneratedAppPersistedState(cardId, itemId);
+					const data = await callGeneratedAppTool(cardId, itemId, toolName, {
+						renderInline: true,
+						...(sessionState ? { sessionState } : {}),
+					});
 					const toolError = generatedToolErrorText(data.result);
 					if (toolError) return sendJson(res, 500, { success: false, error: toolError });
 					return sendJson(res, 200, {
@@ -4727,6 +5368,14 @@ function closeHostedMcpServers() {
 		}
 	}
 	hostedMcpServers.clear();
+	for (const instance of generatedAppInstances.values()) {
+		if (instance && instance.client) {
+			try { instance.client.close(); } catch {}
+		}
+	}
+	generatedAppInstances.clear();
+	closeWatcherMap(mcpConfigWatchers);
+	closeWatcherMap(mcpSourceWatchers);
 }
 
 process.once("SIGINT", closeHostedMcpServers);

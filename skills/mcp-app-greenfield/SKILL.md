@@ -22,6 +22,10 @@ Take a greenfield app from vague idea to a working MCP server + widget + validat
    - tools
    - resources
    - transport
+   - data scope in/out of the app
+   - ownership and mutation authority
+   - default lane-facing result shape
+   - transfer size / token budget limits
    - session model
    - cleanup behavior
 3. Build the server with reusable registration functions if multiple features may share one endpoint.
@@ -36,6 +40,7 @@ Take a greenfield app from vague idea to a working MCP server + widget + validat
 - Prefer one endpoint when the product expectation is one app.
 - Do not bolt on external support after the fact if you already know the app must run externally.
 - Do not ship without session alignment and delete/cleanup verification.
+- Keep large raw datasets behind narrow query paths instead of pushing them into lane context by default.
 
 ## Deliverables
 

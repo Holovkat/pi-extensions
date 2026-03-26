@@ -26,8 +26,9 @@ Reproduce the real failure, identify the owning layer, fix the smallest correct 
    - UI rendering
 3. Compare local vs public tool availability when external use is involved.
 4. Inspect both transport session IDs and app/business session IDs before changing diagnostics.
-5. Restart and re-verify the actual serving process after the fix.
-6. Use these scripts whenever applicable:
+5. Inspect data scoping, ownership, mutation points, and lane payload size on the affected path.
+6. Restart and re-verify the actual serving process after the fix.
+7. Use these scripts whenever applicable:
    - `../mcp-app-playbook/scripts/smoke_test_mcp_http.py`
    - `../mcp-app-playbook/scripts/compare_mcp_tool_lists.py`
 
@@ -36,6 +37,7 @@ Reproduce the real failure, identify the owning layer, fix the smallest correct 
 - Do not “fix” a backend/session bug with a misleading UI patch.
 - Do not assume stale runtime behavior reflects current code.
 - Do not create a separate external app endpoint when the real issue is missing feature registration in the existing endpoint.
+- Do not solve a data-contract problem by flooding the lane with more raw state.
 
 ## Deliverables
 

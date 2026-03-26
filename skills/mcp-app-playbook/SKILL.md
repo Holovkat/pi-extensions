@@ -32,6 +32,10 @@ Drive the work with an explicit app contract, session model, hosting plan, and s
    - tool names
    - widget/resource URIs
    - transport mode
+   - data scope in/out of the app
+   - default lane-facing payload shape
+   - ownership and mutation authority
+   - transfer size / token budget expectations
    - transport session vs app session model
    - cleanup and close behavior
 4. Build or fix the server and widget with the shared patterns in this pack.
@@ -50,6 +54,7 @@ Drive the work with an explicit app contract, session model, hosting plan, and s
 - Never assume changing files means the live runtime changed; restart and re-verify.
 - If the user expects one app, prefer one MCP endpoint with multiple tools over multiple separate app connectors.
 - Treat external widget hydration as first-class work, not a follow-up polish step.
+- Keep lane-facing outputs compact; prefer query tools and summaries over bulk raw state.
 - Prefer small, verifiable loops over large speculative rewrites.
 
 ## Output Discipline

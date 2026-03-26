@@ -36,8 +36,9 @@
         "zod",
         "-p",
         "@modelcontextprotocol/sdk",
-        "tsx",
-        "features/toolshed-mcp-apps/skeuomorphic-calculator-toolbox-app/server.ts"
+        "sh",
+        "-c",
+        "NODE_PATH=\"$(cd \"$(dirname \"$(command -v tsx)\")/..\" && pwd)\" exec tsx features/toolshed-mcp-apps/skeuomorphic-calculator-toolbox-app/server.ts"
       ]
     },
     "toolshed-github-project-kanban-board-app": {

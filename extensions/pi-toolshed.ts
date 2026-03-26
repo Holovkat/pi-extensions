@@ -1,11 +1,10 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionEntry, type SessionInfo } from "@mariozechner/pi-coding-agent";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawn, execSync, execFileSync } from "child_process";
 import { createConnection, type Socket } from "net";
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, statSync, openSync } from "fs";
 import { join, resolve, dirname, basename } from "path";
-import { homedir } from "os";
 import { fileURLToPath } from "url";
 import { runInNewContext } from "vm";
 import { applyExtensionDefaults } from "./themeMap.ts";
@@ -17,13 +16,7 @@ type Tone = "info" | "success" | "warning" | "error" | "neutral";
 type CardSourceKind = "system" | "extension" | "session" | "project";
 type CardPersistKind = "system" | "session" | "project";
 type GeneratedCardKind = "workflow" | "mcp-app";
-
-interface SessionHistorySegment {
-	role: "user" | "assistant" | "tool";
-	timestamp: string;
-	title: string;
-	content: string;
-}
+type ToolshedInlineAppAdapter = "calculator" | "github-project-kanban" | "generic";
 
 interface ToolshedCalculatorHistoryEntry {
 	expression: string;
@@ -178,7 +171,7 @@ interface ToolshedWidgetCardState extends ToolshedWidgetDefinition {
 	cardKind?: GeneratedCardKind;
 	appRuntime?: {
 		kind: "generated-mcp-app";
-		adapter: "calculator" | "generic";
+		adapter: ToolshedInlineAppAdapter;
 		cardId: string;
 		title: string;
 		brief: string;
@@ -386,6 +379,44 @@ interface ToolshedLaneItem {
 	packetId?: string;
 	cardId?: string;
 	meta?: string;
+	appRuntime?: Record<string, any>;
+	appState?: Record<string, any>;
+	adapter?: ToolshedInlineAppAdapter;
+}
+
+interface ToolshedSessionCatalogEntry {
+	sessionId: string;
+	path: string;
+	name?: string;
+	label: string;
+	brief: string;
+	messageCount: number;
+	createdAt: string;
+	modifiedAt: string;
+	current: boolean;
+}
+
+interface ToolshedInlineAppCardDetails {
+	itemId: string;
+	cardId?: string;
+	title: string;
+	adapter: ToolshedInlineAppAdapter;
+	summary?: string;
+	appRuntime?: Record<string, any>;
+	meta?: string;
+}
+
+interface ToolshedInlineAppStateRecord {
+	itemId: string;
+	cardId?: string;
+	title: string;
+	adapter: ToolshedInlineAppAdapter;
+	sessionId: string;
+	appRuntime?: Record<string, any>;
+	appState?: Record<string, any>;
+	summary?: string;
+	deleted?: boolean;
+	syncedAt: string;
 }
 
 interface PersistedLaneEvent {
@@ -398,6 +429,16 @@ interface PersistedLaneEvent {
 	tone: Tone;
 	packetId?: string;
 	cardId?: string;
+}
+
+interface ToolshedLaneCardDetails {
+	title: string;
+	summary?: string;
+	cardId?: string;
+	packetId?: string;
+	meta?: string;
+	kind?: Extract<LaneItemKind, "system" | "user" | "assistant" | "packet" | "card">;
+	tone?: Tone;
 }
 
 interface ToolshedStatusChip {
@@ -417,6 +458,10 @@ interface ToolshedStatusState {
 
 interface ToolshedState {
 	sessionId: string;
+	currentSessionId: string;
+	currentSessionFile: string;
+	sessionDir: string;
+	sessionCatalog: ToolshedSessionCatalogEntry[];
 	projectDir: string;
 	projectName: string;
 	workspaceId: string;
@@ -472,8 +517,13 @@ interface PersistedToolshedState {
 
 const TOOLSHED_WEB_PORT = 3161;
 const TOOLSHED_WEB_CONTROL_PORT = 3162;
+const TOOLSHED_CONTROL_AGENT_ID = "toolshed-main";
 const MAX_PACKETS = 30;
 const MAX_LANE_EVENTS = 60;
+const TOOLSHED_INLINE_APP_CARD_TYPE = "toolshed-inline-app-card";
+const TOOLSHED_INLINE_APP_STATE_TYPE = "toolshed-inline-app-state";
+const TOOLSHED_LANE_CARD_TYPE = "toolshed-lane-card";
+const INLINE_GITHUB_BOARD_COLUMNS = ["Backlog", "In Progress", "Review", "Done"] as const;
 
 const WORKSPACE_PRESETS_STATIC: Array<{ id: string; title: string; description: string; widgetIds: string[] }> = [
 	{
@@ -533,9 +583,10 @@ const STATIC_SLASH_COMMANDS: ToolshedSlashCommand[] = [
 	{ id: "toolshed-web", label: "/toolshed-web", command: "/toolshed-web", description: "Open the Toolshed web workspace.", category: "toolshed" },
 	{ id: "toolshed-status", label: "/toolshed-status", command: "/toolshed-status", description: "Show Toolshed session status in the terminal.", category: "toolshed" },
 	{ id: "toolshed-connections", label: "/toolshed-connections", command: "/toolshed-connections", description: "Show the live PI connection roster.", category: "toolshed" },
-	{ id: "toolshed-app", label: "/toolshed-app", command: "/toolshed-app", description: "Create or update a tracked MCP app through a guided wizard.", category: "toolshed" },
-	{ id: "toolshed-app-new", label: "/toolshed-app-new", command: "/toolshed-app-new", description: "Launch the MCP app greenfield skill for a new app or widget.", category: "toolshed" },
-	{ id: "toolshed-app-fix", label: "/toolshed-app-fix", command: "/toolshed-app-fix", description: "Launch the MCP app maintainer skill for enhancements or bug fixes.", category: "toolshed" },
+	{ id: "toolshed-session-new", label: "/toolshed-session-new", command: "/toolshed-session-new", description: "Create a fresh Pi session and bind Toolshed to it.", category: "toolshed" },
+	{ id: "toolshed-session-switch", label: "/toolshed-session-switch", command: "/toolshed-session-switch", description: "Switch Toolshed to another Pi session file.", category: "toolshed" },
+	{ id: "toolshed-session-fork", label: "/toolshed-session-fork", command: "/toolshed-session-fork", description: "Fork a Pi session file and switch Toolshed to it.", category: "toolshed" },
+	{ id: "toolshed-app", label: "/toolshed-app", command: "/toolshed-app", description: "Plan, build, enhance, or debug an MCP app or widget.", category: "toolshed" },
 	{ id: "toolshed-freeze", label: "/toolshed-freeze", command: "/toolshed-freeze", description: "Freeze the current frontier into a packet.", category: "toolshed" },
 	{ id: "toolshed-packets", label: "/toolshed-packets", command: "/toolshed-packets", description: "List the current packet queue.", category: "toolshed" },
 	{ id: "toolshed-workspace", label: "/toolshed-workspace", command: "/toolshed-workspace", description: "Switch the active Toolshed workspace preset.", category: "toolshed" },
@@ -1351,6 +1402,15 @@ function parsePendingToolshedAppApproval(value: string): PendingToolshedAppAppro
 	};
 }
 
+function inferToolshedAppCommandMode(value: string): "new" | "maintain" {
+	const text = normalizeInlineText(value).toLowerCase();
+	if (!text) return "new";
+	if (/\b(fix|bug|broken|issue|error|debug|repair|regression|troubleshoot|patch)\b/.test(text)) return "maintain";
+	if (/\b(enhance|improve|extend|modify|update|refactor|adjust|polish)\b/.test(text)) return "maintain";
+	if (/\b(existing|current|already)\b/.test(text) && /\b(app|widget|server|tool|board|integration)\b/.test(text)) return "maintain";
+	return "new";
+}
+
 function isApprovalReply(value: string): boolean {
 	const text = normalizeInlineText(value).toLowerCase().replace(/[.!?]+$/g, "");
 	if (!text) return false;
@@ -1456,23 +1516,6 @@ function getToolshedWebScriptPath(sourceRoot: string): string {
 	return join(sourceRoot, "bin", "toolshed-dashboard-web");
 }
 
-function extractPersistedMessageContent(msg: any): string {
-	const content = msg?.content;
-	if (!content) return "";
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		return content
-			.map((item: any) => {
-				if (item?.type === "text") return item.text || "";
-				if (item?.type === "toolCall") return `Tool: ${item.name}(${JSON.stringify(item.arguments).slice(0, 200)})`;
-				return "";
-			})
-			.filter(Boolean)
-			.join("\n");
-	}
-	return JSON.stringify(content).slice(0, 1000);
-}
-
 function collapseSkillInvocationForLane(content: string): { title: string; content: string } | null {
 	const parsed = parseSkillInvocation(content);
 	if (!parsed) return null;
@@ -1481,109 +1524,6 @@ function collapseSkillInvocationForLane(content: string): { title: string; conte
 		title: `Skill Launch · ${label}`,
 		content: parsed.prompt || `Using the ${label} skill.`,
 	};
-}
-
-function collectSessionHistoryFromFilePaths(paths: string[]): SessionHistorySegment[] {
-	const segments: SessionHistorySegment[] = [];
-	for (const filePath of paths) {
-		try {
-			const raw = readFileSync(filePath, "utf-8");
-			for (const line of raw.split("\n")) {
-				if (!line.trim()) continue;
-				const entry = JSON.parse(line);
-				if (entry.type !== "message" || !entry.message) continue;
-				const msg = entry.message;
-				const content = extractPersistedMessageContent(msg).trim();
-				if (!content) continue;
-				if (msg.role === "user") {
-					const skillLaunch = collapseSkillInvocationForLane(content);
-					segments.push({
-						role: "user",
-						timestamp: String(entry.timestamp || msg.timestamp || nowIso()),
-						title: skillLaunch?.title || "User Prompt",
-						content: skillLaunch?.content || content,
-					});
-				} else if (msg.role === "assistant") {
-					segments.push({ role: "assistant", timestamp: String(entry.timestamp || msg.timestamp || nowIso()), title: "Assistant Response", content });
-				} else if (msg.role === "toolResult") {
-					segments.push({ role: "tool", timestamp: String(entry.timestamp || msg.timestamp || nowIso()), title: `Tool Result: ${msg.toolName || "tool"}`, content });
-				}
-			}
-		} catch {}
-	}
-	return segments.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
-}
-
-function collectSessionHistoryFromFiles(sessionDir: string, excludeFiles: string[] = []): SessionHistorySegment[] {
-	if (!sessionDir || !existsSync(sessionDir)) return [];
-	const files = readdirSync(sessionDir)
-		.filter((file) => (file.endsWith(".json") || file.endsWith(".jsonl")) && !excludeFiles.includes(file))
-		.sort();
-	return collectSessionHistoryFromFilePaths(files.map((file) => join(sessionDir, file)));
-}
-
-function getGlobalSessionDirsForCwd(cwd: string): string[] {
-	const base = join(homedir(), ".pi", "agent", "sessions");
-	if (!existsSync(base)) return [];
-	const normalized = cwd.replace(/[\\/]+/g, "-").replace(/^-+|-+$/g, "");
-	try {
-		return readdirSync(base)
-			.map((name) => join(base, name))
-			.filter((dirPath) => {
-				const name = basename(dirPath);
-				return existsSync(dirPath) && name.includes(normalized);
-			})
-			.sort();
-	} catch {
-		return [];
-	}
-}
-
-function getLatestGlobalSessionFilesForCwd(cwd: string, limit: number = 1): string[] {
-	const files = getGlobalSessionDirsForCwd(cwd)
-		.flatMap((dirPath) => {
-			try {
-				return readdirSync(dirPath)
-					.filter((file) => file.endsWith(".jsonl"))
-					.map((file) => join(dirPath, file));
-			} catch {
-				return [];
-			}
-		})
-		.map((filePath) => {
-			try {
-				return { filePath, mtimeMs: statSync(filePath).mtimeMs };
-			} catch {
-				return null;
-			}
-		})
-		.filter(Boolean) as Array<{ filePath: string; mtimeMs: number }>;
-	return files
-		.sort((a, b) => b.mtimeMs - a.mtimeMs)
-		.slice(0, Math.max(1, limit))
-		.map((entry) => entry.filePath);
-}
-
-function normalizeSessionHistoryTimestamp(timestamp: string): string {
-	const parsed = Date.parse(timestamp);
-	if (!Number.isFinite(parsed)) return timestamp;
-	return new Date(Math.floor(parsed / 1000) * 1000).toISOString();
-}
-
-function normalizeSessionHistoryContent(content: string): string {
-	return String(content || "").replace(/\r/g, "").replace(/\s+/g, " ").trim();
-}
-
-function dedupeSessionHistory(segments: SessionHistorySegment[]): SessionHistorySegment[] {
-	const seen = new Set<string>();
-	const deduped: SessionHistorySegment[] = [];
-	for (const segment of segments.sort((a, b) => a.timestamp.localeCompare(b.timestamp))) {
-		const key = `${normalizeSessionHistoryTimestamp(segment.timestamp)}|${segment.role}|${segment.title}|${normalizeSessionHistoryContent(segment.content)}`;
-		if (seen.has(key)) continue;
-		seen.add(key);
-		deduped.push(segment);
-	}
-	return deduped;
 }
 
 function extractSkillDescription(markdown: string): string {
@@ -1728,6 +1668,11 @@ function readProjectMcpState(cwd: string): ToolshedMcpState {
 	};
 }
 
+function buildTsxMcpShellCommand(scriptPath: string): string {
+	const escapedScriptPath = String(scriptPath || "").replace(/'/g, `'\"'\"'`);
+	return `NODE_PATH="$(cd "$(dirname "$(command -v tsx)")/.." && pwd)" exec tsx '${escapedScriptPath}'`;
+}
+
 function buildTrackedMcpServerRegistration(card: ToolshedGeneratedCard): Record<string, any> | null {
 	const serverFile = String(card.serverFile || "").trim();
 	if (!serverFile) return null;
@@ -1742,8 +1687,9 @@ function buildTrackedMcpServerRegistration(card: ToolshedGeneratedCard): Record<
 			"zod",
 			"-p",
 			"@modelcontextprotocol/sdk",
-			"tsx",
-			serverFile,
+			"sh",
+			"-c",
+			buildTsxMcpShellCommand(serverFile),
 		],
 	};
 }
@@ -1907,22 +1853,25 @@ function actionResetLayout(label: string = "Reset layout", variant: ToolshedQuic
 
 export default function (pi: ExtensionAPI) {
 	let widgetCtx: ExtensionContext | null = null;
+	let toolshedCommandCtx: ExtensionCommandContext | null = null;
 	let sessionDir = "";
+	let toolshedPersistDir = "";
 	let logDir = "";
 	let sessionStateFile = "";
 	let toolshedWebUrl = "";
-		let toolshedControlSocket: Socket | null = null;
-		let toolshedControlConnected = false;
-		let toolshedStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
-		let transcriptWatchTimer: ReturnType<typeof setInterval> | null = null;
-		let mcpAppVerifyTimer: ReturnType<typeof setTimeout> | null = null;
-		let mcpAppVerifyRunning = false;
-		let lastTranscriptSignature = "";
+	let toolshedControlSocket: Socket | null = null;
+	let toolshedControlConnected = false;
+	let toolshedStateFlushTimer: ReturnType<typeof setTimeout> | null = null;
+	let transcriptWatchTimer: ReturnType<typeof setInterval> | null = null;
+	let mcpAppVerifyTimer: ReturnType<typeof setTimeout> | null = null;
+	let mcpAppVerifyRunning = false;
+	let lastTranscriptSignature = "";
 	let lastStateJson = "";
 	let lastTranscriptChangeAt = 0;
 	const extensionRepoRoot = getExtensionRepoRoot();
 	let persistedState: PersistedToolshedState = createDefaultPersistedState();
 	let projectCards: ToolshedGeneratedCard[] = [];
+	let cachedSessionCatalog: ToolshedSessionCatalogEntry[] = [];
 
 	function createDefaultPersistedState(): PersistedToolshedState {
 		return {
@@ -1941,6 +1890,31 @@ export default function (pi: ExtensionAPI) {
 
 	function getToolshedStateFile(): string {
 		return join(logDir || join(widgetCtx?.cwd || process.cwd(), ".pi", "pipeline-logs"), "toolshed-state.json");
+	}
+
+	function getToolshedSessionSnapshotFile(sessionId?: string): string {
+		const normalizedSessionId = String(sessionId || persistedState.sessionId || "").trim() || "toolshed-session";
+		return join(logDir || join(widgetCtx?.cwd || process.cwd(), ".pi", "pipeline-logs"), `toolshed-state.${normalizedSessionId}.json`);
+	}
+
+	function getToolshedSessionPersistFile(sessionId?: string): string {
+		const normalizedSessionId = String(sessionId || persistedState.sessionId || "").trim() || "toolshed-session";
+		return join(toolshedPersistDir || join(widgetCtx?.cwd || process.cwd(), ".pi", "agent-sessions"), `pi-toolshed-state.${normalizedSessionId}.json`);
+	}
+
+	function getCurrentPiSessionId(ctx?: ExtensionContext | null): string {
+		const source = ctx || widgetCtx;
+		return String(source?.sessionManager.getSessionId() || persistedState.sessionId || "").trim() || "toolshed-session";
+	}
+
+	function getCurrentPiSessionFile(ctx?: ExtensionContext | null): string {
+		const source = ctx || widgetCtx;
+		return String(source?.sessionManager.getSessionFile() || "").trim();
+	}
+
+	function getCurrentPiSessionDir(ctx?: ExtensionContext | null): string {
+		const source = ctx || widgetCtx;
+		return String(source?.sessionManager.getSessionDir() || sessionDir || "").trim();
 	}
 
 	function getProjectCardsFile(cwd: string): string {
@@ -2093,96 +2067,493 @@ export default function (pi: ExtensionAPI) {
 		scheduleToolshedStateWrite();
 	}
 
+	function currentSessionEntries(): SessionEntry[] {
+		try {
+			return widgetCtx ? widgetCtx.sessionManager.getBranch() : [];
+		} catch {
+			return [];
+		}
+	}
+
+	function normalizeInlineAppAdapter(value: any): ToolshedInlineAppAdapter {
+		const adapter = String(value || "").trim().toLowerCase();
+		if (adapter === "calculator") return "calculator";
+		if (adapter === "github-project-kanban") return "github-project-kanban";
+		return "generic";
+	}
+
+	function detectGeneratedAppAdapter(value: {
+		adapter?: any;
+		title?: any;
+		brief?: any;
+		toolName?: any;
+		serverId?: any;
+		viewFile?: any;
+		resourceUri?: any;
+	} | null | undefined): ToolshedInlineAppAdapter {
+		const explicit = normalizeInlineAppAdapter(value?.adapter);
+		if (explicit === "calculator" || explicit === "github-project-kanban") return explicit;
+		const text = [
+			String(value?.title || "").trim(),
+			String(value?.brief || "").trim(),
+			String(value?.toolName || "").trim(),
+			String(value?.serverId || "").trim(),
+			String(value?.viewFile || "").trim(),
+			String(value?.resourceUri || "").trim(),
+		].join(" ").toLowerCase();
+		if (/calculator/.test(text)) return "calculator";
+		if (/github project kanban board|github.*kanban|kanban board/.test(text)) return "github-project-kanban";
+		return "generic";
+	}
+
+	function generatedAppRuntimeVersion(appRuntime: any): string {
+		return String(appRuntime?.versionTag || appRuntime?.fingerprint || "").trim();
+	}
+
+	function nextInlineAppItemId(cardId?: string): string {
+		const seed = `${String(cardId || "generated-app").trim()}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		return `generated-app-${slugify(seed)}`;
+	}
+
+	function nextInlineAppSessionId(adapter: ToolshedInlineAppAdapter, seed?: string): string {
+		const prefix = adapter === "calculator"
+			? "calc"
+			: adapter === "github-project-kanban"
+				? "board"
+				: "app";
+		const normalizedSeed = String(seed || Date.now()).replace(/[^a-z0-9]+/gi, "").toLowerCase().slice(-12);
+		return `${prefix}-${normalizedSeed || Date.now().toString(36)}`;
+	}
+
+	function createInlineCalculatorState(seed?: string): Record<string, any> {
+		return {
+			sessionId: nextInlineAppSessionId("calculator", seed),
+			display: "0",
+			expression: "",
+			accumulator: null,
+			pendingOperator: null,
+			waitingForOperand: false,
+			history: [],
+			steps: [],
+			updatedAt: nowIso(),
+		};
+	}
+
+	function createInlineGithubBoardState(seed?: string, title?: string): Record<string, any> {
+		return {
+			sessionId: nextInlineAppSessionId("github-project-kanban", seed),
+			repo: null,
+			repoNameWithOwner: "",
+			project: null,
+			projectTitle: String(title || "GitHub Project Board").trim() || "GitHub Project Board",
+			projectNumber: null,
+			projectScopeReady: false,
+			columns: INLINE_GITHUB_BOARD_COLUMNS.map((column) => ({ id: column, title: column, cards: [] })),
+			counts: {
+				Backlog: 0,
+				"In Progress": 0,
+				Review: 0,
+				Done: 0,
+			},
+			updatedAt: nowIso(),
+			warnings: [],
+			error: "",
+			statusText: "Waiting for board data…",
+			pendingCloseQueue: [],
+			displayMode: "inline",
+		};
+	}
+
+	function createInitialInlineAppState(adapter: ToolshedInlineAppAdapter, seed?: string, title?: string): Record<string, any> {
+		if (adapter === "calculator") return createInlineCalculatorState(seed);
+		if (adapter === "github-project-kanban") return createInlineGithubBoardState(seed, title);
+		return {
+			sessionId: nextInlineAppSessionId("generic", seed),
+			updatedAt: nowIso(),
+		};
+	}
+
+	function normalizeInlineAppCardDetails(value: any): ToolshedInlineAppCardDetails | null {
+		if (!value || typeof value !== "object") return null;
+		const itemId = String(value.itemId || "").trim();
+		const title = String(value.title || "").trim();
+		if (!itemId || !title) return null;
+		return {
+			itemId,
+			cardId: String(value.cardId || "").trim() || undefined,
+			title,
+			adapter: normalizeInlineAppAdapter(value.adapter),
+			summary: String(value.summary || "").trim() || undefined,
+			appRuntime: value.appRuntime && typeof value.appRuntime === "object" ? value.appRuntime as Record<string, any> : undefined,
+			meta: String(value.meta || "").trim() || undefined,
+		};
+	}
+
+	function normalizeInlineAppStateRecord(value: any): ToolshedInlineAppStateRecord | null {
+		if (!value || typeof value !== "object") return null;
+		const itemId = String(value.itemId || "").trim();
+		const title = String(value.title || "").trim();
+		const sessionId = String(value.sessionId || "").trim();
+		if (!itemId || !title || (!sessionId && !value.deleted)) return null;
+		return {
+			itemId,
+			cardId: String(value.cardId || "").trim() || undefined,
+			title,
+			adapter: normalizeInlineAppAdapter(value.adapter),
+			sessionId,
+			appRuntime: value.appRuntime && typeof value.appRuntime === "object" ? value.appRuntime as Record<string, any> : undefined,
+			appState: value.appState && typeof value.appState === "object" ? value.appState as Record<string, any> : undefined,
+			summary: String(value.summary || "").trim() || undefined,
+			deleted: Boolean(value.deleted),
+			syncedAt: String(value.syncedAt || nowIso()),
+		};
+	}
+
+	function buildInlineAppSummary(record: ToolshedInlineAppStateRecord): string {
+		if (record.adapter === "calculator") {
+			const display = String(record.appState?.display || "0").trim() || "0";
+			const latest = Array.isArray(record.appState?.history) ? normalizeCalculatorHistoryEntry(record.appState.history[0]) : null;
+			return latest
+				? `${record.title} is open inline. Display: ${display}. Recent: ${latest.expression} = ${latest.result}.`
+				: `${record.title} is open inline. Display: ${display}.`;
+		}
+		if (record.adapter === "github-project-kanban") {
+			const projectTitle = String(record.appState?.project?.title || record.appState?.projectTitle || record.title).trim();
+			const columnCount = Array.isArray(record.appState?.columns) ? record.appState.columns.length : 0;
+			return `${projectTitle} is open inline.${columnCount > 0 ? ` Columns: ${columnCount}.` : ""}`;
+		}
+		return `${record.title} is open inline in this session.`;
+	}
+
+	function buildInlineAppCardDetails(record: ToolshedInlineAppStateRecord): ToolshedInlineAppCardDetails {
+		return {
+			itemId: record.itemId,
+			cardId: record.cardId,
+			title: record.title,
+			adapter: record.adapter,
+			summary: record.summary || buildInlineAppSummary(record),
+			appRuntime: record.appRuntime,
+			meta: "Generated MCP app",
+		};
+	}
+
+	function findInlineAppStateRecord(
+		store: ReturnType<typeof readInlineAppSessionStore>,
+		match: {
+			itemId?: string;
+			cardId?: string;
+			adapter?: ToolshedInlineAppAdapter;
+			sessionId?: string;
+			title?: string;
+		},
+	): ToolshedInlineAppStateRecord | null {
+		const itemId = String(match.itemId || "").trim();
+		if (itemId) {
+			const exact = store.states.get(itemId);
+			if (exact) return exact;
+		}
+		const cardId = String(match.cardId || "").trim();
+		const adapter = match.adapter ? normalizeInlineAppAdapter(match.adapter) : null;
+		const sessionId = String(match.sessionId || "").trim();
+		const title = String(match.title || "").trim();
+		const states = [...store.states.values()].filter((record) => !record.deleted);
+		if (cardId && adapter && sessionId) {
+			const exact = states.find((record) =>
+				record.cardId === cardId
+				&& record.adapter === adapter
+				&& String(record.appState?.sessionId || record.sessionId || "").trim() === sessionId
+			);
+			if (exact) return exact;
+		}
+		if (cardId && adapter) {
+			const exact = [...states].reverse().find((record) =>
+				record.cardId === cardId
+				&& record.adapter === adapter
+			);
+			if (exact) return exact;
+		}
+		if (title && adapter) {
+			const exact = [...states].reverse().find((record) =>
+				record.adapter === adapter
+				&& record.title === title
+			);
+			if (exact) return exact;
+		}
+		return null;
+	}
+
+	function findInlineAppCardRecord(
+		store: ReturnType<typeof readInlineAppSessionStore>,
+		match: {
+			itemId?: string;
+			cardId?: string;
+			adapter?: ToolshedInlineAppAdapter;
+			title?: string;
+		},
+	): { entryId: string; timestamp: string; details: ToolshedInlineAppCardDetails } | null {
+		const itemId = String(match.itemId || "").trim();
+		if (itemId) {
+			const exact = store.cards.get(itemId);
+			if (exact) return exact;
+		}
+		const cardId = String(match.cardId || "").trim();
+		const adapter = match.adapter ? normalizeInlineAppAdapter(match.adapter) : null;
+		const title = String(match.title || "").trim();
+		const cards = [...store.cards.values()];
+		if (cardId && adapter) {
+			const exact = [...cards].reverse().find((record) =>
+				record.details.cardId === cardId
+				&& record.details.adapter === adapter
+			);
+			if (exact) return exact;
+		}
+		if (title && adapter) {
+			const exact = [...cards].reverse().find((record) =>
+				record.details.adapter === adapter
+				&& record.details.title === title
+			);
+			if (exact) return exact;
+		}
+		return null;
+	}
+
+	function readInlineAppSessionStore(entries: SessionEntry[] = currentSessionEntries()) {
+		const cards = new Map<string, { entryId: string; timestamp: string; details: ToolshedInlineAppCardDetails }>();
+		const states = new Map<string, ToolshedInlineAppStateRecord>();
+		for (const entry of entries) {
+			if (entry.type === "custom_message" && entry.customType === TOOLSHED_INLINE_APP_CARD_TYPE) {
+				const details = normalizeInlineAppCardDetails(entry.details);
+				if (!details) continue;
+				cards.set(details.itemId, {
+					entryId: entry.id,
+					timestamp: String(entry.timestamp || nowIso()),
+					details,
+				});
+				continue;
+			}
+			if (entry.type === "custom" && entry.customType === TOOLSHED_INLINE_APP_STATE_TYPE) {
+				const record = normalizeInlineAppStateRecord(entry.data);
+				if (!record) continue;
+				states.set(record.itemId, record);
+			}
+		}
+		return { cards, states };
+	}
+
+	function listActiveInlineAppRecords(entries: SessionEntry[] = currentSessionEntries()): ToolshedInlineAppStateRecord[] {
+		return [...readInlineAppSessionStore(entries).states.values()]
+			.filter((record) => !record.deleted)
+			.sort((a, b) => String(b.syncedAt || "").localeCompare(String(a.syncedAt || "")));
+	}
+
+	function findActiveInlineAppRecord(match?: { itemId?: string; cardId?: string; adapter?: ToolshedInlineAppAdapter }, entries: SessionEntry[] = currentSessionEntries()): ToolshedInlineAppStateRecord | null {
+		const itemId = String(match?.itemId || "").trim();
+		if (itemId) {
+			const exact = listActiveInlineAppRecords(entries).find((record) => record.itemId === itemId);
+			if (exact) return exact;
+		}
+		const cardId = String(match?.cardId || "").trim();
+		const adapter = match?.adapter ? normalizeInlineAppAdapter(match.adapter) : null;
+		if (cardId || adapter) {
+			const exact = listActiveInlineAppRecords(entries).find((record) => {
+				if (cardId && record.cardId !== cardId) return false;
+				if (adapter && record.adapter !== adapter) return false;
+				return true;
+			});
+			if (exact) return exact;
+		}
+		return null;
+	}
+
 	function listInlineCalculatorSessions(): ToolshedInlineCalculatorSession[] {
-		return [...persistedState.inlineCalculatorSessions].sort((a, b) =>
-			String(b.updatedAt || b.syncedAt || "").localeCompare(String(a.updatedAt || a.syncedAt || ""))
-		);
+		return listActiveInlineAppRecords()
+			.filter((record) => record.adapter === "calculator")
+			.map((record) => normalizeInlineCalculatorSession({
+				itemId: record.itemId,
+				cardId: record.cardId,
+				title: record.title,
+				sessionId: String(record.appState?.sessionId || record.sessionId || "").trim(),
+				display: String(record.appState?.display || "").trim(),
+				expression: String(record.appState?.expression || "").trim(),
+				history: Array.isArray(record.appState?.history) ? record.appState.history : [],
+				steps: Array.isArray(record.appState?.steps) ? record.appState.steps : [],
+				updatedAt: String(record.appState?.updatedAt || record.syncedAt || nowIso()),
+				syncedAt: record.syncedAt,
+			}))
+			.filter(Boolean)
+			.sort((a, b) => String(b!.updatedAt || b!.syncedAt || "").localeCompare(String(a!.updatedAt || a!.syncedAt || ""))) as ToolshedInlineCalculatorSession[];
 	}
 
 	function getInlineCalculatorSession(match?: { itemId?: string; cardId?: string; sessionId?: string }): ToolshedInlineCalculatorSession | null {
+		const sessions = listInlineCalculatorSessions();
 		const itemId = String(match?.itemId || "").trim();
 		if (itemId) {
-			const exact = persistedState.inlineCalculatorSessions.find((session) => session.itemId === itemId);
+			const exact = sessions.find((session) => session.itemId === itemId);
 			if (exact) return exact;
 		}
 		const sessionId = String(match?.sessionId || "").trim();
 		if (sessionId) {
-			const exact = persistedState.inlineCalculatorSessions.find((session) => session.sessionId === sessionId);
+			const exact = sessions.find((session) => session.sessionId === sessionId);
 			if (exact) return exact;
 		}
 		const cardId = String(match?.cardId || "").trim();
 		if (cardId) {
-			const exact = listInlineCalculatorSessions().find((session) => session.cardId === cardId);
+			const exact = sessions.find((session) => session.cardId === cardId);
 			if (exact) return exact;
 		}
-		return listInlineCalculatorSessions()[0] || null;
-	}
-
-	function syncInlineCalculatorSession(value: any): ToolshedInlineCalculatorSession | null {
-		const normalized = normalizeInlineCalculatorSession(value);
-		if (!normalized) return null;
-		persistedState.inlineCalculatorSessions = [
-			normalized,
-			...persistedState.inlineCalculatorSessions.filter((session) => session.itemId !== normalized.itemId),
-		].slice(0, 8);
-		saveSessionState();
-		return normalized;
-	}
-
-	function removeInlineCalculatorSession(itemId: string): boolean {
-		const normalizedItemId = String(itemId || "").trim();
-		if (!normalizedItemId) return false;
-		const before = persistedState.inlineCalculatorSessions.length;
-		persistedState.inlineCalculatorSessions = persistedState.inlineCalculatorSessions.filter((session) => session.itemId !== normalizedItemId);
-		if (persistedState.inlineCalculatorSessions.length === before) return false;
-		saveSessionState();
-		return true;
+		return sessions[0] || null;
 	}
 
 	function listInlineGithubBoardSessions(): ToolshedInlineGithubBoardSession[] {
-		return [...persistedState.inlineGithubBoardSessions].sort((a, b) =>
-			String(b.updatedAt || b.syncedAt || "").localeCompare(String(a.updatedAt || a.syncedAt || ""))
-		);
+		return listActiveInlineAppRecords()
+			.filter((record) => record.adapter === "github-project-kanban")
+			.map((record) => normalizeInlineGithubBoardSession({
+				itemId: record.itemId,
+				cardId: record.cardId,
+				title: record.title,
+				sessionId: String(record.appState?.sessionId || record.sessionId || "").trim(),
+				repoNameWithOwner: String(record.appState?.repo?.nameWithOwner || record.appState?.repoNameWithOwner || "").trim(),
+				projectTitle: String(record.appState?.project?.title || record.appState?.projectTitle || "").trim(),
+				projectNumber: record.appState?.project?.number ?? record.appState?.projectNumber,
+				projectScopeReady: Boolean(record.appState?.projectScopeReady),
+				columns: Array.isArray(record.appState?.columns) ? record.appState.columns : [],
+				updatedAt: String(record.appState?.updatedAt || record.syncedAt || nowIso()),
+				syncedAt: record.syncedAt,
+			}))
+			.filter(Boolean)
+			.sort((a, b) => String(b!.updatedAt || b!.syncedAt || "").localeCompare(String(a!.updatedAt || a!.syncedAt || ""))) as ToolshedInlineGithubBoardSession[];
 	}
 
 	function getInlineGithubBoardSession(match?: { itemId?: string; cardId?: string; sessionId?: string }): ToolshedInlineGithubBoardSession | null {
+		const sessions = listInlineGithubBoardSessions();
 		const itemId = String(match?.itemId || "").trim();
 		if (itemId) {
-			const exact = persistedState.inlineGithubBoardSessions.find((session) => session.itemId === itemId);
+			const exact = sessions.find((session) => session.itemId === itemId);
 			if (exact) return exact;
 		}
 		const sessionId = String(match?.sessionId || "").trim();
 		if (sessionId) {
-			const exact = persistedState.inlineGithubBoardSessions.find((session) => session.sessionId === sessionId);
+			const exact = sessions.find((session) => session.sessionId === sessionId);
 			if (exact) return exact;
 		}
 		const cardId = String(match?.cardId || "").trim();
 		if (cardId) {
-			const exact = listInlineGithubBoardSessions().find((session) => session.cardId === cardId);
+			const exact = sessions.find((session) => session.cardId === cardId);
 			if (exact) return exact;
 		}
-		return listInlineGithubBoardSessions()[0] || null;
+		return sessions[0] || null;
 	}
 
-	function syncInlineGithubBoardSession(value: any): ToolshedInlineGithubBoardSession | null {
-		const normalized = normalizeInlineGithubBoardSession(value);
-		if (!normalized) return null;
-		persistedState.inlineGithubBoardSessions = [
-			normalized,
-			...persistedState.inlineGithubBoardSessions.filter((session) => session.itemId !== normalized.itemId),
-		].slice(0, 6);
-		saveSessionState();
-		return normalized;
+	function syncInlineAppSession(value: any): boolean {
+		let record = normalizeInlineAppStateRecord(value);
+		if (!record) return false;
+		const store = readInlineAppSessionStore();
+		const canonicalState = findInlineAppStateRecord(store, {
+			itemId: record.itemId,
+			cardId: record.cardId,
+			adapter: record.adapter,
+			sessionId: String(record.appState?.sessionId || record.sessionId || "").trim(),
+			title: record.title,
+		});
+		const canonicalCard = !canonicalState
+			? findInlineAppCardRecord(store, {
+				itemId: record.itemId,
+				cardId: record.cardId,
+				adapter: record.adapter,
+				title: record.title,
+			})
+			: null;
+		const canonicalItemId = canonicalState?.itemId || canonicalCard?.details.itemId || record.itemId;
+		if (canonicalItemId !== record.itemId) record = { ...record, itemId: canonicalItemId };
+		if (!store.cards.has(record.itemId) && !record.deleted) {
+			const details = buildInlineAppCardDetails(record);
+			pi.sendMessage({
+				customType: TOOLSHED_INLINE_APP_CARD_TYPE,
+				content: details.summary || record.title,
+				display: true,
+				details,
+			}, { triggerTurn: false });
+		}
+		pi.appendEntry(TOOLSHED_INLINE_APP_STATE_TYPE, {
+			...record,
+			summary: record.summary || buildInlineAppSummary(record),
+			syncedAt: nowIso(),
+		});
+		return true;
 	}
 
-	function removeInlineGithubBoardSession(itemId: string): boolean {
+	function clearInlineAppSession(itemId: string, adapter?: ToolshedInlineAppAdapter): boolean {
 		const normalizedItemId = String(itemId || "").trim();
 		if (!normalizedItemId) return false;
-		const before = persistedState.inlineGithubBoardSessions.length;
-		persistedState.inlineGithubBoardSessions = persistedState.inlineGithubBoardSessions.filter((session) => session.itemId !== normalizedItemId);
-		if (persistedState.inlineGithubBoardSessions.length === before) return false;
-		saveSessionState();
+		const store = readInlineAppSessionStore();
+		const existing = store.states.get(normalizedItemId);
+		if (!existing && !adapter) return false;
+		pi.appendEntry(TOOLSHED_INLINE_APP_STATE_TYPE, {
+			itemId: normalizedItemId,
+			cardId: existing?.cardId,
+			title: existing?.title || "Inline app",
+			adapter: adapter || existing?.adapter || "generic",
+			sessionId: existing?.sessionId || getCurrentPiSessionId(),
+			appRuntime: existing?.appRuntime,
+			appState: existing?.appState,
+			deleted: true,
+			syncedAt: nowIso(),
+		});
 		return true;
+	}
+
+	function buildSessionCatalogEntry(info: SessionInfo, currentSessionId: string, currentSessionFile: string): ToolshedSessionCatalogEntry {
+		const isCurrent = (currentSessionFile && info.path === currentSessionFile) || info.id === currentSessionId;
+		const title = String(info.name || "").trim() || `Pi session ${info.id.slice(-8)}`;
+		const firstMessage = clipText(String(info.firstMessage || "").trim(), 96);
+		return {
+			sessionId: String(info.id || "").trim(),
+			path: String(info.path || "").trim(),
+			name: String(info.name || "").trim() || undefined,
+			label: title,
+			brief: firstMessage || `${info.messageCount} message${info.messageCount === 1 ? "" : "s"}`,
+			messageCount: Number(info.messageCount || 0),
+			createdAt: info.created instanceof Date ? info.created.toISOString() : nowIso(),
+			modifiedAt: info.modified instanceof Date ? info.modified.toISOString() : nowIso(),
+			current: isCurrent,
+		};
+	}
+
+	async function refreshSessionCatalog(ctx: ExtensionContext) {
+		const currentSessionId = getCurrentPiSessionId(ctx);
+		const currentSessionFile = getCurrentPiSessionFile(ctx);
+		try {
+			const listed = await SessionManager.list(ctx.cwd, getCurrentPiSessionDir(ctx));
+			cachedSessionCatalog = listed
+				.map((info) => buildSessionCatalogEntry(info, currentSessionId, currentSessionFile))
+				.sort((a, b) => String(b.modifiedAt).localeCompare(String(a.modifiedAt)));
+		} catch {
+			cachedSessionCatalog = currentSessionFile
+				? [{
+					sessionId: currentSessionId,
+					path: currentSessionFile,
+					label: `Pi session ${currentSessionId.slice(-8)}`,
+					brief: "Current Pi session.",
+					messageCount: 0,
+					createdAt: nowIso(),
+					modifiedAt: nowIso(),
+					current: true,
+				}]
+				: [];
+		}
+	}
+
+	function restoreToolshedSession(ctx: ExtensionContext) {
+		widgetCtx = ctx;
+		sessionDir = getCurrentPiSessionDir(ctx);
+		toolshedPersistDir = join(ctx.cwd, ".pi", "agent-sessions");
+		logDir = join(ctx.cwd, ".pi", "pipeline-logs");
+		if (!existsSync(toolshedPersistDir)) mkdirSync(toolshedPersistDir, { recursive: true });
+		if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+		sessionStateFile = getToolshedSessionPersistFile(getCurrentPiSessionId(ctx));
+		restoreSessionState(loadSessionState());
+		persistedState.sessionId = getCurrentPiSessionId(ctx);
+		saveSessionState();
 	}
 
 	function maybeBuildInlineCalculatorPrompt(userText: string, match?: { itemId?: string; cardId?: string; sessionId?: string }): string | null {
@@ -2312,25 +2683,12 @@ export default function (pi: ExtensionAPI) {
 		const userContent = String(userText || "").trim();
 		const assistantContent = String(answerText || "").trim();
 		if (!userContent || !assistantContent) return;
-		const userTimestamp = nowIso();
-		const assistantTimestamp = new Date(Date.now() + 1).toISOString();
-		addLaneEvent({
-			kind: "user",
-			title: "User Prompt",
-			content: userContent,
-			summary: excerptText(userContent, 180),
-			timestamp: userTimestamp,
-			tone: "neutral",
-			cardId: options?.cardId,
-		});
-		addLaneEvent({
-			kind: "assistant",
-			title: "Assistant Response",
-			content: assistantContent,
+		appendSessionLaneCard({
+			title: "Inline session answer",
+			content: `Question:\n${userContent}\n\nAnswer:\n${assistantContent}`,
 			summary: excerptText(assistantContent, 220),
-			timestamp: assistantTimestamp,
-			tone: options?.tone || "success",
 			cardId: options?.cardId,
+			meta: "Inline session answer",
 		});
 		updateWidget();
 	}
@@ -2362,81 +2720,177 @@ export default function (pi: ExtensionAPI) {
 		return JSON.stringify(msg.content).slice(0, 1000);
 	}
 
-	function collectSessionHistory(ctx: ExtensionContext): SessionHistorySegment[] {
-		const branch = ctx.sessionManager.getBranch();
-		const branchSegments: SessionHistorySegment[] = [];
-		for (const entry of branch) {
-			if (entry.type !== "message" || !entry.message) continue;
-			const msg = entry.message;
-			const content = extractSessionMessageContent(entry).trim();
-			if (!content) continue;
-			const timestamp = String((entry as any).timestamp || msg.timestamp || nowIso());
-			if (msg.role === "user") {
-				const skillLaunch = collapseSkillInvocationForLane(content);
-				branchSegments.push({
-					role: "user",
-					timestamp,
-					title: skillLaunch?.title || "User Prompt",
-					content: skillLaunch?.content || content,
-				});
-			} else if (msg.role === "assistant") {
-				branchSegments.push({ role: "assistant", timestamp, title: "Assistant Response", content });
-			} else if (msg.role === "toolResult") {
-				branchSegments.push({ role: "tool", timestamp, title: `Tool Result: ${(msg as any).toolName || "tool"}`, content });
-			}
+	function extractCustomMessageContent(content: any): string {
+		if (!content) return "";
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) {
+			return content
+				.map((item: any) => item?.type === "text" ? String(item.text || "") : "")
+				.filter(Boolean)
+				.join("\n");
 		}
-		const localSegments = collectSessionHistoryFromFiles(sessionDir, ["pi-toolshed-state.json"]);
-		const globalSegments = branchSegments.length > 0 || localSegments.length > 0
-			? []
-			: collectSessionHistoryFromFilePaths(getLatestGlobalSessionFilesForCwd(ctx.cwd));
-		return dedupeSessionHistory([
-			...globalSegments,
-			...localSegments,
-			...branchSegments,
-		]);
+		return JSON.stringify(content).slice(0, 1000);
 	}
 
 	function addLaneEvent(event: Omit<PersistedLaneEvent, "id" | "timestamp"> & { id?: string; timestamp?: string }) {
-		persistedState.laneEvents.push({
-			id: event.id || generateId("toolshed-event"),
-			timestamp: event.timestamp || nowIso(),
-			...event,
+		appendSessionLaneCard({
+			title: event.title,
+			content: event.content,
+			summary: event.summary,
+			cardId: event.cardId,
+			packetId: event.packetId,
+			kind: event.kind,
+			tone: event.tone,
+			meta: event.kind === "packet" ? "Packet event" : event.kind === "card" ? "Card event" : "Toolshed event",
 		});
-		persistedState.laneEvents = persistedState.laneEvents.slice(-MAX_LANE_EVENTS);
-		saveSessionState();
+	}
+
+	function appendSessionLaneCard(details: {
+		title: string;
+		content: string;
+		summary?: string;
+		cardId?: string;
+		packetId?: string;
+		kind?: Extract<LaneItemKind, "system" | "user" | "assistant" | "packet" | "card">;
+		tone?: Tone;
+		meta?: string;
+	}) {
+		const payload: ToolshedLaneCardDetails = {
+			title: String(details.title || "").trim() || "Toolshed card",
+			summary: String(details.summary || "").trim() || excerptText(String(details.content || "").trim(), 180),
+			cardId: String(details.cardId || "").trim() || undefined,
+			packetId: String(details.packetId || "").trim() || undefined,
+			kind: details.kind || "card",
+			tone: details.tone || "info",
+			meta: String(details.meta || "").trim() || undefined,
+		};
+		pi.sendMessage({
+			customType: TOOLSHED_LANE_CARD_TYPE,
+			content: String(details.content || "").trim() || payload.summary,
+			display: true,
+			details: payload,
+		}, { triggerTurn: false });
+		scheduleToolshedStateWrite();
+	}
+
+	function buildInlineAppLaneItem(
+		entry: SessionEntry & { type: "custom_message" },
+		details: ToolshedInlineAppCardDetails,
+		stateRecord?: ToolshedInlineAppStateRecord,
+	): ToolshedLaneItem {
+		const content = extractCustomMessageContent(entry.content).trim();
+		const liveSummary = stateRecord ? String(stateRecord.summary || buildInlineAppSummary(stateRecord)).trim() : "";
+		const summary = String(liveSummary || details.summary || excerptText(content || details.title, 180)).trim();
+		return {
+			id: stateRecord?.itemId || details.itemId,
+			kind: "card",
+			title: details.title,
+			content: liveSummary || content || summary,
+			summary,
+			timestamp: String(entry.timestamp || nowIso()),
+			state: "historical",
+			tone: "info",
+			cardId: details.cardId || stateRecord?.cardId,
+			meta: details.meta || "Generated MCP app",
+			appRuntime: stateRecord?.appRuntime || details.appRuntime,
+			appState: stateRecord?.appState,
+			adapter: stateRecord?.adapter || details.adapter,
+		};
 	}
 
 	function buildLane(ctx: ExtensionContext): ToolshedLaneItem[] {
-		const lane: ToolshedLaneItem[] = collectSessionHistory(ctx).map((segment, index) => {
-			const summary = excerptText(segment.content, segment.role === "tool" ? 180 : 220);
-			const tone: Tone = segment.role === "tool" ? (/(error|fail|warning)/i.test(segment.content) ? "warning" : "info") : segment.role === "assistant" ? "success" : "neutral";
-			return {
-				id: `${normalizeSessionHistoryTimestamp(segment.timestamp)}-${segment.role}-${index}`,
-				kind: segment.role === "tool" ? "tool" : segment.role,
-				title: segment.title,
-				content: segment.content,
-				summary,
-				timestamp: segment.timestamp,
-				state: "historical",
-				tone,
-				meta: segment.role === "tool" ? excerptText(segment.title, 120) : undefined,
-			};
-		});
-		for (const event of persistedState.laneEvents) {
-			lane.push({
-				id: event.id,
-				kind: event.kind,
-				title: event.title,
-				content: event.content,
-				summary: event.summary,
-				timestamp: event.timestamp,
-				state: "historical",
-				tone: event.tone,
-				packetId: event.packetId,
-				cardId: event.cardId,
-				meta: event.kind === "packet" ? "Packet event" : event.kind === "card" ? "Card run" : event.kind === "system" ? "Toolshed event" : undefined,
-			});
+		const branch = ctx.sessionManager.getBranch();
+		const inlineApps = readInlineAppSessionStore(branch);
+		const lane: ToolshedLaneItem[] = [];
+		const inlineAppLane = new Map<string, ToolshedLaneItem>();
+		for (const entry of branch) {
+			if (entry.type === "message" && entry.message) {
+				const msg = entry.message;
+				const content = extractSessionMessageContent(entry).trim();
+				if (!content) continue;
+				const timestamp = String(entry.timestamp || msg.timestamp || nowIso());
+				if (msg.role === "user") {
+					const skillLaunch = collapseSkillInvocationForLane(content);
+					lane.push({
+						id: entry.id,
+						kind: "user",
+						title: skillLaunch?.title || "User Prompt",
+						content: skillLaunch?.content || content,
+						summary: excerptText(skillLaunch?.content || content, 220),
+						timestamp,
+						state: "historical",
+						tone: "neutral",
+					});
+				} else if (msg.role === "assistant") {
+					lane.push({
+						id: entry.id,
+						kind: "assistant",
+						title: "Assistant Response",
+						content,
+						summary: excerptText(content, 220),
+						timestamp,
+						state: "historical",
+						tone: "success",
+					});
+				} else if (msg.role === "toolResult") {
+					lane.push({
+						id: entry.id,
+						kind: "tool",
+						title: `Tool Result: ${(msg as any).toolName || "tool"}`,
+						content,
+						summary: excerptText(content, 180),
+						timestamp,
+						state: "historical",
+						tone: /(error|fail|warning)/i.test(content) ? "warning" : "info",
+						meta: excerptText(`Tool Result: ${(msg as any).toolName || "tool"}`, 120),
+					});
+				}
+				continue;
+			}
+			if (entry.type === "custom_message" && entry.customType === TOOLSHED_INLINE_APP_CARD_TYPE) {
+				const details = normalizeInlineAppCardDetails(entry.details);
+				if (!details) continue;
+				const stateRecord = findInlineAppStateRecord(inlineApps, {
+					itemId: details.itemId,
+					cardId: details.cardId,
+					adapter: details.adapter,
+					title: details.title,
+				});
+				if (stateRecord?.deleted) continue;
+				const itemId = String(stateRecord?.itemId || details.itemId || "").trim();
+				const sessionId = String(stateRecord?.appState?.sessionId || stateRecord?.sessionId || "").trim();
+				const dedupeKey = [
+					String(details.cardId || "").trim(),
+					details.adapter,
+					sessionId || itemId,
+				].join("::");
+				inlineAppLane.set(dedupeKey, buildInlineAppLaneItem(entry, {
+					...details,
+					itemId,
+				}, stateRecord));
+				continue;
+			}
+			if (entry.type === "custom_message" && entry.customType === TOOLSHED_LANE_CARD_TYPE) {
+				const details = entry.details && typeof entry.details === "object" ? entry.details as ToolshedLaneCardDetails : { title: "Toolshed card" };
+				const content = extractCustomMessageContent(entry.content).trim();
+				const kind = details.kind || "card";
+				const tone = details.tone || (kind === "packet" ? "warning" : "info");
+				lane.push({
+					id: entry.id,
+					kind,
+					title: String(details.title || "Toolshed card").trim(),
+					content,
+					summary: String(details.summary || excerptText(content, 180)).trim(),
+					timestamp: String(entry.timestamp || nowIso()),
+					state: "historical",
+					tone,
+					cardId: String(details.cardId || "").trim() || undefined,
+					packetId: String(details.packetId || "").trim() || undefined,
+					meta: String(details.meta || `${humanize(kind)} card`).trim(),
+				});
+			}
 		}
+		lane.push(...inlineAppLane.values());
 		lane.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 		const capped = lane.slice(-120);
 		if (capped.length === 0) {
@@ -2952,11 +3406,11 @@ export default function (pi: ExtensionAPI) {
 				addLaneEvent({
 					kind: "system",
 					title: "App prompt required",
-					content: "Toolshed needs an app prompt before it can create a tracked MCP app.\n\nUse /toolshed-app to start the guided wizard, or launch the Toolshed App Builder skill first.",
+					content: "Toolshed needs an app prompt before it can create a tracked MCP app.\n\nUse /toolshed-app to start the MCP app flow, or create the card from the builder with a short brief.",
 					summary: "App prompt required. Run /toolshed-app.",
 					tone: "warning",
 				});
-				ctx.ui.notify("An app prompt is required. Run /toolshed-app to start the wizard.", "warning");
+				ctx.ui.notify("An app prompt is required. Run /toolshed-app to start the MCP app flow.", "warning");
 				return null;
 			}
 			const starterId = String(input.starterId || "basic-server-react").trim() || "basic-server-react";
@@ -3663,13 +4117,12 @@ export default function (pi: ExtensionAPI) {
 		if (!ctx) return;
 		const example = getBuilderExample(exampleId, ctx);
 		if (!example) return;
-		addLaneEvent({
-			kind: "card",
+		appendSessionLaneCard({
 			title: example.laneTitle,
 			content: example.laneContent,
 			summary: example.laneSummary,
-			tone: "info",
 			cardId: example.preset.preferredId || example.id,
+			meta: "Builder example",
 		});
 		ctx.ui.notify(`Added ${example.title} to the lane.`, "info");
 		updateWidget();
@@ -4048,39 +4501,19 @@ export default function (pi: ExtensionAPI) {
 	function startToolshedAppLaneInterview(ctx: ExtensionContext, seedBrief?: string) {
 		const prompt = String(seedBrief || "").trim()
 			? [
-				'Use the skill "toolshed-app-builder".',
-				"Help me define a new tracked Toolshed MCP app.",
-				"Ask one question at a time, keep the first version small, and stay inline-first.",
-				"Ask your questions directly in the conversation lane. Do not use terminal UI prompts, selects, or slash-command wizards for the interview.",
-				"For app chrome and operator controls, use shared semantic button primitives with tokenized sizing and variants instead of custom fixed pixel button widths.",
-				"Reuse the active Toolshed theme tokens for app backgrounds, borders, text, and controls instead of inventing a local palette unless the app explicitly needs its own visual identity.",
-				"Treat next-app/app/globals.css as the canonical shadcn theme source and mirror its token values when building inline app chrome.",
-				`Seed brief: ${String(seedBrief || "").trim()}`,
-				"When the plan is sharp enough, summarize the app goal, starter pattern, likely files/data sources, and include the exact /toolshed-app <brief> command that should be used.",
-				'Then ask "Is that okay?" and wait for my approval. After I approve, move straight into the build.',
-			].join(" ")
-			: 'Use the skill "toolshed-app-builder". Help me define a new tracked Toolshed MCP app. Ask one question at a time, keep the first version small, and stay inline-first. Ask your questions directly in the conversation lane. Do not use terminal UI prompts, selects, or slash-command wizards for the interview. For app chrome and operator controls, use shared semantic button primitives with tokenized sizing and variants instead of custom fixed pixel button widths. Reuse the active Toolshed theme tokens for app backgrounds, borders, text, and controls instead of inventing a local palette unless the app explicitly needs its own visual identity. Treat next-app/app/globals.css as the canonical shadcn theme source and mirror its token values when building inline app chrome. When the plan is sharp enough, summarize the app goal, starter pattern, likely files/data sources, and include the exact /toolshed-app <brief> command that should be used. Then ask "Is that okay?" and wait for my approval. After I approve, move straight into the build.';
-		if (launchSkillIntoLane(ctx, "toolshed-app-builder", prompt)) return;
-		pi.sendUserMessage(prompt);
-		ctx.ui.notify("Started the Toolshed app interview in the lane.", "info");
-		updateWidget();
-	}
-
-	function startToolshedMcpAppGreenfieldSkill(ctx: ExtensionContext, seedBrief?: string) {
-		const brief = String(seedBrief || "").trim();
-		const prompt = brief
-			? [
 				'Use the skill "mcp-app-greenfield".',
 				"Help me create a new MCP-style app or widget for this workspace.",
-				"Keep the first version small, real, and ready to validate.",
-				"Define the endpoint shape, transport, session model, widget/resource plan, and validation flow before implementation when they matter.",
-				`Seed brief: ${brief}`,
-				"Ask only the minimum clarifying questions needed, then implement once the plan is approved.",
+				"Ask only the minimum clarifying questions needed, keep the first version small, and move into implementation once the plan is approved.",
+				"Treat data scoping, ownership, transfer size, mutation authority, and lane token economy as first-class design constraints from the start.",
+				"Keep lane-facing payloads compact: prefer narrow queries, summaries, cached state, and targeted computations over dumping large raw datasets into conversation context.",
+				`Seed brief: ${String(seedBrief || "").trim()}`,
+				"When the plan is sharp enough, summarize the app goal, endpoint shape, data contract, likely files/data sources, and validation path.",
+				'Then ask "Is that okay?" and wait for my approval. After I approve, move straight into the build.',
 			].join(" ")
-			: 'Use the skill "mcp-app-greenfield". Help me create a new MCP-style app or widget for this workspace. Keep the first version small, real, and ready to validate. Define the endpoint shape, transport, session model, widget/resource plan, and validation flow before implementation when they matter. Ask only the minimum clarifying questions needed, then implement once the plan is approved.';
+			: 'Use the skill "mcp-app-greenfield". Help me create a new MCP-style app or widget for this workspace. Ask only the minimum clarifying questions needed, keep the first version small, and move into implementation once the plan is approved. Treat data scoping, ownership, transfer size, mutation authority, and lane token economy as first-class design constraints from the start. Keep lane-facing payloads compact: prefer narrow queries, summaries, cached state, and targeted computations over dumping large raw datasets into conversation context. When the plan is sharp enough, summarize the app goal, endpoint shape, data contract, likely files/data sources, and validation path. Then ask "Is that okay?" and wait for my approval. After I approve, move straight into the build.';
 		if (launchSkillIntoLane(ctx, "mcp-app-greenfield", prompt)) return;
 		pi.sendUserMessage(prompt);
-		ctx.ui.notify("Started the MCP app greenfield skill in the lane.", "info");
+		ctx.ui.notify("Started the MCP app greenfield flow in the lane.", "info");
 		updateWidget();
 	}
 
@@ -4091,18 +4524,57 @@ export default function (pi: ExtensionAPI) {
 				'Use the skill "mcp-app-maintainer".',
 				"Help me enhance, debug, or bug-fix an existing MCP-style app or widget in this workspace.",
 				"Reproduce the issue on the real runtime first, identify the owning layer, and patch the smallest correct layer.",
-				"Check server, transport, widget hydration, session alignment, config, and stale-runtime risks before concluding.",
+				"Check server, transport, widget hydration, session alignment, config, stale-runtime risks, and the data contract before concluding.",
+				"Pay close attention to data scoping, ownership, transfer size, mutation authority, and lane token economy so the fix behaves like a good citizen.",
 				`Issue brief: ${brief}`,
 				"Validate the served runtime after the fix or enhancement is in place.",
 			].join(" ")
-			: 'Use the skill "mcp-app-maintainer". Help me enhance, debug, or bug-fix an existing MCP-style app or widget in this workspace. Reproduce the issue on the real runtime first, identify the owning layer, and patch the smallest correct layer. Check server, transport, widget hydration, session alignment, config, and stale-runtime risks before concluding. Validate the served runtime after the fix or enhancement is in place.';
+			: 'Use the skill "mcp-app-maintainer". Help me enhance, debug, or bug-fix an existing MCP-style app or widget in this workspace. Reproduce the issue on the real runtime first, identify the owning layer, and patch the smallest correct layer. Check server, transport, widget hydration, session alignment, config, stale-runtime risks, and the data contract before concluding. Pay close attention to data scoping, ownership, transfer size, mutation authority, and lane token economy so the fix behaves like a good citizen. Validate the served runtime after the fix or enhancement is in place.';
 		if (launchSkillIntoLane(ctx, "mcp-app-maintainer", prompt)) return;
 		pi.sendUserMessage(prompt);
 		ctx.ui.notify("Started the MCP app maintainer skill in the lane.", "info");
 		updateWidget();
 	}
 
-	async function dispatchLocalSlashCommand(commandLine: string, ctx: ExtensionContext, source: "terminal" | "web" = "terminal"): Promise<boolean> {
+	function routeToolshedAppCommand(ctx: ExtensionContext, rawArgs?: string) {
+		const brief = String(rawArgs || "").trim();
+		if (inferToolshedAppCommandMode(brief) === "maintain") {
+			startToolshedMcpAppMaintainerSkill(ctx, brief);
+			return;
+		}
+		startToolshedAppLaneInterview(ctx, brief);
+	}
+
+	function getCommandCapableContext(ctx?: ExtensionContext | null): ExtensionCommandContext | null {
+		if (toolshedCommandCtx) return toolshedCommandCtx;
+		if (ctx && typeof (ctx as ExtensionCommandContext).newSession === "function") return ctx as ExtensionCommandContext;
+		return null;
+	}
+
+	async function createToolshedPiSession(ctx?: ExtensionContext | null) {
+		const commandCtx = getCommandCapableContext(ctx);
+		if (!commandCtx) throw new Error("Open /toolshed-web from Pi first so Toolshed can access session controls.");
+		await commandCtx.newSession();
+	}
+
+	async function switchToolshedPiSession(sessionPath: string, ctx?: ExtensionContext | null) {
+		const targetPath = String(sessionPath || "").trim();
+		if (!targetPath) throw new Error("Session path is required.");
+		const commandCtx = getCommandCapableContext(ctx);
+		if (!commandCtx) throw new Error("Open /toolshed-web from Pi first so Toolshed can access session controls.");
+		await commandCtx.switchSession(targetPath);
+	}
+
+	async function forkToolshedPiSession(sessionPath?: string, ctx?: ExtensionContext | null) {
+		const commandCtx = getCommandCapableContext(ctx);
+		if (!commandCtx) throw new Error("Open /toolshed-web from Pi first so Toolshed can access session controls.");
+		const sourcePath = String(sessionPath || getCurrentPiSessionFile(ctx) || "").trim();
+		if (!sourcePath) throw new Error("No Pi session file is available to fork.");
+		const forkedPath = await SessionManager.forkFrom(sourcePath, commandCtx.cwd, getCurrentPiSessionDir(ctx));
+		await commandCtx.switchSession(forkedPath);
+	}
+
+	async function dispatchLocalSlashCommand(commandLine: string, ctx: ExtensionContext, _source: "terminal" | "web" = "terminal"): Promise<boolean> {
 		const parsed = parseSlashCommandLine(commandLine);
 		if (!parsed) return false;
 		switch (parsed.name) {
@@ -4116,26 +4588,11 @@ export default function (pi: ExtensionAPI) {
 				showToolshedConnections(ctx);
 				return true;
 			case "toolshed-app":
-				if (source === "web" && !parsed.args) {
-					startToolshedAppLaneInterview(ctx);
-					updateWidget();
-					return true;
-				}
-				if (source === "web" && parsed.args) {
-					const created = createMcpAppCard({
-						brief: parsed.args,
-						persist: "project",
-						runNow: true,
-					});
-					if (!created) startToolshedAppLaneInterview(ctx, parsed.args);
-					updateWidget();
-					return true;
-				}
-				await runToolshedAppWizard(ctx, parsed.args);
+				routeToolshedAppCommand(ctx, parsed.args);
 				updateWidget();
 				return true;
 			case "toolshed-app-new":
-				startToolshedMcpAppGreenfieldSkill(ctx, parsed.args);
+				startToolshedAppLaneInterview(ctx, parsed.args);
 				return true;
 			case "toolshed-app-fix":
 				startToolshedMcpAppMaintainerSkill(ctx, parsed.args);
@@ -4152,6 +4609,15 @@ export default function (pi: ExtensionAPI) {
 			case "toolshed-reset-layout":
 				resetLayout();
 				ctx.ui.notify("Toolshed card layout reset to defaults.", "info");
+				return true;
+			case "toolshed-session-new":
+				await createToolshedPiSession(ctx);
+				return true;
+			case "toolshed-session-switch":
+				await switchToolshedPiSession(parsed.args, ctx);
+				return true;
+			case "toolshed-session-fork":
+				await forkToolshedPiSession(parsed.args, ctx);
 				return true;
 			case "blueprint-web":
 				openBlueprintWeb();
@@ -4220,44 +4686,21 @@ export default function (pi: ExtensionAPI) {
 		}
 		switch (type) {
 			case "sync-inline-app-state": {
-				const adapter = String(msg.adapter || msg.appRuntime?.adapter || "").trim();
-				if (adapter === "calculator") {
-					const session = syncInlineCalculatorSession({
-						itemId: String(msg.itemId || "").trim(),
-						cardId: String(msg.cardId || "").trim(),
-						title: String(msg.title || msg.appRuntime?.title || "Inline calculator").trim(),
-						sessionId: String(msg.appState?.sessionId || msg.sessionId || "").trim(),
-						display: String(msg.appState?.display || "").trim(),
-						expression: String(msg.appState?.expression || "").trim(),
-						history: Array.isArray(msg.appState?.history) ? msg.appState.history : [],
-						steps: Array.isArray(msg.appState?.steps) ? msg.appState.steps : [],
-						updatedAt: String(msg.appState?.updatedAt || nowIso()),
-						syncedAt: nowIso(),
-					});
-					if (session) updateWidget();
-					return;
-				}
-				if (adapter === "github-project-kanban") {
-					const session = syncInlineGithubBoardSession({
-						itemId: String(msg.itemId || "").trim(),
-						cardId: String(msg.cardId || "").trim(),
-						title: String(msg.title || msg.appRuntime?.title || "GitHub Project Board").trim(),
-						sessionId: String(msg.appState?.sessionId || msg.sessionId || "").trim(),
-						repoNameWithOwner: String(msg.appState?.repo?.nameWithOwner || msg.appState?.repoNameWithOwner || "").trim(),
-						projectTitle: String(msg.appState?.project?.title || msg.appState?.projectTitle || "").trim(),
-						projectNumber: msg.appState?.project?.number ?? msg.appState?.projectNumber,
-						projectScopeReady: Boolean(msg.appState?.projectScopeReady),
-						columns: Array.isArray(msg.appState?.columns) ? msg.appState.columns : [],
-						updatedAt: String(msg.appState?.updatedAt || nowIso()),
-						syncedAt: nowIso(),
-					});
-					if (session) updateWidget();
-					return;
-				}
+				if (syncInlineAppSession({
+					itemId: String(msg.itemId || "").trim(),
+					cardId: String(msg.cardId || "").trim(),
+					title: String(msg.title || msg.appRuntime?.title || "Inline app").trim(),
+					adapter: String(msg.adapter || msg.appRuntime?.adapter || "generic").trim(),
+					sessionId: String(msg.appState?.sessionId || msg.sessionId || getCurrentPiSessionId(ctx)).trim(),
+					appRuntime: msg.appRuntime && typeof msg.appRuntime === "object" ? msg.appRuntime : undefined,
+					appState: msg.appState && typeof msg.appState === "object" ? msg.appState : {},
+					summary: String(msg.summary || "").trim() || undefined,
+					syncedAt: nowIso(),
+				})) updateWidget();
 				return;
 			}
 			case "clear-inline-app-state":
-				if (removeInlineCalculatorSession(String(msg.itemId || "").trim()) || removeInlineGithubBoardSession(String(msg.itemId || "").trim())) updateWidget();
+				if (clearInlineAppSession(String(msg.itemId || "").trim(), normalizeInlineAppAdapter(msg.adapter || msg.appRuntime?.adapter))) updateWidget();
 				return;
 			case "submit-slash-command": {
 				const command = ensureSlashCommand(String(msg.command || msg.message || "").trim());
@@ -4365,18 +4808,30 @@ export default function (pi: ExtensionAPI) {
 			case "reset-layout":
 				resetLayout();
 				return;
+			case "session-new":
+				await createToolshedPiSession(ctx);
+				return;
+			case "session-switch":
+				await switchToolshedPiSession(String(msg.sessionPath || msg.path || "").trim(), ctx);
+				return;
+			case "session-fork":
+				await forkToolshedPiSession(String(msg.sessionPath || msg.path || "").trim() || undefined, ctx);
+				return;
 		}
 	}
 
 	function registerToolshedOnControl() {
 		if (!toolshedControlSocket || !toolshedControlConnected) return;
+		const sessionKey = getCurrentPiSessionId();
 		try {
 			toolshedControlSocket.write(JSON.stringify({
 				type: "register",
-				agentId: "toolshed-main",
-				sessionKey: "toolshed-main",
+				agentId: TOOLSHED_CONTROL_AGENT_ID,
+				sessionKey,
 				info: {
 					name: "pi-toolshed",
+					sessionId: sessionKey,
+					sessionFile: getCurrentPiSessionFile(),
 					workspaceId: persistedState.workspaceId,
 					url: toolshedWebUrl,
 				},
@@ -4399,7 +4854,14 @@ export default function (pi: ExtensionAPI) {
 					if (!line) continue;
 					try {
 						const msg = JSON.parse(line);
-						if (msg.forward) void handleToolshedForwardedCommand(msg);
+						if (msg.forward) {
+							void handleToolshedForwardedCommand(msg).catch((error) => {
+								console.error("[pi-toolshed] forwarded command failed", error);
+								try {
+									widgetCtx?.ui.notify(error instanceof Error ? error.message : String(error), "error");
+								} catch {}
+							});
+						}
 					} catch (error) {
 						console.error("[pi-toolshed] control command failed", error);
 					}
@@ -4591,9 +5053,14 @@ export default function (pi: ExtensionAPI) {
 		const waiting = Boolean(card.kind === "mcp-app" && card.pendingBuildAt && !builtReady);
 		const latestFailed = Boolean(card.kind === "mcp-app" && verificationStatus === "failed");
 		const inlineReady = Boolean(card.kind === "mcp-app" && builtReady);
-		const runtimeAdapter: "calculator" | "generic" = /calculator/i.test([card.title, card.appBrief, card.toolName, card.viewFile].filter(Boolean).join(" "))
-			? "calculator"
-			: "generic";
+		const runtimeAdapter = detectGeneratedAppAdapter({
+			title: card.title,
+			brief: card.appBrief || card.description,
+			toolName: card.toolName,
+			serverId: card.serverId,
+			viewFile: card.viewFile,
+			resourceUri: card.resourceUri,
+		});
 		return buildWidgetCard({
 			id: card.id,
 			title: card.title,
@@ -4745,6 +5212,225 @@ export default function (pi: ExtensionAPI) {
 		return { summary, liveCount, staleCount, publishedCount, entries };
 	}
 
+	function listTrackedInlineAppCandidates(ctx: ExtensionContext) {
+		const lane = buildLane(ctx);
+		const mcp = readProjectMcpState(ctx.cwd);
+		const registry = buildToolshedRegistryState(ctx, lane, mcp);
+		return listTrackedMcpAppCards().map((card) => {
+			const widget = buildGeneratedCardState(card, lane, mcp, ctx);
+			const runtime = widget.appRuntime;
+			const entry = registry.entries.find((candidate) => candidate.cardId === card.id) || null;
+			return runtime
+				? {
+					card,
+					entry,
+					runtime,
+					adapter: detectGeneratedAppAdapter({
+						adapter: runtime.adapter,
+						title: runtime.title || card.title,
+						brief: runtime.brief || card.appBrief || card.description,
+						toolName: runtime.toolName || card.toolName,
+						serverId: runtime.serverId || card.serverId,
+						viewFile: runtime.viewFile || card.viewFile,
+						resourceUri: runtime.resourceUri || card.resourceUri,
+					}),
+				}
+				: null;
+		}).filter(Boolean) as Array<{
+			card: ToolshedGeneratedCard;
+			entry: ToolshedRegistryEntry | null;
+			runtime: NonNullable<ToolshedWidgetCardState["appRuntime"]>;
+			adapter: ToolshedInlineAppAdapter;
+		}>;
+	}
+
+	function scoreTrackedInlineAppCandidate(
+		candidate: ReturnType<typeof listTrackedInlineAppCandidates>[number],
+		filters: {
+			cardId?: string;
+			serverId?: string;
+			toolName?: string;
+			title?: string;
+			query?: string;
+		},
+	): number {
+		let score = 0;
+		const cardId = String(filters.cardId || "").trim();
+		const serverId = String(filters.serverId || "").trim().toLowerCase();
+		const toolName = String(filters.toolName || "").trim().toLowerCase();
+		const title = String(filters.title || "").trim().toLowerCase();
+		const query = String(filters.query || "").trim().toLowerCase();
+		const haystack = [
+			candidate.card.id,
+			candidate.card.title,
+			candidate.card.appBrief,
+			candidate.card.description,
+			candidate.card.serverId,
+			candidate.card.toolName,
+			candidate.card.viewFile,
+			candidate.entry?.title,
+			candidate.entry?.brief,
+			candidate.entry?.serverId,
+			candidate.entry?.toolName,
+		].filter(Boolean).join("\n").toLowerCase();
+		if (cardId) {
+			if (candidate.card.id !== cardId) return -1;
+			score += 1000;
+		}
+		if (serverId) {
+			const serverValue = String(candidate.card.serverId || candidate.entry?.serverId || "").trim().toLowerCase();
+			if (!serverValue) return -1;
+			if (serverValue === serverId) score += 500;
+			else if (slugify(serverValue) === slugify(serverId)) score += 450;
+			else if (serverValue.includes(serverId)) score += 320;
+			else return -1;
+		}
+		if (toolName) {
+			const toolValue = String(candidate.card.toolName || candidate.entry?.toolName || "").trim().toLowerCase();
+			if (!toolValue) return -1;
+			if (toolValue === toolName) score += 450;
+			else if (slugify(toolValue) === slugify(toolName)) score += 420;
+			else if (toolValue.includes(toolName)) score += 280;
+			else return -1;
+		}
+		if (title) {
+			const titleValue = String(candidate.card.title || candidate.entry?.title || "").trim().toLowerCase();
+			if (!titleValue) return -1;
+			if (titleValue === title) score += 320;
+			else if (titleValue.includes(title)) score += 180;
+			else return -1;
+		}
+		if (query) {
+			if (!haystack.includes(query)) return -1;
+			score += 120;
+			const querySlug = slugify(query);
+			if (slugify(String(candidate.card.serverId || "")) === querySlug) score += 240;
+			if (slugify(String(candidate.card.toolName || "")) === querySlug) score += 220;
+			if (slugify(String(candidate.card.title || "")) === querySlug) score += 200;
+		}
+		if (!cardId && !serverId && !toolName && !title && !query) {
+			score += candidate.runtime.ready ? 120 : 0;
+			score += candidate.entry?.liveStatus === "live" ? 80 : candidate.entry?.publishedStatus === "published" ? 40 : 0;
+		}
+		if (candidate.runtime.ready) score += 40;
+		if (candidate.entry?.liveStatus === "live") score += 20;
+		if (candidate.entry?.publishedStatus === "published") score += 10;
+		return score;
+	}
+
+	function resolveTrackedInlineAppCandidate(
+		ctx: ExtensionContext,
+		filters: {
+			cardId?: string;
+			serverId?: string;
+			toolName?: string;
+			title?: string;
+			query?: string;
+		},
+	) {
+		const candidates = listTrackedInlineAppCandidates(ctx)
+			.map((candidate) => ({ candidate, score: scoreTrackedInlineAppCandidate(candidate, filters) }))
+			.filter((entry) => entry.score >= 0)
+			.sort((a, b) =>
+				b.score - a.score
+				|| String(b.candidate.card.updatedAt || "").localeCompare(String(a.candidate.card.updatedAt || ""))
+				|| String(a.candidate.card.title || "").localeCompare(String(b.candidate.card.title || ""))
+			);
+		if (candidates.length === 0) {
+			return {
+				status: "missing" as const,
+				message: "No tracked Toolshed app matched that title, server id, tool name, or query.",
+			};
+		}
+		const top = candidates[0]!;
+		const next = candidates[1] || null;
+		const cardId = String(filters.cardId || "").trim();
+		const serverId = String(filters.serverId || "").trim();
+		const toolName = String(filters.toolName || "").trim();
+		const title = String(filters.title || "").trim();
+		if (next && next.score === top.score && !cardId && !(serverId && toolName) && !title) {
+			return {
+				status: "ambiguous" as const,
+				message: "Multiple tracked Toolshed apps matched. Refine the title, server id, or tool name.",
+				matches: candidates.slice(0, 3).map((entry) => ({
+					cardId: entry.candidate.card.id,
+					title: entry.candidate.card.title,
+					serverId: entry.candidate.card.serverId || entry.candidate.entry?.serverId || null,
+					toolName: entry.candidate.card.toolName || entry.candidate.entry?.toolName || null,
+					liveStatus: entry.candidate.entry?.liveStatus || "inactive",
+					trackedStatus: entry.candidate.entry?.trackedStatus || "draft",
+				})),
+			};
+		}
+		if (!top.candidate.runtime.ready) {
+			return {
+				status: "not-ready" as const,
+				message: top.candidate.entry?.trackedSummary || `${top.candidate.card.title} is not verified and cannot be opened inline yet.`,
+				candidate: top.candidate,
+			};
+		}
+		return {
+			status: "ok" as const,
+			candidate: top.candidate,
+		};
+	}
+
+	function openTrackedInlineApp(
+		ctx: ExtensionContext,
+		filters: {
+			cardId?: string;
+			serverId?: string;
+			toolName?: string;
+			title?: string;
+			query?: string;
+		},
+	) {
+		const resolved = resolveTrackedInlineAppCandidate(ctx, filters);
+		if (resolved.status !== "ok") return resolved;
+		const { candidate } = resolved;
+		const existing = findActiveInlineAppRecord({ cardId: candidate.card.id, adapter: candidate.adapter });
+		const itemId = existing?.itemId || nextInlineAppItemId(candidate.card.id);
+		const nextVersion = generatedAppRuntimeVersion(candidate.runtime);
+		const previousVersion = generatedAppRuntimeVersion(existing?.appRuntime);
+		const preservedState = existing?.appState && previousVersion && previousVersion === nextVersion
+			? JSON.parse(JSON.stringify(existing.appState))
+			: createInitialInlineAppState(candidate.adapter, itemId, candidate.runtime.title || candidate.card.title);
+		const appState = preservedState && typeof preservedState === "object"
+			? preservedState as Record<string, any>
+			: createInitialInlineAppState(candidate.adapter, itemId, candidate.runtime.title || candidate.card.title);
+		appState.sessionId = String(appState.sessionId || existing?.sessionId || nextInlineAppSessionId(candidate.adapter, itemId)).trim();
+		appState.updatedAt = nowIso();
+		const synced = syncInlineAppSession({
+			itemId,
+			cardId: candidate.card.id,
+			title: candidate.runtime.title || candidate.card.title,
+			adapter: candidate.adapter,
+			sessionId: appState.sessionId,
+			appRuntime: candidate.runtime,
+			appState,
+			summary: existing?.summary,
+			syncedAt: nowIso(),
+		});
+		if (!synced) {
+			return {
+				status: "error" as const,
+				message: `Toolshed could not sync ${candidate.card.title} into the current Pi session.`,
+			};
+		}
+		updateWidget();
+		const reused = Boolean(existing && previousVersion === nextVersion);
+		return {
+			status: reused ? "already-open" as const : "ok" as const,
+			message: reused
+				? `${candidate.card.title} is already open inline in this Pi session.`
+				: `Opened ${candidate.card.title} inline in this Pi session via Toolshed session state.`,
+			candidate,
+			itemId,
+			sessionId: String(appState.sessionId || "").trim(),
+			appState,
+		};
+	}
+
 	function formatRegistryEntriesForPrompt(entries: ToolshedRegistryEntry[], limit: number = 8): string {
 		const visible = entries.slice(0, Math.max(1, limit));
 		if (visible.length === 0) return "- none";
@@ -4777,13 +5463,13 @@ export default function (pi: ExtensionAPI) {
 		cards.push(buildWidgetCard(WIDGET_DEFINITIONS[0], {
 			badge: listAllCards().length === 1 ? "1 reusable card" : `${listAllCards().length} reusable cards`,
 			tone: listAllCards().length > 0 ? "success" : "info",
-			summary: "Use the lane-first app flow for tracked MCP apps, or create reusable workflow cards here.",
+			summary: "Use the lane-first app flow for MCP app work, or create reusable workflow cards here.",
 			lines: [
 				`Library: ${persistedState.sessionCards.length} session · ${projectCards.length} project`,
-				"App flow: /toolshed-app asks a few questions, then creates or updates tracked apps.",
-				"Skill flow: /toolshed-app-new starts greenfield and /toolshed-app-fix starts enhancement or bug-fix mode.",
+				"App flow: /toolshed-app launches the MCP app flow and infers new build vs enhancement or bug-fix work from your wording.",
+				"Tracked MCP app cards remain available from the builder controls in this workspace.",
 			],
-			footer: "Use the app wizard for tracked cards, /toolshed-app-new for new MCP apps/widgets, or /toolshed-app-fix for enhancement and bug-fix work.",
+			footer: "Use /toolshed-app as the single command entry point for MCP app work. Use the builder controls here when you specifically want to capture or manage tracked app cards.",
 			actions: [
 				{ ...actionSeedMermaidCard("Seed Mermaid", "secondary"), display: "pill" },
 				{ ...actionOpenBlueprintWeb("Open Blueprint", "ghost"), display: "pill" },
@@ -4874,6 +5560,22 @@ export default function (pi: ExtensionAPI) {
 
 	function buildToolshedState(ctx: ExtensionContext): ToolshedState {
 		const lane = buildLane(ctx);
+		const currentSessionId = getCurrentPiSessionId(ctx);
+		const currentSessionFile = getCurrentPiSessionFile(ctx);
+		const sessionCatalog = cachedSessionCatalog.length > 0
+			? cachedSessionCatalog
+			: currentSessionFile
+				? [{
+					sessionId: currentSessionId,
+					path: currentSessionFile,
+					label: `Pi session ${currentSessionId.slice(-8)}`,
+					brief: "Current Pi session.",
+					messageCount: 0,
+					createdAt: nowIso(),
+					modifiedAt: nowIso(),
+					current: true,
+				}]
+				: [];
 		const packets = [...persistedState.packets].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 		const mcp = readProjectMcpState(ctx.cwd);
 		const skills = scanSkillCatalog(ctx.cwd, extensionRepoRoot);
@@ -4885,7 +5587,11 @@ export default function (pi: ExtensionAPI) {
 		const registry = buildToolshedRegistryState(ctx, lane, mcp);
 		const frontier = getActiveFrontierItem(lane);
 		return {
-			sessionId: persistedState.sessionId,
+			sessionId: currentSessionId,
+			currentSessionId,
+			currentSessionFile,
+			sessionDir: getCurrentPiSessionDir(ctx),
+			sessionCatalog,
 			projectDir: ctx.cwd,
 			projectName: basename(ctx.cwd) || ctx.cwd,
 			workspaceId: persistedState.workspaceId,
@@ -4923,9 +5629,11 @@ export default function (pi: ExtensionAPI) {
 	function flushToolshedState() {
 		if (!widgetCtx || !logDir) return;
 		try {
-			const json = JSON.stringify(buildToolshedState(widgetCtx), null, 2);
+			const state = buildToolshedState(widgetCtx);
+			const json = JSON.stringify(state, null, 2);
 			if (json === lastStateJson) return;
 			writeFileSync(getToolshedStateFile(), json, "utf-8");
+			writeFileSync(getToolshedSessionSnapshotFile(state.sessionId), json, "utf-8");
 			lastStateJson = json;
 		} catch {}
 	}
@@ -5028,6 +5736,101 @@ export default function (pi: ExtensionAPI) {
 					status: "ok",
 					summary: registry.summary,
 					entries,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "toolshed_open_app",
+		label: "Toolshed Open App",
+		description: "Open a tracked Toolshed app inline in the current Pi session using session-backed lane state. Use this when the user asks to open a tracked app, or names a tracked MCP server/tool but the raw MCP namespace is not currently exposed in this Pi startup.",
+		parameters: Type.Object({
+			cardId: Type.Optional(Type.String({
+				description: "Optional tracked Toolshed card id when it is already known.",
+			})),
+			serverId: Type.Optional(Type.String({
+				description: "Optional tracked MCP server id such as `toolshed-skeuomorphic-calculator-toolbox-app`.",
+			})),
+			toolName: Type.Optional(Type.String({
+				description: "Optional tracked MCP tool name such as `open_skeuomorphic_calculator_toolbox_app`.",
+			})),
+			title: Type.Optional(Type.String({
+				description: "Optional exact or partial app title such as `Skeuomorphic Calculator Toolbox App`.",
+			})),
+			query: Type.Optional(Type.String({
+				description: "Optional fallback search text when only a loose app reference is available.",
+			})),
+		}),
+		async execute(_toolCallId, params) {
+			const ctx = widgetCtx;
+			if (!ctx) {
+				return {
+					content: [{ type: "text", text: "Toolshed is not initialized in this session yet." }],
+					details: { status: "missing" },
+				};
+			}
+			const opened = openTrackedInlineApp(ctx, {
+				cardId: String((params as any).cardId || "").trim() || undefined,
+				serverId: String((params as any).serverId || "").trim() || undefined,
+				toolName: String((params as any).toolName || "").trim() || undefined,
+				title: String((params as any).title || "").trim() || undefined,
+				query: String((params as any).query || "").trim() || undefined,
+			});
+			if (opened.status === "missing") {
+				return {
+					content: [{ type: "text", text: opened.message }],
+					details: { status: "missing" },
+				};
+			}
+			if (opened.status === "ambiguous") {
+				return {
+					content: [{ type: "text", text: `${opened.message}\n${(opened.matches || []).map((match) => `- ${match.title}${match.serverId ? ` · server ${match.serverId}` : ""}${match.toolName ? ` · tool ${match.toolName}` : ""}`).join("\n")}` }],
+					details: {
+						status: "ambiguous",
+						matches: opened.matches || [],
+					},
+				};
+			}
+			if (opened.status === "not-ready") {
+				return {
+					content: [{ type: "text", text: opened.message }],
+					details: {
+						status: "not-ready",
+						cardId: opened.candidate.card.id,
+						title: opened.candidate.card.title,
+						serverId: opened.candidate.card.serverId || opened.candidate.entry?.serverId || null,
+						toolName: opened.candidate.card.toolName || opened.candidate.entry?.toolName || null,
+					},
+				};
+			}
+			if (opened.status === "error") {
+				return {
+					content: [{ type: "text", text: opened.message }],
+					details: { status: "error" },
+				};
+			}
+			return {
+				content: [{ type: "text", text: opened.message }],
+				details: {
+					status: opened.status,
+					itemId: opened.itemId,
+					cardId: opened.candidate.card.id,
+					title: opened.candidate.card.title,
+					serverId: opened.candidate.card.serverId || opened.candidate.entry?.serverId || null,
+					toolName: opened.candidate.card.toolName || opened.candidate.entry?.toolName || null,
+					sessionId: opened.sessionId,
+					adapter: opened.candidate.adapter,
+				},
+				structuredContent: {
+					itemId: opened.itemId,
+					cardId: opened.candidate.card.id,
+					title: opened.candidate.card.title,
+					serverId: opened.candidate.card.serverId || opened.candidate.entry?.serverId || null,
+					toolName: opened.candidate.card.toolName || opened.candidate.entry?.toolName || null,
+					sessionId: opened.sessionId,
+					adapter: opened.candidate.adapter,
+					appRuntime: opened.candidate.runtime,
 				},
 			};
 		},
@@ -5270,14 +6073,19 @@ export default function (pi: ExtensionAPI) {
 		const guidanceBlocks: string[] = [];
 		if (ctx) {
 			const registry = buildToolshedRegistryState(ctx, buildLane(ctx), readProjectMcpState(ctx.cwd));
-			const liveEntries = registry.entries.filter((entry) => entry.liveStatus === "live");
-			if (liveEntries.length > 0) {
+			const openableEntries = registry.entries.filter((entry) =>
+				entry.verificationStatus === "passed"
+				|| entry.liveStatus === "live"
+				|| entry.publishedStatus === "published"
+			);
+			if (openableEntries.length > 0) {
 				guidanceBlocks.push([
-					"## Toolshed Live App Registry",
-					"There are tracked Toolshed apps deployed live in this workspace.",
+					"## Toolshed App Registry",
+					"There are tracked Toolshed apps in this workspace that can be opened inline from Pi session state.",
 					'If the user asks what Toolshed apps are available right now, use the `toolshed_live_apps` tool.',
-					"Do not claim a deployed Toolshed app is unavailable without checking the live registry first.",
-					formatRegistryEntriesForPrompt(liveEntries),
+					'If the user asks to open a tracked app inline, or names a tracked MCP server/tool and raw `mcp` is unavailable, use `toolshed_open_app` first.',
+					"Do not treat `server not found` from raw MCP discovery as authoritative for tracked Toolshed apps in this registry.",
+					formatRegistryEntriesForPrompt(openableEntries),
 				].join("\n"));
 			}
 		}
@@ -5311,6 +6119,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("toolshed-web", {
 		description: "Start or reuse the Pi Toolshed web workspace and open it in the default browser",
 		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
 			openToolshedWeb(ctx);
 		},
 	});
@@ -5318,6 +6127,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("toolshed-status", {
 		description: "Show the current Pi Toolshed state summary",
 		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
 			showToolshedStatus(ctx);
 		},
 	});
@@ -5325,38 +6135,49 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("toolshed-connections", {
 		description: "Show the live PI connection roster",
 		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
 			showToolshedConnections(ctx);
 		},
 	});
 
+	pi.registerCommand("toolshed-session-new", {
+		description: "Create a fresh Pi session and bind Toolshed to it",
+		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
+			await createToolshedPiSession(ctx);
+		},
+	});
+
+	pi.registerCommand("toolshed-session-switch", {
+		description: "Switch Toolshed to another Pi session file",
+		handler: async (args, ctx) => {
+			toolshedCommandCtx = ctx;
+			await switchToolshedPiSession(String(args || "").trim(), ctx);
+		},
+	});
+
+	pi.registerCommand("toolshed-session-fork", {
+		description: "Fork a Pi session file and switch Toolshed to it",
+		handler: async (args, ctx) => {
+			toolshedCommandCtx = ctx;
+			await forkToolshedPiSession(String(args || "").trim() || undefined, ctx);
+		},
+	});
+
 	pi.registerCommand("toolshed-app", {
-		description: "Create or update a tracked MCP app through a guided wizard",
+		description: "Plan, build, enhance, or debug an MCP app or widget",
 		handler: async (args, ctx) => {
+			toolshedCommandCtx = ctx;
 			widgetCtx = ctx;
-			await runToolshedAppWizard(ctx, String(args || "").trim());
+			routeToolshedAppCommand(ctx, String(args || "").trim());
 			updateWidget();
-		},
-	});
-
-	pi.registerCommand("toolshed-app-new", {
-		description: "Launch the MCP app greenfield skill for a new app or widget",
-		handler: async (args, ctx) => {
-			widgetCtx = ctx;
-			startToolshedMcpAppGreenfieldSkill(ctx, String(args || "").trim());
-		},
-	});
-
-	pi.registerCommand("toolshed-app-fix", {
-		description: "Launch the MCP app maintainer skill for enhancements or bug fixes",
-		handler: async (args, ctx) => {
-			widgetCtx = ctx;
-			startToolshedMcpAppMaintainerSkill(ctx, String(args || "").trim());
 		},
 	});
 
 	pi.registerCommand("toolshed-workspace", {
 		description: "Switch the active Toolshed workspace: /toolshed-workspace or /toolshed-workspace <id>",
 		handler: async (args, ctx) => {
+			toolshedCommandCtx = ctx;
 			await handleToolshedWorkspaceCommand(String(args || "").trim(), ctx);
 		},
 	});
@@ -5371,6 +6192,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("toolshed-packets", {
 		description: "Show the current packet queue",
 		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
 			showToolshedPackets(ctx);
 		},
 	});
@@ -5378,6 +6200,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("toolshed-reset-layout", {
 		description: "Reset Toolshed card collapse preferences",
 		handler: async (_args, ctx) => {
+			toolshedCommandCtx = ctx;
 			resetLayout();
 			ctx.ui.notify("Toolshed card layout reset to defaults.", "info");
 		},
@@ -5385,20 +6208,15 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		applyExtensionDefaults(import.meta.url, ctx);
-		widgetCtx = ctx;
-		sessionDir = join(ctx.cwd, ".pi", "agent-sessions");
-		logDir = join(ctx.cwd, ".pi", "pipeline-logs");
-		if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
-		if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
-		sessionStateFile = join(sessionDir, "pi-toolshed-state.json");
+		restoreToolshedSession(ctx);
 		toolshedWebUrl = `http://127.0.0.1:${TOOLSHED_WEB_PORT}`;
-		restoreSessionState(loadSessionState());
-			projectCards = loadProjectCards(ctx.cwd);
-			if (listAllCards().length === 0) seedMermaidCard(true);
-			ensureToolshedWebServer(ctx);
-			startTranscriptWatch(ctx);
-			scheduleTrackedMcpAppVerification(ctx, 300);
-			updateWidget();
+		await refreshSessionCatalog(ctx);
+		projectCards = loadProjectCards(ctx.cwd);
+		if (listAllCards().length === 0) seedMermaidCard(true);
+		ensureToolshedWebServer(ctx);
+		startTranscriptWatch(ctx);
+		scheduleTrackedMcpAppVerification(ctx, 300);
+		updateWidget();
 
 		ctx.ui.notify(
 			[
@@ -5408,9 +6226,7 @@ export default function (pi: ExtensionAPI) {
 				"  /toolshed-web          Open the web workspace",
 				"  /toolshed-status       Show current Toolshed state",
 				"  /toolshed-connections  Show the live PI connection roster",
-				"  /toolshed-app          Create or update a tracked MCP app through a guided wizard",
-				"  /toolshed-app-new      Launch the MCP app greenfield skill for a new app or widget",
-				"  /toolshed-app-fix      Launch the MCP app maintainer skill for enhancement or bug fixing",
+				"  /toolshed-app          Plan, build, enhance, or debug an MCP app or widget",
 				"  /toolshed-workspace    Switch card decks",
 				"  /toolshed-freeze       Freeze the current frontier into a packet",
 				"  /toolshed-packets      Inspect the packet queue",
@@ -5443,6 +6259,24 @@ export default function (pi: ExtensionAPI) {
 				return [truncateToWidth(left + pad + right, width)];
 			},
 		}));
+	});
+
+	pi.on("session_switch", async (_event, ctx) => {
+		restoreToolshedSession(ctx);
+		await refreshSessionCatalog(ctx);
+		projectCards = loadProjectCards(ctx.cwd);
+		if (listAllCards().length === 0) seedMermaidCard(true);
+		startTranscriptWatch(ctx);
+		updateWidget();
+	});
+
+	pi.on("session_fork", async (_event, ctx) => {
+		restoreToolshedSession(ctx);
+		await refreshSessionCatalog(ctx);
+		projectCards = loadProjectCards(ctx.cwd);
+		if (listAllCards().length === 0) seedMermaidCard(true);
+		startTranscriptWatch(ctx);
+		updateWidget();
 	});
 
 		pi.on("session_shutdown", async () => {

@@ -94,6 +94,68 @@ function persist(session: CalculatorSession): CalculatorSession {
   return session;
 }
 
+function normalizeHistoryEntry(value: any): HistoryEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const expression = String(value.expression || "").trim();
+  const result = String(value.result || "").trim();
+  if (!expression || !result) return null;
+  return {
+    expression,
+    result,
+    timestamp: String(value.timestamp || nowIso()),
+  };
+}
+
+function normalizeStepEntry(value: any): StepEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const key = String(value.key || "").trim();
+  const label = String(value.label || "").trim();
+  const display = String(value.display || "").trim();
+  if (!key && !label && !display) return null;
+  return {
+    key,
+    label,
+    display,
+    expression: String(value.expression || "").trim(),
+    timestamp: String(value.timestamp || nowIso()),
+  };
+}
+
+function hydrateSession(session: CalculatorSession, value: any): CalculatorSession {
+  if (!value || typeof value !== "object") return session;
+  if (Object.prototype.hasOwnProperty.call(value, "display")) {
+    session.display = String(value.display ?? "0").trim() || "0";
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "expression")) {
+    session.expression = value.expression ? String(value.expression) : "";
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "panelLabel")) {
+    session.panelLabel = value.panelLabel ? String(value.panelLabel) : null;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "panelMessage")) {
+    session.panelMessage = value.panelMessage ? String(value.panelMessage) : null;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "accumulator")) {
+    session.accumulator = Number.isFinite(Number(value.accumulator)) ? Number(value.accumulator) : null;
+  }
+  if (["+", "-", "×", "÷", null].includes(value.pendingOperator)) {
+    session.pendingOperator = value.pendingOperator as Operator;
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "waitingForOperand")) {
+    session.waitingForOperand = Boolean(value.waitingForOperand);
+  }
+  if (Array.isArray(value.history)) {
+    session.history = value.history.map(normalizeHistoryEntry).filter(Boolean) as HistoryEntry[];
+  }
+  if (Array.isArray(value.steps)) {
+    session.steps = value.steps.map(normalizeStepEntry).filter(Boolean) as StepEntry[];
+  }
+  if (typeof value.updatedAt === "string" && value.updatedAt.trim()) {
+    session.updatedAt = value.updatedAt;
+  }
+  return session;
+}
+
 function toNumber(value: string): number {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -387,6 +449,7 @@ export function registerCalculatorFeatures(server: McpServer) {
         sessionId: z.string().optional(),
         renderInline: z.boolean().optional(),
         message: z.string().optional(),
+        sessionState: z.any().optional(),
       }),
       annotations: {
         readOnlyHint: true,
@@ -408,9 +471,9 @@ export function registerCalculatorFeatures(server: McpServer) {
         "openai/toolInvocation/invoked": "Hello-world calculator panel ready.",
       },
     },
-    async ({ sessionId, renderInline, message }) => {
+    async ({ sessionId, renderInline, message, sessionState }) => {
       const session = persist(setPanelContent(
-        getSession(sessionId),
+        hydrateSession(getSession(sessionId || sessionState?.sessionId), sessionState),
         "Hello World",
         message || "Hello world from Toolshed. This text is being rendered inside the calculator panel from your MCP server.",
       ));
@@ -438,6 +501,7 @@ export function registerCalculatorFeatures(server: McpServer) {
         sessionId: z.string().optional(),
         renderInline: z.boolean().optional(),
         prompt: z.string().optional(),
+        sessionState: z.any().optional(),
       }),
       annotations: {
         readOnlyHint: true,
@@ -456,8 +520,8 @@ export function registerCalculatorFeatures(server: McpServer) {
         "openai/toolInvocation/invoked": "Calculator ready.",
       },
     },
-    async ({ sessionId, renderInline, prompt }) => {
-      const session = persist(setPanelContent(getSession(sessionId), null, null));
+    async ({ sessionId, renderInline, prompt, sessionState }) => {
+      const session = persist(setPanelContent(hydrateSession(getSession(sessionId || sessionState?.sessionId), sessionState), null, null));
       return {
         content: [
           {
@@ -483,6 +547,7 @@ export function registerCalculatorFeatures(server: McpServer) {
         sessionId: z.string().optional(),
         renderInline: z.boolean().optional(),
         prompt: z.string().optional(),
+        sessionState: z.any().optional(),
       }),
       annotations: {
         readOnlyHint: true,
@@ -504,8 +569,8 @@ export function registerCalculatorFeatures(server: McpServer) {
         "openai/toolInvocation/invoked": "Math console ready.",
       },
     },
-    async ({ sessionId, renderInline, prompt }) => {
-      const session = persist(setPanelContent(getSession(sessionId), null, null));
+    async ({ sessionId, renderInline, prompt, sessionState }) => {
+      const session = persist(setPanelContent(hydrateSession(getSession(sessionId || sessionState?.sessionId), sessionState), null, null));
       return {
         content: [
           {

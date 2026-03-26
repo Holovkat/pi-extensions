@@ -1644,7 +1644,8 @@ export const html = String.raw`<!doctype html>
 
       function hydrateCurrentHostState() {
         const openai = getOpenAI();
-        if (openai) {
+        const hasOpenAIGlobals = Boolean(openai && (openai.toolInput || openai.toolOutput || openai.widgetState));
+        if (hasOpenAIGlobals) {
           const updated = hydrateFromGlobals({
             theme: openai.theme,
             widgetState: openai.widgetState,
@@ -1658,6 +1659,8 @@ export const html = String.raw`<!doctype html>
         if (attachToolshedBridge()) {
           return true;
         }
+
+        if (openai?.theme) updateTheme(openai.theme);
 
         return false;
       }

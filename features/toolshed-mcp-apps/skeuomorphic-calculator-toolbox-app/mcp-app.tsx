@@ -481,6 +481,7 @@ export const html = String.raw`<!doctype html>
       const $sessionId = document.getElementById("sessionId");
       const initialTheme = new URLSearchParams(window.location.search).get("theme");
       let toolshedBridgeAttached = false;
+      let sessionSyncTimer = 0;
 
       if (initialTheme === "light") {
         document.body.classList.add("light");
@@ -527,6 +528,36 @@ export const html = String.raw`<!doctype html>
           return;
         }
         container.innerHTML = items.map(buildItem).join("");
+      }
+
+      function buildSessionSnapshot() {
+        return {
+          sessionId: state.sessionId,
+          display: state.display,
+          expression: state.expression,
+          panelLabel: state.panelLabel || null,
+          panelMessage: state.panelMessage || null,
+          history: Array.isArray(state.history) ? state.history : [],
+          steps: Array.isArray(state.steps) ? state.steps : [],
+          updatedAt: state.updatedAt || "",
+        };
+      }
+
+      function scheduleSessionSync() {
+        const app = getToolshedApp();
+        if (!app?.syncToolshedSession || !state.sessionId) return;
+        if (sessionSyncTimer) clearTimeout(sessionSyncTimer);
+        sessionSyncTimer = window.setTimeout(async () => {
+          sessionSyncTimer = 0;
+          try {
+            await app.syncToolshedSession({
+              adapter: "calculator",
+              title: "Skeuomorphic Calculator Toolbox App",
+              sessionId: state.sessionId,
+              appState: buildSessionSnapshot(),
+            });
+          } catch {}
+        }, 60);
       }
 
       function render() {
@@ -599,6 +630,7 @@ export const html = String.raw`<!doctype html>
         }
 
         render();
+        scheduleSessionSync();
         return true;
       }
 
@@ -689,9 +721,28 @@ export const html = String.raw`<!doctype html>
         }
       }
 
+      function normalizeKeyboardKey(key) {
+        if (!key) return null;
+        if (/^[0-9]$/.test(key)) return key;
+        if (key === ".") return ".";
+        if (key === "+" || key === "-") return key;
+        if (key === "*" || key === "x" || key === "X") return "×";
+        if (key === "/") return "÷";
+        if (key === "=" || key === "Enter") return "=";
+        if (key === "Backspace") return "⌫";
+        if (key === "Delete" || key === "Escape" || key === "c" || key === "C") return "C";
+        return null;
+      }
+
+      function shouldIgnoreKeyboardEvent(target) {
+        if (!target || typeof target.closest !== "function") return false;
+        return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
+      }
+
       function hydrateCurrentHostState() {
         const openai = getOpenAI();
-        if (openai) {
+        const hasOpenAIGlobals = Boolean(openai && (openai.toolInput || openai.toolOutput || openai.widgetState));
+        if (hasOpenAIGlobals) {
           const updated = hydrateFromGlobals({
             theme: openai.theme,
             widgetState: openai.widgetState,
@@ -705,6 +756,8 @@ export const html = String.raw`<!doctype html>
           return true;
         }
 
+        if (openai?.theme) updateTheme(openai.theme);
+
         return false;
       }
 
@@ -712,6 +765,16 @@ export const html = String.raw`<!doctype html>
         const target = event.target.closest("button[data-key]");
         if (!target) return;
         press(target.getAttribute("data-key"));
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.defaultPrevented) return;
+        if (event.metaKey || event.ctrlKey || event.altKey) return;
+        if (shouldIgnoreKeyboardEvent(event.target)) return;
+        const normalizedKey = normalizeKeyboardKey(event.key);
+        if (!normalizedKey) return;
+        event.preventDefault();
+        press(normalizedKey);
       });
 
       document.getElementById("sendCurrent").addEventListener("click", () => {

@@ -35,6 +35,17 @@ For each tool, define:
 - external widget metadata
 - whether the widget must work in multiple hosts
 
+### Data Contract
+
+- input scope
+- output scope
+- default lane-facing response shape
+- on-demand query shapes for deeper reads
+- ownership of each structure
+- mutation authority
+- transfer size limits / token budget expectations
+- what stays server-side instead of entering conversation context
+
 ### Session Contract
 
 - transport session ID source
@@ -53,6 +64,7 @@ Must pass:
 5. session alignment check
 6. delete/cleanup check
 7. local vs public tool-list comparison if a public route exists
+8. compact lane-facing output check for high-volume data paths
 
 ## Anti-Patterns
 
@@ -60,3 +72,4 @@ Must pass:
 - showing raw transport IDs to operators when the app session is what they care about
 - assuming the public connector reloaded just because the local process changed
 - testing only localhost while the user consumes the public route
+- streaming bulk raw state into the lane when a summary or query tool would do
