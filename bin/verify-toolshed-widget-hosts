@@ -118,8 +118,8 @@ async function main() {
 
   assert(kanban.hasLegacyAttachBridge, "Kanban widget is missing legacy attachToolshedBridge path.");
   assert(kanban.hasLegacyHydrate, "Kanban widget is missing legacy hydrateCurrentHostState path.");
-  assert(!kanban.hasSharedRuntime, "Kanban widget unexpectedly contains shared host runtime injection.");
-  assert(!kanban.hasCreateHostRuntime, "Kanban widget unexpectedly uses createHostRuntime.");
+  assert(kanban.hasSharedRuntime, "Kanban widget is missing shared host runtime injection.");
+  assert(kanban.hasCreateHostRuntime, "Kanban widget is missing createHostRuntime usage.");
 
   const summary = {
     baseUrl,

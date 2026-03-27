@@ -50,9 +50,9 @@ function main() {
   assert(result.calculator.injectsSharedRuntime, "Calculator source no longer injects the shared host runtime.");
   assert(result.calculator.usesCreateHostRuntime, "Calculator source no longer uses createHostRuntime.");
 
-  assert(!result.kanban.importsSharedRuntime, "Kanban source unexpectedly imports the shared host runtime.");
-  assert(!result.kanban.injectsSharedRuntime, "Kanban source unexpectedly injects the shared host runtime.");
-  assert(!result.kanban.usesCreateHostRuntime, "Kanban source unexpectedly uses createHostRuntime.");
+  assert(result.kanban.importsSharedRuntime, "Kanban source is missing the shared host runtime import.");
+  assert(result.kanban.injectsSharedRuntime, "Kanban source is missing the shared host runtime injection.");
+  assert(result.kanban.usesCreateHostRuntime, "Kanban source is missing createHostRuntime usage.");
   assert(result.kanban.hasLegacyAttachBridge, "Kanban source is missing attachToolshedBridge.");
   assert(result.kanban.hasLegacyHydrate, "Kanban source is missing hydrateCurrentHostState.");
 

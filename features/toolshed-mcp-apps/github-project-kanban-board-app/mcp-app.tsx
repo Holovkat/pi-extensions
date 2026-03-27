@@ -1,3 +1,5 @@
+import { hostRuntimeScript } from "../shared/host-runtime.ts";
+
 export const html = String.raw`<!doctype html>
 <html lang="en">
   <head>
@@ -658,6 +660,7 @@ export const html = String.raw`<!doctype html>
         .column { flex-basis: min(88vw, 320px); }
       }
     </style>
+    ${hostRuntimeScript}
   </head>
   <body>
     <div class="app">
@@ -1648,6 +1651,23 @@ export const html = String.raw`<!doctype html>
         return false;
       }
 
+      const sharedHost = window.__toolshedHostRuntime?.createHostRuntime({
+        updateTheme,
+        applyGlobals(globals) {
+          const updated = hydrateFromGlobals(globals);
+          if (updated) attachDragHandlers();
+          return updated;
+        },
+        onDisplayMode(detail) {
+          applyDisplayMode(detail?.mode);
+        },
+        onUnavailable() {
+          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
+            setStatus('Host bridge unavailable.');
+          }
+        },
+      }) || null;
+
       const host = {
         hydrateCurrentState: hydrateCurrentHostState,
         async callTool(name, args) {
@@ -1675,6 +1695,7 @@ export const html = String.raw`<!doctype html>
           return await app.requestDisplayMode(input);
         },
         async openLink(input) {
+          if (sharedHost?.openLink) return await sharedHost.openLink(input);
           const app = getHostApp();
           if (app?.openLink) return await app.openLink(input);
           if (input && input.url) window.open(input.url, '_blank', 'noopener,noreferrer');
