@@ -1671,6 +1671,7 @@ export const html = String.raw`<!doctype html>
       const host = {
         hydrateCurrentState: hydrateCurrentHostState,
         async callTool(name, args) {
+          if (sharedHost?.callTool) return await sharedHost.callTool(name, args);
           const openai = getOpenAI();
           if (openai?.callTool) {
             return await openai.callTool(name, args);
