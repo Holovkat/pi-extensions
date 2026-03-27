@@ -1680,6 +1680,7 @@ export const html = String.raw`<!doctype html>
           return await app.callServerTool({ name, arguments: args });
         },
         async syncToolshedSession(input) {
+          if (sharedHost?.syncToolshedSession) return await sharedHost.syncToolshedSession(input);
           const app = getToolshedApp();
           if (!app?.syncToolshedSession) return { ok: false };
           return await app.syncToolshedSession(input);
@@ -1690,6 +1691,7 @@ export const html = String.raw`<!doctype html>
           return await app.updateModelContext(input);
         },
         async requestDisplayMode(input) {
+          if (sharedHost?.requestDisplayMode) return await sharedHost.requestDisplayMode(input);
           const app = getHostApp();
           if (!app?.requestDisplayMode) throw new Error('Display mode bridge unavailable.');
           return await app.requestDisplayMode(input);
