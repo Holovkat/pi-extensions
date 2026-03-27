@@ -1209,13 +1209,42 @@ function extractGeneratedAppHtml(viewFile) {
 	const absolute = path.isAbsolute(viewFile) ? viewFile : path.join(projectDir, viewFile);
 	if (!fs.existsSync(absolute)) throw new Error("Generated app view file is missing: " + viewFile);
 	const source = fs.readFileSync(absolute, "utf-8");
-	const marker = "export const html = String.raw`";
-	const start = source.indexOf(marker);
+	const markers = ["export const html = String.raw`", "export const html = `"];
+	const marker = markers.find(function(entry) {
+		return source.includes(entry);
+	});
+	const start = marker ? source.indexOf(marker) : -1;
 	const end = source.lastIndexOf("`;");
-	if (start === -1 || end === -1 || end <= start + marker.length) {
+	if (!marker || start === -1 || end === -1 || end <= start + marker.length) {
 		throw new Error("Unable to extract generated app HTML from " + viewFile);
 	}
-	return source.slice(start + marker.length, end);
+	return expandGeneratedAppTemplate(source.slice(start + marker.length, end));
+}
+
+function extractTemplateExport(source, exportName) {
+	if (!source || !exportName) return "";
+	const markers = [
+		"export const " + exportName + " = String.raw`",
+		"export const " + exportName + " = `",
+	];
+	for (const marker of markers) {
+		const start = source.indexOf(marker);
+		if (start === -1) continue;
+		const end = source.indexOf("`;", start + marker.length);
+		if (end === -1 || end <= start + marker.length) continue;
+		return source.slice(start + marker.length, end);
+	}
+	return "";
+}
+
+function expandGeneratedAppTemplate(html) {
+	if (typeof html !== "string" || !html.includes("${")) return html;
+	const sharedFile = path.join(projectDir, "features/toolshed-mcp-apps/shared/host-runtime.ts");
+	let hostRuntimeScript = "";
+	try {
+		hostRuntimeScript = extractTemplateExport(fs.readFileSync(sharedFile, "utf-8"), "hostRuntimeScript");
+	} catch {}
+	return html.replace(/\$\{hostRuntimeScript\}/g, hostRuntimeScript);
 }
 
 function generatedAppInstanceKey(cardId, itemId) {
@@ -1453,16 +1482,36 @@ function buildGeneratedAppBridgeScript(config) {
 		"  if (typeof bridge.ondisplaymodechange === 'function') bridge.ondisplaymodechange({ mode: nextMode });",
 		"  try { window.dispatchEvent(new CustomEvent('toolshed-display-mode', { detail: { mode: nextMode } })); } catch {}",
 		"};",
+		"const emitGlobals = function(){",
+		"  const globals = {",
+		"    theme: bridge.theme,",
+		"    toolInput: bridge.toolInput,",
+		"    toolOutput: bridge.toolOutput,",
+		"    widgetState: bridge.widgetState,",
+		"  };",
+		"  try { window.dispatchEvent(new CustomEvent('openai:set_globals', { detail: { globals: globals } })); } catch {}",
+		"};",
 		"const bridge = {",
 		"  ontoolinput: null,",
 		"  ontoolresult: null,",
 		"  ondisplaymodechange: null,",
 		"  displayMode: 'inline',",
+		"  theme: new URLSearchParams(window.location.search).get('theme') || 'dark',",
+		"  toolInput: null,",
+		"  toolOutput: null,",
+		"  widgetState: null,",
 		"  async callServerTool(input){",
 		"    const data = await bridgeFetch('/api/generated-app-tool',{ cardId:CARD_ID, itemId:ITEM_ID, name:input && input.name, arguments:input && input.arguments || {} });",
 		"    const sessionId = data && data.result && data.result.structuredContent && data.result.structuredContent.sessionId;",
 		"    if (sessionId) window.__toolshedSessionId = sessionId;",
+		"    bridge.toolInput = input && input.arguments ? input.arguments : null;",
+		"    bridge.toolOutput = data && data.result && data.result.structuredContent ? data.result.structuredContent : null;",
+		"    bridge.widgetState = bridge.toolOutput;",
+		"    emitGlobals();",
 		"    return data.result;",
+		"  },",
+		"  async callTool(name, args){",
+		"    return bridge.callServerTool({ name:name, arguments: args || {} });",
 		"  },",
 		"  async updateModelContext(input){",
 		"    try { await bridgeFetch('/api/generated-app-context',{ cardId:CARD_ID, itemId:ITEM_ID, text: input && input.text || '' }); } catch {}",
@@ -1471,6 +1520,10 @@ function buildGeneratedAppBridgeScript(config) {
 		"    const text = extractText(message);",
 		"    if (!text) return { success: false, error: 'No message text provided.' };",
 		"    return bridgeFetch('/api/action',{ type:'send-message', text:text, inlineAppItemId: ITEM_ID, cardId: CARD_ID, sessionId: window.__toolshedSessionId || '' });",
+		"  },",
+		"  async sendFollowUpMessage(input){",
+		"    const prompt = input && typeof input.prompt === 'string' ? input.prompt : input && typeof input.text === 'string' ? input.text : input;",
+		"    return bridge.sendMessage({ role:'user', content:[{ type:'text', text:String(prompt || '') }] });",
 		"  },",
 		"  async requestDisplayMode(input){",
 		"    const mode = input && input.mode ? String(input.mode) : 'inline';",
@@ -1509,6 +1562,7 @@ function buildGeneratedAppBridgeScript(config) {
 		"window.mcp = window.mcp || {};",
 		"window.mcp.app = bridge;",
 		"notifyDisplayMode('inline');",
+		"emitGlobals();",
 		"window.addEventListener('message', function(event){",
 		"  if (!event || event.origin !== window.location.origin) return;",
 		"  const data = event.data;",
@@ -1519,6 +1573,10 @@ function buildGeneratedAppBridgeScript(config) {
 		"  bridgeFetch('/api/generated-app-open',{ cardId:CARD_ID, itemId:ITEM_ID, toolName: OPEN_TOOL }).then(async function(data){",
 		"    const sessionId = data && data.result && data.result.structuredContent && data.result.structuredContent.sessionId;",
 		"    if (sessionId) window.__toolshedSessionId = sessionId;",
+		"    bridge.toolInput = data && data.result && data.result.structuredContent ? data.result.structuredContent : null;",
+		"    bridge.toolOutput = data && data.result && data.result.structuredContent ? data.result.structuredContent : null;",
+		"    bridge.widgetState = bridge.toolOutput;",
+		"    emitGlobals();",
 		"    if (typeof bridge.ontoolinput === 'function') await bridge.ontoolinput(data.result);",
 		"    if (typeof bridge.ontoolresult === 'function') await bridge.ontoolresult(data.result);",
 		"  }).catch(function(error){",

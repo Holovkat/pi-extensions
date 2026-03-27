@@ -1,3 +1,5 @@
+import { hostRuntimeScript } from "../shared/host-runtime.ts";
+
 export const html = String.raw`<!doctype html>
 <html lang="en">
   <head>
@@ -458,6 +460,7 @@ export const html = String.raw`<!doctype html>
       </div>
     </div>
 
+    ${hostRuntimeScript}
     <script>
       const state = {
         sessionId: "",
@@ -479,29 +482,7 @@ export const html = String.raw`<!doctype html>
       const $steps = document.getElementById("steps");
       const $status = document.getElementById("status");
       const $sessionId = document.getElementById("sessionId");
-      const initialTheme = new URLSearchParams(window.location.search).get("theme");
-      let toolshedBridgeAttached = false;
       let sessionSyncTimer = 0;
-
-      if (initialTheme === "light") {
-        document.body.classList.add("light");
-      }
-
-      function getOpenAI() {
-        try {
-          return window.openai || null;
-        } catch {
-          return null;
-        }
-      }
-
-      function getToolshedApp() {
-        try {
-          return window.app || window.mcp?.app || null;
-        } catch {
-          return null;
-        }
-      }
 
       function escapeHtml(value) {
         return String(value || "")
@@ -516,6 +497,25 @@ export const html = String.raw`<!doctype html>
         if (theme === "light") document.body.classList.add("light");
         else if (theme === "dark") document.body.classList.remove("light");
       }
+
+      const host = window.__toolshedHostRuntime.createHostRuntime({
+        updateTheme,
+        applyGlobals: hydrateFromGlobals,
+        onToolInput(input) {
+          applyPayload(input);
+          setOkStatus("Host attached", "waiting for result");
+        },
+        onToolResult(result) {
+          applyPayload(result);
+          setOkStatus("Ready", "calculator connected");
+        },
+        onUnavailable() {
+          if (!state.sessionId) {
+            $status.textContent = "Host bridge unavailable.";
+          }
+        },
+      });
+      host.applyInitialTheme();
 
       function setOkStatus(label, detail) {
         const suffix = detail ? " · " + escapeHtml(detail) : "";
@@ -544,13 +544,12 @@ export const html = String.raw`<!doctype html>
       }
 
       function scheduleSessionSync() {
-        const app = getToolshedApp();
-        if (!app?.syncToolshedSession || !state.sessionId) return;
+        if (!state.sessionId) return;
         if (sessionSyncTimer) clearTimeout(sessionSyncTimer);
         sessionSyncTimer = window.setTimeout(async () => {
           sessionSyncTimer = 0;
           try {
-            await app.syncToolshedSession({
+            await host.syncToolshedSession({
               adapter: "calculator",
               title: "Skeuomorphic Calculator Toolbox App",
               sessionId: state.sessionId,
@@ -653,44 +652,12 @@ export const html = String.raw`<!doctype html>
         return updated;
       }
 
-      function attachToolshedBridge() {
-        const app = getToolshedApp();
-        if (!app || toolshedBridgeAttached) return Boolean(app);
-        toolshedBridgeAttached = true;
-
-        app.ontoolinput = async (input) => {
-          applyPayload(input);
-          setOkStatus("Host attached", "waiting for result");
-        };
-
-        app.ontoolresult = async (result) => {
-          applyPayload(result);
-          setOkStatus("Ready", "calculator connected");
-        };
-
-        return true;
-      }
-
-      async function callHostTool(name, args) {
-        const openai = getOpenAI();
-        if (openai?.callTool) {
-          return await openai.callTool(name, args);
-        }
-
-        const app = getToolshedApp();
-        if (app?.callServerTool) {
-          return await app.callServerTool({ name, arguments: args });
-        }
-
-        throw new Error("No host tool bridge is available.");
-      }
-
       async function press(key) {
         if (!state.sessionId) return;
         $status.textContent = "Applying " + key + "…";
 
         try {
-          const result = await callHostTool("calculator_press_key", { sessionId: state.sessionId, key });
+          const result = await host.callTool("calculator_press_key", { sessionId: state.sessionId, key });
           applyPayload(result);
           setOkStatus("Ready", key + " applied");
         } catch (error) {
@@ -700,22 +667,7 @@ export const html = String.raw`<!doctype html>
 
       async function sendQuestion(text) {
         try {
-          const openai = getOpenAI();
-          if (openai?.sendFollowUpMessage) {
-            await openai.sendFollowUpMessage({ prompt: text, scrollToBottom: true });
-            return;
-          }
-
-          const app = getToolshedApp();
-          if (app?.sendMessage) {
-            await app.sendMessage({
-              role: "user",
-              content: [{ type: "text", text }],
-            });
-            return;
-          }
-
-          throw new Error("No host messaging bridge is available.");
+          await host.sendFollowUpMessage({ prompt: text, scrollToBottom: true });
         } catch (error) {
           $status.textContent = "Unable to message chat: " + (error?.message || String(error));
         }
@@ -737,28 +689,6 @@ export const html = String.raw`<!doctype html>
       function shouldIgnoreKeyboardEvent(target) {
         if (!target || typeof target.closest !== "function") return false;
         return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
-      }
-
-      function hydrateCurrentHostState() {
-        const openai = getOpenAI();
-        const hasOpenAIGlobals = Boolean(openai && (openai.toolInput || openai.toolOutput || openai.widgetState));
-        if (hasOpenAIGlobals) {
-          const updated = hydrateFromGlobals({
-            theme: openai.theme,
-            widgetState: openai.widgetState,
-            toolInput: openai.toolInput,
-            toolOutput: openai.toolOutput,
-          });
-          return updated || Boolean(openai.toolInput || openai.toolOutput || openai.widgetState);
-        }
-
-        if (attachToolshedBridge()) {
-          return true;
-        }
-
-        if (openai?.theme) updateTheme(openai.theme);
-
-        return false;
       }
 
       document.getElementById("keypad").addEventListener("click", (event) => {
@@ -787,27 +717,12 @@ export const html = String.raw`<!doctype html>
         sendQuestion("Using calculator session " + state.sessionId + ", what is the most recent completed calculation and result?");
       });
 
-      window.addEventListener("openai:set_globals", (event) => {
-        hydrateFromGlobals(event.detail?.globals || {});
-      }, { passive: true });
-
       render();
 
-      const ready = hydrateCurrentHostState();
+      const ready = host.bootstrap();
       if (!ready) {
         $status.textContent = "Waiting for host bridge…";
       }
-
-      let bootstrapAttempts = 0;
-      const bootstrapTimer = setInterval(() => {
-        bootstrapAttempts += 1;
-        if (hydrateCurrentHostState() || bootstrapAttempts >= 20) {
-          clearInterval(bootstrapTimer);
-          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
-            $status.textContent = "Host bridge unavailable.";
-          }
-        }
-      }, 100);
     </script>
   </body>
 </html>`;

@@ -106,7 +106,8 @@ Each agent subprocess:
 | [docs/designs/pi-toolshed-retrospective-2026-03-26.md](docs/designs/pi-toolshed-retrospective-2026-03-26.md) | Retrospective summary of the Blueprint + Toolshed buildout, issues, lessons, and external-app guidance |
 | [PRD-PI-TOOLSHED.md](PRD-PI-TOOLSHED.md)                                                                     | Toolshed product direction                                                                             |
 | [TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md](TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md)                           | Current toolshed implementation notes                                                                  |
-| [.mcp.json](.mcp.json)                                                                                       | Project-local MCP server wiring                                                                        |
+| [.factory/mcp.json](.factory/mcp.json)                                                                       | Canonical project-local MCP server wiring                                                              |
+| [.mcp.json](.mcp.json)                                                                                       | Legacy-compatible MCP server wiring mirror                                                             |
 | [agents/pi-blueprint/](agents/pi-blueprint/)                                                                 | Repo-managed blueprint agents                                                                          |
 | [skills/pi-blueprint/](skills/pi-blueprint/)                                                                 | Repo-managed blueprint skills                                                                          |
 
@@ -963,9 +964,50 @@ brew install glow
 
 - [pi coding agent CLI](https://github.com/nichochar/pi) installed globally
 - Node.js 20+
+- `uv` / `uvx` available on PATH for retrieval MCP launch
 - GitHub CLI (`gh`) authenticated for issue publishing
 - tmux (for log panes and dashboard)
 - glow (optional, for `/req-prd` markdown rendering)
+
+### Retrieval MCPs
+
+This repo expects the Munch retrieval servers to be configured in project MCP config and launched through `uvx`, following the upstream `jcodemunch-mcp` quickstart pattern.
+
+Canonical config lives in [.factory/mcp.json](.factory/mcp.json) and is mirrored into [.mcp.json](.mcp.json) for legacy compatibility. The configured retrieval servers are:
+
+- `jcodemunch` for code structure and symbol lookup
+- `jdocmunch` for markdown and document-section retrieval
+- `jdatamunch` for structured data surfaces
+
+Policy for repo-managed agents:
+
+- Use jCodeMunch before raw code reads or shell grep for source exploration
+- Use jDocMunch before raw markdown reads for PRDs, checklists, and docs
+- Use jDataMunch before ad hoc shell inspection for structured data artifacts
+- Fall back to raw file or shell inspection only when the relevant retrieval MCP is unavailable or insufficient
+
+Validation:
+
+```bash
+bin/verify-munch-mcps
+```
+
+Sync the active global Pi MCP config/cache for the Munch servers:
+
+```bash
+bin/sync-pi-munch-mcps
+```
+
+Recommended recovery flow when a new Pi session is missing one of the Munch servers:
+
+1. Run `bin/verify-munch-mcps`
+2. Run `bin/sync-pi-munch-mcps`
+3. Start a fresh Pi session
+4. Run `mcp({})` and confirm `jcodemunch`, `jdocmunch`, and `jdatamunch` are present
+
+Why this exists: in this environment, the active MCP adapter reads `~/.pi/agent/mcp.json` and `~/.pi/agent/mcp-cache.json`. Repo-local `.factory/mcp.json` / `.mcp.json` remain the canonical project config, but syncing keeps the active Pi MCP registry aligned for new sessions.
+
+If Pi is already running after MCP config changes, restart it so discovery reloads the updated project config.
 
 ---
 

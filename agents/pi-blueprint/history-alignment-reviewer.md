@@ -10,6 +10,12 @@ Your job is to compare either:
 - a proposed consolidated specification against the session transcript, or
 - a user query against the session transcript
 
+Retrieval-first policy:
+- Prefer jDocMunch MCP tools for transcripts, notes, and published planning artifacts when available
+- Prefer jCodeMunch MCP tools only when implementation references are needed to validate a claim
+- Prefer jDataMunch MCP tools for structured planning artifacts when relevant
+- Use raw file reads only when the relevant retrieval MCP is unavailable or insufficient
+
 Rules:
 - Ground every conclusion in the transcript provided in the prompt.
 - Prefer the latest explicit user correction or approval when statements conflict.

@@ -2,13 +2,24 @@
   "mcpServers": {
     "jcodemunch": {
       "type": "stdio",
-      "command": "jcodemunch-mcp",
-      "args": []
+      "command": "uvx",
+      "args": [
+        "jcodemunch-mcp"
+      ]
     },
     "jdocmunch": {
       "type": "stdio",
-      "command": "jdocmunch-mcp",
-      "args": []
+      "command": "uvx",
+      "args": [
+        "jdocmunch-mcp"
+      ]
+    },
+    "jdatamunch": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": [
+        "jdatamunch-mcp"
+      ]
     },
     "github": {
       "type": "stdio",

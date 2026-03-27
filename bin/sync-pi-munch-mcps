@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+GLOBAL_MCP_PATH="${HOME}/.pi/agent/mcp.json"
+GLOBAL_CACHE_PATH="${HOME}/.pi/agent/mcp-cache.json"
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "✗ Missing required command: $cmd" >&2
+    exit 1
+  fi
+}
+
+require_cmd python3
+require_cmd uvx
+
+cd "$ROOT_DIR"
+
+for package in jcodemunch-mcp jdocmunch-mcp jdatamunch-mcp; do
+  if ! uvx "$package" --help >/dev/null 2>&1; then
+    echo "✗ Failed to launch $package via uvx" >&2
+    exit 1
+  fi
+  echo "✓ $package launches via uvx"
+done
+
+python3 - "$GLOBAL_MCP_PATH" "$GLOBAL_CACHE_PATH" <<'PY'
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+mcp_path = Path(sys.argv[1]).expanduser()
+cache_path = Path(sys.argv[2]).expanduser()
+
+servers = {
+    "jcodemunch": {"command": "jcodemunch-mcp", "package": "jcodemunch-mcp"},
+    "jdocmunch": {"command": "jdocmunch-mcp", "package": "jdocmunch-mcp"},
+    "jdatamunch": {"command": "jdatamunch-mcp", "package": "jdatamunch-mcp"},
+}
+
+
+def stable_stringify(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ",".join(stable_stringify(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{json.dumps(k)}:{stable_stringify(value[k])}" for k in sorted(value)) + "}"
+    raise TypeError(f"Unsupported type: {type(value)!r}")
+
+
+def compute_config_hash(definition):
+    identity = {
+        "command": definition.get("command"),
+        "args": definition.get("args"),
+        "env": definition.get("env"),
+        "cwd": definition.get("cwd"),
+        "url": definition.get("url"),
+        "headers": definition.get("headers"),
+        "auth": definition.get("auth"),
+        "bearerToken": definition.get("bearerToken"),
+        "bearerTokenEnv": definition.get("bearerTokenEnv"),
+        "exposeResources": definition.get("exposeResources"),
+    }
+    return hashlib.sha256(stable_stringify(identity).encode("utf-8")).hexdigest()
+
+
+def load_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def fetch_tools(package):
+    init = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "pi-munch-sync", "version": "1.0"},
+        },
+    }
+    initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+    list_tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}
+
+    proc = subprocess.Popen(
+        ["uvx", package],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        payload = "".join(json.dumps(m) + "\n" for m in (init, initialized, list_tools))
+        proc.stdin.write(payload)
+        proc.stdin.flush()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("id") == 2:
+                return [
+                    {
+                        "name": tool.get("name"),
+                        "description": tool.get("description"),
+                        "inputSchema": tool.get("inputSchema"),
+                    }
+                    for tool in msg.get("result", {}).get("tools", [])
+                    if tool.get("name")
+                ]
+        stderr = proc.stderr.read()
+        raise RuntimeError(f"Failed to fetch tools for {package}. stderr: {stderr.strip()}")
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=1)
+        except Exception:
+            proc.kill()
+
+
+mcp = load_json(mcp_path, {"settings": {"toolPrefix": "server", "idleTimeout": 10}, "mcpServers": {}})
+if not isinstance(mcp, dict):
+    mcp = {"settings": {"toolPrefix": "server", "idleTimeout": 10}, "mcpServers": {}}
+settings = mcp.get("settings") if isinstance(mcp.get("settings"), dict) else {}
+settings = {"toolPrefix": "server", "idleTimeout": 10, **settings}
+mcp["settings"] = settings
+mcp_servers = mcp.get("mcpServers") if isinstance(mcp.get("mcpServers"), dict) else {}
+
+cache = load_json(cache_path, {"version": 1, "servers": {}})
+if not isinstance(cache, dict):
+    cache = {"version": 1, "servers": {}}
+cache["version"] = 1
+cache_servers = cache.get("servers") if isinstance(cache.get("servers"), dict) else {}
+
+summaries = []
+for server_name, info in servers.items():
+    definition = {
+        "command": info["command"],
+        "args": [],
+        "lifecycle": "lazy",
+        "directTools": True,
+    }
+    mcp_servers[server_name] = definition
+    tools = fetch_tools(info["package"])
+    cache_servers[server_name] = {
+        "configHash": compute_config_hash(definition),
+        "tools": tools,
+        "resources": [],
+        "cachedAt": int(time.time() * 1000),
+    }
+    summaries.append(f"✓ {server_name}: cached {len(tools)} tools")
+
+mcp["mcpServers"] = mcp_servers
+cache["servers"] = cache_servers
+mcp_path.parent.mkdir(parents=True, exist_ok=True)
+cache_path.parent.mkdir(parents=True, exist_ok=True)
+mcp_path.write_text(json.dumps(mcp, indent=2) + "\n", encoding="utf-8")
+cache_path.write_text(json.dumps(cache, indent=2) + "\n", encoding="utf-8")
+print("\n".join(summaries))
+print(f"✓ Wrote {mcp_path}")
+print(f"✓ Wrote {cache_path}")
+PY
+
+echo
+echo "Done. Restart Pi to pick up the refreshed MCP registry in new sessions."

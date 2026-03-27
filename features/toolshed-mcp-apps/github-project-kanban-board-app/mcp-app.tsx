@@ -1096,13 +1096,11 @@ export const html = String.raw`<!doctype html>
 	      }
 
       function scheduleSessionSync() {
-        const app = getToolshedApp();
-        if (!app?.syncToolshedSession) return;
         if (sessionSyncTimer) clearTimeout(sessionSyncTimer);
         sessionSyncTimer = window.setTimeout(async () => {
           sessionSyncTimer = 0;
           try {
-            await app.syncToolshedSession({
+            await host.syncToolshedSession({
               adapter: "github-project-kanban",
               title: state.project?.title || "GitHub Project Board",
               sessionId: state.sessionId || "",
@@ -1149,15 +1147,7 @@ export const html = String.raw`<!doctype html>
       }
 
       async function requestTool(name, args) {
-        const openai = getOpenAI();
-        let result = null;
-        if (openai?.callTool) {
-          result = await openai.callTool(name, args);
-        } else {
-          const app = getToolshedApp();
-          if (!app?.callServerTool) return null;
-          result = await app.callServerTool({ name, arguments: args });
-        }
+        const result = await host.callTool(name, args);
         applyPayload(result);
         await syncModelContext();
         return result;
@@ -1518,11 +1508,9 @@ export const html = String.raw`<!doctype html>
       }
 
       async function syncModelContext() {
-        const app = getHostApp();
-        if (!app?.updateModelContext) return;
         try {
           const summary = state.columns.map((column) => column.title + ': ' + (column.cards?.length || 0)).join(' · ');
-          await app.updateModelContext({ text: 'GitHub Project Kanban Board for ' + (state.repo?.nameWithOwner || 'current repo') + '. ' + summary + '.' });
+          await host.updateModelContext({ text: 'GitHub Project Kanban Board for ' + (state.repo?.nameWithOwner || 'current repo') + '. ' + summary + '.' });
         } catch {}
       }
 
@@ -1599,13 +1587,11 @@ export const html = String.raw`<!doctype html>
 
       $refreshBtn.addEventListener('click', refreshBoard);
       $fullscreenBtn.addEventListener('click', async () => {
-        const app = getHostApp();
-        if (!app?.requestDisplayMode) return;
         const previousMode = state.displayMode;
         const nextMode = previousMode === 'fullscreen' ? 'inline' : 'fullscreen';
         try {
           applyDisplayMode(nextMode);
-          await app.requestDisplayMode({ mode: nextMode });
+          await host.requestDisplayMode({ mode: nextMode });
         } catch (error) {
           applyDisplayMode(previousMode);
           setStatus('Fullscreen unavailable: ' + (error?.message || String(error)));
@@ -1618,13 +1604,10 @@ export const html = String.raw`<!doctype html>
         const href = link.getAttribute('data-open-link');
         if (!href) return;
         event.preventDefault();
-        const app = getHostApp();
-        if (app?.openLink) {
-          try {
-            await app.openLink({ url: href });
-            return;
-          } catch {}
-        }
+        try {
+          await host.openLink({ url: href });
+          return;
+        } catch {}
         window.open(href, '_blank', 'noopener,noreferrer');
       });
 
@@ -1665,34 +1648,76 @@ export const html = String.raw`<!doctype html>
         return false;
       }
 
-      window.addEventListener('toolshed-display-mode', (event) => {
-        applyDisplayMode(event?.detail?.mode);
-      });
+      const host = {
+        hydrateCurrentState: hydrateCurrentHostState,
+        async callTool(name, args) {
+          const openai = getOpenAI();
+          if (openai?.callTool) {
+            return await openai.callTool(name, args);
+          }
+          const app = getToolshedApp();
+          if (!app?.callServerTool) return null;
+          return await app.callServerTool({ name, arguments: args });
+        },
+        async syncToolshedSession(input) {
+          const app = getToolshedApp();
+          if (!app?.syncToolshedSession) return { ok: false };
+          return await app.syncToolshedSession(input);
+        },
+        async updateModelContext(input) {
+          const app = getHostApp();
+          if (!app?.updateModelContext) return null;
+          return await app.updateModelContext(input);
+        },
+        async requestDisplayMode(input) {
+          const app = getHostApp();
+          if (!app?.requestDisplayMode) throw new Error('Display mode bridge unavailable.');
+          return await app.requestDisplayMode(input);
+        },
+        async openLink(input) {
+          const app = getHostApp();
+          if (app?.openLink) return await app.openLink(input);
+          if (input && input.url) window.open(input.url, '_blank', 'noopener,noreferrer');
+          return { ok: true };
+        },
+        attachEventListeners() {
+          window.addEventListener('toolshed-display-mode', (event) => {
+            applyDisplayMode(event?.detail?.mode);
+          });
 
-      window.addEventListener('openai:set_globals', (event) => {
-        const updated = hydrateFromGlobals(event.detail?.globals || {});
-        if (updated) attachDragHandlers();
-      }, { passive: true });
+          window.addEventListener('openai:set_globals', (event) => {
+            const updated = hydrateFromGlobals(event.detail?.globals || {});
+            if (updated) attachDragHandlers();
+          }, { passive: true });
+        },
+        onUnavailable() {
+          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
+            setStatus('Host bridge unavailable.');
+          }
+        },
+        bootstrap() {
+          host.attachEventListeners();
+          const ready = host.hydrateCurrentState();
+          if (!ready) {
+            setStatus('Waiting for host bridge…');
+          }
+          let bootstrapAttempts = 0;
+          const bootstrapTimer = setInterval(() => {
+            bootstrapAttempts += 1;
+            if (host.hydrateCurrentState() || bootstrapAttempts >= 20) {
+              clearInterval(bootstrapTimer);
+              if (bootstrapAttempts >= 20) host.onUnavailable();
+            }
+          }, 100);
+          return ready;
+        },
+      };
 
       const observer = new MutationObserver(() => attachDragHandlers());
       observer.observe($board, { childList: true, subtree: true });
       render();
 
-      const ready = hydrateCurrentHostState();
-      if (!ready) {
-        setStatus('Waiting for host bridge…');
-      }
-
-      let bootstrapAttempts = 0;
-      const bootstrapTimer = setInterval(() => {
-        bootstrapAttempts += 1;
-        if (hydrateCurrentHostState() || bootstrapAttempts >= 20) {
-          clearInterval(bootstrapTimer);
-          if (!state.sessionId && !getOpenAI() && !getToolshedApp()) {
-            setStatus('Host bridge unavailable.');
-          }
-        }
-      }, 100);
+      host.bootstrap();
     </script>
   </body>
 </html>`;

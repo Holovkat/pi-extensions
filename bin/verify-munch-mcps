@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "✗ Missing required command: $cmd" >&2
+    exit 1
+  fi
+}
+
+check_config_entry() {
+  local file="$1"
+  local server="$2"
+  local expected_package="$3"
+
+  python3 - "$file" "$server" "$expected_package" <<'PY'
+import json, sys
+file_path, server_name, expected_package = sys.argv[1:4]
+with open(file_path, 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+servers = data.get('mcpServers', {})
+server = servers.get(server_name)
+if not isinstance(server, dict):
+    raise SystemExit(f"missing server '{server_name}' in {file_path}")
+if server.get('command') != 'uvx':
+    raise SystemExit(f"server '{server_name}' in {file_path} must use command 'uvx'")
+args = server.get('args') or []
+if not args or args[0] != expected_package:
+    raise SystemExit(f"server '{server_name}' in {file_path} must start '{expected_package}' via uvx")
+print(f"✓ {file_path}: {server_name} -> uvx {expected_package}")
+PY
+}
+
+check_uvx_package() {
+  local package="$1"
+  local label="$2"
+  local output
+  if ! output="$(uvx "$package" --help 2>&1)"; then
+    echo "✗ $label failed to launch via uvx" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "✓ $label launches via uvx"
+}
+
+echo "== Verifying retrieval MCP prerequisites =="
+require_cmd uvx
+require_cmd python3
+
+echo
+echo "== Verifying MCP config =="
+check_config_entry ".factory/mcp.json" "jcodemunch" "jcodemunch-mcp"
+check_config_entry ".factory/mcp.json" "jdocmunch" "jdocmunch-mcp"
+check_config_entry ".factory/mcp.json" "jdatamunch" "jdatamunch-mcp"
+check_config_entry ".mcp.json" "jcodemunch" "jcodemunch-mcp"
+check_config_entry ".mcp.json" "jdocmunch" "jdocmunch-mcp"
+check_config_entry ".mcp.json" "jdatamunch" "jdatamunch-mcp"
+
+echo
+echo "== Verifying packages launch =="
+check_uvx_package "jcodemunch-mcp" "jCodeMunch MCP"
+check_uvx_package "jdocmunch-mcp" "jDocMunch MCP"
+check_uvx_package "jdatamunch-mcp" "jDataMunch MCP"
+
+echo
+echo "All Munch MCP checks passed."
+echo "If Pi is already running, restart it so MCP discovery reloads the updated project config."
