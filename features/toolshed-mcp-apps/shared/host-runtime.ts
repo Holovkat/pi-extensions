@@ -44,6 +44,8 @@ export const hostRuntimeScript = String.raw`<script>
       let legacyBridgeAttached = false;
       let globalsListenerAttached = false;
       let displayModeListenerAttached = false;
+      let bootstrapStarted = false;
+      let bootstrapTimer = 0;
 
       function applyGlobals(globals) {
         if (!globals || typeof globals !== "object") return false;
@@ -157,6 +159,10 @@ export const hostRuntimeScript = String.raw`<script>
         hydrateCurrentState: hydrateCurrentHostState,
         hydrateCurrentHostState,
         bootstrap() {
+          if (bootstrapStarted) {
+            return this.hydrateCurrentState();
+          }
+          bootstrapStarted = true;
           this.attachEventListeners();
           const ready = this.hydrateCurrentState();
           let attempts = 0;
@@ -164,10 +170,11 @@ export const hostRuntimeScript = String.raw`<script>
           const intervalMs = Number.isFinite(Number(options.intervalMs)) ? Number(options.intervalMs) : 100;
           if (!ready) {
             const self = this;
-            const timer = window.setInterval(function() {
+            bootstrapTimer = window.setInterval(function() {
               attempts += 1;
               if (self.hydrateCurrentState() || attempts >= maxAttempts) {
-                window.clearInterval(timer);
+                window.clearInterval(bootstrapTimer);
+                bootstrapTimer = 0;
                 if (attempts >= maxAttempts && !getOpenAI() && !getToolshedApp()) {
                   self.onUnavailable();
                 }
@@ -177,8 +184,9 @@ export const hostRuntimeScript = String.raw`<script>
           return ready;
         },
         async callTool(name, args) {
-          const openai = getOpenAI();
-          if (openai?.callTool) return await openai.callTool(name, args);
+          const host = this.getHost();
+          if (host?.callTool) return await host.callTool(name, args);
+          if (host?.callServerTool) return await host.callServerTool({ name, arguments: args });
           const app = getToolshedApp();
           if (app?.callServerTool) {
             return await app.callServerTool({ name, arguments: args });
@@ -186,8 +194,16 @@ export const hostRuntimeScript = String.raw`<script>
           throw new Error("No host tool bridge is available.");
         },
         async sendFollowUpMessage(input) {
-          const openai = getOpenAI();
-          if (openai?.sendFollowUpMessage) return await openai.sendFollowUpMessage(input);
+          const host = this.getHost();
+          if (host?.sendFollowUpMessage) return await host.sendFollowUpMessage(input);
+          if (host?.sendMessage) {
+            const text = normalizeMessageText(input);
+            if (!text) return { success: false, error: "No message text provided." };
+            return await host.sendMessage({
+              role: "user",
+              content: [{ type: "text", text }],
+            });
+          }
           const app = getToolshedApp();
           if (app?.sendMessage) {
             const text = normalizeMessageText(input);

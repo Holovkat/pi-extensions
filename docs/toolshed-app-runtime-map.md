@@ -365,6 +365,22 @@ When something breaks, check these in order:
 7. If the widget sees data but fails to render:
    - the likely break is in widget host/runtime semantics, not server data
 
+## Live Boundary Check
+
+There is now a local verifier for the live MCP-served widget boundary:
+
+```bash
+./bin/verify-toolshed-widget-hosts
+```
+
+What it checks against the live local MCP host:
+
+- calculator must still be served with the shared host runtime
+- kanban must still be served with the legacy host path
+- kanban must not silently switch onto `createHostRuntime(...)`
+
+Use this before asking for manual UAT after any host-runtime or widget-host change.
+
 ## What Should Happen Next
 
 The next safe move is not another broad rewrite.

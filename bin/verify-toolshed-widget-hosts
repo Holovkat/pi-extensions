@@ -1,0 +1,137 @@
+#!/usr/bin/env node
+
+const baseUrl = String(process.argv[2] || "http://127.0.0.1:3161").replace(/\/+$/, "");
+const mcpUrl = `${baseUrl}/mcp/servers/toolshed-app/mcp`;
+
+const resources = {
+  calculator: "ui://widget/toolshed-analog-math-console-v4.html",
+  kanban: "ui://widget/toolshed-github-project-kanban-board-v2.html",
+};
+
+async function postJson(url, body, headers = {}) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      accept: "application/json, text/event-stream",
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await res.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {
+    const eventData = text
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => line.slice(6))
+      .join("\n")
+      .trim();
+    if (eventData) {
+      try {
+        json = JSON.parse(eventData);
+      } catch {
+        throw new Error(`Non-JSON event payload from ${url}: ${text.slice(0, 400)}`);
+      }
+    } else {
+      throw new Error(`Non-JSON response from ${url}: ${text.slice(0, 400)}`);
+    }
+  }
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} from ${url}: ${JSON.stringify(json)}`);
+  }
+  return { res, json };
+}
+
+function extractResourceText(payload) {
+  const item = payload?.result?.contents?.[0];
+  if (!item) throw new Error("Missing MCP resource content.");
+  const text = typeof item.text === "string" ? item.text : "";
+  if (!text) throw new Error("Empty MCP resource content.");
+  return text;
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function summarizeCalculator(html) {
+  return {
+    hasSharedRuntime: html.includes("window.__toolshedHostRuntime"),
+    hasCreateHostRuntime: html.includes("createHostRuntime"),
+    hasLegacyAttachBridge: html.includes("attachToolshedBridge"),
+    hasSendFollowUp: html.includes("sendFollowUpMessage"),
+  };
+}
+
+function summarizeKanban(html) {
+  return {
+    hasSharedRuntime: html.includes("window.__toolshedHostRuntime"),
+    hasCreateHostRuntime: html.includes("createHostRuntime"),
+    hasLegacyAttachBridge: html.includes("attachToolshedBridge"),
+    hasLegacyHydrate: html.includes("hydrateCurrentHostState"),
+    hasRequestDisplayMode: html.includes("requestDisplayMode"),
+    hasOpenLink: html.includes("openLink"),
+  };
+}
+
+async function readResource(sessionId, uri) {
+  const { json } = await postJson(
+    mcpUrl,
+    {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "resources/read",
+      params: { uri },
+    },
+    { "mcp-session-id": sessionId },
+  );
+  return extractResourceText(json);
+}
+
+async function main() {
+  const { res, json } = await postJson(mcpUrl, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "verify-toolshed-widget-hosts", version: "0.1.0" },
+    },
+  });
+
+  const sessionId = res.headers.get("mcp-session-id");
+  if (!sessionId) throw new Error("MCP session id header missing from initialize response.");
+  assert(json?.result?.serverInfo?.name === "toolshed-app", `Unexpected MCP server: ${JSON.stringify(json?.result?.serverInfo || null)}`);
+
+  const calculatorHtml = await readResource(sessionId, resources.calculator);
+  const kanbanHtml = await readResource(sessionId, resources.kanban);
+
+  const calculator = summarizeCalculator(calculatorHtml);
+  const kanban = summarizeKanban(kanbanHtml);
+
+  assert(calculator.hasSharedRuntime, "Calculator widget is missing shared host runtime injection.");
+  assert(calculator.hasCreateHostRuntime, "Calculator widget is missing createHostRuntime usage.");
+
+  assert(kanban.hasLegacyAttachBridge, "Kanban widget is missing legacy attachToolshedBridge path.");
+  assert(kanban.hasLegacyHydrate, "Kanban widget is missing legacy hydrateCurrentHostState path.");
+  assert(!kanban.hasSharedRuntime, "Kanban widget unexpectedly contains shared host runtime injection.");
+  assert(!kanban.hasCreateHostRuntime, "Kanban widget unexpectedly uses createHostRuntime.");
+
+  const summary = {
+    baseUrl,
+    mcpUrl,
+    calculator,
+    kanban,
+  };
+
+  process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+}
+
+main().catch((error) => {
+  process.stderr.write(`verify-toolshed-widget-hosts failed: ${error?.message || String(error)}\n`);
+  process.exit(1);
+});

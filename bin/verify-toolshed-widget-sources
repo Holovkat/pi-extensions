@@ -1,0 +1,62 @@
+#!/usr/bin/env node
+
+const fs = require("fs");
+const path = require("path");
+
+const repoRoot = "/Users/tonyholovka/workspace/pi-extensions";
+
+const files = {
+  calculator: path.join(repoRoot, "features/toolshed-mcp-apps/skeuomorphic-calculator-toolbox-app/mcp-app.tsx"),
+  kanban: path.join(repoRoot, "features/toolshed-mcp-apps/github-project-kanban-board-app/mcp-app.tsx"),
+  sharedRuntime: path.join(repoRoot, "features/toolshed-mcp-apps/shared/host-runtime.ts"),
+};
+
+function read(file) {
+  return fs.readFileSync(file, "utf8");
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function main() {
+  const calculator = read(files.calculator);
+  const kanban = read(files.kanban);
+  const sharedRuntime = read(files.sharedRuntime);
+
+  const result = {
+    calculator: {
+      importsSharedRuntime: calculator.includes('import { hostRuntimeScript } from "../shared/host-runtime.ts";'),
+      injectsSharedRuntime: calculator.includes("${hostRuntimeScript}"),
+      usesCreateHostRuntime: calculator.includes("createHostRuntime({"),
+    },
+    kanban: {
+      importsSharedRuntime: kanban.includes('import { hostRuntimeScript } from "../shared/host-runtime.ts";'),
+      injectsSharedRuntime: kanban.includes("${hostRuntimeScript}"),
+      usesCreateHostRuntime: kanban.includes("createHostRuntime({"),
+      hasLegacyAttachBridge: kanban.includes("attachToolshedBridge()"),
+      hasLegacyHydrate: kanban.includes("hydrateCurrentHostState()"),
+    },
+    sharedRuntime: {
+      exportsCreateHostRuntime: sharedRuntime.includes("function createHostRuntime(config)"),
+      exportsHostRuntimeScript: sharedRuntime.includes("export const hostRuntimeScript = String.raw`<script>"),
+    },
+  };
+
+  assert(result.sharedRuntime.exportsCreateHostRuntime, "Shared host runtime is missing createHostRuntime.");
+  assert(result.sharedRuntime.exportsHostRuntimeScript, "Shared host runtime script export is missing.");
+
+  assert(result.calculator.importsSharedRuntime, "Calculator source no longer imports the shared host runtime.");
+  assert(result.calculator.injectsSharedRuntime, "Calculator source no longer injects the shared host runtime.");
+  assert(result.calculator.usesCreateHostRuntime, "Calculator source no longer uses createHostRuntime.");
+
+  assert(!result.kanban.importsSharedRuntime, "Kanban source unexpectedly imports the shared host runtime.");
+  assert(!result.kanban.injectsSharedRuntime, "Kanban source unexpectedly injects the shared host runtime.");
+  assert(!result.kanban.usesCreateHostRuntime, "Kanban source unexpectedly uses createHostRuntime.");
+  assert(result.kanban.hasLegacyAttachBridge, "Kanban source is missing attachToolshedBridge.");
+  assert(result.kanban.hasLegacyHydrate, "Kanban source is missing hydrateCurrentHostState.");
+
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
+main();
