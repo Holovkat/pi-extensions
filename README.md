@@ -1058,6 +1058,7 @@ pi-extensions/
 │   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
 │   ├── glm-provider.ts        # Zhipu GLM provider
 │   ├── ollama-provider.ts     # Ollama local models provider
+│   ├── factory-droid-provider.ts # Factory Droid CLI provider bridge
 │   ├── themeMap.ts            # Per-extension theme assignments
 │   └── theme-cycler.ts        # Runtime theme switching
 ├── agents/
