@@ -5129,18 +5129,24 @@ export default function (pi: ExtensionAPI) {
 					"warning",
 				);
 
-				ctx.ui.setFooter((_tui, theme, _footerData) => ({
-					dispose: () => {},
-					invalidate() {},
-					render(width: number): string[] {
-						const left = theme.fg("dim", ` observer`) +
-							theme.fg("muted", " · ") +
-							theme.fg("warning", "read-only");
-						const right = theme.fg("dim", `pipeline running elsewhere `);
-						const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-						return [truncateToWidth(left + pad + right, width)];
-					},
-				}));
+				ctx.ui.setFooter((tui, theme, footerData) => {
+					const unsub = footerData.onBranchChange(() => tui.requestRender());
+					return {
+						dispose: unsub,
+						invalidate() {},
+						render(width: number): string[] {
+							const gitBranch = footerData.getGitBranch() || "no git";
+							const left = theme.fg("dim", ` observer`) +
+								theme.fg("muted", " · ") +
+								theme.fg("warning", "read-only");
+							const right = theme.fg("accent", ` ${gitBranch}`) +
+								theme.fg("muted", " · ") +
+								theme.fg("dim", "pipeline running elsewhere ");
+							const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+							return [truncateToWidth(left + pad + right, width)];
+						},
+					};
+				});
 				return;
 			}
 		}
@@ -5225,34 +5231,40 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 
-		ctx.ui.setFooter((_tui, theme, _footerData) => ({
-			dispose: () => {},
-			invalidate() {},
-			render(width: number): string[] {
-				const model = ctx.model?.id || "no-model";
-				const usage = ctx.getContextUsage();
-				const pct = usage ? usage.percent : 0;
-				const filled = Math.round(pct / 10);
-				const bar = "#".repeat(filled) + "-".repeat(10 - filled);
+		ctx.ui.setFooter((tui, theme, footerData) => {
+			const unsub = footerData.onBranchChange(() => tui.requestRender());
+			return {
+				dispose: unsub,
+				invalidate() {},
+				render(width: number): string[] {
+					const model = ctx.model?.id || "no-model";
+					const gitBranch = footerData.getGitBranch() || "no git";
+					const usage = ctx.getContextUsage();
+					const pct = usage ? usage.percent : 0;
+					const filled = Math.round(pct / 10);
+					const bar = "#".repeat(filled) + "-".repeat(10 - filled);
 
-				const phaseInfo = pipeline.currentPhase >= 0 && parsedPhases[pipeline.currentPhase]
-					? parsedPhases[pipeline.currentPhase].name.slice(0, 30)
-					: "idle";
+					const phaseInfo = pipeline.currentPhase >= 0 && parsedPhases[pipeline.currentPhase]
+						? parsedPhases[pipeline.currentPhase].name.slice(0, 30)
+						: "idle";
 
-				const status = pipeline.running
-					? theme.fg("accent", phaseInfo)
-					: theme.fg("dim", phaseInfo);
+					const status = pipeline.running
+						? theme.fg("accent", phaseInfo)
+						: theme.fg("dim", phaseInfo);
 
-				const left = theme.fg("dim", ` ${model}`) +
-					theme.fg("muted", " · ") +
-					theme.fg("accent", "pipeline") +
-					theme.fg("muted", " · ") +
-					status;
-				const right = theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
-				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-				return [truncateToWidth(left + pad + right, width)];
-			},
-		}));
+					const left = theme.fg("dim", ` ${model}`) +
+						theme.fg("muted", " · ") +
+						theme.fg("accent", "pipeline") +
+						theme.fg("muted", " · ") +
+						status;
+					const right = theme.fg("accent", ` ${gitBranch}`) +
+						theme.fg("muted", " · ") +
+						theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
+					const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+					return [truncateToWidth(left + pad + right, width)];
+				},
+			};
+		});
 	});
 
 	pi.on("session_shutdown", async () => {

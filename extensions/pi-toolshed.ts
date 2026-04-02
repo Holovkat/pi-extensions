@@ -1,5 +1,5 @@
 import { SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionEntry, type SessionInfo } from "@mariozechner/pi-coding-agent";
-import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawn, execSync, execFileSync } from "child_process";
 import { createConnection, type Socket } from "net";
@@ -5646,36 +5646,93 @@ export default function (pi: ExtensionAPI) {
 		}, 75);
 	}
 
+	function packFooterSegments(width: number, segments: string[], separator: string): string[] {
+		const lines: string[] = [];
+		let current = "";
+		for (const segment of segments.filter((value) => Boolean(String(value || "").trim()))) {
+			const candidate = current ? `${current}${separator}${segment}` : segment;
+			if (!current || visibleWidth(candidate) <= width) {
+				current = candidate;
+				continue;
+			}
+			lines.push(current);
+			current = segment;
+		}
+		if (current) lines.push(current);
+		return lines;
+	}
+
+	function joinFooterSegments(segments: string[], separator: string): string {
+		return segments.filter((value) => Boolean(String(value || "").trim())).join(separator);
+	}
+
+	function rightAlignFooter(width: number, content: string): string {
+		return `${" ".repeat(Math.max(0, width - visibleWidth(content)))}${content}`;
+	}
+
+	function buildFooterLine(width: number, leftSegments: string[], separator: string, right?: string): string[] {
+		const left = joinFooterSegments(leftSegments, separator);
+		if (!right) return packFooterSegments(width, leftSegments, separator);
+		if (left && visibleWidth(left) + 1 + visibleWidth(right) <= width) {
+			const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
+			return [`${left}${pad}${right}`];
+		}
+		const lines = left ? packFooterSegments(width, leftSegments, separator) : [];
+		lines.push(visibleWidth(right) <= width ? rightAlignFooter(width, right) : right);
+		return lines;
+	}
+
+	function applyToolshedFooter(ctx: ExtensionContext, state: ToolshedState) {
+		ctx.ui.setFooter((tui, theme, footerData) => {
+			const unsub = footerData.onBranchChange(() => tui.requestRender());
+			return {
+				dispose: unsub,
+				invalidate() {},
+				render(width: number): string[] {
+					const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no-model";
+					const gitBranch = footerData.getGitBranch() || "no git";
+					const packets = state.packets.filter((packet) => packet.status === "staged").length;
+					const cards = listAllCards().length;
+					const usage = ctx.getContextUsage();
+					const pct = usage ? usage.percent : 0;
+					const filled = Math.round(pct / 10);
+					const bar = "#".repeat(filled) + "-".repeat(10 - filled);
+					const separator = theme.fg("muted", " · ");
+					const repoLabel = state.repository
+						? [theme.fg("accent", state.projectName), theme.fg("accent", ` ${gitBranch}`)].join(separator)
+						: theme.fg("accent", state.projectName);
+					const usageLabel = theme.fg("dim", `[${bar}] ${Math.round(pct)}%`);
+					const line1Right = [repoLabel, usageLabel].join(separator);
+					const line2Segments = [
+						theme.fg("accent", theme.bold("Pi Toolshed")),
+						theme.fg("accent", humanize(state.workspaceId)),
+						`${theme.fg("dim", "Frontier")}: ${state.frontier.summary}`,
+						`${theme.fg("dim", "Cards")}: ${cards} reusable`,
+						`${theme.fg("dim", "Packets")}: ${packets} staged / ${state.packets.length} total`,
+					];
+					const line3Left = [
+						`${theme.fg("dim", "MCP")}: ${state.mcp.summary}`,
+						`${theme.fg("dim", "Bridge")}: ${state.status.connection}`,
+					];
+					const line3Right = `${theme.fg("dim", "Web")}: ${state.dashboardMeta.webUrl || "not started"}`;
+					return [
+						...buildFooterLine(width, [theme.fg("dim", model)], separator, line1Right),
+						...buildFooterLine(width, line2Segments, separator),
+						...buildFooterLine(width, line3Left, separator, line3Right),
+					];
+				},
+			};
+		});
+	}
+
 	function updateWidget() {
 		if (!widgetCtx) return;
 		registerToolshedOnControl();
 		scheduleToolshedStateWrite();
 		const state = buildToolshedState(widgetCtx);
 		widgetCtx.ui.setStatus("toolshed", `${state.projectName} · ${humanize(state.workspaceId)} · ${listAllCards().length} cards · ${state.packets.filter((packet) => packet.status === "staged").length} pkt`);
-		widgetCtx.ui.setWidget("pi-toolshed", (_tui: any, theme: any) => {
-			const text = new Text("", 0, 1);
-			return {
-				render(width: number): string[] {
-					const frontier = state.frontier.summary;
-					const header = theme.fg("accent", theme.bold("Pi Toolshed")) +
-						theme.fg("muted", " · ") +
-						theme.fg("accent", humanize(state.workspaceId));
-					const lines = [
-						header,
-						"",
-						`${theme.fg("dim", "Frontier")}: ${frontier}`,
-						`${theme.fg("dim", "Cards")}: ${listAllCards().length} reusable`,
-						`${theme.fg("dim", "Packets")}: ${state.packets.filter((packet) => packet.status === "staged").length} staged / ${state.packets.length} total`,
-						`${theme.fg("dim", "MCP")}: ${state.mcp.summary}`,
-						`${theme.fg("dim", "Bridge")}: ${state.status.connection}`,
-						`${theme.fg("dim", "Web")}: ${state.dashboardMeta.webUrl || "not started"}`,
-					];
-					text.setText(lines.join("\n"));
-					return text.render(width);
-				},
-				invalidate() { text.invalidate(); },
-			};
-		});
+		applyToolshedFooter(widgetCtx, state);
+		widgetCtx.ui.setWidget("pi-toolshed", undefined);
 	}
 
 	setTimeout(connectToolshedControlSocket, 1500);
@@ -6236,29 +6293,6 @@ export default function (pi: ExtensionAPI) {
 			].join("\n"),
 			"info",
 		);
-
-		ctx.ui.setFooter((_tui, theme, _footerData) => ({
-			dispose: () => {},
-			invalidate() {},
-			render(width: number): string[] {
-				const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "no-model";
-				const packets = persistedState.packets.filter((packet) => packet.status === "staged").length;
-					const cards = listAllCards().length;
-				const usage = ctx.getContextUsage();
-				const pct = usage ? usage.percent : 0;
-				const filled = Math.round(pct / 10);
-				const bar = "#".repeat(filled) + "-".repeat(10 - filled);
-				const left = theme.fg("dim", ` ${model}`) +
-					theme.fg("muted", " · ") +
-					theme.fg("accent", "toolshed") +
-					theme.fg("muted", " · ") +
-					theme.fg("accent", humanize(persistedState.workspaceId)) +
-						theme.fg("muted", ` · ${cards} cards · ${packets} pkt`);
-				const right = theme.fg("dim", `[${bar}] ${Math.round(pct)}% `);
-				const pad = " ".repeat(Math.max(1, width - visibleWidth(left) - visibleWidth(right)));
-				return [truncateToWidth(left + pad + right, width)];
-			},
-		}));
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
