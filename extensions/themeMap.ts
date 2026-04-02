@@ -11,7 +11,7 @@
  *   synthwave        · tokyo-night
  */
 
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { basename } from "path";
 import { fileURLToPath } from "url";
 
@@ -143,3 +143,9 @@ export function applyExtensionDefaults(fileUrl: string, ctx: ExtensionContext): 
 	applyExtensionTheme(fileUrl, ctx);
 	applyExtensionTitle(ctx);
 }
+
+/**
+ * No-op default export so this helper file can safely live in an auto-discovered
+ * extensions directory without failing Pi's extension loader.
+ */
+export default function (_pi: ExtensionAPI): void {}

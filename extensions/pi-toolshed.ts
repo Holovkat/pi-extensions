@@ -1512,6 +1512,24 @@ function getExtensionRepoRoot(): string {
 	return dirname(dirname(fileURLToPath(import.meta.url)));
 }
 
+function shouldSkipGlobalToolshedAutoload(): boolean {
+	try {
+		const currentFile = fileURLToPath(import.meta.url);
+		const globalExtensionsRoot = join(process.env.HOME || "", ".pi", "agent", "extensions");
+		if (!currentFile.startsWith(`${globalExtensionsRoot}/`)) return false;
+		const settingsPath = join(process.cwd(), ".pi", "settings.json");
+		if (!existsSync(settingsPath)) return false;
+		const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));
+		const packages = Array.isArray(raw?.packages) ? raw.packages : [];
+		return packages.some((entry) => {
+			const resolved = resolve(dirname(settingsPath), String(entry || ""));
+			return basename(resolved) === basename(currentFile) && resolved !== currentFile;
+		});
+	} catch {
+		return false;
+	}
+}
+
 function getToolshedWebScriptPath(sourceRoot: string): string {
 	return join(sourceRoot, "bin", "toolshed-dashboard-web");
 }
@@ -1852,6 +1870,7 @@ function actionResetLayout(label: string = "Reset layout", variant: ToolshedQuic
 }
 
 export default function (pi: ExtensionAPI) {
+	if (shouldSkipGlobalToolshedAutoload()) return;
 	let widgetCtx: ExtensionContext | null = null;
 	let toolshedCommandCtx: ExtensionCommandContext | null = null;
 	let sessionDir = "";
