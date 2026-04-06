@@ -9,6 +9,8 @@
  */
 
 import { execFileSync } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 const OLLAMA_PROVIDER = "ollama";
@@ -17,10 +19,21 @@ const OLLAMA_CLOUD_HOST = process.env.OLLAMA_CLOUD_HOST || "https://ollama.com";
 const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
 const OLLAMA_DISABLE_CLOUD_DISCOVERY = /^(1|true|yes)$/i.test(process.env.OLLAMA_DISABLE_CLOUD_DISCOVERY || "");
 const OLLAMA_CATALOG_TIMEOUT_MS = Number(process.env.OLLAMA_CATALOG_TIMEOUT_MS || 1500);
+const CACHE_DIR = join(process.env.HOME || "", ".pi", "agent", "cache");
+const SHOW_CACHE_PATH = join(CACHE_DIR, "ollama-show-cache.json");
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_COMPAT = {
+	supportsStore: false,
 	supportsDeveloperRole: false,
-	supportsReasoningEffort: false,
+	supportsReasoningEffort: true,
+	reasoningEffortMap: {
+		minimal: "low",
+		low: "low",
+		medium: "medium",
+		high: "high",
+		xhigh: "high",
+	},
+	supportsStrictMode: false,
 	maxTokensField: "max_tokens",
 };
 
@@ -33,12 +46,19 @@ type OllamaTagModel = {
 	model?: string;
 	remote_model?: string | null;
 	remote_host?: string | null;
+	capabilities?: string[] | null;
 	details?: {
 		family?: string;
 		families?: string[] | null;
 		parameter_size?: string;
 		quantization_level?: string;
+		parent_model?: string;
 	};
+};
+
+type OllamaShowResponse = {
+	capabilities?: string[] | null;
+	details?: OllamaTagModel["details"];
 };
 
 type ProviderModel = {
@@ -51,6 +71,8 @@ type ProviderModel = {
 	maxTokens: number;
 	compat: typeof DEFAULT_COMPAT;
 };
+
+type OllamaShowCache = Record<string, OllamaShowResponse>;
 
 const STATIC_MODELS: ProviderModel[] = [
 	{
@@ -160,6 +182,10 @@ function formatModelName(id: string): string {
 	return tag ? `${baseName} (${tag})` : baseName;
 }
 
+function hasCapability(entry: OllamaTagModel, capability: string): boolean {
+	return (entry.capabilities || []).some((value) => String(value).toLowerCase() === capability.toLowerCase());
+}
+
 function isEmbeddingModel(entry: OllamaTagModel): boolean {
 	const id = String(entry.model || entry.name || "").toLowerCase();
 	const families = [entry.details?.family, ...(entry.details?.families || [])]
@@ -169,6 +195,7 @@ function isEmbeddingModel(entry: OllamaTagModel): boolean {
 }
 
 function isVisionModel(entry: OllamaTagModel): boolean {
+	if (hasCapability(entry, "vision")) return true;
 	const haystack = [
 		entry.model,
 		entry.name,
@@ -179,10 +206,11 @@ function isVisionModel(entry: OllamaTagModel): boolean {
 		.filter(Boolean)
 		.join(" ")
 		.toLowerCase();
-	return /(vision|vl|llava|bakllava|minicpm-v|gemma3|gemma4|qwen.?vl|moondream|vila|paligemma|mllama)/i.test(haystack);
+	return /(vision|vl|llava|bakllava|minicpm-v|gemma3|qwen.?vl|moondream|vila|paligemma|mllama)/i.test(haystack);
 }
 
 function supportsReasoning(entry: OllamaTagModel): boolean {
+	if (hasCapability(entry, "thinking")) return true;
 	const haystack = [
 		entry.model,
 		entry.name,
@@ -211,17 +239,37 @@ function inferMaxTokens(id: string): number {
 	return 32_768;
 }
 
+function resolveOllamaApiBaseUrl(rawBaseUrl: string): string {
+	try {
+		const url = new URL(rawBaseUrl);
+		const path = url.pathname.replace(/\/+$/, "");
+		if (!path || path === "/") {
+			url.pathname = "/v1";
+		} else if (!path.endsWith("/v1")) {
+			url.pathname = `${path}/v1`;
+		}
+		return url.toString().replace(/\/+$/, "");
+	} catch {
+		const trimmed = rawBaseUrl.replace(/\/+$/, "");
+		return trimmed.endsWith("/v1") ? trimmed : `${trimmed}/v1`;
+	}
+}
+
 function createProviderConfig(models: ProviderModel[]) {
 	return {
-		baseUrl: OLLAMA_HOST,
+		baseUrl: resolveOllamaApiBaseUrl(OLLAMA_HOST),
 		apiKey: "ollama",
-		api: "anthropic-messages" as const,
+		api: "openai-completions" as const,
 		models,
 	};
 }
 
 function getCatalogUrl(baseUrl: string): string {
 	return new URL("/api/tags", baseUrl).toString();
+}
+
+function getShowUrl(baseUrl: string): string {
+	return new URL("/api/show", baseUrl).toString();
 }
 
 function getCatalogHeaders(apiKey?: string): Record<string, string> {
@@ -254,6 +302,71 @@ function buildCloudProxyId(modelId: string): string {
 	return `${base}:${tag}-cloud`;
 }
 
+function mergeShowMetadata(entry: OllamaTagModel, showPayload: OllamaShowResponse | null): OllamaTagModel {
+	if (!showPayload) return entry;
+	return {
+		...entry,
+		capabilities: showPayload.capabilities || entry.capabilities,
+		details: {
+			...entry.details,
+			...showPayload.details,
+		},
+	};
+}
+
+function readShowMetadataCache(): OllamaShowCache {
+	if (!existsSync(SHOW_CACHE_PATH)) return {};
+	try {
+		return JSON.parse(readFileSync(SHOW_CACHE_PATH, "utf8")) as OllamaShowCache;
+	} catch {
+		return {};
+	}
+}
+
+function writeShowMetadataCache(cache: OllamaShowCache): void {
+	try {
+		mkdirSync(CACHE_DIR, { recursive: true });
+		writeFileSync(SHOW_CACHE_PATH, JSON.stringify(cache, null, 2));
+	} catch {}
+}
+
+async function fetchShowMetadata(modelId: string): Promise<OllamaShowResponse | null> {
+	try {
+		const response = await fetch(getShowUrl(OLLAMA_HOST), {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: JSON.stringify({ model: modelId }),
+		});
+		if (!response.ok) return null;
+		const payload = (await response.json()) as OllamaShowResponse;
+		return {
+			capabilities: payload.capabilities || [],
+			details: payload.details,
+		};
+	} catch {
+		return null;
+	}
+}
+
+function enrichTagModelSync(entry: OllamaTagModel, showCache: OllamaShowCache): OllamaTagModel {
+	const modelId = String(entry.model || entry.name || "").trim();
+	if (!modelId || isEmbeddingModel(entry)) return entry;
+	return mergeShowMetadata(entry, showCache[modelId] || null);
+}
+
+async function enrichTagModel(entry: OllamaTagModel, showCache: OllamaShowCache): Promise<OllamaTagModel> {
+	const modelId = String(entry.model || entry.name || "").trim();
+	if (!modelId || isEmbeddingModel(entry)) return entry;
+	const showMetadata = await fetchShowMetadata(modelId);
+	if (showMetadata) {
+		showCache[modelId] = showMetadata;
+	}
+	return mergeShowMetadata(entry, showMetadata || showCache[modelId] || null);
+}
+
 function buildDiscoveredModel(entry: OllamaTagModel): ProviderModel | null {
 	const id = String(entry.model || entry.name || "").trim();
 	if (!id || isEmbeddingModel(entry)) return null;
@@ -269,26 +382,51 @@ function buildDiscoveredModel(entry: OllamaTagModel): ProviderModel | null {
 	};
 }
 
-function normalizeLocalModels(payload: OllamaTagResponse): ProviderModel[] {
+function normalizeLocalModels(payload: OllamaTagResponse, showCache: OllamaShowCache): ProviderModel[] {
 	return (payload.models || [])
+		.map((entry) => enrichTagModelSync(entry, showCache))
 		.map(buildDiscoveredModel)
 		.filter((model): model is ProviderModel => Boolean(model));
 }
 
-function normalizeCloudCatalogModels(payload: OllamaTagResponse): ProviderModel[] {
+async function normalizeLocalModelsAsync(payload: OllamaTagResponse, showCache: OllamaShowCache): Promise<ProviderModel[]> {
+	const enriched = await Promise.all((payload.models || []).map((entry) => enrichTagModel(entry, showCache)));
+	return enriched.map(buildDiscoveredModel).filter((model): model is ProviderModel => Boolean(model));
+}
+
+function normalizeCloudCatalogModels(payload: OllamaTagResponse, showCache: OllamaShowCache): ProviderModel[] {
 	return (payload.models || [])
 		.map((entry) => {
 			const remoteId = String(entry.model || entry.name || "").trim();
 			if (!remoteId) return null;
-			return buildDiscoveredModel({
+			const cloudEntry: OllamaTagModel = {
 				...entry,
 				name: buildCloudProxyId(remoteId),
 				model: buildCloudProxyId(remoteId),
 				remote_model: remoteId,
 				remote_host: OLLAMA_CLOUD_HOST,
-			});
+			};
+			return buildDiscoveredModel(enrichTagModelSync(cloudEntry, showCache));
 		})
 		.filter((model): model is ProviderModel => Boolean(model));
+}
+
+async function normalizeCloudCatalogModelsAsync(payload: OllamaTagResponse, showCache: OllamaShowCache): Promise<ProviderModel[]> {
+	const enriched = await Promise.all(
+		(payload.models || []).map(async (entry) => {
+			const remoteId = String(entry.model || entry.name || "").trim();
+			if (!remoteId) return null;
+			const cloudEntry: OllamaTagModel = {
+				...entry,
+				name: buildCloudProxyId(remoteId),
+				model: buildCloudProxyId(remoteId),
+				remote_model: remoteId,
+				remote_host: OLLAMA_CLOUD_HOST,
+			};
+			return enrichTagModel(cloudEntry, showCache);
+		}),
+	);
+	return enriched.map((entry) => (entry ? buildDiscoveredModel(entry) : null)).filter((model): model is ProviderModel => Boolean(model));
 }
 
 function mergeDiscoveredModels(localModels: ProviderModel[], cloudModels: ProviderModel[]): ProviderModel[] {
@@ -333,30 +471,33 @@ function loadTagCatalogSync(url: string, headerArgs: string[]): OllamaTagRespons
 }
 
 function loadInitialModels(): ProviderModel[] {
+	const showCache = readShowMetadataCache();
 	const localPayload = loadTagCatalogSync(getCatalogUrl(OLLAMA_HOST), getCurlHeaderArgs());
-	const localModels = localPayload ? normalizeLocalModels(localPayload) : [];
+	const localModels = localPayload ? normalizeLocalModels(localPayload, showCache) : [];
 
 	const cloudPayload = OLLAMA_DISABLE_CLOUD_DISCOVERY
 		? null
 		: loadTagCatalogSync(getCatalogUrl(OLLAMA_CLOUD_HOST), getCurlHeaderArgs(OLLAMA_API_KEY));
-	const cloudModels = cloudPayload ? normalizeCloudCatalogModels(cloudPayload) : [];
+	const cloudModels = cloudPayload ? normalizeCloudCatalogModels(cloudPayload, showCache) : [];
 
 	const models = mergeDiscoveredModels(localModels, cloudModels);
 	return models.length > 0 ? models : STATIC_MODELS;
 }
 
 async function fetchOllamaModels(): Promise<ProviderModel[]> {
+	const showCache = readShowMetadataCache();
 	const localPayload = await fetchTagCatalog(getCatalogUrl(OLLAMA_HOST), getCatalogHeaders());
-	const localModels = normalizeLocalModels(localPayload);
+	const localModels = await normalizeLocalModelsAsync(localPayload, showCache);
 
 	let cloudModels: ProviderModel[] = [];
 	if (!OLLAMA_DISABLE_CLOUD_DISCOVERY) {
 		try {
 			const cloudPayload = await fetchTagCatalog(getCatalogUrl(OLLAMA_CLOUD_HOST), getCatalogHeaders(OLLAMA_API_KEY));
-			cloudModels = normalizeCloudCatalogModels(cloudPayload);
+			cloudModels = await normalizeCloudCatalogModelsAsync(cloudPayload, showCache);
 		} catch {}
 	}
 
+	writeShowMetadataCache(showCache);
 	const models = mergeDiscoveredModels(localModels, cloudModels);
 	return models.length > 0 ? models : STATIC_MODELS;
 }
