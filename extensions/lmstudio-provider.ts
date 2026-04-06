@@ -22,14 +22,17 @@ const LMSTUDIO_PROVIDER = "lmstudio";
 const DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_COMPAT = {
+	supportsStore: false,
 	supportsDeveloperRole: false,
 	supportsReasoningEffort: false,
 	supportsUsageInStreaming: false,
+	supportsStrictMode: false,
 	maxTokensField: "max_tokens",
 };
 const DUMMY_API_KEY = "lm-studio";
 const CACHE_DIR = join(process.env.HOME || "", ".pi", "agent", "cache");
 const CACHE_PATH = join(CACHE_DIR, "lmstudio-models.json");
+const TOOL_CALL_TEMPERATURE = 0.2;
 
 type LMStudioModelsResponse = {
 	data?: LMStudioModelEntry[];
@@ -165,6 +168,23 @@ function createProviderConfig(baseUrl: string, models: ProviderModel[]) {
 	};
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function shouldTuneToolPayload(modelId: string, payload: Record<string, unknown>): boolean {
+	if (!Array.isArray(payload.tools) || payload.tools.length === 0) return false;
+	return /gemma-4/i.test(modelId);
+}
+
+function tuneToolPayload(payload: Record<string, unknown>): Record<string, unknown> {
+	const nextPayload: Record<string, unknown> = { ...payload };
+	if (nextPayload.temperature === undefined) {
+		nextPayload.temperature = TOOL_CALL_TEMPERATURE;
+	}
+	return nextPayload;
+}
+
 function buildDiscoveredModel(entry: LMStudioModelEntry): ProviderModel | null {
 	const id = String(entry.id || "").trim();
 	if (!id || isEmbeddingModel(entry)) return null;
@@ -273,6 +293,13 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await runSync(ctx, false);
 		} catch {}
+	});
+
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.model?.provider !== LMSTUDIO_PROVIDER) return;
+		if (!isRecord(event.payload)) return;
+		if (!shouldTuneToolPayload(ctx.model.id, event.payload)) return;
+		return tuneToolPayload(event.payload);
 	});
 
 	const refreshHandler = async (_args: unknown, ctx: ExtensionContext) => {
