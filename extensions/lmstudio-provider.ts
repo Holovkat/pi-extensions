@@ -287,9 +287,4 @@ export default function (pi: ExtensionAPI) {
 		description: "Refresh LM Studio models from the live /v1/models catalog",
 		handler: refreshHandler,
 	});
-
-	pi.registerCommand("lm-studio-refresh-models", {
-		description: "Refresh LM Studio models from the live /v1/models catalog",
-		handler: refreshHandler,
-	});
 }
