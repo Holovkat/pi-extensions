@@ -27,6 +27,7 @@ const DEFAULT_COMPAT = {
 	supportsUsageInStreaming: false,
 	maxTokensField: "max_tokens",
 };
+const DUMMY_API_KEY = "lm-studio";
 const CACHE_DIR = join(process.env.HOME || "", ".pi", "agent", "cache");
 const CACHE_PATH = join(CACHE_DIR, "lmstudio-models.json");
 
@@ -73,8 +74,24 @@ function resolveBaseUrl(): string {
 	}
 }
 
+function getExplicitApiKey(): string {
+	return process.env.LMSTUDIO_API_KEY || process.env.LM_STUDIO_API_KEY || "";
+}
+
 function getApiKey(): string {
-	return process.env.LMSTUDIO_API_KEY || process.env.LM_STUDIO_API_KEY || "lm-studio";
+	return getExplicitApiKey() || DUMMY_API_KEY;
+}
+
+function getDiscoveryHeaders(): Record<string, string> {
+	const apiKey = getExplicitApiKey();
+	return apiKey
+		? {
+				Accept: "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			}
+		: {
+				Accept: "application/json",
+			};
 }
 
 function getModelsUrl(baseUrl: string): string {
@@ -197,11 +214,16 @@ function normalizeDiscoveredModels(payload: LMStudioModelsResponse): ProviderMod
 
 function loadInitialModels(baseUrl: string): ProviderModel[] {
 	try {
-		const stdout = execFileSync(
-			"curl",
-			["-fsSL", getModelsUrl(baseUrl), "-H", "Accept: application/json", "-H", `Authorization: Bearer ${getApiKey()}`],
-			{ encoding: "utf8", timeout: 1500 },
-		);
+		const curlArgs = ["-fsSL", getModelsUrl(baseUrl), "-H", "Accept: application/json"];
+		const explicitApiKey = getExplicitApiKey();
+		if (explicitApiKey) {
+			curlArgs.push("-H", `Authorization: Bearer ${explicitApiKey}`);
+		}
+		const stdout = execFileSync("curl", curlArgs, {
+			encoding: "utf8",
+			timeout: 1500,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
 		const models = normalizeDiscoveredModels(JSON.parse(stdout) as LMStudioModelsResponse);
 		writeCachedModels(models);
 		return models;
@@ -213,10 +235,7 @@ function loadInitialModels(baseUrl: string): ProviderModel[] {
 async function fetchLMStudioModels(baseUrl: string): Promise<ProviderModel[]> {
 	const modelsUrl = getModelsUrl(baseUrl);
 	const response = await fetch(modelsUrl, {
-		headers: {
-			Accept: "application/json",
-			Authorization: `Bearer ${getApiKey()}`,
-		},
+		headers: getDiscoveryHeaders(),
 	});
 	if (!response.ok) {
 		throw new Error(`LM Studio model catalog request failed: ${response.status} ${await response.text()}`);
