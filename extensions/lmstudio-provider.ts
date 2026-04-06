@@ -14,6 +14,7 @@
  */
 
 import { execFileSync } from "child_process";
+import { createHash } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -32,7 +33,21 @@ const DEFAULT_COMPAT = {
 const DUMMY_API_KEY = "lm-studio";
 const CACHE_DIR = join(process.env.HOME || "", ".pi", "agent", "cache");
 const CACHE_PATH = join(CACHE_DIR, "lmstudio-models.json");
-const TOOL_CALL_TEMPERATURE = 0.2;
+const TOOL_CALL_TEMPERATURE = 0;
+const RECENT_TOOL_CALL_TTL_MS = 8_000;
+const RECENT_WRITE_TTL_MS = 30_000;
+const GEMMA4_TOOL_PROMPT_MARKER = "LM Studio Gemma 4 tool-use rules:";
+const GEMMA4_TOOL_PROMPT = `${GEMMA4_TOOL_PROMPT_MARKER}
+- If a tool is needed, emit a real tool call instead of describing the action in normal text.
+- Call at most one tool per assistant turn, then stop and wait for the tool result.
+- Never repeat the same tool call unless the previous attempt failed.
+- Prefer write/edit/read over bash for normal file creation, modification, and verification.
+- Do not include commentary inside bash commands.
+- After writing a file, do not run ls/cat checks unless the user explicitly asked for them.`;
+
+const recentToolCalls = new Map<string, number>();
+const pendingWritePaths = new Map<string, string>();
+const recentWritePaths = new Map<string, number>();
 
 type LMStudioModelsResponse = {
 	data?: LMStudioModelEntry[];
@@ -172,9 +187,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
 
+function isGemma4Model(modelId: string): boolean {
+	return /gemma-4/i.test(modelId);
+}
+
 function shouldTuneToolPayload(modelId: string, payload: Record<string, unknown>): boolean {
 	if (!Array.isArray(payload.tools) || payload.tools.length === 0) return false;
-	return /gemma-4/i.test(modelId);
+	return isGemma4Model(modelId);
 }
 
 function tuneToolPayload(payload: Record<string, unknown>): Record<string, unknown> {
@@ -183,6 +202,48 @@ function tuneToolPayload(payload: Record<string, unknown>): Record<string, unkno
 		nextPayload.temperature = TOOL_CALL_TEMPERATURE;
 	}
 	return nextPayload;
+}
+
+function appendGemma4ToolPrompt(systemPrompt: string): string {
+	if (systemPrompt.includes(GEMMA4_TOOL_PROMPT_MARKER)) return systemPrompt;
+	return `${systemPrompt.trim()}\n\n${GEMMA4_TOOL_PROMPT}`.trim();
+}
+
+function pruneTimedMap(map: Map<string, number>, ttlMs: number, now: number): void {
+	for (const [key, timestamp] of map) {
+		if (now - timestamp > ttlMs) {
+			map.delete(key);
+		}
+	}
+}
+
+function hashValue(value: unknown): string {
+	return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function buildToolCallFingerprint(cwd: string, modelId: string, toolName: string, input: unknown): string {
+	return `${cwd}\u0000${modelId}\u0000${toolName}\u0000${hashValue(input)}`;
+}
+
+function normalizeBashCommand(command: string): string {
+	return command
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("#"))
+		.join("\n")
+		.trim();
+}
+
+function normalizeTrackedPath(cwd: string, path: string): string {
+	return `${cwd}:${path.trim()}`;
+}
+
+function extractRedundantWriteCheckPath(command: string): string | null {
+	const catMatch = command.match(/^cat\s+(.+)$/);
+	if (catMatch) return catMatch[1].trim().replace(/^['"]|['"]$/g, "");
+	const lsMatch = command.match(/^ls\s+-l\s+(.+)$/);
+	if (lsMatch) return lsMatch[1].trim().replace(/^['"]|['"]$/g, "");
+	return null;
 }
 
 function buildDiscoveredModel(entry: LMStudioModelEntry): ProviderModel | null {
@@ -295,11 +356,68 @@ export default function (pi: ExtensionAPI) {
 		} catch {}
 	});
 
+	pi.on("before_agent_start", (event, ctx) => {
+		if (ctx.model?.provider !== LMSTUDIO_PROVIDER) return;
+		if (!isGemma4Model(ctx.model.id)) return;
+		return {
+			systemPrompt: appendGemma4ToolPrompt(event.systemPrompt),
+		};
+	});
+
 	pi.on("before_provider_request", (event, ctx) => {
 		if (ctx.model?.provider !== LMSTUDIO_PROVIDER) return;
 		if (!isRecord(event.payload)) return;
 		if (!shouldTuneToolPayload(ctx.model.id, event.payload)) return;
 		return tuneToolPayload(event.payload);
+	});
+
+	pi.on("tool_call", (event, ctx) => {
+		if (ctx.model?.provider !== LMSTUDIO_PROVIDER) return;
+		if (!isGemma4Model(ctx.model.id)) return;
+
+		const now = Date.now();
+		pruneTimedMap(recentToolCalls, RECENT_TOOL_CALL_TTL_MS, now);
+		pruneTimedMap(recentWritePaths, RECENT_WRITE_TTL_MS, now);
+
+		if (event.toolName === "bash" && typeof event.input.command === "string") {
+			const normalized = normalizeBashCommand(event.input.command);
+			if (!normalized) {
+				return { block: true, reason: "Blocked empty/comment-only bash command for LM Studio Gemma 4." };
+			}
+			event.input.command = normalized;
+			const recentWritePath = extractRedundantWriteCheckPath(normalized);
+			if (recentWritePath) {
+				const writeTimestamp = recentWritePaths.get(normalizeTrackedPath(ctx.cwd, recentWritePath));
+				if (writeTimestamp && now - writeTimestamp <= RECENT_WRITE_TTL_MS) {
+					return {
+						block: true,
+						reason: "Blocked redundant bash file check after write. Use read only if verification is still needed.",
+					};
+				}
+			}
+		}
+
+		const fingerprint = buildToolCallFingerprint(ctx.cwd, ctx.model.id, event.toolName, event.input);
+		const previous = recentToolCalls.get(fingerprint);
+		if (previous && now - previous <= RECENT_TOOL_CALL_TTL_MS) {
+			return {
+				block: true,
+				reason: `Blocked duplicate ${event.toolName} call for LM Studio Gemma 4. Wait for the prior result before retrying.`,
+			};
+		}
+		recentToolCalls.set(fingerprint, now);
+
+		if (event.toolName === "write" && typeof event.input.path === "string") {
+			pendingWritePaths.set(event.toolCallId, normalizeTrackedPath(ctx.cwd, event.input.path));
+		}
+	});
+
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "write") return;
+		const trackedPath = pendingWritePaths.get(event.toolCallId);
+		pendingWritePaths.delete(event.toolCallId);
+		if (!trackedPath || event.isError) return;
+		recentWritePaths.set(trackedPath, Date.now());
 	});
 
 	const refreshHandler = async (_args: unknown, ctx: ExtensionContext) => {
