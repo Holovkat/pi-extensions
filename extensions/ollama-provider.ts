@@ -8,10 +8,15 @@
  * - /ollama-refresh-models — reload installed Ollama models from /api/tags
  */
 
+import { execFileSync } from "child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 const OLLAMA_PROVIDER = "ollama";
 const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://localhost:11434";
+const OLLAMA_CLOUD_HOST = process.env.OLLAMA_CLOUD_HOST || "https://ollama.com";
+const OLLAMA_API_KEY = process.env.OLLAMA_API_KEY || "";
+const OLLAMA_DISABLE_CLOUD_DISCOVERY = /^(1|true|yes)$/i.test(process.env.OLLAMA_DISABLE_CLOUD_DISCOVERY || "");
+const OLLAMA_CATALOG_TIMEOUT_MS = Number(process.env.OLLAMA_CATALOG_TIMEOUT_MS || 1500);
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const DEFAULT_COMPAT = {
 	supportsDeveloperRole: false,
@@ -26,8 +31,8 @@ type OllamaTagResponse = {
 type OllamaTagModel = {
 	name?: string;
 	model?: string;
-	remote_model?: string;
-	remote_host?: string;
+	remote_model?: string | null;
+	remote_host?: string | null;
 	details?: {
 		family?: string;
 		families?: string[] | null;
@@ -195,6 +200,7 @@ function inferContextWindow(id: string): number {
 	const lower = id.toLowerCase();
 	if (lower.includes("minimax-m2.5")) return 1_000_000;
 	if (lower.includes("glm-5")) return 200_000;
+	if (lower.includes("gemma4:31b")) return 262_144;
 	return 131_072;
 }
 
@@ -214,6 +220,40 @@ function createProviderConfig(models: ProviderModel[]) {
 	};
 }
 
+function getCatalogUrl(baseUrl: string): string {
+	return new URL("/api/tags", baseUrl).toString();
+}
+
+function getCatalogHeaders(apiKey?: string): Record<string, string> {
+	return apiKey
+		? {
+				Accept: "application/json",
+				Authorization: `Bearer ${apiKey}`,
+			}
+		: {
+				Accept: "application/json",
+			};
+}
+
+function getCurlHeaderArgs(apiKey?: string): string[] {
+	const args = ["-H", "Accept: application/json"];
+	if (apiKey) {
+		args.push("-H", `Authorization: Bearer ${apiKey}`);
+	}
+	return args;
+}
+
+function buildCloudProxyId(modelId: string): string {
+	const trimmed = modelId.trim();
+	if (!trimmed) return trimmed;
+	if (trimmed.endsWith(":cloud") || trimmed.endsWith("-cloud")) return trimmed;
+	const colonIndex = trimmed.lastIndexOf(":");
+	if (colonIndex === -1) return `${trimmed}:cloud`;
+	const base = trimmed.slice(0, colonIndex);
+	const tag = trimmed.slice(colonIndex + 1);
+	return `${base}:${tag}-cloud`;
+}
+
 function buildDiscoveredModel(entry: OllamaTagModel): ProviderModel | null {
 	const id = String(entry.model || entry.name || "").trim();
 	if (!id || isEmbeddingModel(entry)) return null;
@@ -229,29 +269,96 @@ function buildDiscoveredModel(entry: OllamaTagModel): ProviderModel | null {
 	};
 }
 
-async function fetchOllamaModels(): Promise<ProviderModel[]> {
-	const response = await fetch(new URL("/api/tags", OLLAMA_HOST), {
-		headers: { Accept: "application/json" },
+function normalizeLocalModels(payload: OllamaTagResponse): ProviderModel[] {
+	return (payload.models || [])
+		.map(buildDiscoveredModel)
+		.filter((model): model is ProviderModel => Boolean(model));
+}
+
+function normalizeCloudCatalogModels(payload: OllamaTagResponse): ProviderModel[] {
+	return (payload.models || [])
+		.map((entry) => {
+			const remoteId = String(entry.model || entry.name || "").trim();
+			if (!remoteId) return null;
+			return buildDiscoveredModel({
+				...entry,
+				name: buildCloudProxyId(remoteId),
+				model: buildCloudProxyId(remoteId),
+				remote_model: remoteId,
+				remote_host: OLLAMA_CLOUD_HOST,
+			});
+		})
+		.filter((model): model is ProviderModel => Boolean(model));
+}
+
+function mergeDiscoveredModels(localModels: ProviderModel[], cloudModels: ProviderModel[]): ProviderModel[] {
+	const byId = new Map<string, ProviderModel>();
+	for (const model of cloudModels) byId.set(model.id, model);
+	for (const model of localModels) byId.set(model.id, model);
+	for (const staticModel of STATIC_MODELS) {
+		if (byId.has(staticModel.id)) {
+			const discoveredModel = byId.get(staticModel.id)!;
+			byId.set(staticModel.id, {
+				...discoveredModel,
+				name: staticModel.name,
+				contextWindow: staticModel.contextWindow,
+				maxTokens: staticModel.maxTokens,
+			});
+		}
+	}
+	return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+}
+
+async function fetchTagCatalog(url: string, headers: Record<string, string>): Promise<OllamaTagResponse> {
+	const response = await fetch(url, {
+		headers,
 	});
 	if (!response.ok) {
 		throw new Error(`Ollama model catalog request failed: ${response.status} ${await response.text()}`);
 	}
+	return (await response.json()) as OllamaTagResponse;
+}
 
-	const payload = (await response.json()) as OllamaTagResponse;
-	const discovered = (payload.models || [])
-		.map(buildDiscoveredModel)
-		.filter((model): model is ProviderModel => Boolean(model));
+function loadTagCatalogSync(url: string, headerArgs: string[]): OllamaTagResponse | null {
+	try {
+		const stdout = execFileSync("curl", ["-fsSL", url, ...headerArgs], {
+			encoding: "utf8",
+			timeout: OLLAMA_CATALOG_TIMEOUT_MS,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return JSON.parse(stdout) as OllamaTagResponse;
+	} catch {
+		return null;
+	}
+}
 
-	const byId = new Map<string, ProviderModel>();
-	for (const model of discovered) byId.set(model.id, model);
-	for (const staticModel of STATIC_MODELS) {
-		if (byId.has(staticModel.id)) {
-			const discoveredModel = byId.get(staticModel.id)!;
-			byId.set(staticModel.id, { ...discoveredModel, name: staticModel.name, contextWindow: staticModel.contextWindow, maxTokens: staticModel.maxTokens });
-		}
+function loadInitialModels(): ProviderModel[] {
+	const localPayload = loadTagCatalogSync(getCatalogUrl(OLLAMA_HOST), getCurlHeaderArgs());
+	const localModels = localPayload ? normalizeLocalModels(localPayload) : [];
+
+	const cloudPayload = OLLAMA_DISABLE_CLOUD_DISCOVERY
+		? null
+		: loadTagCatalogSync(getCatalogUrl(OLLAMA_CLOUD_HOST), getCurlHeaderArgs(OLLAMA_API_KEY));
+	const cloudModels = cloudPayload ? normalizeCloudCatalogModels(cloudPayload) : [];
+
+	const models = mergeDiscoveredModels(localModels, cloudModels);
+	return models.length > 0 ? models : STATIC_MODELS;
+}
+
+async function fetchOllamaModels(): Promise<ProviderModel[]> {
+	const localPayload = await fetchTagCatalog(getCatalogUrl(OLLAMA_HOST), getCatalogHeaders());
+	const localModels = normalizeLocalModels(localPayload);
+
+	let cloudModels: ProviderModel[] = [];
+	if (!OLLAMA_DISABLE_CLOUD_DISCOVERY) {
+		try {
+			const cloudPayload = await fetchTagCatalog(getCatalogUrl(OLLAMA_CLOUD_HOST), getCatalogHeaders(OLLAMA_API_KEY));
+			cloudModels = normalizeCloudCatalogModels(cloudPayload);
+		} catch {}
 	}
 
-	return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id));
+	const models = mergeDiscoveredModels(localModels, cloudModels);
+	return models.length > 0 ? models : STATIC_MODELS;
 }
 
 async function syncOllamaModels(pi: ExtensionAPI, ctx: ExtensionContext, notify = false) {
@@ -263,7 +370,7 @@ async function syncOllamaModels(pi: ExtensionAPI, ctx: ExtensionContext, notify 
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerProvider(OLLAMA_PROVIDER, createProviderConfig(STATIC_MODELS));
+	pi.registerProvider(OLLAMA_PROVIDER, createProviderConfig(loadInitialModels()));
 
 	let syncPromise: Promise<void> | null = null;
 	const runSync = async (ctx: ExtensionContext, notify = false) => {
