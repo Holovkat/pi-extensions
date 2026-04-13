@@ -115,6 +115,7 @@ Each agent subprocess:
 - `req-qa` and `dev-pipeline` remain the baseline discovery and delivery workflow extensions.
 - `pi-blueprint.ts` is the current GitHub-backed planning cockpit, with transcript search, alignment checks, issue rebuilds, asset sync, and a dedicated web mirror.
 - `pi-toolshed.ts` is the current card/workspace shell, with frontier packets, workspace presets, quick actions, and blueprint-aware web surfaces.
+- `paraffine.ts` is a dormant-by-default knowledge-maintenance bridge for the PARA workspace; load it explicitly with `-e` when you want Pi to call the PARAFFINE CLI against AFFiNE.
 - Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprint/`; use `/blueprint-sync-assets` to mirror them into a project-local `.pi` runtime.
 
 ---
@@ -882,6 +883,8 @@ Key commands:
 | ----------------- | --------------------------------------------------------------------------------------------- |
 | `themeMap.ts`     | Maps each extension to a default theme. Called on session start to auto-apply visual styling. |
 | `theme-cycler.ts` | Registers `/theme` command for cycling between installed themes at runtime.                   |
+| `ollama-provider.ts` | Registers local and cloud-proxied Ollama models for Pi sessions.                           |
+| `paraffine.ts`    | Bridges Pi commands to the PARAFFINE AFFiNE CLI for retrieval, cycle runs, and review queues. |
 
 ---
 
@@ -1037,6 +1040,30 @@ brew install glow
 | `/toolshed-freeze`       | Freeze the active frontier into a packet |
 | `/toolshed-packets`      | Inspect the packet queue                 |
 | `/toolshed-reset-layout` | Reset card collapse state                |
+
+### paraffine Commands
+
+Recommended launch:
+
+```bash
+pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:e2b
+```
+
+| Command                 | Description                                                            |
+| ----------------------- | ---------------------------------------------------------------------- |
+| `/paraffine-status`     | Show current model, resolved PARAFFINE CLI path, and launch contract   |
+| `/paraffine-retrieve`   | Query curated PARAFFINE knowledge through the AFFiNE-backed CLI        |
+| `/paraffine-cycle`      | Run one scoped curation and review cycle                               |
+| `/paraffine-review`     | Run the PARAFFINE review queue directly                                |
+| `/paraffine-contract`   | Show the pack-aware and quarantine-aware PARAFFINE operator brief      |
+
+Notes:
+
+- The extension is dormant unless Pi is launched with `-e extensions/paraffine.ts`.
+- It prefers the local Ollama model `ollama/gemma4:e2b`.
+- Its operator brief explicitly tells Pi to preserve knowledge-pack structure and use `Inbox/Quarantine` for ambiguous notes instead of flattening them.
+- It resolves the PARAFFINE CLI from `PARAFFINE_CLI_PATH`, `PARAFFINE_ROOT`, the current workspace, or the stable PARA repo path at `/Users/tonyholovka/workspace/PARA/scripts/paraffine-affine-inbox.js`.
+- For cron or any non-interactive launcher, set `PARAFFINE_ROOT` or `PARAFFINE_CLI_PATH` explicitly rather than relying on cwd discovery.
 
 ---
 

@@ -35,6 +35,7 @@ export const THEME_MAP: Record<string, string> = {
 	"theme-cycler":       "synthwave",        // neon, it's a theme tool
 	"tilldone":           "everforest",       // task-focused calm
 	"dev-pipeline":       "midnight-ocean",   // deep development flow
+	"paraffine":          "everforest",       // calm knowledge maintenance
 	"req-qa":             "rose-pine",        // warm discovery, exploration
 	"tool-counter":       "synthwave",        // techy metrics
 	"tool-counter-widget":"synthwave",        // same family
