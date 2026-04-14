@@ -4,7 +4,7 @@
  * Loads only when explicitly passed via `-e`, so it remains dormant otherwise.
  *
  * Recommended launch:
- *   pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:e2b
+ *   pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:31b-cloud
  *
  * Commands:
  *   /paraffine-status
@@ -20,7 +20,7 @@ import { spawn } from "child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { applyExtensionDefaults } from "./themeMap.ts";
 
-const PREFERRED_MODEL = "ollama/gemma4:e2b";
+const PREFERRED_MODEL = "ollama/gemma4:31b-cloud";
 const DEFAULT_LIMIT = 10;
 const PARAFFINE_OPERATOR_BRIEF = `
 PARAFFINE operator brief

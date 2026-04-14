@@ -1046,7 +1046,7 @@ brew install glow
 Recommended launch:
 
 ```bash
-pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:e2b
+pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:31b-cloud
 ```
 
 | Command                 | Description                                                            |
@@ -1060,7 +1060,7 @@ pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/ge
 Notes:
 
 - The extension is dormant unless Pi is launched with `-e extensions/paraffine.ts`.
-- It prefers the local Ollama model `ollama/gemma4:e2b`.
+- It prefers the Ollama model `ollama/gemma4:31b-cloud`.
 - Its operator brief explicitly tells Pi to preserve knowledge-pack structure and use `Inbox/Quarantine` for ambiguous notes instead of flattening them.
 - It resolves the PARAFFINE CLI from `PARAFFINE_CLI_PATH`, `PARAFFINE_ROOT`, the current workspace, or the stable PARA repo path at `/Users/tonyholovka/workspace/PARA/scripts/paraffine-affine-inbox.js`.
 - For cron or any non-interactive launcher, set `PARAFFINE_ROOT` or `PARAFFINE_CLI_PATH` explicitly rather than relying on cwd discovery.
