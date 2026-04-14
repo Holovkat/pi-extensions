@@ -7,6 +7,7 @@
  *   pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:31b-cloud
  *
  * Commands:
+ *   /paraffine <request>
  *   /paraffine-status
  *   /paraffine-retrieve <query> [--limit N] [--statuses a,b,c]
  *   /paraffine-cycle [query] [--limit N]
@@ -14,8 +15,8 @@
  *   /paraffine-contract
  */
 
-import { existsSync } from "fs";
-import { dirname, join } from "path";
+import { existsSync, readFileSync } from "fs";
+import { basename, dirname, join } from "path";
 import { spawn } from "child_process";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { applyExtensionDefaults } from "./themeMap.ts";
@@ -38,6 +39,12 @@ PARAFFINE operator brief
 type RunnerSpec = {
 	root: string;
 	scriptPath: string;
+};
+
+type SkillSpec = {
+	id: string;
+	sourcePath: string;
+	label: string;
 };
 
 function parseCommandArgs(input: string): { query: string; flags: Record<string, string | boolean> } {
@@ -82,6 +89,59 @@ function resolveParaffineRunner(ctx: ExtensionContext): RunnerSpec | null {
 		}
 	}
 	return null;
+}
+
+function slugify(input: string): string {
+	return String(input || "")
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, "-")
+		.replace(/^-+|-+$/g, "");
+}
+
+function resolveParaffineSkill(ctx: ExtensionContext): SkillSpec | null {
+	const cwd = ctx.cwd || process.cwd();
+	const candidates = [
+		join(cwd, ".pi", "skills", "paraffine", "SKILL.md"),
+		join(cwd, "skills", "paraffine", "SKILL.md"),
+		join("/Users/tonyholovka/workspace/PARA", ".pi", "skills", "paraffine", "SKILL.md"),
+	];
+	for (const candidate of candidates) {
+		if (existsSync(candidate)) {
+			return {
+				id: "paraffine",
+				sourcePath: candidate,
+				label: basename(dirname(candidate)) || "paraffine",
+			};
+		}
+	}
+	return null;
+}
+
+function buildSkillInvocationMessage(skill: SkillSpec, prompt?: string): string | null {
+	try {
+		const markdown = readFileSync(skill.sourcePath, "utf-8");
+		const promptText = String(prompt || "").trim();
+		return [
+			`<skill name="${slugify(skill.id)}" location="${skill.sourcePath}">`,
+			`References are relative to ${dirname(skill.sourcePath)}.`,
+			"",
+			markdown.trim(),
+			"</skill>",
+			promptText ? `\n${promptText}` : "",
+		].join("\n");
+	} catch {
+		return null;
+	}
+}
+
+function launchParaffineSkill(pi: ExtensionAPI, ctx: ExtensionContext, prompt?: string): boolean {
+	const skill = resolveParaffineSkill(ctx);
+	if (!skill) return false;
+	const message = buildSkillInvocationMessage(skill, prompt);
+	if (!message) return false;
+	pi.sendUserMessage(message);
+	if (ctx.hasUI) ctx.ui.notify(`PARAFFINE launched ${skill.label}.`, "info");
+	return true;
 }
 
 function buildArgs(
@@ -203,30 +263,50 @@ export default function paraffineExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-		pi.registerCommand("paraffine-status", {
+	pi.registerCommand("paraffine", {
+		description: "Launch the PARAFFINE assistant surface for writing, retrieval, or curation",
+		handler: async (args, ctx) => {
+			const prompt = String(args || "").trim() || [
+				"Use the PARAFFINE skill.",
+				"Interpret this request using the PARAFFINE operating model.",
+				"If the task is note-taking, write or update a working note in Inbox.",
+				"If the task is retrieval, search the PARAFFINE corpus and return the best match.",
+				"If the task is background maintenance, generate executor actions for curation.",
+			].join(" ");
+			if (!launchParaffineSkill(pi, ctx, prompt)) {
+				emitRuntimeMessage(ctx, "PARAFFINE skill not found. Ensure .pi/skills/paraffine/SKILL.md is available in the workspace.", "error");
+				return;
+			}
+			setParaffineStatus(ctx, `PARAFFINE assistant launched · ${formatModelLine(ctx)}`);
+		},
+	});
+
+	pi.registerCommand("paraffine-status", {
 		description: "Show PARAFFINE extension status, runner path, and preferred model",
 		handler: async (_args, ctx) => {
 			const runner = resolveParaffineRunner(ctx);
+			const skill = resolveParaffineSkill(ctx);
 			const lines = [
 				`Workspace: ${ctx.cwd || process.cwd()}`,
 				`Model: ${formatModelLine(ctx)}`,
 				`CLI: ${runner?.scriptPath || "not found"}`,
+				`Skill: ${skill?.sourcePath || "not found"}`,
 				`Root: ${runner?.root || "not found"}`,
 				`Launch: pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ${PREFERRED_MODEL}`,
 				"Guidance: /paraffine-contract",
 			];
-		emitRuntimeMessage(ctx, lines.join("\n"), runner ? "info" : "warning");
-		setParaffineStatus(ctx, runner ? `PARAFFINE status ok · ${formatModelLine(ctx)}` : "PARAFFINE unavailable · CLI not found");
-	},
-		});
+			emitRuntimeMessage(ctx, lines.join("\n"), runner ? "info" : "warning");
+			setParaffineStatus(ctx, runner ? `PARAFFINE status ok · ${formatModelLine(ctx)}` : "PARAFFINE unavailable · CLI not found");
+		},
+	});
 
-		pi.registerCommand("paraffine-contract", {
-			description: "Show the PARAFFINE pack-aware and quarantine-aware operator brief",
-			handler: async (_args, ctx) => {
-				emitRuntimeMessage(ctx, PARAFFINE_OPERATOR_BRIEF, "info");
-				setParaffineStatus(ctx, `PARAFFINE contract loaded · ${formatModelLine(ctx)}`);
-			},
-		});
+	pi.registerCommand("paraffine-contract", {
+		description: "Show the PARAFFINE pack-aware and quarantine-aware operator brief",
+		handler: async (_args, ctx) => {
+			emitRuntimeMessage(ctx, PARAFFINE_OPERATOR_BRIEF, "info");
+			setParaffineStatus(ctx, `PARAFFINE contract loaded · ${formatModelLine(ctx)}`);
+		},
+	});
 
 	pi.registerCommand("paraffine-retrieve", {
 		description: "Retrieve curated PARAFFINE notes: /paraffine-retrieve <query> [--limit N] [--statuses a,b,c]",

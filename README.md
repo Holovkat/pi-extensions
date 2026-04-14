@@ -1051,16 +1051,21 @@ pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/ge
 
 | Command                 | Description                                                            |
 | ----------------------- | ---------------------------------------------------------------------- |
+| `/paraffine`            | Launch the single PARAFFINE assistant surface through the repo skill   |
 | `/paraffine-status`     | Show current model, resolved PARAFFINE CLI path, and launch contract   |
-| `/paraffine-retrieve`   | Query curated PARAFFINE knowledge through the AFFiNE-backed CLI        |
-| `/paraffine-cycle`      | Run one scoped curation and review cycle                               |
-| `/paraffine-review`     | Run the PARAFFINE review queue directly                                |
 | `/paraffine-contract`   | Show the pack-aware and quarantine-aware PARAFFINE operator brief      |
+
+Legacy operational aliases remain available:
+
+- `/paraffine-retrieve`
+- `/paraffine-cycle`
+- `/paraffine-review`
 
 Notes:
 
 - The extension is dormant unless Pi is launched with `-e extensions/paraffine.ts`.
 - It prefers the Ollama model `ollama/gemma4:31b-cloud`.
+- The primary user-facing PARAFFINE surface is now `/paraffine`, which launches the repo-local PARAFFINE skill when available.
 - Its operator brief explicitly tells Pi to preserve knowledge-pack structure and use `Inbox/Quarantine` for ambiguous notes instead of flattening them.
 - It resolves the PARAFFINE CLI from `PARAFFINE_CLI_PATH`, `PARAFFINE_ROOT`, the current workspace, or the stable PARA repo path at `/Users/tonyholovka/workspace/PARA/scripts/paraffine-affine-inbox.js`.
 - For cron or any non-interactive launcher, set `PARAFFINE_ROOT` or `PARAFFINE_CLI_PATH` explicitly rather than relying on cwd discovery.
