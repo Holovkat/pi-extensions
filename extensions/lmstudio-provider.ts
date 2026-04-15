@@ -29,6 +29,17 @@ const DEFAULT_COMPAT = {
 	supportsStrictMode: false,
 	maxTokensField: "max_tokens",
 };
+
+function detectCompat(entry: LMStudioModelEntry) {
+	const haystack = [entry.id, entry.object, entry.type, entry.architecture?.type]
+		.filter(Boolean)
+		.join(" ")
+		.toLowerCase();
+	if (/qwen/.test(haystack)) {
+		return { ...DEFAULT_COMPAT, supportsReasoningEffort: true, thinkingFormat: "qwen" };
+	}
+	return { ...DEFAULT_COMPAT };
+}
 const DUMMY_API_KEY = "lm-studio";
 const CACHE_DIR = join(process.env.HOME || "", ".pi", "agent", "cache");
 const CACHE_PATH = join(CACHE_DIR, "lmstudio-models.json");
@@ -180,7 +191,7 @@ function buildDiscoveredModel(entry: LMStudioModelEntry): ProviderModel | null {
 		cost: { ...ZERO_COST },
 		contextWindow,
 		maxTokens: inferMaxTokens(contextWindow),
-		compat: { ...DEFAULT_COMPAT },
+		compat: detectCompat(entry) as typeof DEFAULT_COMPAT,
 	};
 }
 
@@ -256,6 +267,11 @@ async function syncLMStudioModels(pi: ExtensionAPI, ctx: ExtensionContext, notif
 		ctx.ui.notify(`Loaded ${models.length} LM Studio models`, "success");
 	}
 }
+
+export const __test = {
+	detectCompat,
+	buildDiscoveredModel,
+};
 
 export default function (pi: ExtensionAPI) {
 	const baseUrl = resolveBaseUrl();

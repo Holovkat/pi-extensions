@@ -354,21 +354,25 @@ function buildBridgePrompt(model: Model<Api>, context: Context): string {
 }
 
 function mapReasoning(model: Model<Api>, reasoning?: string): string | undefined {
-	if (!reasoning || !model.reasoning) {
+	if (!model.reasoning) {
+		return undefined;
+	}
+	if (!reasoning) {
 		return undefined;
 	}
 
-	const isOpenAiStyle = model.id.startsWith("gpt-") || model.id.includes("codex") || model.id.startsWith("glm-") || model.id.startsWith("kimi-");
+	const id = model.id.toLowerCase();
+	const isOpenAiStyle = id.startsWith("gpt-") || id.includes("codex") || id.startsWith("glm-") || id.startsWith("kimi-");
+	const isGemma4 = /(^|[-_])gemma[-_]?4([-.]|$)|\bgemma(?:\s*|[-_]?)(?:4|four)\b/i.test(id);
 
 	switch (reasoning) {
 		case "off":
 			return isOpenAiStyle ? "none" : "off";
 		case "minimal":
-			return "low";
 		case "low":
 			return "low";
 		case "medium":
-			return "medium";
+			return isGemma4 ? "medium" : "medium";
 		case "high":
 		case "xhigh":
 			return "high";

@@ -6282,54 +6282,48 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		applyExtensionDefaults(import.meta.url, ctx);
+	async function initializeToolshedSession(ctx: ExtensionContext, options?: { showIntro?: boolean; ensureServer?: boolean; verifyTrackedApps?: boolean }) {
 		restoreToolshedSession(ctx);
 		toolshedWebUrl = `http://127.0.0.1:${TOOLSHED_WEB_PORT}`;
 		await refreshSessionCatalog(ctx);
 		projectCards = loadProjectCards(ctx.cwd);
 		if (listAllCards().length === 0) seedMermaidCard(true);
-		ensureToolshedWebServer(ctx);
+		if (options?.ensureServer) ensureToolshedWebServer(ctx);
 		startTranscriptWatch(ctx);
-		scheduleTrackedMcpAppVerification(ctx, 300);
+		if (options?.verifyTrackedApps) scheduleTrackedMcpAppVerification(ctx, 300);
 		updateWidget();
 
-		ctx.ui.notify(
-			[
-				"Pi Toolshed — lane-first web workspace",
-				"",
-				"Commands:",
-				"  /toolshed-web          Open the web workspace",
-				"  /toolshed-status       Show current Toolshed state",
-				"  /toolshed-connections  Show the live PI connection roster",
-				"  /toolshed-app          Plan, build, enhance, or debug an MCP app or widget",
-				"  /toolshed-workspace    Switch card decks",
-				"  /toolshed-freeze       Freeze the current frontier into a packet",
-				"  /toolshed-packets      Inspect the packet queue",
-				"  /toolshed-reset-layout Reset card collapse state",
-				"  Built-ins: Component Builder, Pi Blueprint, Mermaid Diagrammer seed",
-				"  /mcp                   Inspect configured MCP servers and tools",
-			].join("\n"),
-			"info",
-		);
-	});
+		if (options?.showIntro) {
+			ctx.ui.notify(
+				[
+					"Pi Toolshed — lane-first web workspace",
+					"",
+					"Commands:",
+					"  /toolshed-web          Open the web workspace",
+					"  /toolshed-status       Show current Toolshed state",
+					"  /toolshed-connections  Show the live PI connection roster",
+					"  /toolshed-app          Plan, build, enhance, or debug an MCP app or widget",
+					"  /toolshed-workspace    Switch card decks",
+					"  /toolshed-freeze       Freeze the current frontier into a packet",
+					"  /toolshed-packets      Inspect the packet queue",
+					"  /toolshed-reset-layout Reset card collapse state",
+					"  Built-ins: Component Builder, Pi Blueprint, Mermaid Diagrammer seed",
+					"  /mcp                   Inspect configured MCP servers and tools",
+				].join("\n"),
+				"info",
+			);
+		}
+	}
 
-	pi.on("session_switch", async (_event, ctx) => {
-		restoreToolshedSession(ctx);
-		await refreshSessionCatalog(ctx);
-		projectCards = loadProjectCards(ctx.cwd);
-		if (listAllCards().length === 0) seedMermaidCard(true);
-		startTranscriptWatch(ctx);
-		updateWidget();
-	});
-
-	pi.on("session_fork", async (_event, ctx) => {
-		restoreToolshedSession(ctx);
-		await refreshSessionCatalog(ctx);
-		projectCards = loadProjectCards(ctx.cwd);
-		if (listAllCards().length === 0) seedMermaidCard(true);
-		startTranscriptWatch(ctx);
-		updateWidget();
+	pi.on("session_start", async (event, ctx) => {
+		applyExtensionDefaults(import.meta.url, ctx);
+		const reason = String(event?.reason || "startup");
+		const isInitialStart = reason === "startup" || reason === "reload";
+		await initializeToolshedSession(ctx, {
+			showIntro: isInitialStart,
+			ensureServer: isInitialStart,
+			verifyTrackedApps: isInitialStart,
+		});
 	});
 
 		pi.on("session_shutdown", async () => {

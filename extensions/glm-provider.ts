@@ -19,14 +19,14 @@ export default function (pi: ExtensionAPI) {
 			{
 				id: "glm-5",
 				name: "GLM-5",
-				reasoning: false,
+				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 200000,
 				maxTokens: 131072,
 				compat: {
 					supportsDeveloperRole: false,
-					supportsReasoningEffort: false,
+					supportsReasoningEffort: true,
 					maxTokensField: "max_tokens",
 				},
 			},

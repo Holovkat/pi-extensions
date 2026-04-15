@@ -304,20 +304,22 @@ export default function (pi: ExtensionAPI) {
 			{
 				id: "qwen3-coder-plus",
 				name: "Qwen3 Coder Plus",
-				reasoning: false,
+				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 1000000,
 				maxTokens: 65536,
+				compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "qwen" },
 			},
 			{
 				id: "qwen3-coder-flash",
 				name: "Qwen3 Coder Flash",
-				reasoning: false,
+				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 1000000,
 				maxTokens: 65536,
+				compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "qwen" },
 			},
 			{
 				id: "vision-model",
@@ -327,7 +329,7 @@ export default function (pi: ExtensionAPI) {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 262144,
 				maxTokens: 32768,
-				compat: { supportsDeveloperRole: false, thinkingFormat: "qwen" },
+				compat: { supportsDeveloperRole: false, supportsReasoningEffort: true, thinkingFormat: "qwen" },
 			},
 		],
 

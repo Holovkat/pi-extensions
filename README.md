@@ -662,7 +662,7 @@ Press Tab to switch between Available and All. The header shows the count for ea
 → anthropic/claude-opus-4-6       Claude Opus 4.6
   anthropic/claude-sonnet-4-6     Claude Sonnet 4.6
   bailian/qwen3.5-plus            Qwen 3.5 Plus
-  google-gemini-cli/gemini-3-pro  Gemini 3 Pro Preview
+  google-gemini-cli/gemini-3-pro-preview  Gemini 3 Pro Preview
   ...
 
   Enter to select and ping · Esc to cancel
