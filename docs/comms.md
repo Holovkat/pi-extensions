@@ -14,20 +14,27 @@ Local same-machine extension:
 - `coms_await`
 - `/coms`
 
-Networked hub extension:
+Networked hub extension preferred council tools:
+
+- `council_list`
+- `council_send`
+- `council_get`
+- `council_await`
+- `/coms-net`
+
+Compatibility aliases remain available:
 
 - `coms_net_list`
 - `coms_net_send`
 - `coms_net_get`
 - `coms_net_await`
-- `/coms-net`
 
 ## Discovery-first usage
 
-Agents should list peers before the first send in a task:
+Agents should list peers/council members before the first send in a task:
 
 - local `coms`: call `coms_list`, then use the exact returned name in `coms_send.target`
-- networked `coms-net`: call `coms_net_list`, then use the exact returned name in `coms_net_send.target`
+- networked council: call `council_list`, review each member's purpose/tags/capabilities/status/context, choose who can answer the question or complete the task, then use the exact returned name in `council_send.target`
 
 Do not guess casual aliases, and do not use `msg_id`, thread/conversation names, model names, or display labels as targets. Once a fresh list is visible in the conversation, follow-up sends can reuse those exact peer names.
 
@@ -71,8 +78,10 @@ PI_COMS_NET_PROJECT=comms-net-uat PI_COMS_NET_PORT=48201 bun scripts/coms-net-se
 In net-alice:
 
 ```text
-Use coms_net_list. Then use coms_net_send to send net-bob: "Reply exactly NET-PONG". Await the returned msg_id with coms_net_await.
+Use council_list to inspect the council members. Then use council_send to ask net-bob: "Reply exactly NET-PONG".
 ```
+
+Normal council sends are async; use `synchronous=true` and `council_await` only when the user explicitly wants a blocking/chained answer.
 
 ## Mediator/orchestrator workflow
 
@@ -85,7 +94,7 @@ pi --no-extensions -e ./extensions/coms-net.ts --name orchestrator --project com
 Prompt the orchestrator:
 
 ```text
-Use coms_net_list to find alice and bob. Send alice a planning question and bob an implementation-risk question. Await both msg_ids, then synthesize the result.
+Use council_list to inspect the council members. Pick the best members by purpose/tags/capabilities: ask alice a planning question and bob an implementation-risk question with council_send. Use async responses by default, or set synchronous=true only if you need to block before synthesis.
 ```
 
 The orchestrator's Pi session memory becomes the mediator's working record. It is not a peer-shared blackboard; use explicit repo files, issues, or a future `pi-council` blackboard when all agents need shared durable memory.
@@ -104,23 +113,25 @@ Use `*_get` when an orchestrator wants to poll several outstanding messages. Use
 
 ## Async/background sends
 
-`coms_net_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later delivers `[coms-net async response from <peer>]` back to the sender session when the peer replies. Do not call `coms_net_await` for normal sends.
+`council_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later delivers `[coms-net async response from <member>]` back to the sender session when the member replies. Do not call `council_await` for normal sends.
 
-Async sends default to `response_mode="agent"`: the sender agent handles the peer reply itself. If Bob asks Alice a question, Alice should answer Bob with another `coms_net_send` using Bob's name as `target`. The hub names the thread after the peer names by default (for example `net-alice↔net-bob`); pass that value only as the optional `conversation_id` field when continuing a thread, never as `target`. The human does not need to answer for Alice. Use `response_mode="notify"` only when the human should read/respond, and `response_mode="none"` for fire-and-forget.
+Async sends default to `response_mode="agent"`: the sender agent handles the council member reply itself. If Bob asks Alice a question, Alice should answer Bob with another `council_send` using Bob's name as `target`. The hub names the thread after the member names by default (for example `net-alice↔net-bob`); pass that value only as the optional `conversation_id` field when continuing a thread, never as `target`. The human does not need to answer for Alice. Use `response_mode="notify"` only when the human should read/respond, and `response_mode="none"` for fire-and-forget.
 
 Default async example:
 
 ```text
-Use coms_net_send to send net-bob: "Reply exactly ASYNC-PONG".
+Use council_send to ask net-bob: "Reply exactly ASYNC-PONG".
 ```
 
 Synchronous/chained example:
 
 ```text
-Use coms_net_send with synchronous=true to send net-bob: "Reply exactly SYNC-PONG". Then await the returned msg_id with coms_net_await.
+Use council_send with synchronous=true to ask net-bob: "Reply exactly SYNC-PONG". Then await the returned msg_id with council_await.
 ```
 
-This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
+This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If a model mistakenly calls `council_await`/`coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
+
+If a receiver turn only runs tools or a tool/transport error such as a WebSocket error prevents final assistant text, the extension now nudges the receiver to recover and produce a final response instead of immediately returning `no assistant response captured`.
 
 ## Hub status
 
@@ -208,6 +219,7 @@ Client/autostart variables:
 - `PI_COMS_NET_PORT` — embedded hub port; defaults to `48201`.
 - `PI_COMS_NET_EMBEDDED_HOST` — embedded hub host; defaults to `127.0.0.1`.
 - `PI_COMS_NET_ASYNC_NOTIFY_GRACE_MS` — delay before displaying async responses, allowing an immediate `*_await` call to suppress duplicate notifications; defaults to `1200`.
+- `PI_COMS_NET_INBOUND_RESPONSE_GRACE_MS` — time to recover/nudge a receiver when no assistant text is captured after tool-only or failed-tool turns; defaults to `120000`.
 
 Local `coms` limits:
 
@@ -235,7 +247,7 @@ For shared durable collaboration memory, use repo files/GitHub issues today or a
 ## UAT smoke checklist
 
 1. Same-machine `coms`: Alice lists Bob, sends `LOCAL-PONG`, and awaits the reply.
-2. Localhost `coms-net`: hub starts, net-alice lists net-bob, sends `NET-PONG`, and awaits the reply.
+2. Localhost council/coms-net: hub starts, net-alice uses `council_list`, picks net-bob, sends `NET-PONG` with `council_send`, and receives the async reply. For synchronous UAT, set `synchronous=true` and use `council_await`.
 3. Reconnect/offline mailbox: stop a receiver, send to its agent name, restart the receiver with the same name/project, and confirm the queued message is popped automatically and moves to `running` then `complete`.
 4. Safety: a forged session secret cannot send/delete/respond for another `coms-net` session.
 5. Redaction: hub logs show ids, agent names, sizes, hops, and statuses, not prompt bodies, unless `PI_COMS_NET_LOG_PAYLOADS=1` is set.

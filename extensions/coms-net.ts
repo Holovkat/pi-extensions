@@ -48,6 +48,7 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 const MESSAGE_TIMEOUT_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS) || 1_800_000;
 const ASYNC_NOTIFY_GRACE_MS = Number(process.env.PI_COMS_NET_ASYNC_NOTIFY_GRACE_MS) || 1_200;
+const INBOUND_RESPONSE_GRACE_MS = Number(process.env.PI_COMS_NET_INBOUND_RESPONSE_GRACE_MS) || 120_000;
 const HTTP_TIMEOUT_MS = 10_000;
 const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES) || 48 * 1024;
 const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES) || 48 * 1024;
@@ -163,6 +164,7 @@ interface InboundContext {
 	fulfilled: boolean;
 	created_at_ms: number;
 	trigger_leaf_id?: string | null;
+	nudge_sent?: boolean;
 }
 
 type AsyncResponseMode = "agent" | "notify" | "none";
@@ -738,14 +740,15 @@ export default function (pi: ExtensionAPI) {
 		try {
 			pi.sendMessage(
 				{
-					customType: "coms-net-operating-guide",
+					customType: "council-operating-guide",
 					content:
-						`[coms-net operating guide]\n` +
-						`This agent is connected as ${name} in project ${project}. ` +
-						`When the user asks to greet, ask, tell, message, contact, delegate to, or reply to another agent, use the coms_net tools instead of answering locally. ` +
-						`Before the first send in a task, call coms_net_list with no project argument and use the exact peer name it returns. ` +
-						`Send with coms_net_send using that peer name as target. Normal sends are async; do not call coms_net_await unless the user explicitly requests synchronous/blocking/chained behavior with synchronous=true. ` +
-						`If a peer replies and expects continuation, answer the peer with coms_net_send back to the peer name, preserving any shown thread as conversation_id. Never use msg_id or thread/conversation values as target.]`,
+						`[council operating guide]\n` +
+						`This agent is connected as ${name} in council/project ${project}. ` +
+						`Preferred tools are council_list, council_send, council_get, and council_await; legacy coms_net_* aliases still work for compatibility. ` +
+						`When the user asks to greet, ask, tell, message, contact, delegate to, or reply to another agent, use the council tools instead of answering locally. ` +
+						`Before the first send in a task, call council_list with no project argument, review the council members' purpose/tags/capabilities/status/context, and choose who can best answer the question or complete the task. ` +
+						`Send with council_send using the exact member name as target. Normal sends are async; do not call council_await unless the user explicitly requests synchronous/blocking/chained behavior with synchronous=true. ` +
+						`If a member replies and expects continuation, answer that member with council_send back to the member name, preserving any shown thread as conversation_id. Never use msg_id or thread/conversation values as target.]`,
 					display: false,
 					details: { project, name },
 				},
@@ -1955,10 +1958,363 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	// ━━ Council aliases (preferred user-facing tools; coms_net_* kept for compatibility) ━━
+
+	async function executeCouncilList(params: any) {
+		if (!identity) throw new Error("council not initialised");
+		const requestedProject = params?.project ?? identity.project;
+		const includeExp = params?.include_explicit === true;
+		const loadMembers = async (projectName: string): Promise<AgentCard[]> => {
+			const qs = `?project=${encodeURIComponent(projectName)}&include_explicit=${includeExp ? "true" : "false"}`;
+			const resp = await httpFetch("GET", `/v1/agents${qs}`);
+			const agents: AgentCard[] = Array.isArray(resp?.agents) ? resp.agents : [];
+			return agents.filter(a => a.session_id !== identity!.session_id);
+		};
+		let projectFilter = requestedProject;
+		let members = await loadMembers(projectFilter);
+		let note = "";
+		if (members.length === 0 && projectFilter !== identity.project) {
+			const currentMembers = await loadMembers(identity.project);
+			if (currentMembers.length > 0) {
+				note = `No council members found in requested project "${projectFilter}"; showing current council project "${identity.project}" instead.\n`;
+				projectFilter = identity.project;
+				members = currentMembers;
+			}
+		}
+
+		const lines = members.length === 0
+			? "No council members found."
+			: members.map((a) => {
+				const live = a.status === "online" ? "●" : a.status === "stale" ? "~" : "✗";
+				const ctxStr = typeof a.context_used_pct === "number" ? ` ${a.context_used_pct}%` : " ?%";
+				const meta = [a.status_text, ...(a.tags ?? []).map((t) => `#${t}`), ...(a.capabilities ?? []).map((c) => `cap:${c}`)].filter(Boolean).join(" ");
+				return `${live} ${a.name} (${abbreviateModel(a.model)})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}${meta ? ` · ${meta}` : ""}`;
+			}).join("\n");
+
+		return {
+			content: [{ type: "text" as const, text: `${note}${members.length} council member(s):\n${lines}` }],
+			details: { agents: members, project: projectFilter, requested_project: requestedProject, note: note || undefined },
+		};
+	}
+
+	async function executeCouncilSend(params: any) {
+		if (!identity) throw new Error("council not initialised");
+
+		const hops = currentInbound ? currentInbound.hops + 1 : 0;
+		if (hops >= MAX_HOPS) throw new Error(`council: hop limit reached (${hops} >= ${MAX_HOPS})`);
+		if (byteLength(params.prompt) > MAX_PROMPT_BYTES) {
+			throw new Error(`council: prompt too large (${byteLength(params.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+		}
+		if (schemaTooLarge(params.response_schema)) {
+			throw new Error(`council: response_schema too large (${jsonByteLength(params.response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
+		}
+
+		const synchronous = params.synchronous === true;
+		let responseMode: AsyncResponseMode = "agent";
+		if (params.response_mode === "notify" || params.response_mode === "none") responseMode = params.response_mode;
+		if (synchronous) responseMode = "none";
+		if (params.notify_on_response === false) responseMode = "none";
+		const notifyOnResponse = responseMode !== "none";
+		const requestedTarget = String(params.target ?? "").trim();
+		const targetRoute = conversationRoutes.get(requestedTarget);
+		const targetForSend = targetRoute?.target_name || targetRoute?.target_session || requestedTarget;
+		const conversationId = typeof params.conversation_id === "string" && params.conversation_id.length > 0
+			? params.conversation_id
+			: targetRoute
+				? requestedTarget
+				: null;
+
+		const req: SendRequest = {
+			project: identity.project,
+			sender_session: identity.session_id,
+			target: targetForSend,
+			target_session: null,
+			prompt: params.prompt,
+			conversation_id: conversationId,
+			response_schema: params.response_schema ?? null,
+			hops,
+		};
+
+		let resp: SendResponse;
+		try {
+			resp = await httpFetch("POST", "/v1/messages", req) as SendResponse;
+		} catch (err) {
+			if (err instanceof HttpError) {
+				const detail = (err.body && err.body.error) || err.message;
+				throw new Error(`council: send failed (${err.status}): ${detail}`);
+			}
+			throw new Error(`council: send failed: ${safeError(err)}`);
+		}
+
+		const { msg_id, target_session } = resp;
+		const targetName = resp.target_name ?? targetRoute?.target_name ?? targetForSend;
+		const status = resp.status ?? "queued";
+		const finalConversationId = resp.conversation_id ?? conversationId;
+		rememberConversationRoute(finalConversationId, targetName, target_session ?? targetRoute?.target_session);
+
+		let resolveFn!: (v: { response?: any; error?: string | null }) => void;
+		let rejectFn!: (e: Error) => void;
+		const promise = new Promise<{ response?: any; error?: string | null }>((res, rej) => {
+			resolveFn = res;
+			rejectFn = rej;
+		});
+		const entry: PendingReply = {
+			resolve: resolveFn,
+			reject: rejectFn,
+			promise,
+			target_name: targetName,
+			target_session: target_session ?? undefined,
+			created_at: nowIso(),
+			status,
+			conversation_id: finalConversationId,
+			notify_on_response: notifyOnResponse,
+			response_mode: responseMode,
+			synchronous,
+			timer: null,
+			notification_timer: null,
+		};
+		entry.timer = setTimeout(() => {
+			if (entry.result) return;
+			entry.result = { error: "expired" };
+			try { entry.resolve(entry.result); } catch { /* ignore */ }
+			scheduleAsyncReplyNotification(msg_id, entry, null, "expired");
+			schedulePendingReplyCleanup(msg_id);
+		}, MESSAGE_TIMEOUT_MS);
+		try { (entry.timer as any).unref?.(); } catch { /* ignore */ }
+		pendingReplies.set(msg_id, entry);
+
+		try {
+			pi.appendEntry("council-log", {
+				event: "prompt_out",
+				ts: nowIso(),
+				msg_id,
+				target: targetName,
+				target_session,
+				status,
+				conversation_id: finalConversationId,
+				notify_on_response: notifyOnResponse,
+				response_mode: responseMode,
+				synchronous,
+				hops,
+			});
+		} catch { /* best-effort */ }
+
+		const nextAction = synchronous
+			? `NEXT ACTION: synchronous=true was specified. Do not answer this delegated prompt yourself; call council_await with msg_id ${msg_id} and return the council member's response.`
+			: responseMode === "agent"
+				? `NEXT ACTION: async is the default. Do not call council_await. Tell the user the message is ${status}; when ${targetName} replies, this agent will handle/respond automatically.`
+				: responseMode === "notify"
+					? `NEXT ACTION: async notify mode. Do not call council_await. Tell the user the message is ${status}; ${targetName}'s reply will be displayed for the human.`
+					: `NEXT ACTION: fire-and-forget mode. Do not call council_await. Tell the user the message is ${status}.`;
+		const threadLine = finalConversationId ? `thread ${finalConversationId}\n` : "";
+		return {
+			content: [{
+				type: "text" as const,
+				text: `council_send → ${targetName}\nmsg_id ${msg_id}\n${threadLine}status ${status}\nhops ${hops}\n\n${nextAction}`,
+			}],
+			details: { msg_id, target: targetName, target_session, conversation_id: finalConversationId, status, notify_on_response: notifyOnResponse, response_mode: responseMode, synchronous, hops },
+			terminate: !synchronous,
+		};
+	}
+
+	async function executeCouncilGet(params: any) {
+		const msg_id = params.msg_id as string;
+		const pending = pendingReplies.get(msg_id);
+		if (pending && pending.result) {
+			const r = pending.result;
+			const status = r.error ? (r.error === "expired" ? "expired" : "error") : "complete";
+			const text = r.error
+				? `council_get: ${status} — ${r.error}`
+				: `council_get: ${status}\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
+			return { content: [{ type: "text" as const, text }], details: { status, response: r.response, error: r.error ?? null } };
+		}
+		try {
+			const resp = await httpFetch("GET", `/v1/messages/${encodeURIComponent(msg_id)}`);
+			const status = resp?.status ?? "pending";
+			if (status === "complete" || status === "error" || status === "timeout") {
+				const text = resp.error
+					? `council_get: ${status} — ${resp.error}`
+					: `council_get: ${status}\n${typeof resp.response === "string" ? resp.response : JSON.stringify(resp.response, null, 2)}`;
+				return { content: [{ type: "text" as const, text }], details: { status, response: resp.response, error: resp.error ?? null } };
+			}
+			return { content: [{ type: "text" as const, text: `council_get: ${status}` }], details: { status } };
+		} catch (err) {
+			const error = err instanceof HttpError && err.status === 404 ? "unknown msg_id" : safeError(err);
+			return { content: [{ type: "text" as const, text: `council_get: error — ${error}` }], details: { status: "error", error } };
+		}
+	}
+
+	async function executeCouncilAwait(params: any) {
+		const msg_id = params.msg_id as string;
+		const pending = pendingReplies.get(msg_id);
+		if (pending && !pending.synchronous) {
+			return {
+				content: [{ type: "text" as const, text: `council_await: ${msg_id} was sent asynchronously. Synchronous waiting must be requested by sending with synchronous=true. Use council_get to poll, or wait for the async response notification.` }],
+				details: { status: pending.status ?? "pending", error: "async_send_not_awaitable" },
+			};
+		}
+		if (pending) {
+			pending.await_started = true;
+			cancelAsyncReplyNotification(pending);
+		}
+		const timeoutMs = typeof params.timeout_ms === "number" && params.timeout_ms > 0 ? params.timeout_ms : MESSAGE_TIMEOUT_MS;
+		if (pending && pending.result) {
+			const r = pending.result;
+			if (r.error) return { content: [{ type: "text" as const, text: `council_await: error — ${r.error}` }], details: { error: r.error } };
+			const resp = r.response;
+			return { content: [{ type: "text" as const, text: typeof resp === "string" ? resp : JSON.stringify(resp, null, 2) }], details: { response: resp } };
+		}
+
+		const localPromise: Promise<{ response?: any; error?: string | null }> = pending ? pending.promise : new Promise(() => {});
+		const serverTimeoutMs = Math.min(timeoutMs, MESSAGE_TIMEOUT_MS);
+		const ac = new AbortController();
+		const serverPromise = httpFetch(
+			"GET",
+			`/v1/messages/${encodeURIComponent(msg_id)}/await?timeout_ms=${serverTimeoutMs}`,
+			undefined,
+			{ timeoutMs: serverTimeoutMs + 5_000, signal: ac.signal },
+		).then((data: any) => {
+			if (data?.status === "complete") return { response: data.response, error: null };
+			if (data?.status === "error") return { response: null, error: data.error ?? "error" };
+			if (data?.status === "timeout") return { response: null, error: "timeout" };
+			return { response: data?.response, error: data?.error ?? null };
+		}).catch((err) => {
+			if (err instanceof HttpError && err.status === 404) return { response: null, error: "unknown msg_id" };
+			return { response: null, error: safeError(err) };
+		});
+		const timeoutPromise = new Promise<{ error: string }>((resolve) => {
+			const t = setTimeout(() => resolve({ error: "timeout" }), timeoutMs);
+			try { (t as any).unref?.(); } catch { /* ignore */ }
+		});
+		const winner = await Promise.race([localPromise, serverPromise, timeoutPromise]);
+		try { ac.abort(); } catch { /* ignore */ }
+		if ((winner as any).error) return { content: [{ type: "text" as const, text: `council_await: error — ${(winner as any).error}` }], details: { error: (winner as any).error } };
+		const resp = (winner as any).response;
+		return { content: [{ type: "text" as const, text: typeof resp === "string" ? resp : JSON.stringify(resp, null, 2) }], details: { response: resp } };
+	}
+
+	pi.registerTool({
+		name: "council_list",
+		label: "Council Members",
+		promptGuidelines: [
+			"Use council_list to discover the available council members before council_send. Read each member's purpose, tags, capabilities, status, and context usage, then choose the member best suited to answer the question or complete the task.",
+			"Use the exact member name from council_list as council_send.target. Do not use msg_id, thread/conversation_id, model name, or display text as target.",
+		],
+		description: "List council members available on the current council hub. Use this first to decide who can answer a question or complete a task.",
+		parameters: Type.Object({
+			project: Type.Optional(Type.String({ description: "Council/project name. Defaults to this agent's current council." })),
+			include_explicit: Type.Optional(Type.Boolean({ description: "Include hidden/explicit members. Default false." })),
+		}),
+		execute: async (_callId, params) => executeCouncilList(params),
+		renderCall(args, theme) {
+			const proj = (args as any).project;
+			return new Text(theme.fg("toolTitle", theme.bold("council_list")) + theme.fg("dim", proj ? ` ${proj}` : ""), 0, 0);
+		},
+		renderResult(result, options, theme) {
+			const agents: any[] = (result.details as any)?.agents ?? [];
+			const header = theme.fg("accent", `🏛 ${agents.length} member(s)`);
+			if (!options.expanded || agents.length === 0) return new Text(header, 0, 0);
+			const rows = agents.map((a) => {
+				const dot = a.status === "online" ? theme.fg("success", "●") : a.status === "stale" ? theme.fg("warning", "~") : theme.fg("error", "✗");
+				const pct = typeof a.context_used_pct === "number" ? `${a.context_used_pct}%` : "?%";
+				const tags = Array.isArray(a.tags) && a.tags.length ? theme.fg("dim", ` #${a.tags.slice(0, 2).join(" #")}`) : "";
+				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", abbreviateModel(a.model))} ${theme.fg("warning", pct)}${tags}`;
+			}).join("\n");
+			return new Text(header + "\n" + rows, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "council_send",
+		label: "Council Ask",
+		promptGuidelines: [
+			"Before council_send, call council_list unless a fresh council_list result or exact member name is already visible. Choose the member by purpose, tags, capabilities, status, and context usage.",
+			"council_send is async by default. Do not call council_await unless the user explicitly asks for synchronous/blocking/chained behavior; set synchronous=true in that case.",
+			"When a council member replies and expects continuation, answer that member with council_send using the member name as target and preserving any shown thread as conversation_id.",
+		],
+		description: "Ask or assign a task to a council member by exact member name. Async by default; the reply is delivered back for this agent to handle.",
+		parameters: Type.Object({
+			target: Type.String({ description: "Exact council member name from council_list, or session_id." }),
+			prompt: Type.String({ description: "Question or task for the council member." }),
+			conversation_id: Type.Optional(Type.String()),
+			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
+			synchronous: Type.Optional(Type.Boolean({ description: "Set true only for explicit blocking/chained exchanges; then call council_await." })),
+			response_mode: Type.Optional(Type.Union([Type.Literal("agent"), Type.Literal("notify"), Type.Literal("none")], { description: "Default 'agent' lets this agent handle member replies. 'notify' displays for human response. 'none' fire-and-forget." })),
+			notify_on_response: Type.Optional(Type.Boolean({ description: "Legacy async response toggle. false maps to response_mode='none'." })),
+		}),
+		execute: async (_callId, params) => executeCouncilSend(params),
+		renderCall(args, theme) {
+			const tgt = (args as any).target ?? "?";
+			const prompt = (args as any).prompt ?? "";
+			const preview = prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt;
+			return new Text(theme.fg("toolTitle", theme.bold("council_send ")) + theme.fg("accent", tgt) + theme.fg("dim", " — ") + theme.fg("muted", preview), 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const d = result.details as any;
+			if (!d) return new Text("", 0, 0);
+			return new Text(theme.fg("success", "→ ") + theme.fg("accent", d.target) + theme.fg("dim", "  msg_id ") + theme.fg("warning", d.msg_id), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "council_get",
+		label: "Council Get",
+		description: "Non-blocking poll for a council_send reply by msg_id.",
+		parameters: Type.Object({ msg_id: Type.String({ description: "msg_id returned by council_send." }) }),
+		execute: async (_callId, params) => executeCouncilGet(params),
+		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("council_get ")) + theme.fg("warning", (args as any).msg_id ?? "?"), 0, 0); },
+		renderResult(result, _options, theme) {
+			const status = (result.details as any)?.status ?? "?";
+			const color = status === "complete" ? "success" : status === "pending" || status === "queued" || status === "running" ? "warning" : "error";
+			return new Text(theme.fg(color, status), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "council_await",
+		label: "Council Await",
+		description: "Block for a council_send reply only when that send used synchronous=true. Normal council_send calls are async and should not be awaited.",
+		parameters: Type.Object({
+			msg_id: Type.String({ description: "msg_id returned by council_send." }),
+			timeout_ms: Type.Optional(Type.Number({ description: "Override the default timeout (ms). Server cap applies." })),
+		}),
+		execute: async (_callId, params) => executeCouncilAwait(params),
+		renderCall(args, theme) { return new Text(theme.fg("toolTitle", theme.bold("council_await ")) + theme.fg("warning", (args as any).msg_id ?? "?"), 0, 0); },
+		renderResult(result, _options, theme) {
+			const d = result.details as any;
+			if (d?.error) return new Text(theme.fg("error", `✗ ${d.error}`), 0, 0);
+			return new Text(theme.fg("success", "✓ response received"), 0, 0);
+		},
+	});
+
 	// ━━ agent_end: capture turn output and submit response ━━━━━━━━━━━━━━━━
 
 	function latestAssistantTextForInbound(ctx: ExtensionContext, inbound: InboundContext): string {
 		return latestAssistantTextAfterBoundary(ctx.sessionManager.getBranch() as any[], inbound.trigger_leaf_id);
+	}
+
+	function nudgeInboundResponse(inbound: InboundContext): void {
+		if (inbound.nudge_sent) return;
+		inbound.nudge_sent = true;
+		try {
+			pi.sendMessage(
+				{
+					customType: "coms-net-response-needed",
+					content:
+						`[coms-net response needed]\n` +
+						`Your previous turn for msg_id ${inbound.msg_id} from ${inbound.sender_name} did not produce final assistant text, possibly because a tool/transport command failed or only tool calls ran. ` +
+						`Recover gracefully now: provide the best concise final response for ${inbound.sender_name}. If a tool failed, summarize the failure and any useful partial findings. ` +
+						`Do not call coms_net_send/council_send to answer this inbound request; write normal assistant text and it will be returned automatically.]`,
+					display: true,
+					details: { msg_id: inbound.msg_id, sender: inbound.sender_name },
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			audit("response_nudge", { msg_id: inbound.msg_id, sender: inbound.sender_name });
+		} catch (err) {
+			audit("response_nudge_failed", { msg_id: inbound.msg_id, reason: safeError(err) });
+		}
 	}
 
 	pi.on("agent_end", async (_event, ctx) => {
@@ -1971,7 +2327,12 @@ export default function (pi: ExtensionAPI) {
 		let payload: any = lastAssistantText;
 		let error: string | null = null;
 		if (!lastAssistantText) {
-			error = "no assistant response captured for inbound turn";
+			const ageMs = Date.now() - inbound.created_at_ms;
+			if (ageMs < INBOUND_RESPONSE_GRACE_MS) {
+				nudgeInboundResponse(inbound);
+				return;
+			}
+			error = "no assistant response captured for inbound turn after recovery grace period";
 			payload = null;
 		} else if (inbound.response_schema && typeof inbound.response_schema === "object") {
 			if (byteLength(lastAssistantText) > MAX_RESPONSE_BYTES) {

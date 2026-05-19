@@ -1182,6 +1182,6 @@ pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-
 pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat
 ```
 
-Ask Alice to list peers first, then send Bob a prompt using the exact name from `coms_net_list`. `coms_net_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is delivered back to Alice, and default `response_mode="agent"` lets Alice continue/reply to Bob without the human answering for her. The receiver replies by writing a normal assistant response; it should not call `*_send` to answer an inbound request.
+Ask Alice to use `council_list` first, choose the best council member by purpose/tags/capabilities, then ask that member with `council_send` using the exact listed name. `council_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is delivered back to Alice, and default `response_mode="agent"` lets Alice continue/reply to Bob without the human answering for her. Legacy `coms_net_*` tool names remain available for compatibility.
 
-See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, async response, structured-response, and UAT notes.
+See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, council async response, structured-response, and UAT notes.
