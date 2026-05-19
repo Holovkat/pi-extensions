@@ -1010,6 +1010,22 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// hasUI may be false in some contexts — non-fatal.
 		}
+		try {
+			pi.sendMessage(
+				{
+					customType: "coms-operating-guide",
+					content:
+						`[coms operating guide]\n` +
+						`This agent is connected as ${name} in project ${project}. ` +
+						`When the user asks to greet, ask, tell, message, contact, delegate to, or reply to another agent, use the coms tools instead of answering locally. ` +
+						`Before the first send in a task, call coms_list with no project argument and use the exact peer name it returns. ` +
+						`Send with coms_send using that peer name as target. Await only when the user expects a synchronous/chained answer; otherwise use coms_get to poll if needed. Never use msg_id or thread/conversation values as target.]`,
+					display: false,
+					details: { project, name },
+				},
+				{ deliverAs: "nextTurn" },
+			);
+		} catch { /* best-effort */ }
 
 		// 7. Start ping + keepalive cycles.
 		pingTimer = setInterval(() => { refreshPool().catch(() => {}); }, PING_INTERVAL_MS);

@@ -734,6 +734,26 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function injectUsageGuide(project: string, name: string): void {
+		try {
+			pi.sendMessage(
+				{
+					customType: "coms-net-operating-guide",
+					content:
+						`[coms-net operating guide]\n` +
+						`This agent is connected as ${name} in project ${project}. ` +
+						`When the user asks to greet, ask, tell, message, contact, delegate to, or reply to another agent, use the coms_net tools instead of answering locally. ` +
+						`Before the first send in a task, call coms_net_list with no project argument and use the exact peer name it returns. ` +
+						`Send with coms_net_send using that peer name as target. Normal sends are async; do not call coms_net_await unless the user explicitly requests synchronous/blocking/chained behavior with synchronous=true. ` +
+						`If a peer replies and expects continuation, answer the peer with coms_net_send back to the peer name, preserving any shown thread as conversation_id. Never use msg_id or thread/conversation values as target.]`,
+					display: false,
+					details: { project, name },
+				},
+				{ deliverAs: "nextTurn" },
+			);
+		} catch { /* best-effort */ }
+	}
+
 	// ━━ SSE event dispatch ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 	function applyAgentPatch(prev: AgentCard, patch: Partial<AgentCard>): AgentCard {
@@ -1324,6 +1344,7 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			// hasUI may be false in some contexts.
 		}
+		injectUsageGuide(identity.project, identity.name);
 
 		// 8. Open SSE — fire and forget.
 		void openSse();
@@ -1500,12 +1521,25 @@ export default function (pi: ExtensionAPI) {
 			if (!identity) {
 				throw new Error("coms-net not initialised");
 			}
-			const projectFilter = (params as any).project ?? identity.project;
+			const requestedProject = (params as any).project ?? identity.project;
 			const includeExp = (params as any).include_explicit === true;
-			const qs = `?project=${encodeURIComponent(projectFilter)}&include_explicit=${includeExp ? "true" : "false"}`;
-			const resp = await httpFetch("GET", `/v1/agents${qs}`);
-			const agents: AgentCard[] = Array.isArray(resp?.agents) ? resp.agents : [];
-			const peers = agents.filter(a => a.session_id !== identity!.session_id);
+			const loadPeers = async (projectName: string): Promise<AgentCard[]> => {
+				const qs = `?project=${encodeURIComponent(projectName)}&include_explicit=${includeExp ? "true" : "false"}`;
+				const resp = await httpFetch("GET", `/v1/agents${qs}`);
+				const agents: AgentCard[] = Array.isArray(resp?.agents) ? resp.agents : [];
+				return agents.filter(a => a.session_id !== identity!.session_id);
+			};
+			let projectFilter = requestedProject;
+			let peers = await loadPeers(projectFilter);
+			let note = "";
+			if (peers.length === 0 && projectFilter !== identity.project) {
+				const currentPeers = await loadPeers(identity.project);
+				if (currentPeers.length > 0) {
+					note = `No peers found in requested project "${projectFilter}"; showing current coms-net project "${identity.project}" instead.\n`;
+					projectFilter = identity.project;
+					peers = currentPeers;
+				}
+			}
 
 			const lines = peers.length === 0
 				? "No peer agents found."
@@ -1517,8 +1551,8 @@ export default function (pi: ExtensionAPI) {
 				}).join("\n");
 
 			return {
-				content: [{ type: "text" as const, text: `${peers.length} peer(s):\n${lines}` }],
-				details: { agents: peers, project: projectFilter },
+				content: [{ type: "text" as const, text: `${note}${peers.length} peer(s):\n${lines}` }],
+				details: { agents: peers, project: projectFilter, requested_project: requestedProject, note: note || undefined },
 			};
 		},
 		renderCall(args, theme) {
