@@ -133,3 +133,18 @@ Source ownership: copy/vendor the reviewed upstream comms extensions into this r
   - [ ] [#97 Sprint: comms v2.0 packaging and deployment](https://github.com/Holovkat/pi-extensions/issues/97)
     - [ ] [#109 Task: package comms as an installable Pi package](https://github.com/Holovkat/pi-extensions/issues/109)
     - [ ] [#110 Task: document deployment profiles and optional structured responses](https://github.com/Holovkat/pi-extensions/issues/110)
+
+## Pi Council Roadmap
+
+Source of truth epic: [GitHub issue #112](https://github.com/Holovkat/pi-extensions/issues/112)
+
+Design direction: `pi-council` is a mediator/orchestrator layer above `coms` / `coms-net`. It should use an explicit lightweight JSONL blackboard for shared collaboration memory rather than concurrent writes to one live Pi session file.
+
+- [ ] [#112 Epic: pi-council mediated multi-agent collaboration](https://github.com/Holovkat/pi-extensions/issues/112)
+  - [ ] [#113 Sprint: pi-council v0.1 JSONL blackboard and mediated rounds](https://github.com/Holovkat/pi-extensions/issues/113)
+    - [ ] [#114 Task: create pi-council extension shell and storage layout](https://github.com/Holovkat/pi-extensions/issues/114)
+    - [ ] [#115 Task: implement pi-council JSONL blackboard tools](https://github.com/Holovkat/pi-extensions/issues/115)
+    - [ ] [#116 Task: implement council member registry and coms-net resolution](https://github.com/Holovkat/pi-extensions/issues/116)
+    - [ ] [#117 Task: implement pi-council mediated round over coms-net](https://github.com/Holovkat/pi-extensions/issues/117)
+    - [ ] [#118 Task: add council task, decision, and transcript records](https://github.com/Holovkat/pi-extensions/issues/118)
+    - [ ] [#119 Task: document pi-council workflows and UAT scenarios](https://github.com/Holovkat/pi-extensions/issues/119)
