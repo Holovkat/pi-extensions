@@ -1485,6 +1485,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "coms_net_list",
 		label: "Coms Net List",
+		promptGuidelines: [
+			"Use coms_net_list to discover available peer agents before the first coms_net_send in a task, unless the conversation already contains a fresh coms_net_list result or the user provided an exact peer name/session_id.",
+			"Use the exact peer name from coms_net_list as coms_net_send.target. Do not use msg_id, thread, conversation_id, model name, or display text as the target.",
+		],
 		description:
 			"List peer agents on the coms-net hub for the current project. Returns names, models, and live context-window usage. " +
 			"Set include_explicit=true to reveal agents launched with --explicit.",
@@ -1549,6 +1553,7 @@ export default function (pi: ExtensionAPI) {
 		name: "coms_net_send",
 		label: "Coms Net Send",
 		promptGuidelines: [
+			"Before the first coms_net_send in a task, call coms_net_list to discover available peers and exact peer names, unless a fresh list is already visible or the user supplied an exact peer name/session_id. Do not guess casual aliases like 'bob' when the listed name is 'net-bob'.",
 			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
 			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the peer name as target. If a thread/conversation_id is shown, pass it only as the separate conversation_id field; never use it as target.",
 		],

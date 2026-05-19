@@ -22,6 +22,15 @@ Networked hub extension:
 - `coms_net_await`
 - `/coms-net`
 
+## Discovery-first usage
+
+Agents should list peers before the first send in a task:
+
+- local `coms`: call `coms_list`, then use the exact returned name in `coms_send.target`
+- networked `coms-net`: call `coms_net_list`, then use the exact returned name in `coms_net_send.target`
+
+Do not guess casual aliases, and do not use `msg_id`, thread/conversation names, model names, or display labels as targets. Once a fresh list is visible in the conversation, follow-up sends can reuse those exact peer names.
+
 ## Same-machine quick start
 
 Start two Pi terminals in the same checkout:

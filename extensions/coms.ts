@@ -1319,6 +1319,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "coms_list",
 		label: "Coms List",
+		promptGuidelines: [
+			"Use coms_list to discover available peer agents before the first coms_send in a task, unless the conversation already contains a fresh coms_list result or the user provided an exact peer name/session_id.",
+			"Use the exact peer name from coms_list as coms_send.target. Do not use msg_id, thread, conversation_id, model name, or display text as the target.",
+		],
 		description:
 			"List peer agents discoverable via coms. Returns names, models, and live context-window usage. " +
 			"Use project=\"*\" to scan all projects. include_explicit=true reveals agents marked --explicit.",
@@ -1407,6 +1411,7 @@ export default function (pi: ExtensionAPI) {
 		name: "coms_send",
 		label: "Coms Send",
 		promptGuidelines: [
+			"Before the first coms_send in a task, call coms_list to discover available peers and exact peer names, unless a fresh list is already visible or the user supplied an exact peer name/session_id. Do not guess casual aliases; use the exact listed name.",
 			"After calling coms_send for a delegated user request, do not answer the delegated prompt yourself; immediately call coms_await with the returned msg_id unless the user explicitly asked for fire-and-forget.",
 		],
 		description:
