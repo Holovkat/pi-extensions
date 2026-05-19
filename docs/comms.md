@@ -109,7 +109,7 @@ Synchronous/chained example:
 Use coms_net_send with synchronous=true to send net-bob: "Reply exactly SYNC-PONG". Then await the returned msg_id with coms_net_await.
 ```
 
-This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
+This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If the user replies to that async peer message, Alice should send the reply back to the peer with the displayed `conversation_id`; the async response block includes that routing instruction. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
 
 ## Hub status
 

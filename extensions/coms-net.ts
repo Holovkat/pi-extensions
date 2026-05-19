@@ -142,6 +142,7 @@ interface SendResponse {
 	status: MessageStatus;
 	target_session: string | null;
 	target_name?: string;
+	conversation_id?: string | null;
 }
 
 interface ResponseSubmitRequest {
@@ -158,6 +159,7 @@ interface InboundContext {
 	sender_name: string;
 	sender_cwd: string;
 	response_schema?: object | null;
+	conversation_id?: string | null;
 	fulfilled: boolean;
 	created_at_ms: number;
 	trigger_leaf_id?: string | null;
@@ -178,6 +180,7 @@ interface PendingReply {
 	target_session?: string;
 	created_at: string;
 	status?: MessageStatus;
+	conversation_id?: string | null;
 }
 
 interface ServerJson {
@@ -828,6 +831,9 @@ export default function (pi: ExtensionAPI) {
 		const senderCwd = typeof sender.cwd === "string" ? sender.cwd : "?";
 		const senderSession = typeof sender.session_id === "string" ? sender.session_id : "?";
 		const promptText = typeof data.prompt === "string" ? data.prompt : "";
+		const conversationId = typeof data.conversation_id === "string" && data.conversation_id.length > 0
+			? data.conversation_id
+			: null;
 		if (byteLength(promptText) > MAX_PROMPT_BYTES) {
 			audit("prompt_in_rejected", { msg_id, reason: "prompt_too_large", bytes: byteLength(promptText) });
 			if (identity) {
@@ -874,6 +880,7 @@ export default function (pi: ExtensionAPI) {
 			sender_name: senderName,
 			sender_cwd: senderCwd,
 			response_schema: responseSchema,
+			conversation_id: conversationId,
 			fulfilled: false,
 			created_at_ms: Date.now(),
 			trigger_leaf_id: currentCtx?.sessionManager?.getLeafId?.() ?? null,
@@ -887,6 +894,7 @@ export default function (pi: ExtensionAPI) {
 					customType: "coms-net-inbound",
 					content:
 						`[inbound coms-net message from ${senderName} @ ${senderCwd}]\n` +
+						(conversationId ? `[conversation_id ${conversationId} — continue this conversation thread using prior session context if present.]\n` : "") +
 						`[reply by writing a normal assistant message — your turn output is auto-returned to ${senderName}. ` +
 						`DO NOT call coms_net_send/coms_net_await/coms_net_get to reply; that creates a ping-pong loop. ` +
 						`msg_id ${msg_id} belongs to ${senderName}'s outbound, not yours.]\n\n` +
@@ -896,6 +904,7 @@ export default function (pi: ExtensionAPI) {
 						msg_id,
 						sender_session: senderSession,
 						response_schema: responseSchema,
+						conversation_id: conversationId,
 						hops,
 					},
 				},
@@ -907,6 +916,7 @@ export default function (pi: ExtensionAPI) {
 					ts: nowIso(),
 					msg_id,
 					sender: senderSession,
+					conversation_id: conversationId,
 					hops,
 				});
 			} catch { /* best-effort */ }
@@ -942,16 +952,20 @@ export default function (pi: ExtensionAPI) {
 			if (pending.await_started || pending.notified) return;
 			pending.notified = true;
 			const peerName = pending.target_name ?? "peer";
+			const conversationLine = pending.conversation_id ? `conversation_id ${pending.conversation_id}\n` : "";
+			const replyGuidance =
+				`[This is ${peerName} talking to this agent/user. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send back to ${peerName}` +
+				`${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""}; do not answer ${peerName}'s question locally.]`;
 			const content = error
-				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n\nERROR: ${error}`
-				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n\n${formatReplyValue(response)}`;
+				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\nERROR: ${error}`
+				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\n${formatReplyValue(response)}`;
 			try {
 				pi.sendMessage(
 					{
 						customType: "coms-net-async-response",
 						content,
 						display: true,
-						details: { msg_id: msgId, target: peerName, response, error },
+						details: { msg_id: msgId, target: peerName, conversation_id: pending.conversation_id ?? null, response, error },
 					},
 					{ deliverAs: "followUp" },
 				);
@@ -964,6 +978,7 @@ export default function (pi: ExtensionAPI) {
 					ts: nowIso(),
 					msg_id: msgId,
 					target: peerName,
+					conversation_id: pending.conversation_id ?? null,
 					error,
 				});
 			} catch { /* best-effort */ }
@@ -988,6 +1003,7 @@ export default function (pi: ExtensionAPI) {
 		const pending = pendingReplies.get(msg_id);
 		if (pending) {
 			if (pending.result) return;
+			if (!pending.conversation_id && typeof data.conversation_id === "string") pending.conversation_id = data.conversation_id;
 			pending.result = { response: responseVal, error: errVal };
 			if (pending.timer) { try { clearTimeout(pending.timer); } catch { /* ignore */ } }
 			try { pending.resolve(pending.result); } catch { /* ignore */ }
@@ -998,6 +1014,7 @@ export default function (pi: ExtensionAPI) {
 					event: "response_in",
 					ts: nowIso(),
 					msg_id,
+					conversation_id: pending.conversation_id ?? null,
 					error: errVal,
 				});
 			} catch { /* best-effort */ }
@@ -1511,6 +1528,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Send",
 		promptGuidelines: [
 			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
+			"When the session shows `[coms-net async response from <peer>]` and the user answers that peer, asks you to reply, or says 'tell <peer> ...', use coms_net_send back to that peer with the shown conversation_id; do not answer the peer's question locally.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
@@ -1552,6 +1570,9 @@ export default function (pi: ExtensionAPI) {
 			const notifyOnResponse = typeof (params as any).notify_on_response === "boolean"
 				? (params as any).notify_on_response
 				: !synchronous;
+			const conversationId = typeof (params as any).conversation_id === "string" && (params as any).conversation_id.length > 0
+				? (params as any).conversation_id
+				: ulid();
 
 			const req: SendRequest = {
 				project: identity.project,
@@ -1559,7 +1580,7 @@ export default function (pi: ExtensionAPI) {
 				target: params.target,
 				target_session: null,
 				prompt: params.prompt,
-				conversation_id: (params as any).conversation_id ?? null,
+				conversation_id: conversationId,
 				response_schema: ((params as any).response_schema as object | undefined) ?? null,
 				hops,
 			};
@@ -1577,6 +1598,7 @@ export default function (pi: ExtensionAPI) {
 			const { msg_id, target_session } = resp;
 			const targetName = resp.target_name ?? params.target;
 			const status = resp.status ?? "queued";
+			const finalConversationId = resp.conversation_id ?? conversationId;
 
 			// Park a pending entry that the SSE `response` event will resolve.
 			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
@@ -1593,6 +1615,7 @@ export default function (pi: ExtensionAPI) {
 				target_session: target_session ?? undefined,
 				created_at: nowIso(),
 				status,
+				conversation_id: finalConversationId,
 				notify_on_response: notifyOnResponse,
 				synchronous,
 				timer: null,
@@ -1616,6 +1639,7 @@ export default function (pi: ExtensionAPI) {
 					target: targetName,
 					target_session,
 					status,
+					conversation_id: finalConversationId,
 					notify_on_response: notifyOnResponse,
 					synchronous,
 					hops,
@@ -1630,10 +1654,10 @@ export default function (pi: ExtensionAPI) {
 				content: [{
 					type: "text" as const,
 					text:
-						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nstatus ${status}\nhops ${hops}\n\n` +
+						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nconversation_id ${finalConversationId}\nstatus ${status}\nhops ${hops}\n\n` +
 						`${nextAction}`,
 				}],
-				details: { msg_id, target: targetName, target_session, status, notify_on_response: notifyOnResponse, synchronous, hops },
+				details: { msg_id, target: targetName, target_session, conversation_id: finalConversationId, status, notify_on_response: notifyOnResponse, synchronous, hops },
 				terminate: !synchronous,
 			};
 		},

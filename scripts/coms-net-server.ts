@@ -259,6 +259,7 @@ export type SendResponse = {
 	status: MessageStatus;
 	target_session: string | null;
 	target_name?: string;
+	conversation_id?: string | null;
 };
 
 export type ResponseSubmitRequest = {
@@ -1101,17 +1102,18 @@ async function handleSendMessage(req: Request): Promise<Response> {
 
 	const created = nowIso();
 	const expires = new Date(Date.now() + MESSAGE_TTL_MS).toISOString();
+	const msgId = ulid();
+	const conversationId = body.conversation_id && typeof body.conversation_id === "string" && body.conversation_id.length > 0
+		? body.conversation_id
+		: msgId;
 	const msg: ComsMessage = {
-		msg_id: ulid(),
+		msg_id: msgId,
 		project: projectName,
 		sender_session: body.sender_session,
 		target_session: target?.session_id ?? "",
 		target_name: targetName,
 		prompt: body.prompt,
-		conversation_id:
-			body.conversation_id && typeof body.conversation_id === "string"
-				? body.conversation_id
-				: null,
+		conversation_id: conversationId,
 		response_schema:
 			body.response_schema && typeof body.response_schema === "object"
 				? body.response_schema
@@ -1150,6 +1152,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		status: msg.status,
 		target_session: target?.session_id ?? null,
 		target_name: targetName,
+		conversation_id: msg.conversation_id,
 	};
 	return json(resp);
 }
@@ -1163,6 +1166,7 @@ function handleGetMessage(_req: Request, msg_id: string): Response {
 				status: m.status,
 				target_session: m.target_session || null,
 				target_name: m.target_name ?? null,
+				conversation_id: m.conversation_id ?? null,
 				response: m.response ?? null,
 				error: m.error ?? null,
 			});
@@ -1197,6 +1201,7 @@ function handleAwaitMessage(req: Request, url: URL, msg_id: string): Response {
 		return json({
 			msg_id: msg.msg_id,
 			status: msg.status,
+			conversation_id: msg.conversation_id ?? null,
 			response: msg.response ?? null,
 			error: msg.error ?? null,
 		});
@@ -1239,6 +1244,7 @@ function handleAwaitMessage(req: Request, url: URL, msg_id: string): Response {
 						finalize({
 							msg_id: m.msg_id,
 							status: m.status,
+							conversation_id: m.conversation_id ?? null,
 							response: m.response ?? null,
 							error: m.error ?? null,
 						});
@@ -1355,6 +1361,7 @@ async function handleSubmitResponse(
 	sendToStream(project, msg.sender_session, "response", {
 		msg_id: msg.msg_id,
 		project: msg.project,
+		conversation_id: msg.conversation_id ?? null,
 		responder: { session_id: body.responder_session, name: responderName },
 		response: msg.response,
 		error: msg.error,
