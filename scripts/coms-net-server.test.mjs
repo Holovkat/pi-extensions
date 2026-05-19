@@ -96,6 +96,33 @@ test('message logs redact prompt bodies by default', () => {
   assert.doesNotMatch(detail, /secret prompt body/);
 });
 
+test('offline name-addressed messages queue and replay when the agent returns', async () => {
+  resetState();
+  const p = __test.getOrCreateProject('default');
+  p.agents.set('sender', agent('sender', 'sender', 'sender-secret'));
+  const senderStream = fakeStream();
+  const targetStream = fakeStream();
+  p.streams.set('sender', { ...senderStream.writer, session_id: 'sender' });
+
+  const resp = await __test.handleSendMessage(jsonRequest({
+    project: 'default', sender_session: 'sender', target: 'net-bob', target_session: null,
+    prompt: 'Reply exactly REPLAY-PONG', conversation_id: null, response_schema: null, hops: 0,
+  }, 'sender-secret'));
+  assert.equal(resp.status, 200);
+  const body = await responseJson(resp);
+  assert.equal(body.status, 'queued');
+  assert.equal(body.target_session, null);
+  assert.equal(body.target_name, 'net-bob');
+
+  p.agents.set('target', agent('target', 'net-bob', 'target-secret'));
+  p.streams.set('target', { ...targetStream.writer, session_id: 'target' });
+  assert.equal(__test.flushQueuedPromptsForTarget(p, 'default', 'target'), 1);
+  const msg = p.messages.get(body.msg_id);
+  assert.equal(msg.target_session, 'target');
+  assert.equal(msg.status, 'running');
+  assert.match(targetStream.frames.join('\n'), /REPLAY-PONG/);
+});
+
 test('session secret is required for sender lifecycle operations and schema cap is enforced', async () => {
   resetState();
   const p = __test.getOrCreateProject('default');

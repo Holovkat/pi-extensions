@@ -134,7 +134,8 @@ interface SendResponse {
 	ok: true;
 	msg_id: string;
 	status: MessageStatus;
-	target_session: string;
+	target_session: string | null;
+	target_name?: string;
 }
 
 interface ResponseSubmitRequest {
@@ -1369,6 +1370,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`coms-net: send failed: ${safeError(err)}`);
 			}
 			const { msg_id, target_session } = resp;
+			const targetName = resp.target_name ?? params.target;
 
 			// Park a pending entry that the SSE `response` event will resolve.
 			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
@@ -1381,8 +1383,8 @@ export default function (pi: ExtensionAPI) {
 				resolve: resolveFn,
 				reject: rejectFn,
 				promise,
-				target_name: params.target,
-				target_session,
+				target_name: targetName,
+				target_session: target_session ?? undefined,
 				created_at: nowIso(),
 				timer: null,
 			};
@@ -1400,7 +1402,7 @@ export default function (pi: ExtensionAPI) {
 					event: "prompt_out",
 					ts: nowIso(),
 					msg_id,
-					target: params.target,
+					target: targetName,
 					target_session,
 					hops,
 				});
@@ -1409,9 +1411,9 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text" as const,
-					text: `coms_net_send → ${params.target}\nmsg_id ${msg_id}\nhops ${hops}`,
+					text: `coms_net_send → ${targetName}\nmsg_id ${msg_id}\nhops ${hops}`,
 				}],
-				details: { msg_id, target: params.target, target_session, hops },
+				details: { msg_id, target: targetName, target_session, hops },
 			};
 		},
 		renderCall(args, theme) {

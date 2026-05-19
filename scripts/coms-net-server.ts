@@ -181,6 +181,7 @@ export type ComsMessage = {
 	project: string;
 	sender_session: string;
 	target_session: string;
+	target_name?: string;
 	prompt: string;
 	conversation_id: string | null;
 	response_schema: object | null;
@@ -240,7 +241,8 @@ export type SendResponse = {
 	ok: true;
 	msg_id: string;
 	status: MessageStatus;
-	target_session: string;
+	target_session: string | null;
+	target_name?: string;
 };
 
 export type ResponseSubmitRequest = {
@@ -553,10 +555,13 @@ function deliverPromptToTarget(
 	msg: ComsMessage,
 ): boolean {
 	const sender = p.agents.get(msg.sender_session);
-	const target = p.agents.get(msg.target_session);
-	const targetWriter = p.streams.get(msg.target_session);
+	const target = msg.target_session
+		? p.agents.get(msg.target_session)
+		: [...p.agents.values()].find((a) => a.name === msg.target_name);
+	if (target && !msg.target_session) msg.target_session = target.session_id;
+	const targetWriter = target ? p.streams.get(target.session_id) : undefined;
 	if (!sender || !target || !targetWriter) return false;
-	sendToStream(p, msg.target_session, "prompt", {
+	sendToStream(p, target.session_id, "prompt", {
 		msg_id: msg.msg_id,
 		project: projectName,
 		sender: {
@@ -580,8 +585,11 @@ function deliverPromptToTarget(
 
 function flushQueuedPromptsForTarget(p: ProjectState, projectName: string, targetSession: string): number {
 	let delivered = 0;
+	const target = p.agents.get(targetSession);
 	for (const msg of p.messages.values()) {
-		if (msg.target_session !== targetSession || msg.status !== "queued") continue;
+		const matchesSession = msg.target_session === targetSession;
+		const matchesNameMailbox = !msg.target_session && target && msg.target_name === target.name;
+		if ((!matchesSession && !matchesNameMailbox) || msg.status !== "queued") continue;
 		const expires = Date.parse(msg.expires_at);
 		if (Number.isFinite(expires) && Date.now() > expires) continue;
 		if (deliverPromptToTarget(p, projectName, msg)) delivered++;
@@ -604,10 +612,10 @@ function releaseAwaiters(p: ProjectState, msg_id: string): void {
 	p.awaiters.delete(msg_id);
 }
 
-function inboxDepthFor(p: ProjectState, targetSession: string): number {
+function inboxDepthFor(p: ProjectState, targetSession: string, targetName?: string): number {
 	let n = 0;
 	for (const m of p.messages.values()) {
-		if (m.target_session !== targetSession) continue;
+		if (m.target_session !== targetSession && !(targetName && !m.target_session && m.target_name === targetName)) continue;
 		if (m.status === "queued" || m.status === "delivered" || m.status === "running") n++;
 	}
 	return n;
@@ -982,44 +990,48 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		return errorJson("hop_limit_exceeded", 409, { hops, max_hops: MAX_HOPS });
 	}
 
-	// Resolve target.
+	// Resolve target. If a target name is currently offline, accept the send as
+	// a name-addressed mailbox entry and replay it when an agent registers with
+	// that name in this project.
 	let target: RegistryEntry | undefined;
+	let targetName = "";
 	if (body.target_session && typeof body.target_session === "string") {
 		target = p.agents.get(body.target_session);
 		if (!target) {
 			logRejected("target_not_found", `${sender.name} → ${body.target_session.slice(-6)}`);
 			return errorJson("target_not_found", 404);
 		}
+		targetName = target.name;
 	} else {
 		const desired = (body.target ?? "").trim();
 		if (!desired) return errorJson("missing_target", 400);
+		targetName = desired;
 		// Direct session_id match first.
 		const directSid = p.agents.get(desired);
 		if (directSid) {
 			target = directSid;
+			targetName = directSid.name;
 		} else {
 			const bag = p.nameIndex.get(desired);
-			if (!bag || bag.size === 0) {
-				logRejected("target_not_found", `${sender.name} → "${desired}"`);
-				return errorJson("target_not_found", 404, { target: desired });
-			}
-			if (bag.size > 1) {
+			if (bag && bag.size > 1) {
 				logRejected("ambiguous", `${sender.name} → "${desired}" matches ${bag.size}`);
 				return errorJson("ambiguous_target", 409, {
 					target: desired,
 					candidates: [...bag],
 				});
 			}
-			const onlySid = [...bag][0];
-			target = p.agents.get(onlySid);
-			if (!target) return errorJson("target_not_found", 404);
+			if (bag && bag.size === 1) {
+				const onlySid = [...bag][0];
+				target = p.agents.get(onlySid);
+				if (target) targetName = target.name;
+			}
 		}
 	}
 
 	// Inbox cap.
-	const depth = inboxDepthFor(p, target.session_id);
+	const depth = inboxDepthFor(p, target?.session_id ?? "", targetName);
 	if (depth >= MAX_INBOX) {
-		logRejected("inbox_full", `${sender.name} → ${target.name} depth=${depth}`);
+		logRejected("inbox_full", `${sender.name} → ${targetName} depth=${depth}`);
 		return errorJson("inbox_full", 429, { depth, max_inbox: MAX_INBOX });
 	}
 
@@ -1029,7 +1041,8 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		msg_id: ulid(),
 		project: projectName,
 		sender_session: body.sender_session,
-		target_session: target.session_id,
+		target_session: target?.session_id ?? "",
+		target_name: targetName,
 		prompt: body.prompt,
 		conversation_id:
 			body.conversation_id && typeof body.conversation_id === "string"
@@ -1060,7 +1073,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 
 	logMessageSend(
 		sender.name,
-		target.name,
+		targetName,
 		msg.msg_id,
 		msg.prompt,
 		hops,
@@ -1071,7 +1084,8 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		ok: true,
 		msg_id: msg.msg_id,
 		status: msg.status,
-		target_session: target.session_id,
+		target_session: target?.session_id ?? null,
+		target_name: targetName,
 	};
 	return json(resp);
 }
@@ -1083,6 +1097,8 @@ function handleGetMessage(_req: Request, msg_id: string): Response {
 			return json({
 				msg_id: m.msg_id,
 				status: m.status,
+				target_session: m.target_session || null,
+				target_name: m.target_name ?? null,
 				response: m.response ?? null,
 				error: m.error ?? null,
 			});

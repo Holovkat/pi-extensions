@@ -80,7 +80,7 @@ The orchestrator's Pi session memory becomes the mediator's working record. It i
 
 `*_get` returns a stable status for known messages:
 
-- `queued` — the hub accepted the message but the receiver has no active stream yet.
+- `queued` — the hub accepted the message but the receiver has no active stream yet, or the message is waiting in a name-addressed mailbox for that agent to return.
 - `running` — the receiver stream has been handed the prompt and a response is expected.
 - `complete` — a response is available.
 - `error` — the message failed, including explicit receiver errors.
@@ -186,7 +186,7 @@ For shared durable collaboration memory, use repo files/GitHub issues today or a
 
 1. Same-machine `coms`: Alice lists Bob, sends `LOCAL-PONG`, and awaits the reply.
 2. Localhost `coms-net`: hub starts, net-alice lists net-bob, sends `NET-PONG`, and awaits the reply.
-3. Reconnect: stop a receiver stream, send a message, reconnect receiver, and confirm the queued message moves to `running` then `complete`.
+3. Reconnect/offline mailbox: stop a receiver, send to its agent name, restart the receiver with the same name/project, and confirm the queued message is popped automatically and moves to `running` then `complete`.
 4. Safety: a forged session secret cannot send/delete/respond for another `coms-net` session.
 5. Redaction: hub logs show ids, agent names, sizes, hops, and statuses, not prompt bodies, unless `PI_COMS_NET_LOG_PAYLOADS=1` is set.
 6. Packaging: `npm run build` creates `dist/comms-package`; `pi install /absolute/path/to/dist/comms-package` exposes `coms` and `coms-net` entrypoints.
