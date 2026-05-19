@@ -10,6 +10,21 @@
       "command": "jdocmunch-mcp",
       "args": []
     },
+    "affine": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "-p",
+        "affine-mcp-server",
+        "affine-mcp"
+      ],
+      "env": {
+        "AFFINE_BASE_URL": "${AFFINE_BASE_URL}",
+        "AFFINE_API_TOKEN": "${AFFINE_API_TOKEN}",
+        "AFFINE_WORKSPACE_ID": "${AFFINE_WORKSPACE_ID}"
+      }
+    },
     "github": {
       "type": "stdio",
       "command": "npx",

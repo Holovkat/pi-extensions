@@ -1,2 +1,9 @@
 .pi/
 .secure/
+.pi/extensions
+.pi/agents
+.pi/themes
+.pi/skills
+.pi/damage-control-rules.yaml
+.pi/agent-sessions
+.githooks/

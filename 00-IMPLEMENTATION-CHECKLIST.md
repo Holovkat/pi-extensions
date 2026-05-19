@@ -108,3 +108,28 @@ Source of truth epic: [GitHub issue #72](https://github.com/Holovkat/pi-extensio
     - [ ] [#90 Task: pilot greenfield end-to-end flow](https://github.com/Holovkat/pi-extensions/issues/90)
     - [ ] [#91 Task: pilot enhancement end-to-end flow](https://github.com/Holovkat/pi-extensions/issues/91)
     - [ ] [#92 Task: pilot bugfix root-cause-to-regression flow](https://github.com/Holovkat/pi-extensions/issues/92)
+
+## Pi-to-Pi Comms Roadmap
+
+Source of truth epic: [GitHub issue #93](https://github.com/Holovkat/pi-extensions/issues/93)
+
+Source ownership: copy/vendor the reviewed upstream comms extensions into this repo and extend the local copy only. Do not modify or PR against `disler/pi-vs-claude-code`.
+
+- [ ] [#93 Epic: Pi-to-Pi comms request/response hardening roadmap](https://github.com/Holovkat/pi-extensions/issues/93)
+  - [ ] [#94 Sprint: comms v1.0 hardening](https://github.com/Holovkat/pi-extensions/issues/94)
+    - [ ] [#98 Task: add first-version Pi-to-Pi comms baseline](https://github.com/Holovkat/pi-extensions/issues/98)
+    - [ ] [#99 Task: bind inbound replies to the triggered assistant turn](https://github.com/Holovkat/pi-extensions/issues/99)
+    - [ ] [#100 Task: replay queued coms-net messages on reconnect](https://github.com/Holovkat/pi-extensions/issues/100)
+    - [ ] [#101 Task: bound pending replies and payload sizes](https://github.com/Holovkat/pi-extensions/issues/101)
+    - [ ] [#102 Task: harden registry paths and shutdown lifecycle](https://github.com/Holovkat/pi-extensions/issues/102)
+  - [ ] [#95 Sprint: comms v1.1 safety](https://github.com/Holovkat/pi-extensions/issues/95)
+    - [ ] [#103 Task: add per-agent ownership to coms-net](https://github.com/Holovkat/pi-extensions/issues/103)
+    - [ ] [#104 Task: harden local coms spoofing boundary](https://github.com/Holovkat/pi-extensions/issues/104)
+    - [ ] [#105 Task: redact audit logging and add abuse tests](https://github.com/Holovkat/pi-extensions/issues/105)
+  - [ ] [#96 Sprint: comms v1.2 ergonomics](https://github.com/Holovkat/pi-extensions/issues/96)
+    - [ ] [#106 Task: add peer status, tags, and capabilities metadata](https://github.com/Holovkat/pi-extensions/issues/106)
+    - [ ] [#107 Task: expose message lifecycle states in get/list/widget](https://github.com/Holovkat/pi-extensions/issues/107)
+    - [ ] [#108 Task: document first-version workflows and non-goals](https://github.com/Holovkat/pi-extensions/issues/108)
+  - [ ] [#97 Sprint: comms v2.0 packaging and deployment](https://github.com/Holovkat/pi-extensions/issues/97)
+    - [ ] [#109 Task: package comms as an installable Pi package](https://github.com/Holovkat/pi-extensions/issues/109)
+    - [ ] [#110 Task: document deployment profiles and optional structured responses](https://github.com/Holovkat/pi-extensions/issues/110)
