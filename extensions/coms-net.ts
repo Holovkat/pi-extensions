@@ -31,7 +31,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { applyExtensionDefaults } from "./themeMap.ts";
-import { byteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
+import { byteLength, jsonByteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -48,6 +48,7 @@ const MESSAGE_TIMEOUT_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS) || 1_8
 const HTTP_TIMEOUT_MS = 10_000;
 const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES) || 48 * 1024;
 const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES) || 48 * 1024;
+const MAX_SCHEMA_BYTES = Number(process.env.PI_COMS_NET_MAX_SCHEMA_BYTES) || 16 * 1024;
 const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COMS_NET_REPLY_RETENTION_MS) || 5 * 60_000;
 const SHUTDOWN_DELETE_TIMEOUT_MS = 2_000;
 
@@ -63,7 +64,7 @@ const FALLBACK_PALETTE = [
 // ━━ Shared types (canonical block — mirrored on server) ━━━━━━━━━━━━━━━━━━━
 
 type AgentStatus = "online" | "stale" | "offline";
-type MessageStatus = "queued" | "delivered" | "complete" | "error" | "timeout";
+type MessageStatus = "queued" | "delivered" | "running" | "complete" | "error" | "timeout";
 
 interface AgentCard {
 	session_id: string;
@@ -79,6 +80,9 @@ interface AgentCard {
 	context_used_pct: number;
 	queue_depth: number;
 	status: AgentStatus;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 interface RegisterRequest {
@@ -91,6 +95,9 @@ interface RegisterRequest {
 	color: string;
 	cwd: string;
 	explicit: boolean;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 interface RegisterResponse {
@@ -98,6 +105,7 @@ interface RegisterResponse {
 	agent: AgentCard;
 	heartbeat_interval_ms: number;
 	sse_url: string;
+	session_secret: string;
 }
 
 interface HeartbeatRequest {
@@ -106,6 +114,9 @@ interface HeartbeatRequest {
 	queue_depth: number;
 	model?: string;
 	status?: AgentStatus;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 interface SendRequest {
@@ -251,6 +262,18 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function parseCsvList(value: string | undefined): string[] {
+	return (value ?? "")
+		.split(",")
+		.map((v) => v.trim())
+		.filter(Boolean)
+		.slice(0, 16);
+}
+
+function schemaTooLarge(schema: unknown): boolean {
+	return schema != null && jsonByteLength(schema) > MAX_SCHEMA_BYTES;
+}
+
 function abbreviateModel(model: string): string {
 	let m = model || "";
 	if (m.startsWith("claude-")) m = m.slice("claude-".length);
@@ -353,6 +376,9 @@ interface CliFlags {
 	explicit?: boolean;
 	serverUrl?: string;
 	authToken?: string;
+	statusText?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 function readCliFlags(pi: ExtensionAPI): CliFlags {
@@ -363,6 +389,9 @@ function readCliFlags(pi: ExtensionAPI): CliFlags {
 	const explicit = pi.getFlag("explicit") as boolean | undefined;
 	const serverUrl = pi.getFlag("server-url") as string | undefined;
 	const authToken = pi.getFlag("auth-token") as string | undefined;
+	const statusText = pi.getFlag("status") as string | undefined;
+	const tags = pi.getFlag("tags") as string | undefined;
+	const capabilities = pi.getFlag("capabilities") as string | undefined;
 	return {
 		name: name && name.length > 0 ? name : undefined,
 		purpose: purpose && purpose.length > 0 ? purpose : undefined,
@@ -371,6 +400,9 @@ function readCliFlags(pi: ExtensionAPI): CliFlags {
 		explicit: explicit === true,
 		serverUrl: serverUrl && serverUrl.length > 0 ? serverUrl : undefined,
 		authToken: authToken && authToken.length > 0 ? authToken : undefined,
+		statusText: statusText && statusText.length > 0 ? statusText : undefined,
+		tags: parseCsvList(tags),
+		capabilities: parseCsvList(capabilities),
 	};
 }
 
@@ -413,6 +445,21 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 		default: undefined,
 	});
+	pi.registerFlag("status", {
+		description: "Short status text advertised to peers",
+		type: "string",
+		default: undefined,
+	});
+	pi.registerFlag("tags", {
+		description: "Comma-separated peer tags advertised in coms_net_list",
+		type: "string",
+		default: undefined,
+	});
+	pi.registerFlag("capabilities", {
+		description: "Comma-separated peer capabilities advertised in coms_net_list",
+		type: "string",
+		default: undefined,
+	});
 
 	// ━━ Module-scope state ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 	let identity: {
@@ -425,9 +472,13 @@ export default function (pi: ExtensionAPI) {
 		cwd: string;
 		model: string;
 		started_at: string;
+		status_text?: string;
+		tags: string[];
+		capabilities: string[];
 	} | null = null;
 	let serverUrl: string | null = null;
 	let authToken: string | null = null;
+	let sessionSecret: string | null = null;
 	let sseUrlPath: string | null = null;
 	const peerCards: Map<string, AgentCard> = new Map();
 	const pendingReplies: Map<string, PendingReply> = new Map();
@@ -454,6 +505,7 @@ export default function (pi: ExtensionAPI) {
 			"Authorization": `Bearer ${authToken}`,
 			"Accept": "application/json",
 		};
+		if (sessionSecret) headers["x-pi-coms-net-session-secret"] = sessionSecret;
 		const init: any = { method, headers };
 		if (body !== undefined) {
 			headers["Content-Type"] = "application/json";
@@ -694,6 +746,18 @@ export default function (pi: ExtensionAPI) {
 		}
 		const hops = typeof data.hops === "number" ? data.hops : 0;
 		const responseSchema = (data.response_schema && typeof data.response_schema === "object") ? data.response_schema : null;
+		if (schemaTooLarge(responseSchema)) {
+			audit("prompt_in_rejected", { msg_id, reason: "schema_too_large", bytes: jsonByteLength(responseSchema) });
+			if (identity) {
+				void httpFetch("POST", `/v1/messages/${encodeURIComponent(msg_id)}/response`, {
+					project: identity.project,
+					responder_session: identity.session_id,
+					response: null,
+					error: `response_schema too large (${jsonByteLength(responseSchema)} > ${MAX_SCHEMA_BYTES} bytes)`,
+				}).catch((err) => audit("prompt_reject_response_failed", { msg_id, reason: safeError(err) }));
+			}
+			return;
+		}
 
 		const inbound: InboundContext = {
 			msg_id,
@@ -791,6 +855,7 @@ export default function (pi: ExtensionAPI) {
 			"Authorization": `Bearer ${authToken}`,
 			"Accept": "text/event-stream",
 		};
+		if (sessionSecret) headers["x-pi-coms-net-session-secret"] = sessionSecret;
 		let resp: Response;
 		try {
 			resp = await fetch(url, { method: "GET", headers, signal: ac.signal });
@@ -883,11 +948,15 @@ export default function (pi: ExtensionAPI) {
 			color: identity.color,
 			cwd: identity.cwd,
 			explicit: identity.explicit,
+			status_text: identity.status_text ?? "",
+			tags: identity.tags ?? [],
+			capabilities: identity.capabilities ?? [],
 		};
 		const resp = await httpFetch("POST", "/v1/agents/register", req) as RegisterResponse;
-		if (!resp || !resp.agent) {
+		if (!resp || !resp.agent || typeof resp.session_secret !== "string") {
 			throw new Error("coms-net: malformed register response");
 		}
+		sessionSecret = resp.session_secret;
 		// Server may auto-suffix the name on collision.
 		if (resp.agent.name !== identity.name) {
 			try {
@@ -929,6 +998,9 @@ export default function (pi: ExtensionAPI) {
 		const defaultName = `agent-${session_id.slice(-6)}`;
 		const desiredName = flags.name || fm.name || defaultName;
 		const purpose = flags.purpose || fm.description || "";
+		const status_text = flags.statusText ?? "";
+		const tags = flags.tags ?? [];
+		const capabilities = flags.capabilities ?? [];
 
 		// Color — fallback chain: --color > frontmatter > deterministic.
 		let color = fallbackColor(session_id);
@@ -949,6 +1021,9 @@ export default function (pi: ExtensionAPI) {
 			cwd,
 			model,
 			started_at,
+			status_text,
+			tags,
+			capabilities,
 		};
 		displayProject = project;
 		includeExplicit = false;
@@ -1038,6 +1113,9 @@ export default function (pi: ExtensionAPI) {
 				queue_depth: inboundQueue.size,
 				model: ctxNow?.model?.id ?? identity.model,
 				status: "online",
+				status_text: identity.status_text ?? "",
+				tags: identity.tags ?? [],
+				capabilities: identity.capabilities ?? [],
 			};
 			httpFetch("POST", `/v1/agents/${encodeURIComponent(identity.session_id)}/heartbeat`, hbReq, { timeoutMs: 5_000 })
 				.catch((err) => {
@@ -1058,6 +1136,9 @@ export default function (pi: ExtensionAPI) {
 			pct: number | null;
 			pending: boolean;
 			stale: boolean;
+			status_text: string;
+			tags: string[];
+			capabilities: string[];
 		}
 
 		const rows: Row[] = [];
@@ -1072,6 +1153,9 @@ export default function (pi: ExtensionAPI) {
 				pct: typeof card.context_used_pct === "number" ? card.context_used_pct : null,
 				pending: card.status === "stale",
 				stale: card.status === "offline",
+				status_text: card.status_text ?? "",
+				tags: card.tags ?? [],
+				capabilities: card.capabilities ?? [],
 			});
 		}
 
@@ -1138,7 +1222,8 @@ export default function (pi: ExtensionAPI) {
 			const bar = theme.fg("warning", "[") + barFill + theme.fg("warning", "]");
 			const pctPart = " " + theme.fg("accent", pctLabel.padStart(4));
 			const sep = theme.fg("dim", "  —  ");
-			const purposePart = theme.fg("muted", r.purpose || "");
+			const meta = [r.status_text, ...r.tags.slice(0, 2).map((t) => `#${t}`), ...r.capabilities.slice(0, 1).map((c) => `cap:${c}`)].filter(Boolean).join(" ");
+			const purposePart = theme.fg("muted", meta || r.purpose || "");
 
 			const line = " " + swatch + " " + namePart + " " + modelPart + " " + bar + pctPart + sep + purposePart;
 			out.push(truncateToWidth(line, width));
@@ -1190,7 +1275,8 @@ export default function (pi: ExtensionAPI) {
 				: peers.map((a) => {
 					const live = a.status === "online" ? "●" : a.status === "stale" ? "~" : "✗";
 					const ctxStr = typeof a.context_used_pct === "number" ? ` ${a.context_used_pct}%` : " ?%";
-					return `${live} ${a.name} (${abbreviateModel(a.model)})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}`;
+					const meta = [a.status_text, ...(a.tags ?? []).map((t) => `#${t}`), ...(a.capabilities ?? []).map((c) => `cap:${c}`)].filter(Boolean).join(" ");
+					return `${live} ${a.name} (${abbreviateModel(a.model)})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}${meta ? ` · ${meta}` : ""}`;
 				}).join("\n");
 
 			return {
@@ -1218,7 +1304,9 @@ export default function (pi: ExtensionAPI) {
 					: a.status === "stale" ? theme.fg("warning", "~")
 					: theme.fg("error", "✗");
 				const pct = typeof a.context_used_pct === "number" ? `${a.context_used_pct}%` : "?%";
-				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", abbreviateModel(a.model))} ${theme.fg("warning", pct)}`;
+				const tags = Array.isArray(a.tags) && a.tags.length ? theme.fg("dim", ` #${a.tags.slice(0, 2).join(" #")}`) : "";
+				const statusText = a.status_text ? theme.fg("muted", ` ${a.status_text}`) : "";
+				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", abbreviateModel(a.model))} ${theme.fg("warning", pct)}${statusText}${tags}`;
 			}).join("\n");
 			return new Text(header + "\n" + rows, 0, 0);
 		},
@@ -1254,6 +1342,9 @@ export default function (pi: ExtensionAPI) {
 
 			if (byteLength(params.prompt) > MAX_PROMPT_BYTES) {
 				throw new Error(`coms-net: prompt too large (${byteLength(params.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+			}
+			if (schemaTooLarge((params as any).response_schema)) {
+				throw new Error(`coms-net: response_schema too large (${jsonByteLength((params as any).response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
 			}
 
 			const req: SendRequest = {
@@ -1297,7 +1388,7 @@ export default function (pi: ExtensionAPI) {
 			};
 			entry.timer = setTimeout(() => {
 				if (entry.result) return;
-				entry.result = { error: "timeout" };
+				entry.result = { error: "expired" };
 				try { entry.resolve(entry.result); } catch { /* ignore */ }
 				schedulePendingReplyCleanup(msg_id);
 			}, MESSAGE_TIMEOUT_MS);
@@ -1367,12 +1458,13 @@ export default function (pi: ExtensionAPI) {
 			const pending = pendingReplies.get(msg_id);
 			if (pending && pending.result) {
 				const r = pending.result;
+				const status = r.error ? (r.error === "expired" ? "expired" : "error") : "complete";
 				const text = r.error
-					? `coms_net_get: error — ${r.error}`
-					: `coms_net_get: complete\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
+					? `coms_net_get: ${status} — ${r.error}`
+					: `coms_net_get: ${status}\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
 				return {
 					content: [{ type: "text" as const, text }],
-					details: { status: "complete", response: r.response, error: r.error ?? null },
+					details: { status, response: r.response, error: r.error ?? null },
 				};
 			}
 			// Fall back to server.
@@ -1417,7 +1509,7 @@ export default function (pi: ExtensionAPI) {
 			const d = result.details as any;
 			const status = d?.status ?? "?";
 			const color = status === "complete" ? "success"
-				: status === "pending" || status === "queued" || status === "delivered" ? "warning"
+				: status === "pending" || status === "queued" || status === "delivered" || status === "running" ? "warning"
 				: "error";
 			return new Text(theme.fg(color, status), 0, 0);
 		},

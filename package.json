@@ -1,0 +1,37 @@
+{
+  "name": "@holovkat/pi-comms",
+  "version": "0.1.0",
+  "description": "Pi-to-Pi request/response comms extensions for local and networked agents.",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-comms",
+    "agent-communication"
+  ],
+  "files": [
+    "extensions/coms.ts",
+    "extensions/coms-net.ts",
+    "extensions/coms-shared.ts",
+    "extensions/themeMap.ts",
+    "scripts/coms-net-server.ts",
+    "docs/comms.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build-comms-package.mjs",
+    "test:comms": "node --test extensions/coms.test.mjs scripts/coms-net-server.test.mjs scripts/comms-package-smoke.test.mjs"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/coms.ts",
+      "./extensions/coms-net.ts"
+    ]
+  }
+}

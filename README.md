@@ -1160,3 +1160,29 @@ A 7-task epic with 2 fix depths typically takes 5-10 minutes. If agents yield an
 | **Fix strategy**       | Re-attempt with gap feedback        | Surgical subtask decomposition       |
 | **UAT**                | Manual sign-off                     | Automated Playwright + approval gate |
 | **Best for**           | Complex architectures, first builds | Iteration, known patterns, speed     |
+
+## Pi-to-Pi Comms
+
+This repo includes first-version Pi-to-Pi request/response communication extensions:
+
+- `extensions/coms.ts` — same-machine peer discovery and request/response over local IPC.
+- `extensions/coms-net.ts` — networked request/response client over the Bun hub in `scripts/coms-net-server.ts`.
+
+Quick local smoke:
+
+```bash
+pi --no-extensions -e ./extensions/coms.ts --name alice --project comms-uat
+pi --no-extensions -e ./extensions/coms.ts --name bob --project comms-uat
+```
+
+Quick networked smoke:
+
+```bash
+PI_COMS_NET_PROJECT=comms-net-uat PI_COMS_NET_PORT=48201 bun scripts/coms-net-server.ts
+pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-net-uat
+pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat
+```
+
+Ask Alice to list peers, send Bob a prompt, and await the returned `msg_id`. The receiver replies by writing a normal assistant response; it should not call `*_send` to answer an inbound request.
+
+See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, structured-response, and UAT notes.

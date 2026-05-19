@@ -19,7 +19,7 @@
 // - Atomic writes via .tmp + renameSync.
 // - SIGINT/SIGTERM unlinks server.json (always best-effort) and server.secret.json
 //   only if TOKEN_FILE_OWNED_BY_US is true.
-// - Status state machine: queued | delivered | complete | error | timeout.
+// - Status state machine: queued | delivered | running | complete | error | timeout.
 //   No `in_progress` (dropped from v1).
 
 import * as crypto from "node:crypto";
@@ -46,6 +46,7 @@ const STALE_AFTER_MS = Number(process.env.PI_COMS_NET_STALE_AFTER_MS ?? 30_000);
 const OFFLINE_AFTER_MS = Number(process.env.PI_COMS_NET_OFFLINE_AFTER_MS ?? 60_000);
 const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES ?? 48 * 1024);
 const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES ?? 48 * 1024);
+const MAX_SCHEMA_BYTES = Number(process.env.PI_COMS_NET_MAX_SCHEMA_BYTES ?? 16 * 1024);
 
 const STALE_SCAN_INTERVAL_MS = 5_000;
 const TTL_SCAN_INTERVAL_MS = 10_000;
@@ -70,6 +71,7 @@ let TOKEN_FILE_OWNED_BY_US = false;
 const LOG_TTY = process.stdout.isTTY === true;
 const LOG_QUIET = process.env.PI_COMS_NET_LOG_QUIET === "1";
 const LOG_HEARTBEAT = process.env.PI_COMS_NET_LOG_HEARTBEAT === "1";
+const LOG_PAYLOADS = process.env.PI_COMS_NET_LOG_PAYLOADS === "1";
 
 const C_DIM    = LOG_TTY ? "\x1b[2m"  : "";
 const C_RESET  = LOG_TTY ? "\x1b[0m"  : "";
@@ -103,11 +105,17 @@ function logSseOpen(name: string, totalStreams: number): void {
 function logSseClose(name: string, reason: string): void {
 	logLine("⇄", C_DIM, "sse-close", `${name} ${dim("reason=" + reason)}`);
 }
-function logMessageSend(sender: string, target: string, msgId: string, prompt: string, hops: number, delivered: boolean): void {
+function formatMessageSendDetail(sender: string, target: string, msgId: string, prompt: string, hops: number, delivered: boolean): string {
+	const status = delivered ? dim("delivered") : dim("queued");
+	const base = `${sender} → ${target} ${dim(tail6(msgId))} ${dim(`bytes=${byteLength(prompt)} hops=${hops}`)} ${status}`;
+	if (!LOG_PAYLOADS) return base;
 	const preview = prompt.length > 50 ? prompt.slice(0, 47) + "…" : prompt;
 	const safePreview = preview.replace(/\n/g, " ⏎ ");
-	const status = delivered ? dim("delivered") : dim("queued");
-	logLine("→", C_PINK, "message", `${sender} → ${target} ${dim(tail6(msgId))} "${safePreview}" ${dim(`hops=${hops}`)} ${status}`);
+	return `${base} ${dim("preview=")}"${safePreview}"`;
+}
+
+function logMessageSend(sender: string, target: string, msgId: string, prompt: string, hops: number, delivered: boolean): void {
+	logLine("→", C_PINK, "message", formatMessageSendDetail(sender, target, msgId, prompt, hops, delivered));
 }
 function logResponse(responder: string, sender: string, msgId: string, isError: boolean, error: string | null, size: number): void {
 	const status = isError ? `${C_RED}error=${error}${C_RESET}` : dim(`${size}c`);
@@ -138,6 +146,7 @@ export type AgentStatus = "online" | "stale" | "offline";
 export type MessageStatus =
 	| "queued"
 	| "delivered"
+	| "running"
 	| "complete"
 	| "error"
 	| "timeout";
@@ -156,11 +165,15 @@ export type AgentCard = {
 	context_used_pct: number;
 	queue_depth: number;
 	status: AgentStatus;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 };
 
 export type RegistryEntry = AgentCard & {
 	last_seen_at: string;
 	registered_at: string;
+	session_secret: string;
 };
 
 export type ComsMessage = {
@@ -191,6 +204,9 @@ export type RegisterRequest = {
 	color: string;
 	cwd: string;
 	explicit: boolean;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 };
 
 export type RegisterResponse = {
@@ -198,6 +214,7 @@ export type RegisterResponse = {
 	agent: AgentCard;
 	heartbeat_interval_ms: number;
 	sse_url: string;
+	session_secret: string;
 };
 
 export type HeartbeatRequest = {
@@ -334,6 +351,19 @@ function authed(req: Request): boolean {
 	return tokensEqual(h.slice(7), TOKEN);
 }
 
+function newSessionSecret(): string {
+	return crypto.randomBytes(32).toString("hex");
+}
+
+function sessionSecretFrom(req: Request): string {
+	return req.headers.get("x-pi-coms-net-session-secret") ?? "";
+}
+
+function verifySessionSecret(req: Request, entry: RegistryEntry): boolean {
+	const supplied = sessionSecretFrom(req);
+	return supplied.length > 0 && tokensEqual(supplied, entry.session_secret);
+}
+
 export function json(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
 		status,
@@ -460,6 +490,9 @@ function entryToCard(e: RegistryEntry): AgentCard {
 		context_used_pct,
 		queue_depth,
 		status,
+		status_text,
+		tags,
+		capabilities,
 	} = e;
 	return {
 		session_id,
@@ -475,6 +508,9 @@ function entryToCard(e: RegistryEntry): AgentCard {
 		context_used_pct,
 		queue_depth,
 		status,
+		status_text,
+		tags: tags ?? [],
+		capabilities: capabilities ?? [],
 	};
 }
 
@@ -533,11 +569,11 @@ function deliverPromptToTarget(
 		response_schema: msg.response_schema,
 		hops: msg.hops,
 	});
-	msg.status = "delivered";
+	msg.status = "running";
 	msg.delivered_at = nowIso();
 	sendToStream(p, msg.sender_session, "message_status", {
 		msg_id: msg.msg_id,
-		status: "delivered",
+		status: "running",
 	});
 	return true;
 }
@@ -572,7 +608,7 @@ function inboxDepthFor(p: ProjectState, targetSession: string): number {
 	let n = 0;
 	for (const m of p.messages.values()) {
 		if (m.target_session !== targetSession) continue;
-		if (m.status === "queued" || m.status === "delivered") n++;
+		if (m.status === "queued" || m.status === "delivered" || m.status === "running") n++;
 	}
 	return n;
 }
@@ -612,6 +648,9 @@ async function handleRegister(req: Request): Promise<Response> {
 	let resolvedName = desiredName;
 	const existing = p.agents.get(body.session_id);
 	const isReregister = !!existing;
+	if (existing && !verifySessionSecret(req, existing)) {
+		return errorJson("invalid_session_secret", 403);
+	}
 	if (existing) {
 		// upsert: keep their existing name unless they ask for a different one
 		resolvedName =
@@ -636,11 +675,15 @@ async function handleRegister(req: Request): Promise<Response> {
 		context_used_pct: existing?.context_used_pct ?? 0,
 		queue_depth: existing?.queue_depth ?? 0,
 		status: "online",
+		status_text: body.status_text ?? existing?.status_text ?? "",
+		tags: Array.isArray(body.tags) ? body.tags.slice(0, 16).map(String) : existing?.tags ?? [],
+		capabilities: Array.isArray(body.capabilities) ? body.capabilities.slice(0, 16).map(String) : existing?.capabilities ?? [],
 	};
 	const entry: RegistryEntry = {
 		...card,
 		registered_at: existing?.registered_at ?? nowIso(),
 		last_seen_at: nowIso(),
+		session_secret: existing?.session_secret ?? newSessionSecret(),
 	};
 
 	if (existing && existing.name !== entry.name) {
@@ -666,6 +709,7 @@ async function handleRegister(req: Request): Promise<Response> {
 		agent: entryToCard(entry),
 		heartbeat_interval_ms: HEARTBEAT_MS,
 		sse_url,
+		session_secret: entry.session_secret,
 	};
 	return json(resp);
 }
@@ -677,6 +721,7 @@ function handleEvents(req: Request, url: URL): Response {
 	const p = getOrCreateProject(projectName);
 	const entry = p.agents.get(session_id);
 	if (!entry) return errorJson("agent_not_found", 404);
+	if (!verifySessionSecret(req, entry)) return errorJson("invalid_session_secret", 403);
 
 	const enc = new TextEncoder();
 	let writer: SseWriter | null = null;
@@ -827,6 +872,7 @@ async function handleHeartbeat(
 	if (!p) return errorJson("agent_not_found", 404);
 	const entry = p.agents.get(sessionId);
 	if (!entry) return errorJson("agent_not_found", 404);
+	if (!verifySessionSecret(req, entry)) return errorJson("invalid_session_secret", 403);
 
 	const before: Partial<AgentCard> = {
 		context_used_pct: entry.context_used_pct,
@@ -839,6 +885,9 @@ async function handleHeartbeat(
 	if (typeof body.queue_depth === "number")
 		entry.queue_depth = body.queue_depth;
 	if (typeof body.model === "string") entry.model = body.model;
+	if (typeof (body as any).status_text === "string") entry.status_text = (body as any).status_text;
+	if (Array.isArray((body as any).tags)) entry.tags = (body as any).tags.slice(0, 16).map(String);
+	if (Array.isArray((body as any).capabilities)) entry.capabilities = (body as any).capabilities.slice(0, 16).map(String);
 	if (
 		body.status === "online" ||
 		body.status === "stale" ||
@@ -870,6 +919,9 @@ async function handleHeartbeat(
 					queue_depth: entry.queue_depth,
 					model: entry.model,
 					status: entry.status,
+					status_text: entry.status_text ?? "",
+					tags: entry.tags ?? [],
+					capabilities: entry.capabilities ?? [],
 				},
 			},
 			sessionId,
@@ -915,9 +967,13 @@ async function handleSendMessage(req: Request): Promise<Response> {
 
 	const sender = p.agents.get(body.sender_session);
 	if (!sender) return errorJson("sender_not_registered", 404);
+	if (!verifySessionSecret(req, sender)) return errorJson("invalid_session_secret", 403);
 	if (byteLength(body.prompt) > MAX_PROMPT_BYTES) {
 		logRejected("prompt_too_large", `${sender.name} bytes=${byteLength(body.prompt)} max=${MAX_PROMPT_BYTES}`);
 		return errorJson("prompt_too_large", 413, { bytes: byteLength(body.prompt), max_bytes: MAX_PROMPT_BYTES });
+	}
+	if (body.response_schema && jsonByteLength(body.response_schema) > MAX_SCHEMA_BYTES) {
+		return errorJson("schema_too_large", 413, { bytes: jsonByteLength(body.response_schema), max_bytes: MAX_SCHEMA_BYTES });
 	}
 
 	const hops = typeof body.hops === "number" ? body.hops : 0;
@@ -1008,7 +1064,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		msg.msg_id,
 		msg.prompt,
 		hops,
-		msg.status === "delivered",
+		msg.status === "running" || msg.status === "delivered",
 	);
 
 	const resp: SendResponse = {
@@ -1188,6 +1244,8 @@ async function handleSubmitResponse(
 		}
 	}
 	if (!project || !msg) return errorJson("message_not_found", 404);
+	const responderEntry = project.agents.get(body.responder_session);
+	if (!responderEntry || !verifySessionSecret(req, responderEntry)) return errorJson("invalid_session_secret", 403);
 	if (body.responder_session !== msg.target_session) {
 		return errorJson("not_target", 403);
 	}
@@ -1248,6 +1306,7 @@ function handleDeleteAgent(_req: Request, url: URL, sessionId: string): Response
 	if (!p) return errorJson("agent_not_found", 404);
 	const entry = p.agents.get(sessionId);
 	if (!entry) return errorJson("agent_not_found", 404);
+	if (!verifySessionSecret(_req, entry)) return errorJson("invalid_session_secret", 403);
 
 	// Close stream first; the abort handler may also fire.
 	const stream = p.streams.get(sessionId);
@@ -1433,7 +1492,8 @@ function ttlScanTick(): void {
 			const completedAt = m.completed_at ? Date.parse(m.completed_at) : 0;
 			if (
 				m.status === "queued" ||
-				m.status === "delivered"
+				m.status === "delivered" ||
+				m.status === "running"
 			) {
 				if (Number.isFinite(expires) && now > expires) {
 					m.status = "error";
@@ -1505,11 +1565,16 @@ function stopLoops(): void {
 
 export const __test = {
 	state,
+	formatMessageSendDetail,
 	sanitizePathSegment,
 	getOrCreateProject,
 	deliverPromptToTarget,
 	flushQueuedPromptsForTarget,
 	ttlScanTick,
+	handleRegister,
+	handleSendMessage,
+	handleSubmitResponse,
+	handleDeleteAgent,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

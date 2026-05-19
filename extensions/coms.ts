@@ -22,7 +22,7 @@ import { Text, Container, truncateToWidth, visibleWidth, wrapTextWithAnsi } from
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { applyExtensionDefaults } from "./themeMap.ts";
-import { byteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
+import { byteLength, jsonByteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -39,6 +39,7 @@ const KEEPALIVE_INTERVAL_MS = 30_000;
 const LINE_CAP_BYTES = 64 * 1024;
 const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_MAX_PROMPT_BYTES) || 48 * 1024;
 const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_MAX_RESPONSE_BYTES) || 48 * 1024;
+const MAX_SCHEMA_BYTES = Number(process.env.PI_COMS_MAX_SCHEMA_BYTES) || 16 * 1024;
 const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COMS_REPLY_RETENTION_MS) || 5 * 60_000;
 
 const FALLBACK_PALETTE = [
@@ -85,6 +86,9 @@ interface AgentCard {
 	color: string;
 	context_used_pct: number;
 	queue_depth: number;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 interface Pong {
@@ -110,7 +114,12 @@ interface RegistryEntry {
 	context_used_pct?: number;
 	queue_depth?: number;
 	heartbeat_at?: string;
+	status_text?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
+
+type LocalMessageStatus = "queued" | "running" | "complete" | "error" | "expired";
 
 interface PendingReply {
 	resolve: (value: any) => void;
@@ -119,6 +128,8 @@ interface PendingReply {
 	promise: Promise<{ response?: any; error?: string | null }>;
 	result?: { response?: any; error?: string | null };
 	target_name?: string;
+	target_session?: string;
+	status: LocalMessageStatus;
 	created_at: string;
 }
 
@@ -211,6 +222,33 @@ function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function parseCsvList(value: string | undefined): string[] {
+	return (value ?? "")
+		.split(",")
+		.map((v) => v.trim())
+		.filter(Boolean)
+		.slice(0, 16);
+}
+
+function schemaTooLarge(schema: unknown): boolean {
+	return schema != null && jsonByteLength(schema) > MAX_SCHEMA_BYTES;
+}
+
+function findRegistryEntryBySession(sessionId: string): RegistryEntry | null {
+	for (const entry of readAllRegistryEntriesAcrossProjects()) {
+		if (entry.session_id === sessionId) return entry;
+	}
+	return null;
+}
+
+function validateSenderRegistry(env: PromptEnvelope): string | null {
+	const entry = findRegistryEntryBySession(env.sender_session);
+	if (!entry) return "sender not registered";
+	if (entry.endpoint !== env.sender_endpoint) return "sender endpoint mismatch";
+	try { process.kill(entry.pid, 0); } catch { return "sender process not live"; }
+	return null;
+}
+
 function abbreviateModel(model: string): string {
 	let m = model || "";
 	if (m.startsWith("claude-")) m = m.slice("claude-".length);
@@ -226,6 +264,9 @@ interface CliFlags {
 	project?: string;
 	color?: string;
 	explicit?: boolean;
+	statusText?: string;
+	tags?: string[];
+	capabilities?: string[];
 }
 
 function readCliFlags(pi: ExtensionAPI): CliFlags {
@@ -236,12 +277,18 @@ function readCliFlags(pi: ExtensionAPI): CliFlags {
 	const project = pi.getFlag("project") as string | undefined;
 	const color = pi.getFlag("color") as string | undefined;
 	const explicit = pi.getFlag("explicit") as boolean | undefined;
+	const statusText = pi.getFlag("status") as string | undefined;
+	const tags = pi.getFlag("tags") as string | undefined;
+	const capabilities = pi.getFlag("capabilities") as string | undefined;
 	return {
 		name: name && name.length > 0 ? name : undefined,
 		purpose: purpose && purpose.length > 0 ? purpose : undefined,
 		project: project && project.length > 0 ? project : undefined,
 		color: color && color.length > 0 ? color : undefined,
 		explicit: explicit === true,
+		statusText: statusText && statusText.length > 0 ? statusText : undefined,
+		tags: parseCsvList(tags),
+		capabilities: parseCsvList(capabilities),
 	};
 }
 
@@ -574,6 +621,21 @@ export default function (pi: ExtensionAPI) {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag("status", {
+		description: "Short status text advertised to peers",
+		type: "string",
+		default: undefined,
+	});
+	pi.registerFlag("tags", {
+		description: "Comma-separated peer tags advertised in coms_list",
+		type: "string",
+		default: undefined,
+	});
+	pi.registerFlag("capabilities", {
+		description: "Comma-separated peer capabilities advertised in coms_list",
+		type: "string",
+		default: undefined,
+	});
 
 	// State containers — shared across all hooks for this extension instance.
 	let identity: {
@@ -587,6 +649,9 @@ export default function (pi: ExtensionAPI) {
 		model: string;
 		endpoint: string;
 		registryFile: string;
+		status_text?: string;
+		tags: string[];
+		capabilities: string[];
 	} | null = null;
 	const peerCards: Map<string, AgentCard & { staleCount: number }> = new Map();
 	const pendingReplies: Map<string, PendingReply> = new Map();
@@ -626,6 +691,15 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (byteLength(env.prompt ?? "") > MAX_PROMPT_BYTES) {
 			nack(socket, env.msg_id, `prompt too large (${byteLength(env.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+			return;
+		}
+		if (schemaTooLarge(env.response_schema)) {
+			nack(socket, env.msg_id, `response_schema too large (${jsonByteLength(env.response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
+			return;
+		}
+		const senderRegistryError = validateSenderRegistry(env);
+		if (senderRegistryError) {
+			nack(socket, env.msg_id, senderRegistryError);
 			return;
 		}
 		if ([...inboundQueue.values()].some((i) => !i.fulfilled)) {
@@ -698,6 +772,10 @@ export default function (pi: ExtensionAPI) {
 	function handleResponse(socket: net.Socket, env: ResponseEnvelope): void {
 		const pending = pendingReplies.get(env.msg_id);
 		if (pending) {
+			if (pending.target_session && pending.target_session !== env.sender_session) {
+				nack(socket, env.msg_id, "responder session mismatch");
+				return;
+			}
 			if (pending.result) {
 				ackOk(socket, env.msg_id);
 				return;
@@ -706,6 +784,7 @@ export default function (pi: ExtensionAPI) {
 				try { clearTimeout(pending.timer); } catch { /* ignore */ }
 				pending.timer = null;
 			}
+			pending.status = env.error ? "error" : "complete";
 			pending.result = { response: env.response, error: env.error ?? null };
 			try {
 				pending.resolve(pending.result);
@@ -734,6 +813,9 @@ export default function (pi: ExtensionAPI) {
 			color: ident?.color ?? "#36F9F6",
 			context_used_pct: pct,
 			queue_depth: inboundQueue.size,
+			status_text: ident?.status_text ?? "",
+			tags: ident?.tags ?? [],
+			capabilities: ident?.capabilities ?? [],
 		};
 		const pong: Pong = { type: "pong", msg_id: env.msg_id, agent_card: card };
 		try {
@@ -828,6 +910,9 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const purpose = flags.purpose || fm.description || "";
+		const status_text = flags.statusText ?? "";
+		const tags = flags.tags ?? [];
+		const capabilities = flags.capabilities ?? [];
 
 		// Color: validate at every level; fall through invalid hex to next.
 		// Order: --color CLI flag > frontmatter color > deterministic fallback.
@@ -876,6 +961,9 @@ export default function (pi: ExtensionAPI) {
 			started_at: nowIso(),
 			explicit,
 			version: 1,
+			status_text,
+			tags,
+			capabilities,
 		};
 		let registryFile: string;
 		try {
@@ -897,6 +985,9 @@ export default function (pi: ExtensionAPI) {
 			model,
 			endpoint,
 			registryFile,
+			status_text,
+			tags,
+			capabilities,
 		};
 		includeExplicit = false;
 		displayProject = project;
@@ -945,6 +1036,9 @@ export default function (pi: ExtensionAPI) {
 					context_used_pct: Math.round(ctx?.getContextUsage()?.percent ?? 0),
 					queue_depth: inboundQueue.size,
 					heartbeat_at: nowIso(),
+					status_text: identity.status_text ?? "",
+					tags: identity.tags ?? [],
+					capabilities: identity.capabilities ?? [],
 				};
 				// Unconditional atomic write: handles BOTH the live-status refresh
 				// (file present → overwrite with fresh values) AND self-heal (file
@@ -1188,7 +1282,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function listProjects(): string[] {
+	function listProjectSegments(): string[] {
 		const root = path.join(COMS_DIR, "projects");
 		try {
 			return fs.readdirSync(root).filter((d) => {
@@ -1207,13 +1301,13 @@ export default function (pi: ExtensionAPI) {
 			if (byName) return byName;
 		}
 		// Fall back to scanning all projects by session_id (or name as last resort).
-		for (const proj of listProjects()) {
-			const entries = pruneDeadEntries(proj);
+		for (const proj of listProjectSegments()) {
+			const entries = pruneDeadEntries(proj, true);
 			const bySession = entries.find((e) => e.session_id === target);
 			if (bySession) return bySession;
 		}
-		for (const proj of listProjects()) {
-			const entries = pruneDeadEntries(proj);
+		for (const proj of listProjectSegments()) {
+			const entries = pruneDeadEntries(proj, true);
 			const byName = entries.find((e) => e.name === target);
 			if (byName) return byName;
 		}
@@ -1235,11 +1329,11 @@ export default function (pi: ExtensionAPI) {
 		async execute(_callId, params) {
 			const includeExp = params.include_explicit === true;
 			const projectFilter = params.project ?? identity?.project ?? "default";
-			const projects = projectFilter === "*" ? listProjects() : [projectFilter];
+			const projects = projectFilter === "*" ? listProjectSegments() : [projectFilter];
 
 			const collected: { entry: RegistryEntry; project: string }[] = [];
 			for (const proj of projects) {
-				for (const entry of pruneDeadEntries(proj)) {
+				for (const entry of pruneDeadEntries(proj, projectFilter === "*")) {
 					if (entry.explicit && !includeExp) continue;
 					if (identity && entry.session_id === identity.session_id) continue;
 					collected.push({ entry, project: proj });
@@ -1261,6 +1355,10 @@ export default function (pi: ExtensionAPI) {
 					project: c.project,
 					alive: pong != null,
 					context_used_pct: pong ? pong.context_used_pct : null,
+					queue_depth: pong ? pong.queue_depth : c.entry.queue_depth ?? null,
+					status_text: pong?.status_text ?? c.entry.status_text ?? "",
+					tags: pong?.tags ?? c.entry.tags ?? [],
+					capabilities: pong?.capabilities ?? c.entry.capabilities ?? [],
 					color: c.entry.color,
 				};
 			});
@@ -1270,7 +1368,8 @@ export default function (pi: ExtensionAPI) {
 				: agents.map((a) => {
 					const ctxStr = a.context_used_pct != null ? ` ${a.context_used_pct}%` : " ?%";
 					const live = a.alive ? "●" : "✗";
-					return `${live} ${a.name} (${a.model})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}`;
+					const meta = [a.status_text, ...(a.tags ?? []).map((t: string) => `#${t}`), ...(a.capabilities ?? []).map((c: string) => `cap:${c}`)].filter(Boolean).join(" ");
+					return `${live} ${a.name} (${a.model})${ctxStr}${a.purpose ? ` — ${a.purpose}` : ""}${meta ? ` · ${meta}` : ""}`;
 				}).join("\n");
 
 			return {
@@ -1296,7 +1395,9 @@ export default function (pi: ExtensionAPI) {
 			const rows = agents.map((a) => {
 				const dot = a.alive ? theme.fg("success", "●") : theme.fg("error", "✗");
 				const pct = a.context_used_pct != null ? `${a.context_used_pct}%` : "?%";
-				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}`;
+				const tags = Array.isArray(a.tags) && a.tags.length ? theme.fg("dim", ` #${a.tags.slice(0, 2).join(" #")}`) : "";
+				const status = a.status_text ? theme.fg("muted", ` ${a.status_text}`) : "";
+				return `${dot} ${theme.fg("accent", a.name)} ${theme.fg("dim", a.model)} ${theme.fg("warning", pct)}${status}${tags}`;
 			}).join("\n");
 			return new Text(header + "\n" + rows, 0, 0);
 		},
@@ -1345,6 +1446,9 @@ export default function (pi: ExtensionAPI) {
 			if (byteLength(params.prompt) > MAX_PROMPT_BYTES) {
 				throw new Error(`coms: prompt too large (${byteLength(params.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
 			}
+			if (schemaTooLarge(params.response_schema)) {
+				throw new Error(`coms: response_schema too large (${jsonByteLength(params.response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
+			}
 
 			// Register the pending entry before sending so a very fast receiver cannot
 			// race its response ahead of pendingReplies.set().
@@ -1360,11 +1464,14 @@ export default function (pi: ExtensionAPI) {
 				timer: null,
 				promise,
 				target_name: target.name,
+				target_session: target.session_id,
+				status: "queued",
 				created_at: nowIso(),
 			};
 			entry.timer = setTimeout(() => {
 				if (entry.result) return;
-				entry.result = { error: "timeout" };
+				entry.status = "expired";
+				entry.result = { error: "expired" };
 				try { entry.resolve(entry.result); } catch { /* ignore */ }
 				schedulePendingReplyCleanup(msg_id);
 			}, TIMEOUT_MS);
@@ -1375,6 +1482,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				// Send the envelope synchronously and wait for the receiver's ack.
 				await sendEnvelope(target.endpoint, env);
+				entry.status = "running";
 			} catch (err) {
 				if (entry.timer) { try { clearTimeout(entry.timer); } catch { /* ignore */ } }
 				pendingReplies.delete(msg_id);
@@ -1443,17 +1551,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (entry.result) {
 				const r = entry.result;
+				const status = entry.status;
 				const text = r.error
-					? `coms_get: error — ${r.error}`
-					: `coms_get: complete\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
+					? `coms_get: ${status} — ${r.error}`
+					: `coms_get: ${status}\n${typeof r.response === "string" ? r.response : JSON.stringify(r.response, null, 2)}`;
 				return {
 					content: [{ type: "text" as const, text }],
-					details: { status: "complete", response: r.response, error: r.error ?? null },
+					details: { status, response: r.response, error: r.error ?? null },
 				};
 			}
 			return {
-				content: [{ type: "text" as const, text: `coms_get: pending` }],
-				details: { status: "pending" },
+				content: [{ type: "text" as const, text: `coms_get: ${entry.status}` }],
+				details: { status: entry.status },
 			};
 		},
 		renderCall(args, theme) {
@@ -1466,7 +1575,7 @@ export default function (pi: ExtensionAPI) {
 		renderResult(result, _options, theme) {
 			const d = result.details as any;
 			const status = d?.status ?? "?";
-			const color = status === "complete" ? "success" : status === "pending" ? "warning" : "error";
+			const color = status === "complete" ? "success" : status === "pending" || status === "queued" || status === "running" ? "warning" : "error";
 			return new Text(theme.fg(color, status), 0, 0);
 		},
 	});

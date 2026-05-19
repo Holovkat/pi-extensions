@@ -4,6 +4,14 @@ export function byteLength(s: string): number {
 	return Buffer.byteLength(s, "utf-8");
 }
 
+export function jsonByteLength(value: unknown): number {
+	try {
+		return byteLength(JSON.stringify(value));
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
 function takeUtf8Prefix(s: string, maxBytes: number): string {
 	let out = "";
 	let used = 0;
@@ -66,6 +74,7 @@ export function latestAssistantTextAfterBoundary(branch: any[], triggerLeafId?: 
 
 export const __test = {
 	byteLength,
+	jsonByteLength,
 	truncateUtf8,
 	sanitizePathSegment,
 	latestAssistantTextAfterBoundary,

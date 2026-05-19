@@ -7,3 +7,5 @@
 .pi/damage-control-rules.yaml
 .pi/agent-sessions
 .githooks/
+
+dist/
