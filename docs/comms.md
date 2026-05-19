@@ -93,6 +93,18 @@ The orchestrator's Pi session memory becomes the mediator's working record. It i
 
 Use `*_await` when you want to block for the reply. Use `*_get` when an orchestrator wants to poll several outstanding messages.
 
+## Async/background sends
+
+`coms_net_send` itself is non-blocking: it returns as soon as the hub accepts or queues the message. For chained work, call `coms_net_await` with the returned `msg_id`. For background work, send with `notify_on_response: true` and do not await. The sender session will display a later `[coms-net async response from <peer>]` message when the peer replies.
+
+Example prompt:
+
+```text
+Use coms_net_send to send net-bob asynchronously with notify_on_response=true: "Reply exactly ASYNC-PONG". Do not await; tell me whether it was queued or running.
+```
+
+This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message.
+
 ## Hub status
 
 The `coms-net` panel includes a hub status line with local URL, agent count, stream count, queue depth, running count, and the last server event kind. You can also ask an agent to run:
@@ -178,6 +190,7 @@ Client/autostart variables:
 - `PI_COMS_NET_AUTOSTART=0` — disable first-agent hub startup.
 - `PI_COMS_NET_PORT` — embedded hub port; defaults to `48201`.
 - `PI_COMS_NET_EMBEDDED_HOST` — embedded hub host; defaults to `127.0.0.1`.
+- `PI_COMS_NET_ASYNC_NOTIFY_GRACE_MS` — delay before displaying async responses, allowing an immediate `*_await` call to suppress duplicate notifications; defaults to `1200`.
 
 Local `coms` limits:
 

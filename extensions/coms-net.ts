@@ -47,6 +47,7 @@ const HEARTBEAT_MS = Number(process.env.PI_COMS_NET_HEARTBEAT_MS) || 10_000;
 const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 const MESSAGE_TIMEOUT_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS) || 1_800_000;
+const ASYNC_NOTIFY_GRACE_MS = Number(process.env.PI_COMS_NET_ASYNC_NOTIFY_GRACE_MS) || 1_200;
 const HTTP_TIMEOUT_MS = 10_000;
 const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES) || 48 * 1024;
 const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES) || 48 * 1024;
@@ -168,9 +169,14 @@ interface PendingReply {
 	promise: Promise<{ response?: any; error?: string | null }>;
 	result?: { response?: any; error?: string | null };
 	timer?: ReturnType<typeof setTimeout> | null;
+	notification_timer?: ReturnType<typeof setTimeout> | null;
+	notify_on_response?: boolean;
+	await_started?: boolean;
+	notified?: boolean;
 	target_name?: string;
 	target_session?: string;
 	created_at: string;
+	status?: MessageStatus;
 }
 
 interface ServerJson {
@@ -793,7 +799,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			case "message_status": {
-				// Informational. No-op beyond audit at debug level.
+				const msgId: string | undefined = data?.msg_id;
+				const status: MessageStatus | undefined = data?.status;
+				if (msgId && status) {
+					const pending = pendingReplies.get(msgId);
+					if (pending) pending.status = status;
+				}
 				return;
 			}
 			case "server_ping": {
@@ -905,8 +916,64 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function formatReplyValue(value: any): string {
+		if (typeof value === "string") return value;
+		try { return JSON.stringify(value, null, 2); } catch { return String(value); }
+	}
+
+	function cancelAsyncReplyNotification(pending: PendingReply): void {
+		if (pending.notification_timer) {
+			try { clearTimeout(pending.notification_timer); } catch { /* ignore */ }
+			pending.notification_timer = null;
+		}
+	}
+
+	function scheduleAsyncReplyNotification(
+		msgId: string,
+		pending: PendingReply,
+		response: any,
+		error: string | null,
+	): void {
+		if (!pending.notify_on_response || pending.await_started || pending.notified) return;
+		cancelAsyncReplyNotification(pending);
+		pending.notification_timer = setTimeout(() => {
+			pending.notification_timer = null;
+			if (pending.await_started || pending.notified) return;
+			pending.notified = true;
+			const peerName = pending.target_name ?? "peer";
+			const content = error
+				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n\nERROR: ${error}`
+				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n\n${formatReplyValue(response)}`;
+			try {
+				pi.sendMessage(
+					{
+						customType: "coms-net-async-response",
+						content,
+						display: true,
+						details: { msg_id: msgId, target: peerName, response, error },
+					},
+					{ deliverAs: "followUp" },
+				);
+			} catch (err) {
+				audit("async_response_notify_failed", { msg_id: msgId, reason: safeError(err) });
+			}
+			try {
+				pi.appendEntry("coms-net-log", {
+					event: "async_response_notify",
+					ts: nowIso(),
+					msg_id: msgId,
+					target: peerName,
+					error,
+				});
+			} catch { /* best-effort */ }
+		}, ASYNC_NOTIFY_GRACE_MS);
+		try { (pending.notification_timer as any).unref?.(); } catch { /* ignore */ }
+	}
+
 	function schedulePendingReplyCleanup(msgId: string): void {
 		const t = setTimeout(() => {
+			const pending = pendingReplies.get(msgId);
+			if (pending) cancelAsyncReplyNotification(pending);
 			pendingReplies.delete(msgId);
 		}, PENDING_REPLY_RETENTION_MS);
 		try { (t as any).unref?.(); } catch { /* ignore */ }
@@ -923,6 +990,7 @@ export default function (pi: ExtensionAPI) {
 			pending.result = { response: responseVal, error: errVal };
 			if (pending.timer) { try { clearTimeout(pending.timer); } catch { /* ignore */ } }
 			try { pending.resolve(pending.result); } catch { /* ignore */ }
+			scheduleAsyncReplyNotification(msg_id, pending, responseVal, errVal);
 			schedulePendingReplyCleanup(msg_id);
 			try {
 				pi.appendEntry("coms-net-log", {
@@ -1441,12 +1509,13 @@ export default function (pi: ExtensionAPI) {
 		name: "coms_net_send",
 		label: "Coms Net Send",
 		promptGuidelines: [
-			"After calling coms_net_send for a delegated user request, do not answer the delegated prompt yourself; immediately call coms_net_await with the returned msg_id unless the user explicitly asked for fire-and-forget.",
+			"After calling coms_net_send for a delegated user request, do not answer the delegated prompt yourself. For chained/synchronous work, immediately call coms_net_await with the returned msg_id. If the user asks for async/background/fire-and-forget delivery, set notify_on_response=true, tell the user the message is queued/running, and do not call coms_net_await.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
 			"Returns synchronously with a msg_id once the server queues the prompt. " +
-			"Use coms_net_get (non-blocking) or coms_net_await (blocking) with that msg_id to retrieve the peer's reply.\n\n" +
+			"Use coms_net_get (non-blocking) or coms_net_await (blocking) with that msg_id to retrieve the peer's reply. " +
+			"For async/background delegation, set notify_on_response=true and the extension will display the peer's eventual reply back in this session without blocking.\n\n" +
 			"⚠️  DO NOT call this tool to REPLY to an inbound message. " +
 			"When you receive a `[from <peer>] …` follow-up, just write your answer as your normal assistant message — " +
 			"the coms-net extension automatically captures the final assistant text at the end of your turn and " +
@@ -1459,6 +1528,7 @@ export default function (pi: ExtensionAPI) {
 			prompt: Type.String({ description: "The prompt to send." }),
 			conversation_id: Type.Optional(Type.String()),
 			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
+			notify_on_response: Type.Optional(Type.Boolean({ description: "Set true for async/background sends: do not await; display the peer's eventual response in this session when it arrives." })),
 		}),
 		async execute(_callId, params) {
 			if (!identity) throw new Error("coms-net not initialised");
@@ -1474,6 +1544,9 @@ export default function (pi: ExtensionAPI) {
 			if (schemaTooLarge((params as any).response_schema)) {
 				throw new Error(`coms-net: response_schema too large (${jsonByteLength((params as any).response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
 			}
+
+			const explicitAsyncMode = (params as any).notify_on_response === true;
+			const notifyOnResponse = (params as any).notify_on_response !== false;
 
 			const req: SendRequest = {
 				project: identity.project,
@@ -1498,6 +1571,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const { msg_id, target_session } = resp;
 			const targetName = resp.target_name ?? params.target;
+			const status = resp.status ?? "queued";
 
 			// Park a pending entry that the SSE `response` event will resolve.
 			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
@@ -1513,12 +1587,16 @@ export default function (pi: ExtensionAPI) {
 				target_name: targetName,
 				target_session: target_session ?? undefined,
 				created_at: nowIso(),
+				status,
+				notify_on_response: notifyOnResponse,
 				timer: null,
+				notification_timer: null,
 			};
 			entry.timer = setTimeout(() => {
 				if (entry.result) return;
 				entry.result = { error: "expired" };
 				try { entry.resolve(entry.result); } catch { /* ignore */ }
+				scheduleAsyncReplyNotification(msg_id, entry, null, "expired");
 				schedulePendingReplyCleanup(msg_id);
 			}, MESSAGE_TIMEOUT_MS);
 			try { (entry.timer as any).unref?.(); } catch { /* ignore */ }
@@ -1531,19 +1609,24 @@ export default function (pi: ExtensionAPI) {
 					msg_id,
 					target: targetName,
 					target_session,
+					status,
+					notify_on_response: notifyOnResponse,
 					hops,
 				});
 			} catch { /* best-effort */ }
+
+			const nextAction = explicitAsyncMode
+				? `NEXT ACTION: async notification is armed. Tell the user the message is ${status}; do not call coms_net_await unless they ask to block.`
+				: `NEXT ACTION: do not answer this delegated prompt yourself. Call coms_net_await with msg_id ${msg_id} and return the peer's response unless the user explicitly asked for async/fire-and-forget. If you do not await, an async response notification is armed.`;
 
 			return {
 				content: [{
 					type: "text" as const,
 					text:
-						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nhops ${hops}\n\n` +
-						`NEXT ACTION: do not answer this delegated prompt yourself. ` +
-						`Call coms_net_await with msg_id ${msg_id} and return the peer's response unless the user explicitly asked for fire-and-forget.`,
+						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nstatus ${status}\nhops ${hops}\n\n` +
+						`${nextAction}`,
 				}],
-				details: { msg_id, target: targetName, target_session, hops },
+				details: { msg_id, target: targetName, target_session, status, notify_on_response: notifyOnResponse, hops },
 			};
 		},
 		renderCall(args, theme) {
@@ -1662,12 +1745,16 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_callId, params) {
 			const msg_id = (params as any).msg_id as string;
+			const pending = pendingReplies.get(msg_id);
+			if (pending) {
+				pending.await_started = true;
+				cancelAsyncReplyNotification(pending);
+			}
 			const timeoutMs = typeof (params as any).timeout_ms === "number" && (params as any).timeout_ms > 0
 				? (params as any).timeout_ms
 				: MESSAGE_TIMEOUT_MS;
 
 			// Local SSE-resolved fast path.
-			const pending = pendingReplies.get(msg_id);
 			if (pending && pending.result) {
 				const r = pending.result;
 				if (r.error) {
