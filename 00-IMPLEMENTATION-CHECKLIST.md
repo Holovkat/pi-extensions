@@ -117,7 +117,7 @@ Source ownership: copy/vendor the reviewed upstream comms extensions into this r
 
 - [ ] [#93 Epic: Pi-to-Pi comms request/response hardening roadmap](https://github.com/Holovkat/pi-extensions/issues/93)
   - [ ] [#94 Sprint: comms v1.0 hardening](https://github.com/Holovkat/pi-extensions/issues/94)
-    - [ ] [#98 Task: add first-version Pi-to-Pi comms baseline](https://github.com/Holovkat/pi-extensions/issues/98)
+    - [x] [#98 Task: add first-version Pi-to-Pi comms baseline](https://github.com/Holovkat/pi-extensions/issues/98)
     - [ ] [#99 Task: bind inbound replies to the triggered assistant turn](https://github.com/Holovkat/pi-extensions/issues/99)
     - [ ] [#100 Task: replay queued coms-net messages on reconnect](https://github.com/Holovkat/pi-extensions/issues/100)
     - [ ] [#101 Task: bound pending replies and payload sizes](https://github.com/Holovkat/pi-extensions/issues/101)
