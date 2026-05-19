@@ -304,6 +304,10 @@ type ServerState = {
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
+function looksLikeUlid(value: string): boolean {
+	return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
+}
+
 export function ulid(): string {
 	const time = Date.now();
 	const rand = crypto.randomBytes(10);
@@ -1089,6 +1093,12 @@ async function handleSendMessage(req: Request): Promise<Response> {
 				const onlySid = [...bag][0];
 				target = p.agents.get(onlySid);
 				if (target) targetName = target.name;
+			}
+			if (!target && looksLikeUlid(desired)) {
+				logRejected("conversation_id_as_target", `${sender.name} → ${desired}`);
+				return errorJson("conversation_id_as_target", 400, {
+					message: "target looks like a conversation_id; send to the peer name/session and pass conversation_id separately",
+				});
 			}
 		}
 	}

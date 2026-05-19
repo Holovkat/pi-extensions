@@ -522,6 +522,7 @@ export default function (pi: ExtensionAPI) {
 	const peerCards: Map<string, AgentCard> = new Map();
 	const pendingReplies: Map<string, PendingReply> = new Map();
 	const inboundQueue: Map<string, InboundContext> = new Map();
+	const conversationRoutes: Map<string, { target_name: string; target_session?: string; updated_at: string }> = new Map();
 	let sseAbort: AbortController | null = null;
 	let heartbeatTimer: NodeJS.Timeout | null = null;
 	let hubStatusTimer: NodeJS.Timeout | null = null;
@@ -837,6 +838,7 @@ export default function (pi: ExtensionAPI) {
 		const conversationId = typeof data.conversation_id === "string" && data.conversation_id.length > 0
 			? data.conversation_id
 			: null;
+		rememberConversationRoute(conversationId, senderName, senderSession);
 		if (byteLength(promptText) > MAX_PROMPT_BYTES) {
 			audit("prompt_in_rejected", { msg_id, reason: "prompt_too_large", bytes: byteLength(promptText) });
 			if (identity) {
@@ -930,6 +932,19 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function rememberConversationRoute(
+		conversationId: string | null | undefined,
+		targetName: string | null | undefined,
+		targetSession?: string | null,
+	): void {
+		if (!conversationId || !targetName) return;
+		conversationRoutes.set(conversationId, {
+			target_name: targetName,
+			target_session: targetSession || undefined,
+			updated_at: nowIso(),
+		});
+	}
+
 	function formatReplyValue(value: any): string {
 		if (typeof value === "string") return value;
 		try { return JSON.stringify(value, null, 2); } catch { return String(value); }
@@ -960,8 +975,8 @@ export default function (pi: ExtensionAPI) {
 			const selfName = identity?.name ?? "this agent";
 			const conversationLine = pending.conversation_id ? `conversation_id ${pending.conversation_id}\n` : "";
 			const replyGuidance = agentMode
-				? `[This is ${peerName} talking to you (${selfName}), not to the human user. Handle it yourself; do not ask the user to answer. If ${peerName} asks a question, requests an action, or expects a continuation, your next action MUST be coms_net_send back to ${peerName}${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""} and response_mode "agent". Do not answer ${peerName}'s question in normal assistant text to the user.]`
-				: `[This is ${peerName} talking to this session. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send back to ${peerName}${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""}; do not answer ${peerName}'s question locally.]`;
+				? `[This is ${peerName} talking to you (${selfName}), not to the human user. Handle it yourself; do not ask the user to answer. If ${peerName} asks a question, requests an action, or expects a continuation, your next action MUST be coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""} and response_mode "agent". Never use conversation_id as target. Do not answer ${peerName}'s question in normal assistant text to the user.]`
+				: `[This is ${peerName} talking to this session. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""}; never use conversation_id as target; do not answer ${peerName}'s question locally.]`;
 			const content = error
 				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\nERROR: ${error}`
 				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\n${formatReplyValue(response)}`;
@@ -1535,7 +1550,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Send",
 		promptGuidelines: [
 			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
-			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the shown conversation_id and response_mode='agent'; do not ask the user to answer unless response_mode='notify' was explicitly used.",
+			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the peer name/session as target plus the shown conversation_id as the separate conversation_id field and response_mode='agent'; do not ask the user to answer unless response_mode='notify' was explicitly used. Never use conversation_id as the target.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
@@ -1587,14 +1602,20 @@ export default function (pi: ExtensionAPI) {
 			if (synchronous) responseMode = "none";
 			if ((params as any).notify_on_response === false) responseMode = "none";
 			const notifyOnResponse = responseMode !== "none";
+			const requestedTarget = String(params.target ?? "").trim();
+			const targetRoute = conversationRoutes.get(requestedTarget);
+			// Prefer the peer name for routed conversations so replies survive peer restarts.
+			const targetForSend = targetRoute?.target_name || targetRoute?.target_session || requestedTarget;
 			const conversationId = typeof (params as any).conversation_id === "string" && (params as any).conversation_id.length > 0
 				? (params as any).conversation_id
-				: ulid();
+				: targetRoute
+					? requestedTarget
+					: ulid();
 
 			const req: SendRequest = {
 				project: identity.project,
 				sender_session: identity.session_id,
-				target: params.target,
+				target: targetForSend,
 				target_session: null,
 				prompt: params.prompt,
 				conversation_id: conversationId,
@@ -1613,9 +1634,10 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`coms-net: send failed: ${safeError(err)}`);
 			}
 			const { msg_id, target_session } = resp;
-			const targetName = resp.target_name ?? params.target;
+			const targetName = resp.target_name ?? targetRoute?.target_name ?? targetForSend;
 			const status = resp.status ?? "queued";
 			const finalConversationId = resp.conversation_id ?? conversationId;
+			rememberConversationRoute(finalConversationId, targetName, target_session ?? targetRoute?.target_session);
 
 			// Park a pending entry that the SSE `response` event will resolve.
 			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
