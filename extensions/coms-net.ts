@@ -31,6 +31,7 @@ import { Text } from "@mariozechner/pi-tui";
 import { truncateToWidth } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { applyExtensionDefaults } from "./themeMap.ts";
+import { byteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -45,6 +46,9 @@ const RECONNECT_BASE_MS = 500;
 const RECONNECT_MAX_MS = 10_000;
 const MESSAGE_TIMEOUT_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS) || 1_800_000;
 const HTTP_TIMEOUT_MS = 10_000;
+const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES) || 48 * 1024;
+const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES) || 48 * 1024;
+const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COMS_NET_REPLY_RETENTION_MS) || 5 * 60_000;
 const SHUTDOWN_DELETE_TIMEOUT_MS = 2_000;
 
 const SERVER_URL_ENV = process.env.PI_COMS_NET_SERVER_URL;
@@ -137,6 +141,8 @@ interface InboundContext {
 	sender_cwd: string;
 	response_schema?: object | null;
 	fulfilled: boolean;
+	created_at_ms: number;
+	trigger_leaf_id?: string | null;
 }
 
 interface PendingReply {
@@ -144,6 +150,7 @@ interface PendingReply {
 	reject: (err: Error) => void;
 	promise: Promise<{ response?: any; error?: string | null }>;
 	result?: { response?: any; error?: string | null };
+	timer?: ReturnType<typeof setTimeout> | null;
 	target_name?: string;
 	target_session?: string;
 	created_at: string;
@@ -287,7 +294,7 @@ function readFrontmatterFromArgv(argv: string[]): { name?: string; description?:
 // ━━ Registry / server-discovery I/O ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 function projectDir(project: string): string {
-	return path.join(COMS_NET_DIR, "projects", project);
+	return path.join(COMS_NET_DIR, "projects", sanitizePathSegment(project));
 }
 
 function readServerJson(project: string): ServerJson | null {
@@ -661,6 +668,30 @@ export default function (pi: ExtensionAPI) {
 		const senderCwd = typeof sender.cwd === "string" ? sender.cwd : "?";
 		const senderSession = typeof sender.session_id === "string" ? sender.session_id : "?";
 		const promptText = typeof data.prompt === "string" ? data.prompt : "";
+		if (byteLength(promptText) > MAX_PROMPT_BYTES) {
+			audit("prompt_in_rejected", { msg_id, reason: "prompt_too_large", bytes: byteLength(promptText) });
+			if (identity) {
+				void httpFetch("POST", `/v1/messages/${encodeURIComponent(msg_id)}/response`, {
+					project: identity.project,
+					responder_session: identity.session_id,
+					response: null,
+					error: `prompt too large (${byteLength(promptText)} > ${MAX_PROMPT_BYTES} bytes)`,
+				}).catch((err) => audit("prompt_reject_response_failed", { msg_id, reason: safeError(err) }));
+			}
+			return;
+		}
+		if ([...inboundQueue.values()].some((i) => !i.fulfilled)) {
+			audit("prompt_in_rejected", { msg_id, reason: "receiver_busy" });
+			if (identity) {
+				void httpFetch("POST", `/v1/messages/${encodeURIComponent(msg_id)}/response`, {
+					project: identity.project,
+					responder_session: identity.session_id,
+					response: null,
+					error: "receiver busy",
+				}).catch((err) => audit("prompt_reject_response_failed", { msg_id, reason: safeError(err) }));
+			}
+			return;
+		}
 		const hops = typeof data.hops === "number" ? data.hops : 0;
 		const responseSchema = (data.response_schema && typeof data.response_schema === "object") ? data.response_schema : null;
 
@@ -672,6 +703,8 @@ export default function (pi: ExtensionAPI) {
 			sender_cwd: senderCwd,
 			response_schema: responseSchema,
 			fulfilled: false,
+			created_at_ms: Date.now(),
+			trigger_leaf_id: currentCtx?.sessionManager?.getLeafId?.() ?? null,
 		};
 		inboundQueue.set(msg_id, inbound);
 		currentInbound = inbound;
@@ -712,6 +745,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function schedulePendingReplyCleanup(msgId: string): void {
+		const t = setTimeout(() => {
+			pendingReplies.delete(msgId);
+		}, PENDING_REPLY_RETENTION_MS);
+		try { (t as any).unref?.(); } catch { /* ignore */ }
+	}
+
 	function handleInboundResponse(data: any): void {
 		const msg_id: string | undefined = data?.msg_id;
 		if (!msg_id) return;
@@ -719,8 +759,11 @@ export default function (pi: ExtensionAPI) {
 		const errVal: string | null = typeof data.error === "string" ? data.error : null;
 		const pending = pendingReplies.get(msg_id);
 		if (pending) {
+			if (pending.result) return;
 			pending.result = { response: responseVal, error: errVal };
+			if (pending.timer) { try { clearTimeout(pending.timer); } catch { /* ignore */ } }
 			try { pending.resolve(pending.result); } catch { /* ignore */ }
+			schedulePendingReplyCleanup(msg_id);
 			try {
 				pi.appendEntry("coms-net-log", {
 					event: "response_in",
@@ -1209,6 +1252,10 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`coms-net: hop limit reached (${hops} >= ${MAX_HOPS})`);
 			}
 
+			if (byteLength(params.prompt) > MAX_PROMPT_BYTES) {
+				throw new Error(`coms-net: prompt too large (${byteLength(params.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+			}
+
 			const req: SendRequest = {
 				project: identity.project,
 				sender_session: identity.session_id,
@@ -1239,14 +1286,23 @@ export default function (pi: ExtensionAPI) {
 				resolveFn = res;
 				rejectFn = rej;
 			});
-			pendingReplies.set(msg_id, {
+			const entry: PendingReply = {
 				resolve: resolveFn,
 				reject: rejectFn,
 				promise,
 				target_name: params.target,
 				target_session,
 				created_at: nowIso(),
-			});
+				timer: null,
+			};
+			entry.timer = setTimeout(() => {
+				if (entry.result) return;
+				entry.result = { error: "timeout" };
+				try { entry.resolve(entry.result); } catch { /* ignore */ }
+				schedulePendingReplyCleanup(msg_id);
+			}, MESSAGE_TIMEOUT_MS);
+			try { (entry.timer as any).unref?.(); } catch { /* ignore */ }
+			pendingReplies.set(msg_id, entry);
 
 			try {
 				pi.appendEntry("coms-net-log", {
@@ -1464,35 +1520,37 @@ export default function (pi: ExtensionAPI) {
 
 	// ━━ agent_end: capture turn output and submit response ━━━━━━━━━━━━━━━━
 
+	function latestAssistantTextForInbound(ctx: ExtensionContext, inbound: InboundContext): string {
+		return latestAssistantTextAfterBoundary(ctx.sessionManager.getBranch() as any[], inbound.trigger_leaf_id);
+	}
+
 	pi.on("agent_end", async (_event, ctx) => {
-		const inbound = [...inboundQueue.values()].reverse().find((i) => !i.fulfilled);
+		const inbound = currentInbound && !currentInbound.fulfilled
+			? currentInbound
+			: [...inboundQueue.values()].find((i) => !i.fulfilled);
 		if (!inbound || !identity) return;
 
-		// Walk the session branch for the most recent assistant text.
-		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				const m = entry.message as any;
-				if (typeof m.content === "string") {
-					lastAssistantText = m.content;
-				} else if (Array.isArray(m.content)) {
-					lastAssistantText = m.content
-						.filter((b: any) => b && b.type === "text")
-						.map((b: any) => b.text)
-						.join("\n");
-				}
-			}
-		}
-
+		let lastAssistantText = latestAssistantTextForInbound(ctx, inbound);
 		let payload: any = lastAssistantText;
 		let error: string | null = null;
-		if (inbound.response_schema && typeof inbound.response_schema === "object") {
-			try {
-				payload = JSON.parse(lastAssistantText);
-			} catch {
-				error = "response not valid JSON";
+		if (!lastAssistantText) {
+			error = "no assistant response captured for inbound turn";
+			payload = null;
+		} else if (inbound.response_schema && typeof inbound.response_schema === "object") {
+			if (byteLength(lastAssistantText) > MAX_RESPONSE_BYTES) {
+				error = `response too large (${byteLength(lastAssistantText)} > ${MAX_RESPONSE_BYTES} bytes)`;
 				payload = null;
+			} else {
+				try {
+					payload = JSON.parse(lastAssistantText);
+				} catch {
+					error = "response not valid JSON";
+					payload = null;
+				}
 			}
+		} else {
+			const truncated = truncateUtf8(String(payload), MAX_RESPONSE_BYTES, "coms-net");
+			payload = truncated.text;
 		}
 
 		const req: ResponseSubmitRequest = {
@@ -1630,9 +1688,13 @@ export default function (pi: ExtensionAPI) {
 			try { currentCtx.ui.setWidget("coms-net-pool", undefined); } catch { /* ignore */ }
 			try { currentCtx.ui.setStatus("coms-net", ""); } catch { /* ignore */ }
 		}
+		process.off("SIGINT", handleSigint);
+		process.off("SIGTERM", handleSigterm);
 	}
 
+	const handleSigint = () => { void cleanShutdown(); };
+	const handleSigterm = () => { void cleanShutdown(); };
 	pi.on("session_shutdown", async () => { await cleanShutdown(); });
-	process.on("SIGINT", () => { void cleanShutdown(); });
-	process.on("SIGTERM", () => { void cleanShutdown(); });
+	process.on("SIGINT", handleSigint);
+	process.on("SIGTERM", handleSigterm);
 }

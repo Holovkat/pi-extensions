@@ -22,6 +22,7 @@ import { Text, Container, truncateToWidth, visibleWidth, wrapTextWithAnsi } from
 import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { applyExtensionDefaults } from "./themeMap.ts";
+import { byteLength, latestAssistantTextAfterBoundary, sanitizePathSegment, truncateUtf8 } from "./coms-shared.ts";
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -36,6 +37,9 @@ const TIMEOUT_MS = Number(process.env.PI_COMS_TIMEOUT_MS) || 1_800_000;
 const PING_INTERVAL_MS = Number(process.env.PI_COMS_PING_INTERVAL_MS) || 10_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
 const LINE_CAP_BYTES = 64 * 1024;
+const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_MAX_PROMPT_BYTES) || 48 * 1024;
+const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_MAX_RESPONSE_BYTES) || 48 * 1024;
+const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COMS_REPLY_RETENTION_MS) || 5 * 60_000;
 
 const FALLBACK_PALETTE = [
 	"#72F1B8", "#36F9F6", "#FF7EDB", "#FEDE5D",
@@ -125,6 +129,8 @@ interface InboundContext {
 	sender_session: string;
 	response_schema?: object | null;
 	fulfilled: boolean;
+	created_at_ms: number;
+	trigger_leaf_id?: string | null;
 }
 
 // ━━ Helpers ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -241,12 +247,20 @@ function readCliFlags(pi: ExtensionAPI): CliFlags {
 
 // ━━ Registry I/O ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+function projectAgentsDirFromSegment(projectSegment: string): string {
+	return path.join(COMS_DIR, "projects", projectSegment, "agents");
+}
+
 function projectAgentsDir(project: string): string {
-	return path.join(COMS_DIR, "projects", project, "agents");
+	return projectAgentsDirFromSegment(sanitizePathSegment(project));
 }
 
 function registryFilePath(project: string, name: string): string {
-	return path.join(projectAgentsDir(project), `${name}.json`);
+	return path.join(projectAgentsDir(project), `${sanitizePathSegment(name, "agent")}.json`);
+}
+
+function registryFilePathFromProjectSegment(projectSegment: string, name: string): string {
+	return path.join(projectAgentsDirFromSegment(projectSegment), `${sanitizePathSegment(name, "agent")}.json`);
 }
 
 function writeRegistryAtomic(entry: RegistryEntry, project: string): string {
@@ -259,8 +273,8 @@ function writeRegistryAtomic(entry: RegistryEntry, project: string): string {
 	return final;
 }
 
-function readAllRegistryEntries(project: string): RegistryEntry[] {
-	const dir = projectAgentsDir(project);
+function readAllRegistryEntries(project: string, projectAlreadySegment = false): RegistryEntry[] {
+	const dir = projectAlreadySegment ? projectAgentsDirFromSegment(project) : projectAgentsDir(project);
 	if (!fs.existsSync(dir)) return [];
 	const out: RegistryEntry[] = [];
 	let files: string[];
@@ -299,21 +313,21 @@ function readAllRegistryEntriesAcrossProjects(): RegistryEntry[] {
 		} catch {
 			continue;
 		}
-		out.push(...readAllRegistryEntries(p));
+		out.push(...readAllRegistryEntries(p, true));
 	}
 	return out;
 }
 
-function removeRegistryEntry(project: string, name: string): void {
+function removeRegistryEntry(project: string, name: string, projectAlreadySegment = false): void {
 	try {
-		fs.unlinkSync(registryFilePath(project, name));
+		fs.unlinkSync(projectAlreadySegment ? registryFilePathFromProjectSegment(project, name) : registryFilePath(project, name));
 	} catch {
 		// best-effort
 	}
 }
 
-function pruneDeadEntries(project: string): RegistryEntry[] {
-	const entries = readAllRegistryEntries(project);
+function pruneDeadEntries(project: string, projectAlreadySegment = false): RegistryEntry[] {
+	const entries = readAllRegistryEntries(project, projectAlreadySegment);
 	const live: RegistryEntry[] = [];
 	for (const entry of entries) {
 		try {
@@ -321,7 +335,7 @@ function pruneDeadEntries(project: string): RegistryEntry[] {
 			live.push(entry);
 		} catch (e: any) {
 			if (e && e.code === "ESRCH") {
-				removeRegistryEntry(project, entry.name);
+				removeRegistryEntry(project, entry.name, projectAlreadySegment);
 			} else {
 				// EPERM means the process exists but we can't signal it — treat as live.
 				live.push(entry);
@@ -357,7 +371,7 @@ function pruneDeadEntriesAllProjects(): RegistryEntry[] {
 		} catch {
 			continue;
 		}
-		out.push(...pruneDeadEntries(p));
+		out.push(...pruneDeadEntries(p, true));
 	}
 	return out;
 }
@@ -605,13 +619,22 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function handlePrompt(socket: net.Socket, env: PromptEnvelope): void {
-		// 1. Hop limit check
+		// 1. Hop limit and payload-size checks
 		if (typeof env.hops !== "number" || env.hops >= MAX_HOPS) {
 			nack(socket, env.msg_id, "hops exceeded");
 			return;
 		}
+		if (byteLength(env.prompt ?? "") > MAX_PROMPT_BYTES) {
+			nack(socket, env.msg_id, `prompt too large (${byteLength(env.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+			return;
+		}
+		if ([...inboundQueue.values()].some((i) => !i.fulfilled)) {
+			nack(socket, env.msg_id, "receiver busy");
+			return;
+		}
 
-		// 2. Insert into inbound queue
+		// 2. Insert into inbound queue and remember the branch boundary so the
+		//    response cannot accidentally reuse stale assistant text.
 		const inbound: InboundContext = {
 			msg_id: env.msg_id,
 			hops: env.hops,
@@ -619,6 +642,8 @@ export default function (pi: ExtensionAPI) {
 			sender_session: env.sender_session,
 			response_schema: env.response_schema ?? null,
 			fulfilled: false,
+			created_at_ms: Date.now(),
+			trigger_leaf_id: currentCtx?.sessionManager?.getLeafId?.() ?? null,
 		};
 		inboundQueue.set(env.msg_id, inbound);
 
@@ -663,9 +688,20 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	function schedulePendingReplyCleanup(msgId: string): void {
+		const t = setTimeout(() => {
+			pendingReplies.delete(msgId);
+		}, PENDING_REPLY_RETENTION_MS);
+		try { (t as any).unref?.(); } catch { /* ignore */ }
+	}
+
 	function handleResponse(socket: net.Socket, env: ResponseEnvelope): void {
 		const pending = pendingReplies.get(env.msg_id);
 		if (pending) {
+			if (pending.result) {
+				ackOk(socket, env.msg_id);
+				return;
+			}
 			if (pending.timer) {
 				try { clearTimeout(pending.timer); } catch { /* ignore */ }
 				pending.timer = null;
@@ -676,7 +712,7 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				// ignore
 			}
-			// Note: do NOT delete the entry here — coms_get poll may still want it.
+			schedulePendingReplyCleanup(env.msg_id);
 		} else {
 			try {
 				pi.appendEntry("coms-log", { event: "orphan_response", msg_id: env.msg_id });
@@ -809,7 +845,7 @@ export default function (pi: ExtensionAPI) {
 
 		// 2. Ensure storage dirs exist.
 		try {
-			fs.mkdirSync(path.join(COMS_DIR, "projects", project, "agents"), { recursive: true });
+			fs.mkdirSync(projectAgentsDir(project), { recursive: true });
 			if (process.platform !== "win32") {
 				fs.mkdirSync(path.join(COMS_DIR, "sockets"), { recursive: true });
 				try { fs.chmodSync(COMS_DIR, 0o700); } catch { /* best-effort */ }
@@ -1306,11 +1342,12 @@ export default function (pi: ExtensionAPI) {
 				response_schema: (params.response_schema as object | undefined) ?? null,
 			};
 
-			// Send the envelope synchronously and wait for the receiver's ack.
-			await sendEnvelope(target.endpoint, env);
+			if (byteLength(params.prompt) > MAX_PROMPT_BYTES) {
+				throw new Error(`coms: prompt too large (${byteLength(params.prompt)} > ${MAX_PROMPT_BYTES} bytes)`);
+			}
 
-			// Register a pending entry whose promise the receiver-side handleResponse
-			// (or the timeout below) will settle.
+			// Register the pending entry before sending so a very fast receiver cannot
+			// race its response ahead of pendingReplies.set().
 			let resolveFn!: (v: { response?: any; error?: string | null }) => void;
 			let rejectFn!: (e: Error) => void;
 			const promise = new Promise<{ response?: any; error?: string | null }>((res, rej) => {
@@ -1329,10 +1366,20 @@ export default function (pi: ExtensionAPI) {
 				if (entry.result) return;
 				entry.result = { error: "timeout" };
 				try { entry.resolve(entry.result); } catch { /* ignore */ }
+				schedulePendingReplyCleanup(msg_id);
 			}, TIMEOUT_MS);
 			// Don't keep the event loop alive solely for this timer.
 			try { (entry.timer as any).unref?.(); } catch { /* ignore */ }
 			pendingReplies.set(msg_id, entry);
+
+			try {
+				// Send the envelope synchronously and wait for the receiver's ack.
+				await sendEnvelope(target.endpoint, env);
+			} catch (err) {
+				if (entry.timer) { try { clearTimeout(entry.timer); } catch { /* ignore */ } }
+				pendingReplies.delete(msg_id);
+				throw err;
+			}
 
 			try {
 				pi.appendEntry("coms-log", {
@@ -1479,35 +1526,37 @@ export default function (pi: ExtensionAPI) {
 
 	// ━━ agent_end: capture turn output and dispatch response back ━━━━━━━━
 
+	function latestAssistantTextForInbound(ctx: ExtensionContext, inbound: InboundContext): string {
+		return latestAssistantTextAfterBoundary(ctx.sessionManager.getBranch() as any[], inbound.trigger_leaf_id);
+	}
+
 	pi.on("agent_end", async (_event, ctx) => {
-		const inbound = [...inboundQueue.values()].reverse().find((i) => !i.fulfilled);
+		const inbound = currentInbound && !currentInbound.fulfilled
+			? currentInbound
+			: [...inboundQueue.values()].find((i) => !i.fulfilled);
 		if (!inbound || !identity) return;
 
-		// Walk the session branch for the most recent assistant message text.
-		let lastAssistantText = "";
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "message" && entry.message.role === "assistant") {
-				const m = entry.message as any;
-				if (typeof m.content === "string") {
-					lastAssistantText = m.content;
-				} else if (Array.isArray(m.content)) {
-					lastAssistantText = m.content
-						.filter((b: any) => b && b.type === "text")
-						.map((b: any) => b.text)
-						.join("\n");
-				}
-			}
-		}
-
+		let lastAssistantText = latestAssistantTextForInbound(ctx, inbound);
 		let payload: any = lastAssistantText;
 		let error: string | null = null;
-		if (inbound.response_schema && typeof inbound.response_schema === "object") {
-			try {
-				payload = JSON.parse(lastAssistantText);
-			} catch {
-				error = "response not valid JSON";
+		if (!lastAssistantText) {
+			error = "no assistant response captured for inbound turn";
+			payload = null;
+		} else if (inbound.response_schema && typeof inbound.response_schema === "object") {
+			if (byteLength(lastAssistantText) > MAX_RESPONSE_BYTES) {
+				error = `response too large (${byteLength(lastAssistantText)} > ${MAX_RESPONSE_BYTES} bytes)`;
 				payload = null;
+			} else {
+				try {
+					payload = JSON.parse(lastAssistantText);
+				} catch {
+					error = "response not valid JSON";
+					payload = null;
+				}
 			}
+		} else {
+			const truncated = truncateUtf8(String(payload), MAX_RESPONSE_BYTES);
+			payload = truncated.text;
 		}
 
 		const respEnv: ResponseEnvelope = {
@@ -1591,10 +1640,15 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (currentCtx?.hasUI) {
 			try { currentCtx.ui.setWidget("coms-pool", undefined); } catch { /* ignore */ }
+			try { currentCtx.ui.setStatus("coms", ""); } catch { /* ignore */ }
 		}
+		process.off("SIGINT", handleSigint);
+		process.off("SIGTERM", handleSigterm);
 	}
 
+	const handleSigint = () => { void cleanShutdown(); };
+	const handleSigterm = () => { void cleanShutdown(); };
 	pi.on("session_shutdown", async () => { await cleanShutdown(); });
-	process.on("SIGINT", () => { void cleanShutdown(); });
-	process.on("SIGTERM", () => { void cleanShutdown(); });
+	process.on("SIGINT", handleSigint);
+	process.on("SIGTERM", handleSigterm);
 }

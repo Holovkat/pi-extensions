@@ -44,6 +44,8 @@ const MAX_INBOX = Number(process.env.PI_COMS_NET_MAX_INBOX ?? 100);
 const HEARTBEAT_MS = Number(process.env.PI_COMS_NET_HEARTBEAT_MS ?? 10_000);
 const STALE_AFTER_MS = Number(process.env.PI_COMS_NET_STALE_AFTER_MS ?? 30_000);
 const OFFLINE_AFTER_MS = Number(process.env.PI_COMS_NET_OFFLINE_AFTER_MS ?? 60_000);
+const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES ?? 48 * 1024);
+const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES ?? 48 * 1024);
 
 const STALE_SCAN_INTERVAL_MS = 5_000;
 const TTL_SCAN_INTERVAL_MS = 10_000;
@@ -293,6 +295,27 @@ export function nowIso(): string {
 	return new Date().toISOString();
 }
 
+function byteLength(s: string): number {
+	return Buffer.byteLength(s, "utf-8");
+}
+
+function jsonByteLength(value: unknown): number {
+	if (typeof value === "string") return byteLength(value);
+	try {
+		return byteLength(JSON.stringify(value));
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
+function sanitizePathSegment(value: string, fallback = "default"): string {
+	const trimmed = value.trim();
+	if (!trimmed) return `%00${encodeURIComponent(fallback)}`;
+	if (trimmed === ".") return "%2E";
+	if (trimmed === "..") return "%2E%2E";
+	return encodeURIComponent(trimmed).slice(0, 160);
+}
+
 export function isLoopback(host: string): boolean {
 	return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
@@ -335,7 +358,7 @@ function unauthorized(): Response {
 }
 
 function projectDir(project: string): string {
-	return path.join(REG_ROOT, "projects", project);
+	return path.join(REG_ROOT, "projects", sanitizePathSegment(project));
 }
 
 function ensureDirSync(dir: string): void {
@@ -486,6 +509,48 @@ function sendToStream(
 	} catch {
 		// dead; abort handler will reap
 	}
+}
+
+function deliverPromptToTarget(
+	p: ProjectState,
+	projectName: string,
+	msg: ComsMessage,
+): boolean {
+	const sender = p.agents.get(msg.sender_session);
+	const target = p.agents.get(msg.target_session);
+	const targetWriter = p.streams.get(msg.target_session);
+	if (!sender || !target || !targetWriter) return false;
+	sendToStream(p, msg.target_session, "prompt", {
+		msg_id: msg.msg_id,
+		project: projectName,
+		sender: {
+			session_id: sender.session_id,
+			name: sender.name,
+			cwd: sender.cwd,
+		},
+		prompt: msg.prompt,
+		conversation_id: msg.conversation_id,
+		response_schema: msg.response_schema,
+		hops: msg.hops,
+	});
+	msg.status = "delivered";
+	msg.delivered_at = nowIso();
+	sendToStream(p, msg.sender_session, "message_status", {
+		msg_id: msg.msg_id,
+		status: "delivered",
+	});
+	return true;
+}
+
+function flushQueuedPromptsForTarget(p: ProjectState, projectName: string, targetSession: string): number {
+	let delivered = 0;
+	for (const msg of p.messages.values()) {
+		if (msg.target_session !== targetSession || msg.status !== "queued") continue;
+		const expires = Date.parse(msg.expires_at);
+		if (Number.isFinite(expires) && Date.now() > expires) continue;
+		if (deliverPromptToTarget(p, projectName, msg)) delivered++;
+	}
+	return delivered;
 }
 
 function releaseAwaiters(p: ProjectState, msg_id: string): void {
@@ -691,6 +756,12 @@ function handleEvents(req: Request, url: URL): Response {
 				closed = true;
 			}
 
+			// Replay queued prompts that arrived while this agent had no active SSE stream.
+			const replayed = flushQueuedPromptsForTarget(p, projectName, session_id);
+			if (replayed > 0) {
+				logLine("↥", C_PINK, "replay", `${entry.name} ${dim(`${replayed} queued prompt${replayed === 1 ? "" : "s"}`)}`);
+			}
+
 			// abort handler
 			const onAbort = () => {
 				if (closed) return;
@@ -844,6 +915,10 @@ async function handleSendMessage(req: Request): Promise<Response> {
 
 	const sender = p.agents.get(body.sender_session);
 	if (!sender) return errorJson("sender_not_registered", 404);
+	if (byteLength(body.prompt) > MAX_PROMPT_BYTES) {
+		logRejected("prompt_too_large", `${sender.name} bytes=${byteLength(body.prompt)} max=${MAX_PROMPT_BYTES}`);
+		return errorJson("prompt_too_large", 413, { bytes: byteLength(body.prompt), max_bytes: MAX_PROMPT_BYTES });
+	}
 
 	const hops = typeof body.hops === "number" ? body.hops : 0;
 	if (hops >= MAX_HOPS) {
@@ -923,30 +998,9 @@ async function handleSendMessage(req: Request): Promise<Response> {
 		status: "queued",
 	});
 
-	// Emit prompt to target if its stream is open.
-	const targetWriter = p.streams.get(target.session_id);
-	if (targetWriter) {
-		sendToStream(p, target.session_id, "prompt", {
-			msg_id: msg.msg_id,
-			project: projectName,
-			sender: {
-				session_id: sender.session_id,
-				name: sender.name,
-				cwd: sender.cwd,
-			},
-			prompt: msg.prompt,
-			conversation_id: msg.conversation_id,
-			response_schema: msg.response_schema,
-			hops: msg.hops,
-		});
-		msg.status = "delivered";
-		msg.delivered_at = nowIso();
-		// Notify sender: delivered
-		sendToStream(p, body.sender_session, "message_status", {
-			msg_id: msg.msg_id,
-			status: "delivered",
-		});
-	}
+	// Emit prompt to target if its stream is open. If not, it remains queued
+	// and is replayed when the target reconnects to /v1/events.
+	deliverPromptToTarget(p, projectName, msg);
 
 	logMessageSend(
 		sender.name,
@@ -1146,6 +1200,10 @@ async function handleSubmitResponse(
 	}
 
 	const isError = body.error !== null && body.error !== undefined;
+	const responseBytes = jsonByteLength(body.response ?? null);
+	if (responseBytes > MAX_RESPONSE_BYTES) {
+		return errorJson("response_too_large", 413, { bytes: responseBytes, max_bytes: MAX_RESPONSE_BYTES });
+	}
 	msg.status = isError ? "error" : "complete";
 	msg.response = body.response ?? null;
 	msg.error = isError ? String(body.error) : null;
@@ -1381,9 +1439,17 @@ function ttlScanTick(): void {
 					m.status = "error";
 					m.error = "expired";
 					m.completed_at = nowIso();
+					sendToStream(p, m.sender_session, "response", {
+						msg_id: m.msg_id,
+						project: m.project,
+						responder: { session_id: m.target_session, name: p.agents.get(m.target_session)?.name ?? "unknown" },
+						response: null,
+						error: "expired",
+						status: "error",
+					});
+					sendToStream(p, m.sender_session, "message_status", { msg_id: m.msg_id, status: "error" });
 					releaseAwaiters(p, id);
 					logExpired(id);
-					p.messages.delete(id);
 				}
 			} else if (m.status === "complete" || m.status === "error") {
 				if (
@@ -1436,6 +1502,15 @@ function stopLoops(): void {
 	ttlScanTimer = null;
 	keepaliveTimer = null;
 }
+
+export const __test = {
+	state,
+	sanitizePathSegment,
+	getOrCreateProject,
+	deliverPromptToTarget,
+	flushQueuedPromptsForTarget,
+	ttlScanTick,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // main() — only runs when launched directly
@@ -1546,6 +1621,8 @@ export function main(): void {
 	const shutdown = (sig: string) => {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		process.off("SIGINT", handleSigint);
+		process.off("SIGTERM", handleSigterm);
 		// FIRST: unlink state files synchronously. This must happen before any other
 		// work so that even if the process is hard-killed (SIGKILL from a parent
 		// process manager racing the SIGINT handler) or the broadcast/stream-close
@@ -1592,8 +1669,10 @@ export function main(): void {
 		setTimeout(() => process.exit(0), 50).unref?.();
 	};
 
-	process.on("SIGINT", () => shutdown("SIGINT"));
-	process.on("SIGTERM", () => shutdown("SIGTERM"));
+	const handleSigint = () => shutdown("SIGINT");
+	const handleSigterm = () => shutdown("SIGTERM");
+	process.on("SIGINT", handleSigint);
+	process.on("SIGTERM", handleSigterm);
 	// Belt-and-suspenders: any other path to process termination (uncaught
 	// exception, explicit process.exit, normal exit) gets a final synchronous
 	// chance to unlink. Note: this does NOT fire on SIGKILL.
