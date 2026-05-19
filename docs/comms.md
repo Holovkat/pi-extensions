@@ -41,17 +41,22 @@ Bob should receive the injected prompt and reply normally. Bob should not call `
 
 ## Localhost `coms-net` quick start
 
-Start the hub:
-
-```bash
-PI_COMS_NET_PROJECT=comms-net-uat PI_COMS_NET_PORT=48201 bun scripts/coms-net-server.ts
-```
-
-Start agents:
+Start the first agent. If no hub is already registered for the project, the extension auto-starts an embedded localhost hub on `127.0.0.1:48201` by running `bun scripts/coms-net-server.ts` in the background.
 
 ```bash
 pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-net-uat --tags planner --capabilities planning,review
+```
+
+Start additional agents normally; they discover the embedded hub from `~/.pi/coms-net/projects/<project>/server.json`:
+
+```bash
 pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat --tags implementer --capabilities coding,test
+```
+
+Manual hub startup is still supported when you want to choose host/port/token yourself:
+
+```bash
+PI_COMS_NET_PROJECT=comms-net-uat PI_COMS_NET_PORT=48201 bun scripts/coms-net-server.ts
 ```
 
 In net-alice:
@@ -88,6 +93,16 @@ The orchestrator's Pi session memory becomes the mediator's working record. It i
 
 Use `*_await` when you want to block for the reply. Use `*_get` when an orchestrator wants to poll several outstanding messages.
 
+## Hub status
+
+The `coms-net` panel includes a hub status line with local URL, agent count, stream count, queue depth, running count, and the last server event kind. You can also ask an agent to run:
+
+```text
+/coms-net --server
+```
+
+That reports the current hub PID/URL, queue statistics, and the most recent server events.
+
 ## Metadata
 
 Agents can advertise lightweight selection metadata:
@@ -108,7 +123,9 @@ Security boundary: local `coms` is same-user local IPC. It validates sender regi
 
 ### Localhost `coms-net`
 
-Use the hub on `127.0.0.1` for multiple local terminals or tmux panes. If no `PI_COMS_NET_AUTH_TOKEN` is supplied on loopback, the server generates `server.secret.json` with mode `0600` under `~/.pi/coms-net/projects/<project>/`.
+Use the hub on `127.0.0.1` for multiple local terminals or tmux panes. By default, the first `coms-net` agent auto-starts the hub on port `48201` when no server is registered for the project. If no `PI_COMS_NET_AUTH_TOKEN` is supplied on loopback, the server generates `server.secret.json` with mode `0600` under `~/.pi/coms-net/projects/<project>/`.
+
+Set `PI_COMS_NET_AUTOSTART=0` to disable embedded startup and require an explicit server process.
 
 ### LAN hub
 
@@ -153,11 +170,14 @@ Common server variables:
 - `PI_COMS_NET_LOG_HEARTBEAT=1`
 - `PI_COMS_NET_LOG_PAYLOADS=1` — explicit debug mode for prompt previews; off by default.
 
-Client variables:
+Client/autostart variables:
 
 - `PI_COMS_NET_SERVER_URL`
 - `PI_COMS_NET_AUTH_TOKEN`
 - `PI_COMS_NET_PROJECT`
+- `PI_COMS_NET_AUTOSTART=0` — disable first-agent hub startup.
+- `PI_COMS_NET_PORT` — embedded hub port; defaults to `48201`.
+- `PI_COMS_NET_EMBEDDED_HOST` — embedded hub host; defaults to `127.0.0.1`.
 
 Local `coms` limits:
 

@@ -36,6 +36,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 // ━━ Constants ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -51,6 +53,9 @@ const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES) ||
 const MAX_SCHEMA_BYTES = Number(process.env.PI_COMS_NET_MAX_SCHEMA_BYTES) || 16 * 1024;
 const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COMS_NET_REPLY_RETENTION_MS) || 5 * 60_000;
 const SHUTDOWN_DELETE_TIMEOUT_MS = 2_000;
+const DEFAULT_EMBEDDED_HOST = process.env.PI_COMS_NET_EMBEDDED_HOST || "127.0.0.1";
+const DEFAULT_EMBEDDED_PORT = Number(process.env.PI_COMS_NET_PORT || 48201);
+const AUTOSTART_SERVER = process.env.PI_COMS_NET_AUTOSTART !== "0";
 
 const SERVER_URL_ENV = process.env.PI_COMS_NET_SERVER_URL;
 const AUTH_TOKEN_ENV = process.env.PI_COMS_NET_AUTH_TOKEN;
@@ -367,6 +372,23 @@ function resolveAuthToken(project: string, cliFlag: string | undefined): string 
 	return null;
 }
 
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function findComsNetServerScript(): string | null {
+	try {
+		const here = path.dirname(fileURLToPath(import.meta.url));
+		const candidates = [
+			path.resolve(here, "../scripts/coms-net-server.ts"),
+			path.resolve(process.cwd(), "scripts/coms-net-server.ts"),
+		];
+		return candidates.find((candidate) => fs.existsSync(candidate)) ?? null;
+	} catch {
+		return null;
+	}
+}
+
 // ━━ CLI flag shape ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 interface CliFlags {
@@ -481,11 +503,15 @@ export default function (pi: ExtensionAPI) {
 	let authToken: string | null = null;
 	let sessionSecret: string | null = null;
 	let sseUrlPath: string | null = null;
+	let embeddedServerProcess: ChildProcess | null = null;
+	let embeddedServerStarted = false;
+	let hubStatus: any = null;
 	const peerCards: Map<string, AgentCard> = new Map();
 	const pendingReplies: Map<string, PendingReply> = new Map();
 	const inboundQueue: Map<string, InboundContext> = new Map();
 	let sseAbort: AbortController | null = null;
 	let heartbeatTimer: NodeJS.Timeout | null = null;
+	let hubStatusTimer: NodeJS.Timeout | null = null;
 	let reconnectTimer: NodeJS.Timeout | null = null;
 	let reconnectAttempts = 0;
 	let notifiedReconnectCap = false;
@@ -495,6 +521,75 @@ export default function (pi: ExtensionAPI) {
 	let displayProject: string | null = null;
 	let lastWidgetSnapshot = "";
 	let shuttingDown = false;
+
+	// ━━ Embedded local hub ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+	function canAutostartHub(flags: CliFlags): boolean {
+		return AUTOSTART_SERVER && !flags.serverUrl && !SERVER_URL_ENV;
+	}
+
+	async function waitForLocalHub(project: string, timeoutMs = 4_000): Promise<boolean> {
+		const started = Date.now();
+		while (Date.now() - started < timeoutMs) {
+			const sj = readServerJson(project);
+			const sec = readServerSecret(project);
+			if (sj?.local_url && sec?.token) return true;
+			await sleep(100);
+		}
+		return false;
+	}
+
+	async function autostartLocalHub(project: string): Promise<boolean> {
+		if (!AUTOSTART_SERVER || embeddedServerStarted) return false;
+		const script = findComsNetServerScript();
+		if (!script) {
+			audit("embedded_server_start_skipped", { reason: "script_not_found" });
+			return false;
+		}
+		const bunCheck = spawnSync("bun", ["--version"], { stdio: "ignore" });
+		if (bunCheck.error || bunCheck.status !== 0) {
+			audit("embedded_server_start_skipped", { reason: "bun_not_available" });
+			return false;
+		}
+		try {
+			embeddedServerProcess = spawn("bun", [script], {
+				detached: true,
+				stdio: "ignore",
+				env: {
+					...process.env,
+					PI_COMS_NET_PROJECT: project,
+					PI_COMS_NET_HOST: DEFAULT_EMBEDDED_HOST,
+					PI_COMS_NET_PORT: String(DEFAULT_EMBEDDED_PORT),
+				},
+			});
+			embeddedServerStarted = true;
+			embeddedServerProcess.unref?.();
+			audit("embedded_server_start", { project, pid: embeddedServerProcess.pid, port: DEFAULT_EMBEDDED_PORT });
+		} catch (err) {
+			audit("embedded_server_start_failed", { reason: safeError(err) });
+			return false;
+		}
+		return waitForLocalHub(project);
+	}
+
+	async function refreshHubStatus(): Promise<void> {
+		if (!identity || !serverUrl || !authToken) return;
+		hubStatus = await httpFetch("GET", `/v1/server/status?project=${encodeURIComponent(identity.project)}`, undefined, { timeoutMs: 3_000 });
+		maybeRequestRender();
+	}
+
+	function formatHubStatusLine(theme: Theme, width: number): string | null {
+		if (!hubStatus?.stats) return null;
+		const stats = hubStatus.stats;
+		const counts = stats.counts ?? {};
+		const last = Array.isArray(hubStatus.recent_events) && hubStatus.recent_events.length
+			? hubStatus.recent_events[hubStatus.recent_events.length - 1]
+			: null;
+		const owner = embeddedServerStarted ? "embedded" : "hub";
+		const lastText = last ? ` last=${last.kind}` : "";
+		const line = ` hub:${owner} ${hubStatus.local_url ?? serverUrl} agents=${stats.agents ?? 0} streams=${stats.streams ?? 0} queue=${stats.queue_depth ?? 0} running=${counts.running ?? 0}${lastText}`;
+		return truncateToWidth(theme.fg("dim", line), width);
+	}
 
 	// ━━ HTTP helper ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -1029,11 +1124,16 @@ export default function (pi: ExtensionAPI) {
 		displayProject = project;
 		includeExplicit = false;
 
-		// 2. Resolve server URL.
+		// 2. Resolve or auto-start local server. The first agent in a project can
+		// bootstrap the hub so operators do not need a separate remembered command.
 		serverUrl = resolveServerUrl(project, flags.serverUrl);
+		if (!serverUrl && canAutostartHub(flags)) {
+			await autostartLocalHub(project);
+			serverUrl = resolveServerUrl(project, flags.serverUrl);
+		}
 		if (!serverUrl) {
 			ctx.ui?.notify?.(
-				`📡 coms-net: no server URL for project "${project}". Start one with: bun scripts/coms-net-server.ts`,
+				`📡 coms-net: no server URL for project "${project}". Autostart is enabled but no local hub could be started.`,
 				"error",
 			);
 			audit("boot_failed", { reason: "no_server_url", project });
@@ -1042,6 +1142,10 @@ export default function (pi: ExtensionAPI) {
 
 		// 3. Resolve auth token.
 		authToken = resolveAuthToken(project, flags.authToken);
+		if (!authToken && canAutostartHub(flags)) {
+			await waitForLocalHub(project);
+			authToken = resolveAuthToken(project, flags.authToken);
+		}
 		if (!authToken) {
 			ctx.ui?.notify?.(
 				`📡 coms-net: no auth token for project "${project}". Set PI_COMS_NET_AUTH_TOKEN or pass --auth-token. ` +
@@ -1052,16 +1156,29 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		// 4. Health check — verify reachability without consuming auth surface.
+		// 4. Health check — verify reachability. If a stale server.json points at a
+		// dead local hub, try one autostart/retry before failing.
+		let healthOk = false;
+		let healthErr: any = null;
 		try {
 			await httpFetch("GET", "/health");
+			healthOk = true;
 		} catch (err) {
-			ctx.ui?.notify?.(
-				`📡 coms-net: server unreachable at ${serverUrl} — ${safeError(err)}. ` +
-				`Start one with: bun scripts/coms-net-server.ts`,
-				"error",
-			);
-			audit("boot_failed", { reason: "health_failed", error: safeError(err) });
+			healthErr = err;
+			if (canAutostartHub(flags) && await autostartLocalHub(project)) {
+				serverUrl = resolveServerUrl(project, flags.serverUrl);
+				authToken = resolveAuthToken(project, flags.authToken);
+				try {
+					await httpFetch("GET", "/health");
+					healthOk = true;
+				} catch (retryErr) {
+					healthErr = retryErr;
+				}
+			}
+		}
+		if (!healthOk) {
+			ctx.ui?.notify?.(`📡 coms-net: server unreachable at ${serverUrl} — ${safeError(healthErr)}`, "error");
+			audit("boot_failed", { reason: "health_failed", error: safeError(healthErr) });
 			return;
 		}
 
@@ -1102,8 +1219,9 @@ export default function (pi: ExtensionAPI) {
 
 		// 8. Open SSE — fire and forget.
 		void openSse();
+		void refreshHubStatus().catch(() => {});
 
-		// 9. Heartbeat loop.
+		// 9. Heartbeat and hub status loops.
 		heartbeatTimer = setInterval(() => {
 			if (!identity || shuttingDown) return;
 			const ctxNow = currentCtx;
@@ -1124,6 +1242,8 @@ export default function (pi: ExtensionAPI) {
 				});
 		}, HEARTBEAT_MS);
 		try { (heartbeatTimer as any).unref?.(); } catch { /* ignore */ }
+		hubStatusTimer = setInterval(() => { refreshHubStatus().catch(() => {}); }, Math.max(5_000, HEARTBEAT_MS));
+		try { (hubStatusTimer as any).unref?.(); } catch { /* ignore */ }
 	});
 
 	// ━━ Pool widget rendering ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1191,8 +1311,10 @@ export default function (pi: ExtensionAPI) {
 
 		if (rows.length === 0) {
 			const emptyMsg = theme.fg("muted", "no peers connected");
+			const hubLine = formatHubStatusLine(theme, width);
 			return [
 				topBorder,
+				...(hubLine ? [hubLine] : []),
 				truncateToWidth(theme.fg("dim", " ") + emptyMsg, width),
 				bottomBorder,
 			];
@@ -1201,6 +1323,8 @@ export default function (pi: ExtensionAPI) {
 		rows.sort((a, b) => a.name.localeCompare(b.name));
 
 		const out: string[] = [topBorder];
+		const hubLine = formatHubStatusLine(theme, width);
+		if (hubLine) out.push(hubLine);
 
 		for (const r of rows) {
 			const pctNum = r.pct ?? 0;
@@ -1703,13 +1827,18 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (trimmed.includes("--server")) {
 				try {
-					const health = await httpFetch("GET", "/health");
-					ctx.ui.notify(
-						`coms-net server: ${serverUrl} · version ${health?.version ?? "?"} · server_id ${health?.server_id ?? "?"}`,
-						"info",
-					);
+					await refreshHubStatus();
+					const stats = hubStatus?.stats ?? {};
+					const counts = stats.counts ?? {};
+					const recent = Array.isArray(hubStatus?.recent_events) ? hubStatus.recent_events.slice(-8) : [];
+					const lines = [
+						`coms-net server: ${hubStatus?.local_url ?? serverUrl} · ${embeddedServerStarted ? "embedded" : "external"} · pid ${hubStatus?.pid ?? "?"}`,
+						`agents=${stats.agents ?? 0} streams=${stats.streams ?? 0} queue=${stats.queue_depth ?? 0} queued=${counts.queued ?? 0} running=${counts.running ?? 0} complete=${counts.complete ?? 0} error=${counts.error ?? 0}`,
+						...recent.map((e: any) => `${String(e.ts).slice(11, 19)} ${e.symbol} ${e.kind}: ${e.detail}`),
+					];
+					ctx.ui.notify(lines.join("\n"), "info");
 				} catch (err) {
-					ctx.ui.notify(`coms-net: server health failed — ${safeError(err)}`, "error");
+					ctx.ui.notify(`coms-net: server status failed — ${safeError(err)}`, "error");
 				}
 			}
 			const projectMatch = trimmed.match(/--project\s+(\S+)/);
@@ -1745,6 +1874,10 @@ export default function (pi: ExtensionAPI) {
 		if (heartbeatTimer) {
 			try { clearInterval(heartbeatTimer); } catch { /* ignore */ }
 			heartbeatTimer = null;
+		}
+		if (hubStatusTimer) {
+			try { clearInterval(hubStatusTimer); } catch { /* ignore */ }
+			hubStatusTimer = null;
 		}
 		if (reconnectTimer) {
 			try { clearTimeout(reconnectTimer); } catch { /* ignore */ }

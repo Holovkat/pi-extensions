@@ -32,7 +32,7 @@ import * as os from "node:os";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const HOST = process.env.PI_COMS_NET_HOST ?? "127.0.0.1";
-const PORT = Number(process.env.PI_COMS_NET_PORT ?? 0);
+const PORT = Number(process.env.PI_COMS_NET_PORT ?? 48201);
 const PUBLIC_URL = process.env.PI_COMS_NET_PUBLIC_URL;
 const PROJECT = process.env.PI_COMS_NET_PROJECT ?? "default";
 const ENV_TOKEN = process.env.PI_COMS_NET_AUTH_TOKEN;
@@ -55,6 +55,9 @@ const DEFAULT_AWAIT_TIMEOUT_MS = 30_000;
 
 let TOKEN: string = ENV_TOKEN ?? "";
 let TOKEN_FILE_OWNED_BY_US = false;
+let boundLocalUrl: string | null = null;
+let boundPublicUrl: string | null = null;
+let serverJsonPathForStatus: string | null = null;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Console event logger
@@ -82,7 +85,20 @@ const C_RED    = LOG_TTY ? "\x1b[31m" : "";
 const C_PINK   = LOG_TTY ? "\x1b[95m" : "";
 const C_BLUE   = LOG_TTY ? "\x1b[34m" : "";
 
+const RECENT_EVENT_LIMIT = 200;
+const recentEvents: Array<{ ts: string; symbol: string; kind: string; detail: string }> = [];
+
+function stripAnsi(s: string): string {
+	return s.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function rememberEvent(symbol: string, kind: string, detail: string): void {
+	recentEvents.push({ ts: nowIso(), symbol, kind, detail: stripAnsi(detail) });
+	if (recentEvents.length > RECENT_EVENT_LIMIT) recentEvents.splice(0, recentEvents.length - RECENT_EVENT_LIMIT);
+}
+
 function logLine(symbol: string, color: string, kind: string, detail: string): void {
+	rememberEvent(symbol, kind, detail);
 	if (LOG_QUIET) return;
 	const t = new Date().toISOString().slice(11, 23); // HH:MM:SS.sss
 	const padded = kind.padEnd(10);
@@ -624,6 +640,54 @@ function inboxDepthFor(p: ProjectState, targetSession: string, targetName?: stri
 // ─────────────────────────────────────────────────────────────────────────────
 // Route handlers
 // ─────────────────────────────────────────────────────────────────────────────
+
+function projectStats(p: ProjectState | undefined) {
+	const counts: Record<string, number> = { queued: 0, delivered: 0, running: 0, complete: 0, error: 0, timeout: 0 };
+	let messages = 0;
+	let awaiters = 0;
+	if (p) {
+		for (const m of p.messages.values()) {
+			messages++;
+			counts[m.status] = (counts[m.status] ?? 0) + 1;
+		}
+		for (const set of p.awaiters.values()) awaiters += set.size;
+	}
+	return {
+		agents: p?.agents.size ?? 0,
+		streams: p?.streams.size ?? 0,
+		messages,
+		awaiters,
+		queue_depth: counts.queued + counts.delivered + counts.running,
+		counts,
+	};
+}
+
+function handleServerStatus(_req: Request, url: URL): Response {
+	const projectName = url.searchParams.get("project") ?? PROJECT;
+	const p = state.projects.get(projectName);
+	const projects: Record<string, ReturnType<typeof projectStats>> = {};
+	for (const [name, project] of state.projects) {
+		projects[name] = projectStats(project);
+	}
+	return json({
+		ok: true,
+		version: 1,
+		server_id: state.server_id,
+		pid: process.pid,
+		started_at: state.started_at,
+		uptime_ms: Date.now() - Date.parse(state.started_at),
+		command: [process.argv[0], ...process.argv.slice(1)].join(" "),
+		host: HOST,
+		port: boundLocalUrl ? Number(new URL(boundLocalUrl).port) : PORT,
+		local_url: boundLocalUrl,
+		public_url: boundPublicUrl,
+		server_json: serverJsonPathForStatus,
+		project: projectName,
+		stats: projectStats(p),
+		projects,
+		recent_events: recentEvents.slice(-50),
+	});
+}
 
 async function handleHealth(_req: Request): Promise<Response> {
 	return json({
@@ -1382,7 +1446,12 @@ async function router(req: Request): Promise<Response> {
 		return errorJson("not_found", 404);
 	}
 
-	// 2. POST /v1/agents/register
+	// 2. GET /v1/server/status
+	if (pathname === "/v1/server/status" && method === "GET") {
+		return handleServerStatus(req, url);
+	}
+
+	// 3. POST /v1/agents/register
 	if (pathname === "/v1/agents/register" && method === "POST") {
 		return handleRegister(req);
 	}
@@ -1627,9 +1696,12 @@ export function main(): void {
 	const localHost = HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST;
 	const localUrl = `http://${localHost}:${claimedPort}`;
 	const publicUrl = PUBLIC_URL ?? localUrl;
+	boundLocalUrl = localUrl;
+	boundPublicUrl = publicUrl;
 
 	// Write server.json (NEVER include the token).
 	const serverJsonPath = path.join(dir, "server.json");
+	serverJsonPathForStatus = serverJsonPath;
 	const serverJson = {
 		version: 1,
 		project: PROJECT,

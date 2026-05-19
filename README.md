@@ -1175,10 +1175,9 @@ pi --no-extensions -e ./extensions/coms.ts --name alice --project comms-uat
 pi --no-extensions -e ./extensions/coms.ts --name bob --project comms-uat
 ```
 
-Quick networked smoke:
+Quick networked smoke. The first agent auto-starts a localhost hub on port `48201` when no hub is already registered for the project:
 
 ```bash
-PI_COMS_NET_PROJECT=comms-net-uat PI_COMS_NET_PORT=48201 bun scripts/coms-net-server.ts
 pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-net-uat
 pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat
 ```
