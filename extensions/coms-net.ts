@@ -1316,6 +1316,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "coms_net_send",
 		label: "Coms Net Send",
+		promptGuidelines: [
+			"After calling coms_net_send for a delegated user request, do not answer the delegated prompt yourself; immediately call coms_net_await with the returned msg_id unless the user explicitly asked for fire-and-forget.",
+		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
 			"Returns synchronously with a msg_id once the server queues the prompt. " +
@@ -1411,7 +1414,10 @@ export default function (pi: ExtensionAPI) {
 			return {
 				content: [{
 					type: "text" as const,
-					text: `coms_net_send → ${targetName}\nmsg_id ${msg_id}\nhops ${hops}`,
+					text:
+						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nhops ${hops}\n\n` +
+						`NEXT ACTION: do not answer this delegated prompt yourself. ` +
+						`Call coms_net_await with msg_id ${msg_id} and return the peer's response unless the user explicitly asked for fire-and-forget.`,
 				}],
 				details: { msg_id, target: targetName, target_session, hops },
 			};

@@ -1406,6 +1406,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "coms_send",
 		label: "Coms Send",
+		promptGuidelines: [
+			"After calling coms_send for a delegated user request, do not answer the delegated prompt yourself; immediately call coms_await with the returned msg_id unless the user explicitly asked for fire-and-forget.",
+		],
 		description:
 			"Send a prompt to a peer agent. Returns synchronously with a msg_id once the receiver acks. " +
 			"Use coms_get (non-blocking) or coms_await (blocking) with the msg_id to retrieve the response. " +
@@ -1501,7 +1504,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			return {
-				content: [{ type: "text" as const, text: `coms_send → ${target.name}\nmsg_id ${msg_id}\nhops ${hops}` }],
+				content: [{
+					type: "text" as const,
+					text:
+						`coms_send → ${target.name}\nmsg_id ${msg_id}\nhops ${hops}\n\n` +
+						`NEXT ACTION: do not answer this delegated prompt yourself. ` +
+						`Call coms_await with msg_id ${msg_id} and return the peer's response unless the user explicitly asked for fire-and-forget.`,
+				}],
 				details: { msg_id, target: target.name, target_session: target.session_id, hops },
 			};
 		},
