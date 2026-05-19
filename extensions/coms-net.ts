@@ -171,6 +171,7 @@ interface PendingReply {
 	timer?: ReturnType<typeof setTimeout> | null;
 	notification_timer?: ReturnType<typeof setTimeout> | null;
 	notify_on_response?: boolean;
+	synchronous?: boolean;
 	await_started?: boolean;
 	notified?: boolean;
 	target_name?: string;
@@ -1509,13 +1510,14 @@ export default function (pi: ExtensionAPI) {
 		name: "coms_net_send",
 		label: "Coms Net Send",
 		promptGuidelines: [
-			"After calling coms_net_send for a delegated user request, do not answer the delegated prompt yourself. For chained/synchronous work, immediately call coms_net_await with the returned msg_id. If the user asks for async/background/fire-and-forget delivery, set notify_on_response=true, tell the user the message is queued/running, and do not call coms_net_await.",
+			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
 			"Returns synchronously with a msg_id once the server queues the prompt. " +
-			"Use coms_net_get (non-blocking) or coms_net_await (blocking) with that msg_id to retrieve the peer's reply. " +
-			"For async/background delegation, set notify_on_response=true and the extension will display the peer's eventual reply back in this session without blocking.\n\n" +
+			"Async/background behavior is the default: do not await unless the user explicitly asks for a synchronous/blocking/chained reply. " +
+			"Use coms_net_get (non-blocking) to poll, or coms_net_await (blocking) only when synchronous=true was deliberately requested. " +
+			"The extension displays the peer's eventual reply back in this session without blocking.\n\n" +
 			"⚠️  DO NOT call this tool to REPLY to an inbound message. " +
 			"When you receive a `[from <peer>] …` follow-up, just write your answer as your normal assistant message — " +
 			"the coms-net extension automatically captures the final assistant text at the end of your turn and " +
@@ -1528,7 +1530,8 @@ export default function (pi: ExtensionAPI) {
 			prompt: Type.String({ description: "The prompt to send." }),
 			conversation_id: Type.Optional(Type.String()),
 			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
-			notify_on_response: Type.Optional(Type.Boolean({ description: "Set true for async/background sends: do not await; display the peer's eventual response in this session when it arrives." })),
+			synchronous: Type.Optional(Type.Boolean({ description: "Set true only when the caller explicitly requests a blocking/chained/synchronous exchange; after send, call coms_net_await." })),
+			notify_on_response: Type.Optional(Type.Boolean({ description: "Async response notification toggle. Defaults to true for normal async sends and false when synchronous=true." })),
 		}),
 		async execute(_callId, params) {
 			if (!identity) throw new Error("coms-net not initialised");
@@ -1545,8 +1548,10 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`coms-net: response_schema too large (${jsonByteLength((params as any).response_schema)} > ${MAX_SCHEMA_BYTES} bytes)`);
 			}
 
-			const explicitAsyncMode = (params as any).notify_on_response === true;
-			const notifyOnResponse = (params as any).notify_on_response !== false;
+			const synchronous = (params as any).synchronous === true;
+			const notifyOnResponse = typeof (params as any).notify_on_response === "boolean"
+				? (params as any).notify_on_response
+				: !synchronous;
 
 			const req: SendRequest = {
 				project: identity.project,
@@ -1589,6 +1594,7 @@ export default function (pi: ExtensionAPI) {
 				created_at: nowIso(),
 				status,
 				notify_on_response: notifyOnResponse,
+				synchronous,
 				timer: null,
 				notification_timer: null,
 			};
@@ -1611,13 +1617,14 @@ export default function (pi: ExtensionAPI) {
 					target_session,
 					status,
 					notify_on_response: notifyOnResponse,
+					synchronous,
 					hops,
 				});
 			} catch { /* best-effort */ }
 
-			const nextAction = explicitAsyncMode
-				? `NEXT ACTION: async notification is armed. Tell the user the message is ${status}; do not call coms_net_await unless they ask to block.`
-				: `NEXT ACTION: do not answer this delegated prompt yourself. Call coms_net_await with msg_id ${msg_id} and return the peer's response unless the user explicitly asked for async/fire-and-forget. If you do not await, an async response notification is armed.`;
+			const nextAction = synchronous
+				? `NEXT ACTION: synchronous=true was specified. Do not answer this delegated prompt yourself; call coms_net_await with msg_id ${msg_id} and return the peer's response.`
+				: `NEXT ACTION: async is the default. Do not call coms_net_await. Tell the user the message is ${status}; an async response notification will appear when ${targetName} replies.`;
 
 			return {
 				content: [{
@@ -1626,7 +1633,8 @@ export default function (pi: ExtensionAPI) {
 						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nstatus ${status}\nhops ${hops}\n\n` +
 						`${nextAction}`,
 				}],
-				details: { msg_id, target: targetName, target_session, status, notify_on_response: notifyOnResponse, hops },
+				details: { msg_id, target: targetName, target_session, status, notify_on_response: notifyOnResponse, synchronous, hops },
+				terminate: !synchronous,
 			};
 		},
 		renderCall(args, theme) {
@@ -1735,7 +1743,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Await",
 		description:
 			"Block until the reply to YOUR OWN outbound coms_net_send arrives, or the timeout fires (default 30 min). " +
-			"Only call this with a msg_id that YOU received as the return value of a coms_net_send call you just made.\n\n" +
+			"Only call this for a msg_id returned by coms_net_send when that send used synchronous=true. Normal coms_net_send calls are async by default and should not be awaited.\n\n" +
 			"⚠️  Do NOT call this with a msg_id that came in via an inbound `[from <peer>] …` prompt — those msg_ids belong to the *peer's* outbound, not yours. " +
 			"To reply to an inbound message, do nothing special: just answer normally as your assistant message, " +
 			"and the extension will auto-submit your final text back to the caller when your turn ends.",
@@ -1746,6 +1754,15 @@ export default function (pi: ExtensionAPI) {
 		async execute(_callId, params) {
 			const msg_id = (params as any).msg_id as string;
 			const pending = pendingReplies.get(msg_id);
+			if (pending && !pending.synchronous) {
+				return {
+					content: [{
+						type: "text" as const,
+						text: `coms_net_await: ${msg_id} was sent asynchronously. Synchronous waiting must be requested by sending with synchronous=true. Use coms_net_get to poll, or wait for the async response notification.`,
+					}],
+					details: { status: pending.status ?? "pending", error: "async_send_not_awaitable" },
+				};
+			}
 			if (pending) {
 				pending.await_started = true;
 				cancelAsyncReplyNotification(pending);

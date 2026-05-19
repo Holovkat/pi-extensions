@@ -1182,6 +1182,6 @@ pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-
 pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat
 ```
 
-Ask Alice to list peers, send Bob a prompt, and await the returned `msg_id` for chained work. For background work, use `notify_on_response=true` and skip `*_await`; Bob's eventual reply is displayed later in Alice's session. The receiver replies by writing a normal assistant response; it should not call `*_send` to answer an inbound request.
+Ask Alice to list peers and send Bob a prompt. `coms_net_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is displayed later in Alice's session. The receiver replies by writing a normal assistant response; it should not call `*_send` to answer an inbound request.
 
 See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, async response, structured-response, and UAT notes.

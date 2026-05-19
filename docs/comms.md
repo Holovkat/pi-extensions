@@ -91,19 +91,25 @@ The orchestrator's Pi session memory becomes the mediator's working record. It i
 - `error` — the message failed, including explicit receiver errors.
 - `expired` / `timeout` — the sender waited too long or the message exceeded its TTL.
 
-Use `*_await` when you want to block for the reply. Use `*_get` when an orchestrator wants to poll several outstanding messages.
+Use `*_get` when an orchestrator wants to poll several outstanding messages. Use `*_await` only for sends that explicitly set `synchronous=true`.
 
 ## Async/background sends
 
-`coms_net_send` itself is non-blocking: it returns as soon as the hub accepts or queues the message. For chained work, call `coms_net_await` with the returned `msg_id`. For background work, send with `notify_on_response: true` and do not await. The sender session will display a later `[coms-net async response from <peer>]` message when the peer replies.
+`coms_net_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later displays `[coms-net async response from <peer>]` in the sender session when the peer replies. Do not call `coms_net_await` for normal sends.
 
-Example prompt:
+Default async example:
 
 ```text
-Use coms_net_send to send net-bob asynchronously with notify_on_response=true: "Reply exactly ASYNC-PONG". Do not await; tell me whether it was queued or running.
+Use coms_net_send to send net-bob: "Reply exactly ASYNC-PONG".
 ```
 
-This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message.
+Synchronous/chained example:
+
+```text
+Use coms_net_send with synchronous=true to send net-bob: "Reply exactly SYNC-PONG". Then await the returned msg_id with coms_net_await.
+```
+
+This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
 
 ## Hub status
 
