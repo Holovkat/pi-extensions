@@ -899,7 +899,7 @@ export default function (pi: ExtensionAPI) {
 					customType: "coms-net-inbound",
 					content:
 						`[inbound coms-net message from ${senderName} @ ${senderCwd}]\n` +
-						(conversationId ? `[conversation_id ${conversationId} — continue this conversation thread using prior session context if present.]\n` : "") +
+						(conversationId ? `[thread ${conversationId} — continue this conversation using prior session context if present.]\n` : "") +
 						`[reply by writing a normal assistant message — your turn output is auto-returned to ${senderName}. ` +
 						`DO NOT call coms_net_send/coms_net_await/coms_net_get to reply; that creates a ping-pong loop. ` +
 						`msg_id ${msg_id} belongs to ${senderName}'s outbound, not yours.]\n\n` +
@@ -973,10 +973,10 @@ export default function (pi: ExtensionAPI) {
 			const mode: AsyncResponseMode = pending.response_mode ?? "agent";
 			const agentMode = mode === "agent" && !error;
 			const selfName = identity?.name ?? "this agent";
-			const conversationLine = pending.conversation_id ? `conversation_id ${pending.conversation_id}\n` : "";
+			const conversationLine = pending.conversation_id ? `thread ${pending.conversation_id}\n` : "";
 			const replyGuidance = agentMode
-				? `[This is ${peerName} talking to you (${selfName}), not to the human user. Handle it yourself; do not ask the user to answer. If ${peerName} asks a question, requests an action, or expects a continuation, your next action MUST be coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""} and response_mode "agent". Never use conversation_id as target. Do not answer ${peerName}'s question in normal assistant text to the user.]`
-				: `[This is ${peerName} talking to this session. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""}; never use conversation_id as target; do not answer ${peerName}'s question locally.]`;
+				? `[This is ${peerName} talking to you (${selfName}), not to the human user. Handle it yourself; do not ask the user to answer. If ${peerName} asks a question, requests an action, or expects a continuation, your next action MUST be coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""} and response_mode "agent". Use the peer name as target; never use the thread/conversation value as target. Do not answer ${peerName}'s question in normal assistant text to the user.]`
+				: `[This is ${peerName} talking to this session. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send with target "${peerName}"${pending.conversation_id ? ` and conversation_id "${pending.conversation_id}"` : ""}; use the peer name as target and do not answer ${peerName}'s question locally.]`;
 			const content = error
 				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\nERROR: ${error}`
 				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\n${formatReplyValue(response)}`;
@@ -1550,7 +1550,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Send",
 		promptGuidelines: [
 			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
-			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the peer name/session as target plus the shown conversation_id as the separate conversation_id field and response_mode='agent'; do not ask the user to answer unless response_mode='notify' was explicitly used. Never use conversation_id as the target.",
+			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the peer name as target. If a thread/conversation_id is shown, pass it only as the separate conversation_id field; never use it as target.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
@@ -1610,7 +1610,7 @@ export default function (pi: ExtensionAPI) {
 				? (params as any).conversation_id
 				: targetRoute
 					? requestedTarget
-					: ulid();
+					: null;
 
 			const req: SendRequest = {
 				project: identity.project,
@@ -1695,11 +1695,12 @@ export default function (pi: ExtensionAPI) {
 						? `NEXT ACTION: async notify mode. Do not call coms_net_await. Tell the user the message is ${status}; ${targetName}'s reply will be displayed for the human.`
 						: `NEXT ACTION: fire-and-forget mode. Do not call coms_net_await. Tell the user the message is ${status}.`;
 
+			const threadLine = finalConversationId ? `thread ${finalConversationId}\n` : "";
 			return {
 				content: [{
 					type: "text" as const,
 					text:
-						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nconversation_id ${finalConversationId}\nstatus ${status}\nhops ${hops}\n\n` +
+						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\n${threadLine}status ${status}\nhops ${hops}\n\n` +
 						`${nextAction}`,
 				}],
 				details: { msg_id, target: targetName, target_session, conversation_id: finalConversationId, status, notify_on_response: notifyOnResponse, response_mode: responseMode, synchronous, hops },

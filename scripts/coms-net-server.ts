@@ -308,6 +308,18 @@ function looksLikeUlid(value: string): boolean {
 	return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
 
+function defaultConversationName(a: string, b: string): string {
+	const names = [a || "agent", b || "peer"].sort((x, y) => x.localeCompare(y));
+	return `${names[0]}↔${names[1]}`;
+}
+
+function isKnownConversationId(p: ProjectState, value: string): boolean {
+	for (const m of p.messages.values()) {
+		if (m.conversation_id === value) return true;
+	}
+	return false;
+}
+
 export function ulid(): string {
 	const time = Date.now();
 	const rand = crypto.randomBytes(10);
@@ -1094,10 +1106,10 @@ async function handleSendMessage(req: Request): Promise<Response> {
 				target = p.agents.get(onlySid);
 				if (target) targetName = target.name;
 			}
-			if (!target && looksLikeUlid(desired)) {
+			if (!target && (looksLikeUlid(desired) || isKnownConversationId(p, desired))) {
 				logRejected("conversation_id_as_target", `${sender.name} → ${desired}`);
 				return errorJson("conversation_id_as_target", 400, {
-					message: "target looks like a conversation_id; send to the peer name/session and pass conversation_id separately",
+					message: "target looks like a conversation/thread id; send to the peer name/session and pass conversation_id separately",
 				});
 			}
 		}
@@ -1115,7 +1127,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 	const msgId = ulid();
 	const conversationId = body.conversation_id && typeof body.conversation_id === "string" && body.conversation_id.length > 0
 		? body.conversation_id
-		: msgId;
+		: defaultConversationName(sender.name, targetName);
 	const msg: ComsMessage = {
 		msg_id: msgId,
 		project: projectName,

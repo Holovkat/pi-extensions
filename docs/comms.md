@@ -97,7 +97,7 @@ Use `*_get` when an orchestrator wants to poll several outstanding messages. Use
 
 `coms_net_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later delivers `[coms-net async response from <peer>]` back to the sender session when the peer replies. Do not call `coms_net_await` for normal sends.
 
-Async sends default to `response_mode="agent"`: the sender agent handles the peer reply itself. If Bob asks Alice a question, Alice should answer Bob with another `coms_net_send` using the same `conversation_id`; the human does not need to answer for Alice. Use `response_mode="notify"` only when the human should read/respond, and `response_mode="none"` for fire-and-forget.
+Async sends default to `response_mode="agent"`: the sender agent handles the peer reply itself. If Bob asks Alice a question, Alice should answer Bob with another `coms_net_send` using Bob's name as `target`. The hub names the thread after the peer names by default (for example `net-alice↔net-bob`); pass that value only as the optional `conversation_id` field when continuing a thread, never as `target`. The human does not need to answer for Alice. Use `response_mode="notify"` only when the human should read/respond, and `response_mode="none"` for fire-and-forget.
 
 Default async example:
 
