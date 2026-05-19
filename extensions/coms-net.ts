@@ -165,6 +165,8 @@ interface InboundContext {
 	trigger_leaf_id?: string | null;
 }
 
+type AsyncResponseMode = "agent" | "notify" | "none";
+
 interface PendingReply {
 	resolve: (value: { response?: any; error?: string | null }) => void;
 	reject: (err: Error) => void;
@@ -173,6 +175,7 @@ interface PendingReply {
 	timer?: ReturnType<typeof setTimeout> | null;
 	notification_timer?: ReturnType<typeof setTimeout> | null;
 	notify_on_response?: boolean;
+	response_mode?: AsyncResponseMode;
 	synchronous?: boolean;
 	await_started?: boolean;
 	notified?: boolean;
@@ -952,10 +955,13 @@ export default function (pi: ExtensionAPI) {
 			if (pending.await_started || pending.notified) return;
 			pending.notified = true;
 			const peerName = pending.target_name ?? "peer";
+			const mode: AsyncResponseMode = pending.response_mode ?? "agent";
+			const agentMode = mode === "agent" && !error;
+			const selfName = identity?.name ?? "this agent";
 			const conversationLine = pending.conversation_id ? `conversation_id ${pending.conversation_id}\n` : "";
-			const replyGuidance =
-				`[This is ${peerName} talking to this agent/user. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send back to ${peerName}` +
-				`${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""}; do not answer ${peerName}'s question locally.]`;
+			const replyGuidance = agentMode
+				? `[This is ${peerName} talking to you (${selfName}), not to the human user. Handle it yourself; do not ask the user to answer. If ${peerName} asks a question, requests an action, or expects a continuation, your next action MUST be coms_net_send back to ${peerName}${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""} and response_mode "agent". Do not answer ${peerName}'s question in normal assistant text to the user.]`
+				: `[This is ${peerName} talking to this session. If the user answers this message, asks to reply, or says "tell ${peerName}...", call coms_net_send back to ${peerName}${pending.conversation_id ? ` with conversation_id ${pending.conversation_id}` : ""}; do not answer ${peerName}'s question locally.]`;
 			const content = error
 				? `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\nERROR: ${error}`
 				: `[coms-net async response from ${peerName}]\nmsg_id ${msgId}\n${conversationLine}${replyGuidance}\n\n${formatReplyValue(response)}`;
@@ -965,9 +971,9 @@ export default function (pi: ExtensionAPI) {
 						customType: "coms-net-async-response",
 						content,
 						display: true,
-						details: { msg_id: msgId, target: peerName, conversation_id: pending.conversation_id ?? null, response, error },
+						details: { msg_id: msgId, target: peerName, conversation_id: pending.conversation_id ?? null, response_mode: mode, response, error },
 					},
-					{ deliverAs: "followUp" },
+					agentMode ? { deliverAs: "followUp", triggerTurn: true } : { deliverAs: "followUp" },
 				);
 			} catch (err) {
 				audit("async_response_notify_failed", { msg_id: msgId, reason: safeError(err) });
@@ -979,6 +985,7 @@ export default function (pi: ExtensionAPI) {
 					msg_id: msgId,
 					target: peerName,
 					conversation_id: pending.conversation_id ?? null,
+					response_mode: mode,
 					error,
 				});
 			} catch { /* best-effort */ }
@@ -1528,14 +1535,15 @@ export default function (pi: ExtensionAPI) {
 		label: "Coms Net Send",
 		promptGuidelines: [
 			"coms_net_send is async by default. After calling it, do not answer the delegated prompt yourself and do not call coms_net_await unless the user explicitly asks to wait, block, chain, or run synchronously. For synchronous/chained work, set synchronous=true on coms_net_send, then immediately call coms_net_await with the returned msg_id. Otherwise tell the user the message is queued/running and rely on the async response notification.",
-			"When the session shows `[coms-net async response from <peer>]` and the user answers that peer, asks you to reply, or says 'tell <peer> ...', use coms_net_send back to that peer with the shown conversation_id; do not answer the peer's question locally.",
+			"Async coms_net_send defaults to response_mode='agent': when the peer replies, the response is delivered back as a follow-up turn for this agent to handle. If the peer asks a question or expects continuation, answer the peer with coms_net_send using the shown conversation_id and response_mode='agent'; do not ask the user to answer unless response_mode='notify' was explicitly used.",
 		],
 		description:
 			"INITIATE a new outbound message to a peer agent on the coms-net hub. " +
 			"Returns synchronously with a msg_id once the server queues the prompt. " +
 			"Async/background behavior is the default: do not await unless the user explicitly asks for a synchronous/blocking/chained reply. " +
-			"Use coms_net_get (non-blocking) to poll, or coms_net_await (blocking) only when synchronous=true was deliberately requested. " +
-			"The extension displays the peer's eventual reply back in this session without blocking.\n\n" +
+			"Async sends default to response_mode='agent', so the peer's eventual reply is delivered back as a follow-up turn for this agent to handle/reply without user intervention. " +
+			"Use response_mode='notify' when the human should answer the peer, or response_mode='none' for fire-and-forget. " +
+			"Use coms_net_get (non-blocking) to poll, or coms_net_await (blocking) only when synchronous=true was deliberately requested.\n\n" +
 			"⚠️  DO NOT call this tool to REPLY to an inbound message. " +
 			"When you receive a `[from <peer>] …` follow-up, just write your answer as your normal assistant message — " +
 			"the coms-net extension automatically captures the final assistant text at the end of your turn and " +
@@ -1549,7 +1557,12 @@ export default function (pi: ExtensionAPI) {
 			conversation_id: Type.Optional(Type.String()),
 			response_schema: Type.Optional(Type.Any({ description: "Optional JSON Schema describing the expected response shape." })),
 			synchronous: Type.Optional(Type.Boolean({ description: "Set true only when the caller explicitly requests a blocking/chained/synchronous exchange; after send, call coms_net_await." })),
-			notify_on_response: Type.Optional(Type.Boolean({ description: "Async response notification toggle. Defaults to true for normal async sends and false when synchronous=true." })),
+			response_mode: Type.Optional(Type.Union([
+				Type.Literal("agent"),
+				Type.Literal("notify"),
+				Type.Literal("none"),
+			], { description: "Async reply handling. Default 'agent' lets this agent handle/respond to peer replies. 'notify' displays only for human response. 'none' disables async handling." })),
+			notify_on_response: Type.Optional(Type.Boolean({ description: "Legacy async response toggle. false maps to response_mode='none'." })),
 		}),
 		async execute(_callId, params) {
 			if (!identity) throw new Error("coms-net not initialised");
@@ -1567,9 +1580,13 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const synchronous = (params as any).synchronous === true;
-			const notifyOnResponse = typeof (params as any).notify_on_response === "boolean"
-				? (params as any).notify_on_response
-				: !synchronous;
+			let responseMode: AsyncResponseMode = "agent";
+			if ((params as any).response_mode === "notify" || (params as any).response_mode === "none") {
+				responseMode = (params as any).response_mode;
+			}
+			if (synchronous) responseMode = "none";
+			if ((params as any).notify_on_response === false) responseMode = "none";
+			const notifyOnResponse = responseMode !== "none";
 			const conversationId = typeof (params as any).conversation_id === "string" && (params as any).conversation_id.length > 0
 				? (params as any).conversation_id
 				: ulid();
@@ -1617,6 +1634,7 @@ export default function (pi: ExtensionAPI) {
 				status,
 				conversation_id: finalConversationId,
 				notify_on_response: notifyOnResponse,
+				response_mode: responseMode,
 				synchronous,
 				timer: null,
 				notification_timer: null,
@@ -1641,6 +1659,7 @@ export default function (pi: ExtensionAPI) {
 					status,
 					conversation_id: finalConversationId,
 					notify_on_response: notifyOnResponse,
+					response_mode: responseMode,
 					synchronous,
 					hops,
 				});
@@ -1648,7 +1667,11 @@ export default function (pi: ExtensionAPI) {
 
 			const nextAction = synchronous
 				? `NEXT ACTION: synchronous=true was specified. Do not answer this delegated prompt yourself; call coms_net_await with msg_id ${msg_id} and return the peer's response.`
-				: `NEXT ACTION: async is the default. Do not call coms_net_await. Tell the user the message is ${status}; an async response notification will appear when ${targetName} replies.`;
+				: responseMode === "agent"
+					? `NEXT ACTION: async is the default. Do not call coms_net_await. Tell the user the message is ${status}; when ${targetName} replies, this agent will handle/respond automatically.`
+					: responseMode === "notify"
+						? `NEXT ACTION: async notify mode. Do not call coms_net_await. Tell the user the message is ${status}; ${targetName}'s reply will be displayed for the human.`
+						: `NEXT ACTION: fire-and-forget mode. Do not call coms_net_await. Tell the user the message is ${status}.`;
 
 			return {
 				content: [{
@@ -1657,7 +1680,7 @@ export default function (pi: ExtensionAPI) {
 						`coms_net_send → ${targetName}\nmsg_id ${msg_id}\nconversation_id ${finalConversationId}\nstatus ${status}\nhops ${hops}\n\n` +
 						`${nextAction}`,
 				}],
-				details: { msg_id, target: targetName, target_session, conversation_id: finalConversationId, status, notify_on_response: notifyOnResponse, synchronous, hops },
+				details: { msg_id, target: targetName, target_session, conversation_id: finalConversationId, status, notify_on_response: notifyOnResponse, response_mode: responseMode, synchronous, hops },
 				terminate: !synchronous,
 			};
 		},

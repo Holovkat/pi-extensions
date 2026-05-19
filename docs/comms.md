@@ -95,7 +95,9 @@ Use `*_get` when an orchestrator wants to poll several outstanding messages. Use
 
 ## Async/background sends
 
-`coms_net_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later displays `[coms-net async response from <peer>]` in the sender session when the peer replies. Do not call `coms_net_await` for normal sends.
+`coms_net_send` is async by default: it returns as soon as the hub accepts or queues the message, terminates the follow-up LLM turn, and later delivers `[coms-net async response from <peer>]` back to the sender session when the peer replies. Do not call `coms_net_await` for normal sends.
+
+Async sends default to `response_mode="agent"`: the sender agent handles the peer reply itself. If Bob asks Alice a question, Alice should answer Bob with another `coms_net_send` using the same `conversation_id`; the human does not need to answer for Alice. Use `response_mode="notify"` only when the human should read/respond, and `response_mode="none"` for fire-and-forget.
 
 Default async example:
 
@@ -109,7 +111,7 @@ Synchronous/chained example:
 Use coms_net_send with synchronous=true to send net-bob: "Reply exactly SYNC-PONG". Then await the returned msg_id with coms_net_await.
 ```
 
-This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If the user replies to that async peer message, Alice should send the reply back to the peer with the displayed `conversation_id`; the async response block includes that routing instruction. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
+This is useful for offline mailbox flow: Alice can continue after seeing `queued`, and Bob's eventual response is relayed back into Alice's session after Bob reconnects and reads the message. If a model mistakenly calls `coms_net_await` for an async send, the await call returns immediately with guidance instead of blocking.
 
 ## Hub status
 
