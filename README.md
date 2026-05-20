@@ -14,6 +14,7 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
     - [3-Wave Mode](#3-wave-mode---multiwave)
   - [pi-blueprint — Interactive Planning Cockpit](#pi-blueprint--interactive-planning-cockpit)
   - [pi-toolshed — Card-Based Workbench](#pi-toolshed--card-based-workbench)
+  - [council — Networked Agent Council](#council--networked-agent-council)
   - [Supporting Extensions](#supporting-extensions)
 - [Agent Definitions](#agent-definitions)
 - [Installation](#installation)
@@ -102,6 +103,7 @@ Each agent subprocess:
 | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
 | [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md)                                             | Current rollout checklist and repo alignment tracker                                                   |
 | [docs/walkthrough-fasttrack.md](docs/walkthrough-fasttrack.md)                                               | Fast Track workflow walkthrough                                                                        |
+| [docs/comms.md](docs/comms.md)                                                                             | Local `coms` and networked `council` setup, tools, deployment profiles, UAT notes                       |
 | [docs/research-diffusion-llm-code-generation.md](docs/research-diffusion-llm-code-generation.md)             | Research context behind the pipeline design                                                            |
 | [docs/designs/pi-toolshed-retrospective-2026-03-26.md](docs/designs/pi-toolshed-retrospective-2026-03-26.md) | Retrospective summary of the Blueprint + Toolshed buildout, issues, lessons, and external-app guidance |
 | [PRD-PI-TOOLSHED.md](PRD-PI-TOOLSHED.md)                                                                     | Toolshed product direction                                                                             |
@@ -115,6 +117,7 @@ Each agent subprocess:
 - `req-qa` and `dev-pipeline` remain the baseline discovery and delivery workflow extensions.
 - `pi-blueprint.ts` is the current GitHub-backed planning cockpit, with transcript search, alignment checks, issue rebuilds, asset sync, and a dedicated web mirror.
 - `pi-toolshed.ts` is the current card/workspace shell, with frontier packets, workspace presets, quick actions, and blueprint-aware web surfaces.
+- `council.ts` is the networked Pi-to-Pi council layer: agents discover council members, select by purpose/tags/capabilities, and exchange async request/response work over `scripts/council-server.ts`.
 - `paraffine.ts` is a dormant-by-default knowledge-maintenance bridge for the PARA workspace; load it explicitly with `-e` when you want Pi to call the PARAFFINE CLI against AFFiNE.
 - Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprint/`; use `/blueprint-sync-assets` to mirror them into a project-local `.pi` runtime.
 
@@ -877,6 +880,57 @@ Key commands:
 
 ---
 
+### council — Networked Agent Council
+
+**File:** `extensions/council.ts`<br>
+**Server:** `scripts/council-server.ts`<br>
+**Package:** `@holovkat/pi-council` via `npm run build` → `dist/council-package`
+
+A networked request/response council for multiple Pi agents. The first agent in a project auto-starts a local council hub when needed; additional agents join the same project and advertise metadata so the questioner can choose the best member for each task.
+
+Council tools:
+
+| Tool | Purpose |
+| ---- | ------- |
+| `council_list` | List available council members with name, model, purpose, status, tags, capabilities, and context usage. Use this before the first send. |
+| `council_send` | Ask or assign work to a selected council member by exact name. Async by default; replies return to the sender agent. |
+| `council_get` | Non-blocking poll for a known `msg_id`. |
+| `council_await` | Blocking wait, only for sends created with `synchronous=true`. |
+
+Slash command:
+
+| Command | Purpose |
+| ------- | ------- |
+| `/council` | Refresh the council panel. |
+| `/council --server` | Show hub URL, PID, queue/status counts, and recent events. |
+| `/council --reconnect` | Re-register and reopen the event stream. |
+| `/council --project <name>` | View another project/council pool in the panel. |
+
+Quick local council:
+
+```bash
+pi --no-extensions -e ./extensions/council.ts --name net-alice --project council-uat --tags planner --capabilities planning,review
+pi --no-extensions -e ./extensions/council.ts --name net-bob --project council-uat --tags implementer --capabilities coding,test
+```
+
+In Alice:
+
+```text
+Use council_list to inspect the council members. Choose who can answer based on purpose, tags, capabilities, status, and context usage. Then use council_send to ask net-bob: "Reply exactly COUNCIL-PONG".
+```
+
+Defaults and behavior:
+
+- `council_send` is async by default.
+- The sender should not call `council_await` unless the user explicitly asks for synchronous/blocking/chained behavior.
+- Default `response_mode="agent"` lets the sender agent handle council member replies without the human answering for it.
+- If port `48201` is busy, autostart falls back to an OS-assigned local port and writes the actual URL to `~/.pi/council/projects/<project>/server.json`.
+- Use `PI_COUNCIL_*` environment variables for host, port, project, auth token, limits, and autostart controls.
+
+See [`docs/comms.md`](docs/comms.md) for deployment profiles, security notes, lifecycle states, async behavior, and UAT scenarios.
+
+---
+
 ### Supporting Extensions
 
 | Extension         | Purpose                                                                                       |
@@ -955,6 +1009,7 @@ _PIX="$HOME/.pi-init/extensions"
 alias pi-dev='pi -ne -e "$_PIX/dev-pipeline.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-req='pi -ne -e "$_PIX/req-qa.ts" -e "$_PIX/theme-cycler.ts"'
 alias pi-blueprint='pi -ne -e "$_PIX/pi-blueprint.ts" -e "$_PIX/theme-cycler.ts"'
+alias pi-council='pi --no-extensions -e "$_PIX/council.ts"'
 alias pi-dash='~/.pi-init/bin/pipeline-dashboard'
 alias pi-web='~/.pi-init/bin/pipeline-dashboard-web'
 
@@ -968,6 +1023,7 @@ brew install glow
 - Node.js 20+
 - GitHub CLI (`gh`) authenticated for issue publishing
 - tmux (for log panes and dashboard)
+- Bun (for the embedded/local `council` hub server)
 - glow (optional, for `/req-prd` markdown rendering)
 
 ---
@@ -979,6 +1035,7 @@ brew install glow
 | `pi-req`       | Launch requirements discovery session           |
 | `pi-dev`       | Launch sprint development pipeline              |
 | `pi-blueprint` | Launch the Blueprint planning cockpit           |
+| `pi-council`   | Launch a Pi session with the networked council extension |
 | `pi-dash`      | Launch standalone terminal dashboard            |
 | `pi-web`       | Launch Pipeline Control Center (web, port 3141) |
 
@@ -1029,6 +1086,18 @@ brew install glow
 | `/blueprint-sync-assets`     | Sync repo-managed agents and skills into local `.pi` |
 | `/blueprint-check-alignment` | Verify transcript-backed alignment                   |
 | `/blueprint-rebuild-issues`  | Rebuild or recover GitHub issues                     |
+
+### council Tools and Commands
+
+| Tool / Command      | Description                                                       |
+| ------------------- | ----------------------------------------------------------------- |
+| `council_list`      | Discover council members and choose who can answer or do the work |
+| `council_send`      | Ask/assign work to a selected council member by exact name         |
+| `council_get`       | Poll for a known reply without blocking                           |
+| `council_await`     | Block only for sends created with `synchronous=true`               |
+| `/council`          | Refresh the council panel                                         |
+| `/council --server` | Show hub URL, PID, queue/status counts, and recent events         |
+| `/council --reconnect` | Re-register and reopen the event stream                        |
 
 ### pi-toolshed Commands
 
@@ -1161,7 +1230,7 @@ A 7-task epic with 2 fix depths typically takes 5-10 minutes. If agents yield an
 | **UAT**                | Manual sign-off                     | Automated Playwright + approval gate |
 | **Best for**           | Complex architectures, first builds | Iteration, known patterns, speed     |
 
-## Pi-to-Pi Comms
+## Pi-to-Pi Comms and Council
 
 This repo includes first-version Pi-to-Pi request/response communication extensions:
 
