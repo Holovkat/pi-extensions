@@ -308,6 +308,11 @@ function looksLikeUlid(value: string): boolean {
 	return /^[0-9A-HJKMNP-TV-Z]{26}$/.test(value);
 }
 
+function containsMaliciousPayload(value: string): boolean {
+	if (value.includes("\u0000")) return true;
+	return /<\s*script\b/i.test(value) || /javascript:/i.test(value);
+}
+
 function defaultConversationName(a: string, b: string): string {
 	const names = [a || "agent", b || "peer"].sort((x, y) => x.localeCompare(y));
 	return `${names[0]}↔${names[1]}`;
@@ -1050,6 +1055,21 @@ async function handleSendMessage(req: Request): Promise<Response> {
 	) {
 		return errorJson("invalid_request", 400);
 	}
+	if (body.target_session !== undefined && body.target_session !== null && typeof body.target_session !== "string") {
+		return errorJson("invalid_request", 400, { field: "target_session" });
+	}
+	if (body.target !== undefined && body.target !== null && typeof body.target !== "string") {
+		return errorJson("invalid_request", 400, { field: "target" });
+	}
+	if (body.conversation_id !== undefined && body.conversation_id !== null && typeof body.conversation_id !== "string") {
+		return errorJson("invalid_request", 400, { field: "conversation_id" });
+	}
+	if (body.response_schema !== undefined && body.response_schema !== null && typeof body.response_schema !== "object") {
+		return errorJson("invalid_request", 400, { field: "response_schema" });
+	}
+	if (containsMaliciousPayload(body.prompt)) {
+		return errorJson("malicious_payload", 400, { field: "prompt" });
+	}
 	const projectName = body.project ?? "default";
 	const p = state.projects.get(projectName);
 	if (!p) return errorJson("agent_not_found", 404);
@@ -1077,6 +1097,9 @@ async function handleSendMessage(req: Request): Promise<Response> {
 	let target: RegistryEntry | undefined;
 	let targetName = "";
 	if (body.target_session && typeof body.target_session === "string") {
+		if (containsMaliciousPayload(body.target_session)) {
+			return errorJson("malicious_target", 400, { field: "target_session" });
+		}
 		target = p.agents.get(body.target_session);
 		if (!target) {
 			logRejected("target_not_found", `${sender.name} → ${body.target_session.slice(-6)}`);
@@ -1086,6 +1109,9 @@ async function handleSendMessage(req: Request): Promise<Response> {
 	} else {
 		const desired = (body.target ?? "").trim();
 		if (!desired) return errorJson("missing_target", 400);
+		if (containsMaliciousPayload(desired)) {
+			return errorJson("malicious_target", 400, { field: "target" });
+		}
 		targetName = desired;
 		// Direct session_id match first.
 		const directSid = p.agents.get(desired);
@@ -1340,6 +1366,12 @@ async function handleSubmitResponse(
 		typeof body.responder_session !== "string"
 	) {
 		return errorJson("invalid_request", 400);
+	}
+	if (typeof body.error === "string" && containsMaliciousPayload(body.error)) {
+		return errorJson("malicious_payload", 400, { field: "error" });
+	}
+	if (typeof body.response === "string" && containsMaliciousPayload(body.response)) {
+		return errorJson("malicious_payload", 400, { field: "response" });
 	}
 	let project: ProjectState | undefined;
 	let msg: CouncilMessage | undefined;

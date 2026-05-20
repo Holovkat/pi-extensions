@@ -38,6 +38,12 @@ function jsonRequest(body, secret) {
   return new Request('http://council.test/v1', { method: 'POST', headers, body: JSON.stringify(body) });
 }
 
+function rawRequest(path, bodyText, secret) {
+  const headers = { 'content-type': 'application/json' };
+  if (secret) headers['x-pi-council-session-secret'] = secret;
+  return new Request(`http://council.test${path}`, { method: 'POST', headers, body: bodyText });
+}
+
 async function responseJson(resp) {
   return JSON.parse(await resp.text());
 }
@@ -160,4 +166,108 @@ test('session secret prevents response and delete impersonation', async () => {
   const forgedDelete = __test.handleDeleteAgent(jsonRequest({}, 'sender-secret'), new URL('http://council.test/v1/agents/target?project=default'), 'target');
   assert.equal(forgedDelete.status, 403);
   assert.equal((await responseJson(forgedDelete)).error, 'invalid_session_secret');
+});
+
+test('send endpoint rejects malformed JSON without changing server message state', async () => {
+  resetState();
+  const p = __test.getOrCreateProject('default');
+  p.agents.set('sender', agent('sender', 'sender', 'sender-secret'));
+
+  const beforeMessages = p.messages.size;
+  const resp = await __test.handleSendMessage(rawRequest('/v1/messages', '{"project":"default","sender_session":"sender","target":"target","prompt":"oops"', 'sender-secret'));
+
+  assert.equal(resp.status, 400);
+  assert.equal((await responseJson(resp)).error, 'invalid_json');
+  assert.equal(p.messages.size, beforeMessages);
+});
+
+test('send endpoint rejects oversized prompts and malformed target/payload types without mutating state', async () => {
+  resetState();
+  const p = __test.getOrCreateProject('default');
+  p.agents.set('sender', agent('sender', 'sender', 'sender-secret'));
+  p.agents.set('target', agent('target', 'target', 'target-secret'));
+
+  const senderStream = fakeStream();
+  p.streams.set('sender', { ...senderStream.writer, session_id: 'sender' });
+
+  const base = {
+    project: 'default', sender_session: 'sender', target: 'target', target_session: null,
+    prompt: 'hello', conversation_id: null, response_schema: null, hops: 0,
+  };
+
+  const badTargetSession = await __test.handleSendMessage(jsonRequest({ ...base, target_session: 123 }, 'sender-secret'));
+  assert.equal(badTargetSession.status, 400);
+  assert.equal((await responseJson(badTargetSession)).error, 'invalid_request');
+
+  const oversize = 'a'.repeat(70_000);
+  const beforeMessages = p.messages.size;
+  const senderFramesBefore = senderStream.frames.length;
+  const tooLarge = await __test.handleSendMessage(jsonRequest({ ...base, prompt: oversize }, 'sender-secret'));
+  assert.equal(tooLarge.status, 413);
+  assert.equal((await responseJson(tooLarge)).error, 'prompt_too_large');
+  assert.equal(p.messages.size, beforeMessages);
+  assert.equal(p.messages.has('msg1'), false);
+  assert.equal(senderStream.frames.length, senderFramesBefore);
+
+  const badTarget = await __test.handleSendMessage(jsonRequest({ ...base, target: { name: 'target' } }, 'sender-secret'));
+  assert.equal(badTarget.status, 400);
+  assert.equal((await responseJson(badTarget)).error, 'invalid_request');
+
+  const badPromptType = await __test.handleSendMessage(jsonRequest({ ...base, prompt: { text: 'hi' } }, 'sender-secret'));
+  assert.equal(badPromptType.status, 400);
+  assert.equal((await responseJson(badPromptType)).error, 'invalid_request');
+  assert.equal(p.messages.size, beforeMessages);
+});
+
+test('send endpoint blocks suspicious or null-byte prompt payloads with stable rejection', async () => {
+  resetState();
+  const p = __test.getOrCreateProject('default');
+  p.agents.set('sender', agent('sender', 'sender', 'sender-secret'));
+  p.agents.set('target', agent('target', 'target', 'target-secret'));
+
+  const base = {
+    project: 'default', sender_session: 'sender', target: 'target', target_session: null,
+    conversation_id: null, response_schema: null, hops: 0,
+  };
+
+  const script = await __test.handleSendMessage(jsonRequest({ ...base, prompt: '<script>alert(1)</script>' }, 'sender-secret'));
+  assert.equal(script.status, 400);
+  assert.equal((await responseJson(script)).error, 'malicious_payload');
+
+  const nullBytes = await __test.handleSendMessage(jsonRequest({ ...base, prompt: 'safe\u0000payload' }, 'sender-secret'));
+  assert.equal(nullBytes.status, 400);
+  assert.equal((await responseJson(nullBytes)).error, 'malicious_payload');
+  assert.equal(p.messages.size, 0);
+});
+
+test('submit response endpoint rejects malformed JSON and oversized or suspicious responses without mutating state', async () => {
+  resetState();
+  const p = __test.getOrCreateProject('default');
+  p.agents.set('sender', agent('sender', 'sender', 'sender-secret'));
+  p.agents.set('target', agent('target', 'target', 'target-secret'));
+
+  const msg = {
+    msg_id: 'msg1', project: 'default', sender_session: 'sender', target_session: 'target', target_name: 'target', prompt: 'hello',
+    conversation_id: null, response_schema: null, hops: 0, status: 'running', response: null, error: null,
+    created_at: now(), expires_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+  p.messages.set('msg1', msg);
+  const senderStream = fakeStream();
+  p.streams.set('sender', { ...senderStream.writer, session_id: 'sender' });
+
+  const malformed = await __test.handleSubmitResponse(rawRequest('/v1/messages/msg1/response', '{"project":"default","responder_session":"target"', 'target-secret'), 'msg1');
+  assert.equal(malformed.status, 400);
+  assert.equal((await responseJson(malformed)).error, 'invalid_json');
+
+  const beforeStatus = p.messages.get('msg1').status;
+  const tooLarge = await __test.handleSubmitResponse(jsonRequest({ project: 'default', responder_session: 'target', response: 'x'.repeat(70_000), error: null }, 'target-secret'), 'msg1');
+  assert.equal(tooLarge.status, 413);
+  assert.equal((await responseJson(tooLarge)).error, 'response_too_large');
+  assert.equal(p.messages.get('msg1').status, beforeStatus);
+  assert.equal(p.messages.get('msg1').response, null);
+
+  const suspicious = await __test.handleSubmitResponse(jsonRequest({ project: 'default', responder_session: 'target', response: '<script>alert(1)</script>', error: null }, 'target-secret'), 'msg1');
+  assert.equal(suspicious.status, 400);
+  assert.equal((await responseJson(suspicious)).error, 'malicious_payload');
+  assert.equal(p.messages.get('msg1').status, beforeStatus);
 });
