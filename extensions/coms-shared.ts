@@ -1,4 +1,4 @@
-// Shared helpers for local coms and coms-net.
+// Shared helpers for local coms and council.
 
 export function byteLength(s: string): number {
 	return Buffer.byteLength(s, "utf-8");

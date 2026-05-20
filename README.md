@@ -1166,7 +1166,7 @@ A 7-task epic with 2 fix depths typically takes 5-10 minutes. If agents yield an
 This repo includes first-version Pi-to-Pi request/response communication extensions:
 
 - `extensions/coms.ts` — same-machine peer discovery and request/response over local IPC.
-- `extensions/coms-net.ts` — networked request/response client over the Bun hub in `scripts/coms-net-server.ts`.
+- `extensions/council.ts` — networked request/response client over the Bun hub in `scripts/council-server.ts`.
 
 Quick local smoke:
 
@@ -1178,10 +1178,10 @@ pi --no-extensions -e ./extensions/coms.ts --name bob --project comms-uat
 Quick networked smoke. The first agent auto-starts a localhost hub on port `48201` when no hub is already registered for the project:
 
 ```bash
-pi --no-extensions -e ./extensions/coms-net.ts --name net-alice --project comms-net-uat
-pi --no-extensions -e ./extensions/coms-net.ts --name net-bob --project comms-net-uat
+pi --no-extensions -e ./extensions/council.ts --name net-alice --project council-uat
+pi --no-extensions -e ./extensions/council.ts --name net-bob --project council-uat
 ```
 
-Ask Alice to use `council_list` first, choose the best council member by purpose/tags/capabilities, then ask that member with `council_send` using the exact listed name. `council_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is delivered back to Alice, and default `response_mode="agent"` lets Alice continue/reply to Bob without the human answering for her. Legacy `coms_net_*` tool names remain available for compatibility.
+Ask Alice to use `council_list` first, choose the best council member by purpose/tags/capabilities, then ask that member with `council_send` using the exact listed name. `council_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is delivered back to Alice, and default `response_mode="agent"` lets Alice continue/reply to Bob without the human answering for her.
 
 See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, council async response, structured-response, and UAT notes.

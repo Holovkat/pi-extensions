@@ -1,17 +1,17 @@
 // Vendored baseline from https://github.com/disler/pi-vs-claude-code commit 3ce1639
 // Source ownership: upstream is read-only provenance; extend this local copy in Holovkat/pi-extensions only.
 
-// scripts/coms-net-server.ts
+// scripts/council-server.ts
 //
-// coms-net Bun HTTP/SSE hub server (v1).
+// council Bun HTTP/SSE hub server (v1).
 //
-// Implements the protocol defined in specs/coms-net-v1.md.
+// Implements the protocol defined in specs/council-v1.md.
 //
 // Hard rules:
 // - Entrypoint guard: Bun.serve boot lives inside main(); only fires when
 //   `import.meta.main` is true. `bun -e "import('...')"` must NOT start the server.
 // - Token policy:
-//     * PI_COMS_NET_AUTH_TOKEN set -> use it; do NOT write server.secret.json.
+//     * PI_COUNCIL_AUTH_TOKEN set -> use it; do NOT write server.secret.json.
 //     * Loopback bind w/o env token -> generate random, write server.secret.json (0600).
 //     * Non-loopback bind w/o env token -> fail startup (exit 1).
 // - Never log the auth token. Print only the *path* to server.secret.json.
@@ -31,22 +31,22 @@ import * as os from "node:os";
 // Env-var reads (module scope; all tunables here)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const HOST = process.env.PI_COMS_NET_HOST ?? "127.0.0.1";
-const PORT = Number(process.env.PI_COMS_NET_PORT ?? 48201);
-const PUBLIC_URL = process.env.PI_COMS_NET_PUBLIC_URL;
-const PROJECT = process.env.PI_COMS_NET_PROJECT ?? "default";
-const ENV_TOKEN = process.env.PI_COMS_NET_AUTH_TOKEN;
-const REG_ROOT = path.join(os.homedir(), ".pi", "coms-net");
+const HOST = process.env.PI_COUNCIL_HOST ?? "127.0.0.1";
+const PORT = Number(process.env.PI_COUNCIL_PORT ?? 48201);
+const PUBLIC_URL = process.env.PI_COUNCIL_PUBLIC_URL;
+const PROJECT = process.env.PI_COUNCIL_PROJECT ?? "default";
+const ENV_TOKEN = process.env.PI_COUNCIL_AUTH_TOKEN;
+const REG_ROOT = path.join(os.homedir(), ".pi", "council");
 
-const MAX_HOPS = Number(process.env.PI_COMS_NET_MAX_HOPS ?? 5);
-const MESSAGE_TTL_MS = Number(process.env.PI_COMS_NET_MESSAGE_TTL_MS ?? 1_800_000);
-const MAX_INBOX = Number(process.env.PI_COMS_NET_MAX_INBOX ?? 100);
-const HEARTBEAT_MS = Number(process.env.PI_COMS_NET_HEARTBEAT_MS ?? 10_000);
-const STALE_AFTER_MS = Number(process.env.PI_COMS_NET_STALE_AFTER_MS ?? 30_000);
-const OFFLINE_AFTER_MS = Number(process.env.PI_COMS_NET_OFFLINE_AFTER_MS ?? 60_000);
-const MAX_PROMPT_BYTES = Number(process.env.PI_COMS_NET_MAX_PROMPT_BYTES ?? 48 * 1024);
-const MAX_RESPONSE_BYTES = Number(process.env.PI_COMS_NET_MAX_RESPONSE_BYTES ?? 48 * 1024);
-const MAX_SCHEMA_BYTES = Number(process.env.PI_COMS_NET_MAX_SCHEMA_BYTES ?? 16 * 1024);
+const MAX_HOPS = Number(process.env.PI_COUNCIL_MAX_HOPS ?? 5);
+const MESSAGE_TTL_MS = Number(process.env.PI_COUNCIL_MESSAGE_TTL_MS ?? 1_800_000);
+const MAX_INBOX = Number(process.env.PI_COUNCIL_MAX_INBOX ?? 100);
+const HEARTBEAT_MS = Number(process.env.PI_COUNCIL_HEARTBEAT_MS ?? 10_000);
+const STALE_AFTER_MS = Number(process.env.PI_COUNCIL_STALE_AFTER_MS ?? 30_000);
+const OFFLINE_AFTER_MS = Number(process.env.PI_COUNCIL_OFFLINE_AFTER_MS ?? 60_000);
+const MAX_PROMPT_BYTES = Number(process.env.PI_COUNCIL_MAX_PROMPT_BYTES ?? 48 * 1024);
+const MAX_RESPONSE_BYTES = Number(process.env.PI_COUNCIL_MAX_RESPONSE_BYTES ?? 48 * 1024);
+const MAX_SCHEMA_BYTES = Number(process.env.PI_COUNCIL_MAX_SCHEMA_BYTES ?? 16 * 1024);
 
 const STALE_SCAN_INTERVAL_MS = 5_000;
 const TTL_SCAN_INTERVAL_MS = 10_000;
@@ -68,13 +68,13 @@ let serverJsonPathForStatus: string | null = null;
 //
 // Format: HH:MM:SS.sss <symbol> <kind:10> <detail>
 //
-// Set PI_COMS_NET_LOG_HEARTBEAT=1 to also see heartbeats (very chatty).
-// Set PI_COMS_NET_LOG_QUIET=1 to suppress everything except startup/shutdown.
+// Set PI_COUNCIL_LOG_HEARTBEAT=1 to also see heartbeats (very chatty).
+// Set PI_COUNCIL_LOG_QUIET=1 to suppress everything except startup/shutdown.
 
 const LOG_TTY = process.stdout.isTTY === true;
-const LOG_QUIET = process.env.PI_COMS_NET_LOG_QUIET === "1";
-const LOG_HEARTBEAT = process.env.PI_COMS_NET_LOG_HEARTBEAT === "1";
-const LOG_PAYLOADS = process.env.PI_COMS_NET_LOG_PAYLOADS === "1";
+const LOG_QUIET = process.env.PI_COUNCIL_LOG_QUIET === "1";
+const LOG_HEARTBEAT = process.env.PI_COUNCIL_LOG_HEARTBEAT === "1";
+const LOG_PAYLOADS = process.env.PI_COUNCIL_LOG_PAYLOADS === "1";
 
 const C_DIM    = LOG_TTY ? "\x1b[2m"  : "";
 const C_RESET  = LOG_TTY ? "\x1b[0m"  : "";
@@ -192,7 +192,7 @@ export type RegistryEntry = AgentCard & {
 	session_secret: string;
 };
 
-export type ComsMessage = {
+export type CouncilMessage = {
 	msg_id: string;
 	project: string;
 	sender_session: string;
@@ -273,7 +273,7 @@ export type ErrorResponse = { ok: false; error: string; details?: any };
 
 // SSE writer & per-project state
 type Awaiter = {
-	resolve: (m: ComsMessage) => void;
+	resolve: (m: CouncilMessage) => void;
 	timer: ReturnType<typeof setTimeout> | null;
 };
 
@@ -287,7 +287,7 @@ type SseWriter = {
 type ProjectState = {
 	agents: Map<string, RegistryEntry>;
 	nameIndex: Map<string, Set<string>>;
-	messages: Map<string, ComsMessage>;
+	messages: Map<string, CouncilMessage>;
 	streams: Map<string, SseWriter>;
 	awaiters: Map<string, Set<Awaiter>>;
 };
@@ -391,7 +391,7 @@ function newSessionSecret(): string {
 }
 
 function sessionSecretFrom(req: Request): string {
-	return req.headers.get("x-pi-coms-net-session-secret") ?? "";
+	return req.headers.get("x-pi-council-session-secret") ?? "";
 }
 
 function verifySessionSecret(req: Request, entry: RegistryEntry): boolean {
@@ -417,7 +417,7 @@ function unauthorized(): Response {
 		status: 401,
 		headers: {
 			"content-type": "application/json",
-			"www-authenticate": 'Bearer realm="coms-net"',
+			"www-authenticate": 'Bearer realm="council"',
 		},
 	});
 }
@@ -585,7 +585,7 @@ function sendToStream(
 function deliverPromptToTarget(
 	p: ProjectState,
 	projectName: string,
-	msg: ComsMessage,
+	msg: CouncilMessage,
 ): boolean {
 	const sender = p.agents.get(msg.sender_session);
 	const target = msg.target_session
@@ -1128,7 +1128,7 @@ async function handleSendMessage(req: Request): Promise<Response> {
 	const conversationId = body.conversation_id && typeof body.conversation_id === "string" && body.conversation_id.length > 0
 		? body.conversation_id
 		: defaultConversationName(sender.name, targetName);
-	const msg: ComsMessage = {
+	const msg: CouncilMessage = {
 		msg_id: msgId,
 		project: projectName,
 		sender_session: body.sender_session,
@@ -1199,7 +1199,7 @@ function handleGetMessage(_req: Request, msg_id: string): Response {
 
 function handleAwaitMessage(req: Request, url: URL, msg_id: string): Response {
 	let project: ProjectState | undefined;
-	let msg: ComsMessage | undefined;
+	let msg: CouncilMessage | undefined;
 	for (const p of state.projects.values()) {
 		const m = p.messages.get(msg_id);
 		if (m) {
@@ -1262,7 +1262,7 @@ function handleAwaitMessage(req: Request, url: URL, msg_id: string): Response {
 				};
 
 				const awaiter: Awaiter = {
-					resolve: (m: ComsMessage) => {
+					resolve: (m: CouncilMessage) => {
 						finalize({
 							msg_id: m.msg_id,
 							status: m.status,
@@ -1342,7 +1342,7 @@ async function handleSubmitResponse(
 		return errorJson("invalid_request", 400);
 	}
 	let project: ProjectState | undefined;
-	let msg: ComsMessage | undefined;
+	let msg: CouncilMessage | undefined;
 	for (const p of state.projects.values()) {
 		const m = p.messages.get(msg_id);
 		if (m) {
@@ -1700,7 +1700,7 @@ export function main(): void {
 	if (!TOKEN) {
 		if (!isLoopback(HOST)) {
 			console.error(
-				`coms-net: refusing to bind ${HOST} without an explicit PI_COMS_NET_AUTH_TOKEN.`,
+				`council: refusing to bind ${HOST} without an explicit PI_COUNCIL_AUTH_TOKEN.`,
 			);
 			process.exit(1);
 		}
@@ -1764,16 +1764,16 @@ export function main(): void {
 	const bootDim = LOG_TTY ? C_DIM : "";
 	const bootCyan = LOG_TTY ? C_CYAN : "";
 	const bootReset = LOG_TTY ? C_RESET : "";
-	console.log(`${bootCyan}coms-net${bootReset}: listening on ${bootCyan}${localUrl}${bootReset}`);
+	console.log(`${bootCyan}council${bootReset}: listening on ${bootCyan}${localUrl}${bootReset}`);
 	console.log(`${bootDim}          project=${PROJECT} pid=${process.pid}${bootReset}`);
 	console.log(`${bootDim}          server.json=${serverJsonPath}${bootReset}`);
 	if (secretPath) {
 		console.log(`${bootDim}          server.secret.json=${secretPath} (chmod 0600)${bootReset}`);
 	} else {
-		console.log(`${bootDim}          using token from PI_COMS_NET_AUTH_TOKEN${bootReset}`);
+		console.log(`${bootDim}          using token from PI_COUNCIL_AUTH_TOKEN${bootReset}`);
 	}
 	if (!LOG_QUIET) {
-		console.log(`${bootDim}          ─── events below (Ctrl-C to quit, set PI_COMS_NET_LOG_HEARTBEAT=1 for heartbeat noise) ───${bootReset}`);
+		console.log(`${bootDim}          ─── events below (Ctrl-C to quit, set PI_COUNCIL_LOG_HEARTBEAT=1 for heartbeat noise) ───${bootReset}`);
 	}
 
 	// Start cleanup loops.
@@ -1811,7 +1811,7 @@ export function main(): void {
 		// loop somehow stalls, the registry doesn't leak across runs.
 		unlinkStateFiles();
 		try {
-			console.log(`coms-net: ${sig} received, shutting down`);
+			console.log(`council: ${sig} received, shutting down`);
 		} catch {
 			// noop
 		}

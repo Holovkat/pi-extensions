@@ -1,27 +1,27 @@
 {
-  "name": "@holovkat/pi-comms",
+  "name": "@holovkat/pi-council",
   "version": "0.1.0",
-  "description": "Pi-to-Pi request/response comms extensions for local and networked agents.",
+  "description": "Pi-to-Pi council request/response extensions for local and networked agents.",
   "type": "module",
   "private": true,
   "keywords": [
     "pi-package",
     "pi-extension",
-    "pi-comms",
+    "pi-council",
     "agent-communication"
   ],
   "files": [
     "extensions/coms.ts",
-    "extensions/coms-net.ts",
+    "extensions/council.ts",
     "extensions/coms-shared.ts",
     "extensions/themeMap.ts",
-    "scripts/coms-net-server.ts",
+    "scripts/council-server.ts",
     "docs/comms.md",
     "README.md"
   ],
   "scripts": {
-    "build": "node scripts/build-comms-package.mjs",
-    "test:comms": "node --test extensions/coms.test.mjs scripts/coms-net-server.test.mjs scripts/comms-package-smoke.test.mjs"
+    "build": "node scripts/build-council-package.mjs",
+    "test:council": "node --test extensions/coms.test.mjs scripts/council-server.test.mjs scripts/council-package-smoke.test.mjs"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
@@ -31,7 +31,7 @@
   "pi": {
     "extensions": [
       "./extensions/coms.ts",
-      "./extensions/coms-net.ts"
+      "./extensions/council.ts"
     ]
   }
 }

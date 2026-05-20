@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { __test } from './coms-net-server.ts';
+import { __test } from './council-server.ts';
 
 function resetState() {
   __test.state.projects.clear();
@@ -34,15 +34,15 @@ function fakeStream() {
 
 function jsonRequest(body, secret) {
   const headers = { 'content-type': 'application/json' };
-  if (secret) headers['x-pi-coms-net-session-secret'] = secret;
-  return new Request('http://coms-net.test/v1', { method: 'POST', headers, body: JSON.stringify(body) });
+  if (secret) headers['x-pi-council-session-secret'] = secret;
+  return new Request('http://council.test/v1', { method: 'POST', headers, body: JSON.stringify(body) });
 }
 
 async function responseJson(resp) {
   return JSON.parse(await resp.text());
 }
 
-test('queued coms-net messages replay when target SSE stream reconnects', () => {
+test('queued council messages replay when target SSE stream reconnects', () => {
   resetState();
   const p = __test.getOrCreateProject('default');
   p.agents.set('sender', agent('sender', 'sender'));
@@ -157,7 +157,7 @@ test('session secret prevents response and delete impersonation', async () => {
   assert.equal(forgedResponse.status, 403);
   assert.equal((await responseJson(forgedResponse)).error, 'invalid_session_secret');
 
-  const forgedDelete = __test.handleDeleteAgent(jsonRequest({}, 'sender-secret'), new URL('http://coms-net.test/v1/agents/target?project=default'), 'target');
+  const forgedDelete = __test.handleDeleteAgent(jsonRequest({}, 'sender-secret'), new URL('http://council.test/v1/agents/target?project=default'), 'target');
   assert.equal(forgedDelete.status, 403);
   assert.equal((await responseJson(forgedDelete)).error, 'invalid_session_secret');
 });

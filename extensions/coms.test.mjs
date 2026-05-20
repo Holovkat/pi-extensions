@@ -25,12 +25,12 @@ test('reply extraction returns an empty response when the triggered turn has not
 
 test('response truncation preserves UTF-8 boundaries and caps byte length', () => {
   const original = '🙂'.repeat(100);
-  const truncated = shared.truncateUtf8(original, 96, 'coms-net');
-  const tiny = shared.truncateUtf8(original, 8, 'coms-net');
+  const truncated = shared.truncateUtf8(original, 96, 'council');
+  const tiny = shared.truncateUtf8(original, 8, 'council');
 
   assert.equal(truncated.truncated, true);
   assert.ok(shared.byteLength(truncated.text) <= 96);
-  assert.match(truncated.text, /coms-net: response truncated/);
+  assert.match(truncated.text, /council: response truncated/);
   assert.equal(tiny.truncated, true);
   assert.ok(shared.byteLength(tiny.text) <= 8);
 });

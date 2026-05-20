@@ -119,11 +119,11 @@ Source ownership: copy/vendor the reviewed upstream comms extensions into this r
   - [ ] [#94 Sprint: comms v1.0 hardening](https://github.com/Holovkat/pi-extensions/issues/94)
     - [x] [#98 Task: add first-version Pi-to-Pi comms baseline](https://github.com/Holovkat/pi-extensions/issues/98)
     - [x] [#99 Task: bind inbound replies to the triggered assistant turn](https://github.com/Holovkat/pi-extensions/issues/99)
-    - [x] [#100 Task: replay queued coms-net messages on reconnect](https://github.com/Holovkat/pi-extensions/issues/100)
+    - [x] [#100 Task: replay queued council messages on reconnect](https://github.com/Holovkat/pi-extensions/issues/100)
     - [x] [#101 Task: bound pending replies and payload sizes](https://github.com/Holovkat/pi-extensions/issues/101)
     - [x] [#102 Task: harden registry paths and shutdown lifecycle](https://github.com/Holovkat/pi-extensions/issues/102)
   - [ ] [#95 Sprint: comms v1.1 safety](https://github.com/Holovkat/pi-extensions/issues/95)
-    - [x] [#103 Task: add per-agent ownership to coms-net](https://github.com/Holovkat/pi-extensions/issues/103)
+    - [x] [#103 Task: add per-agent ownership to council](https://github.com/Holovkat/pi-extensions/issues/103)
     - [x] [#104 Task: harden local coms spoofing boundary](https://github.com/Holovkat/pi-extensions/issues/104)
     - [x] [#105 Task: redact audit logging and add abuse tests](https://github.com/Holovkat/pi-extensions/issues/105)
   - [ ] [#96 Sprint: comms v1.2 ergonomics](https://github.com/Holovkat/pi-extensions/issues/96)
@@ -138,13 +138,13 @@ Source ownership: copy/vendor the reviewed upstream comms extensions into this r
 
 Source of truth epic: [GitHub issue #112](https://github.com/Holovkat/pi-extensions/issues/112)
 
-Design direction: `pi-council` is a mediator/orchestrator layer above `coms` / `coms-net`. It should use an explicit lightweight JSONL blackboard for shared collaboration memory rather than concurrent writes to one live Pi session file.
+Design direction: `pi-council` is a mediator/orchestrator layer above local `coms` and networked `council`. It should use an explicit lightweight JSONL blackboard for shared collaboration memory rather than concurrent writes to one live Pi session file.
 
 - [ ] [#112 Epic: pi-council mediated multi-agent collaboration](https://github.com/Holovkat/pi-extensions/issues/112)
   - [ ] [#113 Sprint: pi-council v0.1 JSONL blackboard and mediated rounds](https://github.com/Holovkat/pi-extensions/issues/113)
     - [ ] [#114 Task: create pi-council extension shell and storage layout](https://github.com/Holovkat/pi-extensions/issues/114)
     - [ ] [#115 Task: implement pi-council JSONL blackboard tools](https://github.com/Holovkat/pi-extensions/issues/115)
-    - [ ] [#116 Task: implement council member registry and coms-net resolution](https://github.com/Holovkat/pi-extensions/issues/116)
-    - [ ] [#117 Task: implement pi-council mediated round over coms-net](https://github.com/Holovkat/pi-extensions/issues/117)
+    - [ ] [#116 Task: implement council member registry and networked council resolution](https://github.com/Holovkat/pi-extensions/issues/116)
+    - [ ] [#117 Task: implement pi-council mediated round over networked council](https://github.com/Holovkat/pi-extensions/issues/117)
     - [ ] [#118 Task: add council task, decision, and transcript records](https://github.com/Holovkat/pi-extensions/issues/118)
     - [ ] [#119 Task: document pi-council workflows and UAT scenarios](https://github.com/Holovkat/pi-extensions/issues/119)
