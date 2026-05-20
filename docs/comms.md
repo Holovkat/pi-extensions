@@ -156,7 +156,7 @@ Security boundary: local `coms` is same-user local IPC. It validates sender regi
 
 ### Localhost `council`
 
-Use the hub on `127.0.0.1` for multiple local terminals or tmux panes. By default, the first `council` agent auto-starts the hub on port `48201` when no server is registered for the project. If no `PI_COUNCIL_AUTH_TOKEN` is supplied on loopback, the server generates `server.secret.json` with mode `0600` under `~/.pi/council/projects/<project>/`.
+Use the hub on `127.0.0.1` for multiple local terminals or tmux panes. By default, the first `council` agent auto-starts the hub on port `48201` when no server is registered for the project; if that port is already occupied and `PI_COUNCIL_PORT` was not explicitly set, it falls back to an OS-assigned port and writes the actual URL to `server.json`. If no `PI_COUNCIL_AUTH_TOKEN` is supplied on loopback, the server generates `server.secret.json` with mode `0600` under `~/.pi/council/projects/<project>/`.
 
 Set `PI_COUNCIL_AUTOSTART=0` to disable embedded startup and require an explicit server process.
 

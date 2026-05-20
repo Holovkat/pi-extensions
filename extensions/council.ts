@@ -56,7 +56,9 @@ const MAX_SCHEMA_BYTES = Number(process.env.PI_COUNCIL_MAX_SCHEMA_BYTES) || 16 *
 const PENDING_REPLY_RETENTION_MS = Number(process.env.PI_COUNCIL_REPLY_RETENTION_MS) || 5 * 60_000;
 const SHUTDOWN_DELETE_TIMEOUT_MS = 2_000;
 const DEFAULT_EMBEDDED_HOST = process.env.PI_COUNCIL_EMBEDDED_HOST || "127.0.0.1";
-const DEFAULT_EMBEDDED_PORT = Number(process.env.PI_COUNCIL_PORT || 48201);
+const EMBEDDED_PORT_ENV = process.env.PI_COUNCIL_PORT;
+const DEFAULT_EMBEDDED_PORT = Number(EMBEDDED_PORT_ENV || 48201);
+const EMBEDDED_PORT_EXPLICIT = EMBEDDED_PORT_ENV != null && EMBEDDED_PORT_ENV.length > 0;
 const AUTOSTART_SERVER = process.env.PI_COUNCIL_AUTOSTART !== "0";
 
 const SERVER_URL_ENV = process.env.PI_COUNCIL_SERVER_URL;
@@ -567,25 +569,45 @@ export default function (pi: ExtensionAPI) {
 			audit("embedded_server_start_skipped", { reason: "bun_not_available" });
 			return false;
 		}
-		try {
-			embeddedServerProcess = spawn("bun", [script], {
-				detached: true,
-				stdio: "ignore",
-				env: {
-					...process.env,
-					PI_COUNCIL_PROJECT: project,
-					PI_COUNCIL_HOST: DEFAULT_EMBEDDED_HOST,
-					PI_COUNCIL_PORT: String(DEFAULT_EMBEDDED_PORT),
-				},
-			});
-			embeddedServerStarted = true;
-			embeddedServerProcess.unref?.();
-			audit("embedded_server_start", { project, pid: embeddedServerProcess.pid, port: DEFAULT_EMBEDDED_PORT });
-		} catch (err) {
-			audit("embedded_server_start_failed", { reason: safeError(err) });
-			return false;
+
+		// Prefer the stable default port, but if it is occupied by a stale/old hub,
+		// fall back to an OS-assigned port. The actual URL is written to server.json
+		// and subsequent agents discover it there, so operators do not need to know
+		// which fallback port was chosen.
+		const candidatePorts = EMBEDDED_PORT_EXPLICIT
+			? [DEFAULT_EMBEDDED_PORT]
+			: [DEFAULT_EMBEDDED_PORT, 0];
+
+		for (const port of candidatePorts) {
+			let proc: ChildProcess;
+			try {
+				proc = spawn("bun", [script], {
+					detached: true,
+					stdio: "ignore",
+					env: {
+						...process.env,
+						PI_COUNCIL_PROJECT: project,
+						PI_COUNCIL_HOST: DEFAULT_EMBEDDED_HOST,
+						PI_COUNCIL_PORT: String(port),
+					},
+				});
+				proc.unref?.();
+				audit("embedded_server_start_attempt", { project, pid: proc.pid, port: port === 0 ? "auto" : port });
+			} catch (err) {
+				audit("embedded_server_start_failed", { port, reason: safeError(err) });
+				continue;
+			}
+
+			const ok = await waitForLocalHub(project, port === 0 ? 4_000 : 2_000);
+			if (ok) {
+				embeddedServerProcess = proc;
+				embeddedServerStarted = true;
+				audit("embedded_server_start", { project, pid: proc.pid, port: port === 0 ? "auto" : port });
+				return true;
+			}
+			audit("embedded_server_start_not_ready", { project, pid: proc.pid, port: port === 0 ? "auto" : port });
 		}
-		return waitForLocalHub(project);
+		return false;
 	}
 
 	async function refreshHubStatus(): Promise<void> {
