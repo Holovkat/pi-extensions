@@ -118,7 +118,6 @@ Each agent subprocess:
 - `pi-blueprint.ts` is the current GitHub-backed planning cockpit, with transcript search, alignment checks, issue rebuilds, asset sync, and a dedicated web mirror.
 - `pi-toolshed.ts` is the current card/workspace shell, with frontier packets, workspace presets, quick actions, and blueprint-aware web surfaces.
 - `council.ts` is the networked Pi-to-Pi council layer: agents discover council members, select by purpose/tags/capabilities, and exchange async request/response work over `scripts/council-server.ts`.
-- `paraffine.ts` is a dormant-by-default knowledge-maintenance bridge for the PARA workspace; load it explicitly with `-e` when you want Pi to call the PARAFFINE CLI against AFFiNE.
 - Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprint/`; use `/blueprint-sync-assets` to mirror them into a project-local `.pi` runtime.
 
 ---
@@ -938,8 +937,7 @@ See [`docs/comms.md`](docs/comms.md) for deployment profiles, security notes, li
 | `themeMap.ts`     | Maps each extension to a default theme. Called on session start to auto-apply visual styling. |
 | `theme-cycler.ts` | Registers `/theme` command for cycling between installed themes at runtime.                   |
 | `ollama-provider.ts` | Registers local and cloud-proxied Ollama models for Pi sessions.                           |
-| `paraffine.ts`    | Bridges Pi commands to the PARAFFINE AFFiNE CLI for retrieval, cycle runs, and review queues. |
-
+| `apfel-provider.ts` | Registers Apple's local FoundationModels service via `apfel --serve`.                    |
 ---
 
 ## Agent Definitions
@@ -1110,35 +1108,6 @@ brew install glow
 | `/toolshed-packets`      | Inspect the packet queue                 |
 | `/toolshed-reset-layout` | Reset card collapse state                |
 
-### paraffine Commands
-
-Recommended launch:
-
-```bash
-pi -e extensions/ollama-provider.ts -e extensions/paraffine.ts --model ollama/gemma4:31b-cloud
-```
-
-| Command                 | Description                                                            |
-| ----------------------- | ---------------------------------------------------------------------- |
-| `/paraffine`            | Launch the single PARAFFINE assistant surface through the repo skill   |
-| `/paraffine-status`     | Show current model, resolved PARAFFINE CLI path, and launch contract   |
-| `/paraffine-contract`   | Show the pack-aware and quarantine-aware PARAFFINE operator brief      |
-
-Legacy operational aliases remain available:
-
-- `/paraffine-retrieve`
-- `/paraffine-cycle`
-- `/paraffine-review`
-
-Notes:
-
-- The extension is dormant unless Pi is launched with `-e extensions/paraffine.ts`.
-- It prefers the Ollama model `ollama/gemma4:31b-cloud`.
-- The primary user-facing PARAFFINE surface is now `/paraffine`, which launches the repo-local PARAFFINE skill when available.
-- Its operator brief explicitly tells Pi to preserve knowledge-pack structure and use `Inbox/Quarantine` for ambiguous notes instead of flattening them.
-- It resolves the PARAFFINE CLI from `PARAFFINE_CLI_PATH`, `PARAFFINE_ROOT`, the current workspace, or the stable PARA repo path at `/Users/tonyholovka/workspace/PARA/scripts/paraffine-affine-inbox.js`.
-- For cron or any non-interactive launcher, set `PARAFFINE_ROOT` or `PARAFFINE_CLI_PATH` explicitly rather than relying on cwd discovery.
-
 ---
 
 ## File Structure
@@ -1159,6 +1128,7 @@ pi-extensions/
 │   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
 │   ├── glm-provider.ts        # Zhipu GLM provider
 │   ├── ollama-provider.ts     # Ollama local models provider
+│   ├── apfel-provider.ts      # Apple FoundationModels via apfel
 │   ├── factory-droid-provider.ts # Factory Droid CLI provider bridge
 │   ├── themeMap.ts            # Per-extension theme assignments
 │   └── theme-cycler.ts        # Runtime theme switching
