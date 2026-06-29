@@ -54,10 +54,11 @@ const vizHtml = viewerHtml.replace(
 	escapeForScript(injectedData).replace(/\\\\/g, "\\").replace(/\\`/g, "`").replace(/\\\$/g, "$")
 );
 
-// Actually, JSON.stringify already handles escaping properly. Let's use a cleaner approach.
+// Use a function replacement to avoid $ being interpreted as special patterns
+// (e.g. $' inserts everything after the match, which corrupts the output)
 const cleanVizHtml = viewerHtml.replace(
 	"let __OKF_DATA__ = null;",
-	`__OKF_DATA__ = ${dataJson};`
+	() => `__OKF_DATA__ = ${dataJson};`
 );
 
 const outputPath = path.join(knowledgeDir, "viz.html");
