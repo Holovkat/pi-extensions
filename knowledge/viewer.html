@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OKF Knowledge Viewer</title>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape@3.30.4/dist/cytoscape.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+header { background: #161b22; padding: 10px 20px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+header h1 { font-size: 16px; font-weight: 600; white-space: nowrap; }
+header .stats { font-size: 12px; color: #8b949e; }
+nav { display: flex; gap: 2px; margin-left: 8px; }
+nav button { background: none; border: none; color: #8b949e; padding: 6px 14px; cursor: pointer; font-size: 13px; border-radius: 6px; }
+nav button:hover { color: #c9d1d9; background: #21262d; }
+nav button.active { color: #f0f6fc; background: #21262d; font-weight: 600; }
+#toolbar { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+#folder-btn { background: #238636; color: #fff; border: none; padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500; }
+#folder-btn:hover { background: #2ea043; }
+#folder-btn:disabled { background: #21262d; color: #484f58; cursor: default; }
+#search { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 5px 10px; border-radius: 6px; font-size: 12px; width: 180px; }
+#search:focus { outline: none; border-color: #58a6ff; }
+
+/* Views */
+#browse-view, #graph-view { display: none; flex: 1; overflow: hidden; }
+#browse-view.active, #graph-view.active { display: flex; }
+
+/* Browse: folder tree + detail */
+#sidebar { width: 280px; background: #161b22; border-right: 1px solid #30363d; overflow-y: auto; flex-shrink: 0; }
+#sidebar .tree-header { padding: 10px 14px; font-size: 11px; font-weight: 700; text-transform: uppercase; color: #484f58; letter-spacing: 0.5px; position: sticky; top: 0; background: #161b22; z-index: 1; }
+.tree-dir { padding: 6px 14px; cursor: pointer; font-size: 13px; font-weight: 600; color: #c9d1d9; display: flex; align-items: center; gap: 6px; user-select: none; }
+.tree-dir:hover { background: #21262d; }
+.tree-dir .arrow { font-size: 10px; width: 12px; color: #636c76; transition: transform 0.15s; }
+.tree-dir.collapsed .arrow { transform: rotate(-90deg); }
+.tree-dir .dir-count { font-size: 11px; color: #484f58; font-weight: 400; margin-left: auto; }
+.tree-dir .dir-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.tree-files { overflow: hidden; }
+.tree-files.collapsed { display: none; }
+.tree-file { padding: 4px 14px 4px 34px; cursor: pointer; font-size: 12px; color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
+.tree-file:hover { color: #c9d1d9; background: #21262d; }
+.tree-file.active { color: #58a6ff; background: #161b22; }
+.tree-file .file-status { font-size: 10px; color: #f85149; margin-left: 4px; }
+
+/* Detail panel (shared between browse and graph) */
+#detail { overflow-y: auto; flex: 1; background: #0d1117; }
+#detail .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #484f58; font-size: 14px; }
+#detail .content { padding: 24px 32px; }
+#detail h2 { font-size: 22px; margin-bottom: 8px; color: #f0f6fc; }
+#detail .meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+#detail .badge { font-size: 11px; padding: 2px 8px; border-radius: 12px; background: #21262d; border: 1px solid #30363d; }
+#detail .badge.type { font-weight: 600; }
+#detail .badge.type[data-type="Architecture"] { color: #58a6ff; border-color: #58a6ff44; }
+#detail .badge.type[data-type="Component"] { color: #f778ba; border-color: #f778ba44; }
+#detail .badge.type[data-type="Domain"] { color: #7ee787; border-color: #7ee78744; }
+#detail .badge.type[data-type="Decision"] { color: #d29922; border-color: #d2992244; }
+#detail .badge.type[data-type="Process"] { color: #bc8cff; border-color: #bc8cff44; }
+#detail .badge.type[data-type="Deprecation"] { color: #f85149; border-color: #f8514944; }
+#detail .badge.type[data-type="State"] { color: #79c0ff; border-color: #79c0ff44; }
+#detail .badge.type[data-type="Inbox"] { color: #ffa657; border-color: #ffa65744; }
+#detail .badge.status { color: #8b949e; }
+#detail .badge.status.deprecated { color: #f85149; }
+#detail .frontmatter { font-size: 12px; color: #8b949e; margin-bottom: 14px; font-family: monospace; }
+#detail .frontmatter div { margin-bottom: 2px; }
+#detail .body { font-size: 14px; line-height: 1.7; color: #c9d1d9; }
+#detail .body h1 { font-size: 22px; margin: 20px 0 10px; color: #f0f6fc; }
+#detail .body h2 { font-size: 18px; margin: 18px 0 8px; color: #f0f6fc; }
+#detail .body h3 { font-size: 15px; margin: 14px 0 6px; color: #f0f6fc; }
+#detail .body p { margin-bottom: 10px; }
+#detail .body ul, #detail .body ol { margin: 10px 0 10px 24px; }
+#detail .body li { margin-bottom: 4px; }
+#detail .body code { background: #21262d; padding: 2px 6px; border-radius: 4px; font-size: 13px; }
+#detail .body pre { background: #0d1117; border: 1px solid #30363d; padding: 14px; border-radius: 6px; overflow-x: auto; margin: 10px 0; }
+#detail .body pre code { background: none; padding: 0; }
+#detail .body a { color: #58a6ff; text-decoration: none; }
+#detail .body a:hover { text-decoration: underline; }
+#detail .body table { border-collapse: collapse; margin: 10px 0; width: 100%; }
+#detail .body th, #detail .body td { border: 1px solid #30363d; padding: 6px 10px; text-align: left; font-size: 13px; }
+#detail .body th { background: #21262d; }
+#detail .backlinks { margin-top: 20px; padding-top: 14px; border-top: 1px solid #30363d; }
+#detail .backlinks h3 { font-size: 13px; color: #8b949e; margin-bottom: 6px; }
+#detail .backlinks a { display: block; font-size: 13px; color: #58a6ff; text-decoration: none; padding: 3px 0; cursor: pointer; }
+#detail .backlinks a:hover { text-decoration: underline; }
+
+/* Graph view */
+#graph-view { flex-direction: row; }
+#cy { flex: 1; background: #0d1117; }
+#graph-detail { width: 480px; background: #161b22; border-left: 1px solid #30363d; overflow-y: auto; flex-shrink: 0; }
+#graph-detail .empty { display: flex; align-items: center; justify-content: center; height: 100%; color: #484f58; font-size: 14px; }
+.filter-btn { background: #21262d; border: 1px solid #30363d; color: #8b949e; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 11px; }
+.filter-btn.active { border-color: currentColor; }
+.filter-btn.active[data-type="Architecture"] { color: #58a6ff; }
+.filter-btn.active[data-type="Component"] { color: #f778ba; }
+.filter-btn.active[data-type="Domain"] { color: #7ee787; }
+.filter-btn.active[data-type="Decision"] { color: #d29922; }
+.filter-btn.active[data-type="Process"] { color: #bc8cff; }
+.filter-btn.active[data-type="Deprecation"] { color: #f85149; }
+.filter-btn.active[data-type="State"] { color: #79c0ff; }
+.filter-btn.active[data-type="Inbox"] { color: #ffa657; }
+
+#loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #161b22; border: 1px solid #30363d; padding: 20px 30px; border-radius: 8px; font-size: 14px; display: none; z-index: 100; }
+#drop-zone { position: fixed; inset: 0; background: rgba(13,17,23,0.9); display: none; align-items: center; justify-content: center; z-index: 200; }
+#drop-zone .text { font-size: 20px; color: #58a6ff; }
+</style>
+</head>
+<body>
+<header>
+<h1>OKF Knowledge Viewer</h1>
+<nav>
+<button id="nav-browse" class="active">Browse</button>
+<button id="nav-graph">Knowledge Graph</button>
+</nav>
+<span class="stats" id="stats"></span>
+<div id="toolbar">
+<input type="text" id="search" placeholder="Search concepts...">
+<button id="folder-btn">Open Folder</button>
+</div>
+</header>
+
+<div id="browse-view" class="active">
+<div id="sidebar">
+<div class="tree-header">Knowledge Bundle</div>
+<div id="tree"></div>
+</div>
+<div id="detail"><div class="empty">Select a concept from the tree</div></div>
+</div>
+
+<div id="graph-view">
+<div id="cy"></div>
+<div id="graph-detail"><div class="empty">Click a node to view details</div></div>
+</div>
+
+<div id="loading">Loading...</div>
+<div id="drop-zone"><div class="text">Drop the knowledge/ folder here</div></div>
+
+<script>
+const TYPE_COLORS = {
+  Architecture: '#58a6ff', Component: '#f778ba', Domain: '#7ee787',
+  Decision: '#d29922', Process: '#bc8cff', Deprecation: '#f85149',
+  State: '#79c0ff', Inbox: '#ffa657', unknown: '#8b949e'
+};
+const DIR_ORDER = ['architecture','components','domain','decisions','process','deprecation','state','inbox'];
+
+mermaid.initialize({ startOnLoad: false, theme: 'dark', securityLevel: 'loose', flowchart: { useMaxWidth: true }, er: { useMaxWidth: true } });
+
+let allConcepts = [];
+let allLinks = [];
+let cy = null;
+let activeFilters = new Set();
+let __OKF_DATA__ = null;
+let currentView = 'browse';
+
+function parseFrontmatter(content) {
+  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+  if (!match) return { frontmatter: {}, body: content };
+  const yaml = match[1], body = match[2], fm = {};
+  for (const line of yaml.split('\n')) {
+    const m = line.match(/^(\w+):\s*(.*)$/);
+    if (!m) continue;
+    const key = m[1]; let value = m[2].trim();
+    if (value.startsWith('[') && value.endsWith(']')) {
+      const inner = value.slice(1, -1).trim();
+      fm[key] = inner ? inner.split(',').map(s => s.trim().replace(/^["']|["']$/g, '')) : [];
+    } else { fm[key] = value.replace(/^["']|["']$/g, ''); }
+  }
+  return { frontmatter: fm, body };
+}
+
+function extractLinks(body, basePath) {
+  const links = [];
+  const regex = /\[([^\]]+)\]\(([^)]+\.md)\)/g;
+  let match;
+  while ((match = regex.exec(body)) !== null) {
+    let target = match[2];
+    if (target.startsWith('http')) continue;
+    const baseDir = basePath.includes('/') ? basePath.split('/').slice(0, -1).join('/') : '';
+    if (target.startsWith('./')) target = target.slice(2);
+    if (target.startsWith('../')) {
+      const parts = (baseDir ? baseDir.split('/') : []).concat(target.split('/'));
+      const resolved = [];
+      for (const p of parts) { if (p === '..') resolved.pop(); else if (p !== '.' && p !== '') resolved.push(p); }
+      target = resolved.join('/');
+    } else if (baseDir) { target = baseDir + '/' + target; }
+    links.push({ label: match[1], target });
+  }
+  return links;
+}
+
+function slugToId(fp) { return fp.replace(/\.md$/, ''); }
+
+function getConceptType(fp, fm) {
+  if (fm.type) return fm.type;
+  for (const d of DIR_ORDER) { if (fp.includes(d + '/')) return d.charAt(0).toUpperCase() + d.slice(1); }
+  return 'unknown';
+}
+
+function buildConcept(item) {
+  const { frontmatter, body } = parseFrontmatter(item.content);
+  const type = getConceptType(item.filepath, frontmatter);
+  const id = slugToId(item.filepath);
+  const links = extractLinks(body, item.filepath);
+  return {
+    id, filepath: item.filepath, filename: item.filepath.split('/').pop(),
+    frontmatter, body, type, links, backlinks: [],
+    title: frontmatter.title || item.filepath.replace(/\.md$/, '').replace(/-/g, ' '),
+    description: frontmatter.description || '',
+    tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : [],
+    status: frontmatter.status || 'active',
+    resource: frontmatter.resource || '',
+    issueRefs: Array.isArray(frontmatter.issue_refs) ? frontmatter.issue_refs : [],
+  };
+}
+
+function processConcepts(items) {
+  allConcepts = items.map(buildConcept);
+  const conceptIds = new Set(allConcepts.map(c => c.id));
+  allLinks = [];
+  const backlinks = new Map();
+  for (const c of allConcepts) {
+    for (const link of c.links) {
+      const tid = slugToId(link.target);
+      if (conceptIds.has(tid)) {
+        allLinks.push({ source: c.id, target: tid });
+        if (!backlinks.has(tid)) backlinks.set(tid, []);
+        backlinks.get(tid).push(c.id);
+      }
+    }
+  }
+  for (const c of allConcepts) c.backlinks = backlinks.get(c.id) || [];
+}
+
+async function readDirectory(dirHandle, prefix = '') {
+  const results = [];
+  for await (const [name, handle] of dirHandle.entries()) {
+    if (name === 'index.md' || name === 'log.md' || name.startsWith('.') || name.endsWith('.html') || name.endsWith('.js')) continue;
+    const p = prefix ? prefix + '/' + name : name;
+    if (handle.kind === 'directory') { results.push(...await readDirectory(handle, p)); }
+    else if (name.endsWith('.md')) { results.push({ filepath: p, content: await (await handle.getFile()).text() }); }
+  }
+  return results;
+}
+
+async function loadFolder(dirHandle) {
+  document.getElementById('loading').style.display = 'block';
+  document.getElementById('folder-btn').disabled = true;
+  try {
+    const items = await readDirectory(dirHandle);
+    processConcepts(items);
+    onDataLoaded();
+  } catch (err) { alert('Error: ' + err.message); }
+  finally { document.getElementById('loading').style.display = 'none'; }
+}
+
+function onDataLoaded() {
+  renderTree();
+  renderGraph();
+  renderFilters();
+  document.getElementById('stats').textContent = `${allConcepts.length} concepts | ${allLinks.length} links`;
+  document.getElementById('folder-btn').textContent = allConcepts.length + ' loaded';
+  document.getElementById('folder-btn').disabled = true;
+}
+
+/* ---- Folder Tree ---- */
+function renderTree() {
+  const tree = document.getElementById('tree');
+  tree.innerHTML = '';
+  const grouped = {};
+  for (const c of allConcepts) {
+    const dir = c.filepath.includes('/') ? c.filepath.split('/')[0] : 'root';
+    if (!grouped[dir]) grouped[dir] = [];
+    grouped[dir].push(c);
+  }
+  const search = document.getElementById('search').value.toLowerCase();
+  for (const dir of DIR_ORDER) {
+    const concepts = (grouped[dir] || []).filter(c => {
+      if (!search) return true;
+      return c.title.toLowerCase().includes(search) || c.id.toLowerCase().includes(search) ||
+        c.tags.some(t => t.toLowerCase().includes(search)) || (c.description && c.description.toLowerCase().includes(search));
+    });
+    if (concepts.length === 0) continue;
+    const typeLabel = dir.charAt(0).toUpperCase() + dir.slice(1);
+    const color = TYPE_COLORS[typeLabel] || '#8b949e';
+
+    const dirEl = document.createElement('div');
+    dirEl.className = 'tree-dir';
+    dirEl.innerHTML = `<span class="arrow">▼</span><span class="dir-dot" style="background:${color}"></span>${typeLabel}<span class="dir-count">${concepts.length}</span>`;
+    dirEl.onclick = () => {
+      dirEl.classList.toggle('collapsed');
+      filesEl.classList.toggle('collapsed');
+    };
+
+    const filesEl = document.createElement('div');
+    filesEl.className = 'tree-files';
+    for (const c of concepts.sort((a, b) => a.title.localeCompare(b.title))) {
+      const fEl = document.createElement('div');
+      fEl.className = 'tree-file';
+      fEl.dataset.id = c.id;
+      fEl.textContent = c.title;
+      if (c.status === 'deprecated') fEl.innerHTML += '<span class="file-status">○</span>';
+      fEl.onclick = () => {
+        document.querySelectorAll('.tree-file').forEach(e => e.classList.remove('active'));
+        fEl.classList.add('active');
+        showDetail(c, 'detail');
+      };
+      filesEl.appendChild(fEl);
+    }
+    tree.appendChild(dirEl);
+    tree.appendChild(filesEl);
+  }
+}
+
+/* ---- Detail Panel ---- */
+function showDetail(concept, targetId) {
+  const el = document.getElementById(targetId);
+  const fm = concept.frontmatter;
+  const fmLines = [];
+  if (fm.resource) fmLines.push(`<div>resource: <a href="${fm.resource}" target="_blank">${fm.resource}</a></div>`);
+  if (fm.timestamp) fmLines.push(`<div>timestamp: ${fm.timestamp}</div>`);
+  if (concept.issueRefs.length) fmLines.push(`<div>issue_refs: [${concept.issueRefs.join(', ')}]</div>`);
+  if (fm.supersedes && Array.isArray(fm.supersedes) && fm.supersedes.length) fmLines.push(`<div>supersedes: [${fm.supersedes.join(', ')}]</div>`);
+
+  const badges = [`<span class="badge type" data-type="${concept.type}">${concept.type}</span>`];
+  if (concept.status && concept.status !== 'active')
+    badges.push(`<span class="badge status ${concept.status === 'deprecated' ? 'deprecated' : ''}">${concept.status}</span>`);
+  if (concept.tags.length) badges.push(...concept.tags.map(t => `<span class="badge">${t}</span>`));
+
+  const backlinkHtml = concept.backlinks.length ? `
+    <div class="backlinks"><h3>Cited by (${concept.backlinks.length})</h3>
+    ${concept.backlinks.map(id => { const c = allConcepts.find(x => x.id === id); return c ? `<a data-id="${id}">${c.title}</a>` : ''; }).join('')}
+    </div>` : '';
+
+  el.innerHTML = `<div class="content">
+    <h2>${concept.title}</h2>
+    <div class="meta">${badges.join('')}</div>
+    ${fmLines.length ? `<div class="frontmatter">${fmLines.join('')}</div>` : ''}
+    <div class="body">${marked.parse(concept.body)}</div>
+    ${backlinkHtml}
+  </div>`;
+
+  // Attach backlink click handlers first (before mermaid, which can throw)
+  el.querySelectorAll('.backlinks a').forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const c = allConcepts.find(x => x.id === a.dataset.id);
+      if (c) { showDetail(c, targetId); if (cy) cy.getElementById(c.id).select(); }
+    };
+  });
+
+  // Intercept relative .md links in body and frontmatter
+  el.querySelectorAll('.body a[href], .frontmatter a[href]').forEach(a => {
+    const href = a.getAttribute('href');
+    if (!href || href.startsWith('http') || href.startsWith('#')) return;
+    a.onclick = (e) => {
+      e.preventDefault();
+      // Resolve relative path from current concept's directory
+      const baseDir = concept.id.includes('/') ? concept.id.substring(0, concept.id.lastIndexOf('/') + 1) : '';
+      let resolved = baseDir + href;
+      // Normalise path segments
+      while (resolved.includes('../')) {
+        resolved = resolved.replace(/[^/]+\/\.\.\//, '');
+      }
+      resolved = resolved.replace(/\/\.\//g, '/');
+      resolved = resolved.replace(/^\.\//, '');
+      // Strip .md extension to match concept IDs
+      resolved = resolved.replace(/\.md$/, '');
+      const target = allConcepts.find(x => x.id === resolved);
+      if (target) {
+        showDetail(target, targetId);
+        if (cy) cy.getElementById(target.id).select();
+      }
+    };
+  });
+
+  // Render mermaid diagrams (wrapped in try-catch so errors don't break navigation)
+  try {
+    el.querySelectorAll('pre code').forEach((codeEl, i) => {
+      const text = codeEl.textContent.trim();
+      if (text.startsWith('erDiagram') || text.startsWith('flowchart') || text.startsWith('graph') || text.startsWith('sequenceDiagram')) {
+        const pre = codeEl.parentElement;
+        const div = document.createElement('div');
+        div.className = 'mermaid';
+        div.id = 'mermaid-' + Date.now() + '-' + i;
+        div.textContent = text;
+        pre.replaceWith(div);
+      }
+    });
+    const mermaidNodes = el.querySelectorAll('.mermaid');
+    if (mermaidNodes.length > 0 && typeof mermaid !== 'undefined') {
+      mermaid.run({ nodes: mermaidNodes }).catch(() => {});
+    }
+  } catch (e) { /* mermaid not loaded or render error - ignore */ }
+
+  el.scrollTop = 0;
+}
+
+/* ---- Graph ---- */
+function renderGraph() {
+  const nodes = allConcepts.map(c => ({ data: { id: c.id, label: c.title.length > 28 ? c.title.slice(0, 26) + '..' : c.title, type: c.type, color: TYPE_COLORS[c.type] || '#8b949e', concept: c } }));
+  const edges = allLinks.map((l, i) => ({ data: { id: 'e' + i, source: l.source, target: l.target } }));
+  if (cy) cy.destroy();
+  cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: [...nodes, ...edges],
+    style: [
+      { selector: 'node', style: { 'background-color': 'data(color)', 'label': 'data(label)', 'color': '#c9d1d9', 'font-size': '10px', 'text-valign': 'bottom', 'text-halign': 'center', 'text-margin-y': 4, 'width': 22, 'height': 22, 'border-width': 2, 'border-color': '#21262d', 'text-wrap': 'ellipsis', 'text-max-width': '120px' }},
+      { selector: 'node:selected', style: { 'border-width': 3, 'border-color': '#f0f6fc', 'width': 28, 'height': 28 }},
+      { selector: 'edge', style: { 'width': 1, 'line-color': '#30363d', 'target-arrow-color': '#30363d', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.6 }},
+      { selector: '.deprecated', style: { 'border-style': 'dashed', 'opacity': 0.5 }}
+    ],
+    layout: { name: 'cose', animate: true, padding: 40, idealEdgeLength: 80, nodeRepulsion: 8000 }
+  });
+  cy.nodes().forEach(n => { if (n.data('concept').status === 'deprecated') n.addClass('deprecated'); });
+  cy.on('tap', 'node', evt => showDetail(evt.target.data('concept'), 'graph-detail'));
+}
+
+function renderFilters() {
+  const tb = document.getElementById('toolbar');
+  document.querySelectorAll('.filter-btn').forEach(e => e.remove());
+  for (const type of [...new Set(allConcepts.map(c => c.type))].sort()) {
+    const btn = document.createElement('button');
+    btn.className = 'filter-btn active'; btn.dataset.type = type; btn.textContent = type;
+    btn.onclick = () => {
+      if (activeFilters.has(type)) { activeFilters.delete(type); btn.classList.remove('active'); }
+      else { activeFilters.add(type); btn.classList.add('active'); }
+      applyFilters();
+    };
+    tb.insertBefore(btn, document.getElementById('search'));
+  }
+}
+
+function applyFilters() {
+  if (currentView !== 'graph' || !cy) return;
+  const s = document.getElementById('search').value.toLowerCase();
+  cy.nodes().forEach(n => {
+    const c = n.data('concept');
+    const tm = activeFilters.size === 0 || activeFilters.has(c.type);
+    const sm = !s || c.title.toLowerCase().includes(s) || c.id.toLowerCase().includes(s) || c.tags.some(t => t.toLowerCase().includes(s));
+    n.style('display', (tm && sm) ? 'element' : 'none');
+  });
+  cy.edges().forEach(e => {
+    e.style('display', (cy.getElementById(e.data('source')).style('display') !== 'none' && cy.getElementById(e.data('target')).style('display') !== 'none') ? 'element' : 'none');
+  });
+}
+
+/* ---- Navigation ---- */
+function switchView(view) {
+  currentView = view;
+  document.getElementById('nav-browse').classList.toggle('active', view === 'browse');
+  document.getElementById('nav-graph').classList.toggle('active', view === 'graph');
+  document.getElementById('browse-view').classList.toggle('active', view === 'browse');
+  document.getElementById('graph-view').classList.toggle('active', view === 'graph');
+  if (view === 'graph' && cy) cy.resize();
+  if (view === 'browse') renderTree();
+}
+document.getElementById('nav-browse').onclick = () => switchView('browse');
+document.getElementById('nav-graph').onclick = () => switchView('graph');
+
+/* ---- Search ---- */
+document.getElementById('search').oninput = () => {
+  if (currentView === 'browse') renderTree();
+  else applyFilters();
+};
+
+/* ---- Folder picker ---- */
+document.getElementById('folder-btn').onclick = async () => {
+  try { await loadFolder(await window.showDirectoryPicker()); }
+  catch (err) { if (err.name !== 'AbortError') alert('Error: ' + err.message); }
+};
+
+/* ---- Auto-load embedded data ---- */
+function loadEmbeddedData() {
+  if (typeof __OKF_DATA__ !== 'undefined' && __OKF_DATA__ && Array.isArray(__OKF_DATA__)) {
+    processConcepts(__OKF_DATA__.map(item => ({ filepath: item.filepath, content: item.content })));
+    onDataLoaded();
+  }
+}
+loadEmbeddedData();
+
+/* ---- Drag and drop ---- */
+let dragCounter = 0;
+window.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; document.getElementById('drop-zone').style.display = 'flex'; });
+window.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter === 0) document.getElementById('drop-zone').style.display = 'none'; });
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', async (e) => {
+  e.preventDefault(); dragCounter = 0;
+  document.getElementById('drop-zone').style.display = 'none';
+  const items = e.dataTransfer.items;
+  if (items && items.length > 0 && items[0].webkitGetAsEntry) {
+    const entry = items[0].webkitGetAsEntry();
+    if (entry.isDirectory) {
+      try { const handle = await entry.getFilesystemHandle?.(); if (handle) await loadFolder(handle); } catch {}
+    }
+  }
+});
+</script>
+</body>
+</html>
