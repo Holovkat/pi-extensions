@@ -4,13 +4,14 @@
  * Bridges pi model requests through the local `droid` CLI.
  *
  * Current scope:
- * - Exposes Factory's built-in/core models only
- * - Intentionally excludes `custom:*` Droid models for now
+ * - Exposes the verified Factory Opus 5 models used by Pi subagents
+ * - Intentionally excludes other built-in and `custom:*` Droid models until
+ *   dynamic catalog discovery is added
  * - Uses the stable `droid exec -o json` bridge rather than Droid's
  *   ACP daemon/session protocol because Pi already owns conversation state
  *   and tool execution for this provider path
- * - Keeps pi in charge of tool execution by disabling Droid's own tools and
- *   asking the selected model to emit pi-compatible JSON blocks
+ * - Keeps Droid exec in its default read-only mode and asks the selected model
+ *   to emit pi-compatible JSON blocks so pi remains the mutation authority
  *
  * Notes:
  * - This first pass is text-first. The Droid CLI itself supports richer
@@ -35,14 +36,14 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
-import { calculateCost, createAssistantMessageEventStream } from "@mariozechner/pi-ai";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-ai";
+import { calculateCost, createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_NAME = "factory-droid";
 const DROID_EXECUTABLE = process.env.FACTORY_DROID_PATH || process.env.DROID_PATH || "droid";
 const DROID_TIMEOUT_MS = Number(process.env.FACTORY_DROID_TIMEOUT_MS || 180_000);
-const TOOL_DISCOVERY_MODEL = "glm-4.7";
+const TOOL_DISCOVERY_MODEL = "claude-opus-5";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
 const TEXT_INPUT = ["text"] as const;
 
@@ -64,33 +65,30 @@ type BridgeTextBlock = { type: "text"; text: string };
 type BridgeToolCallBlock = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
 type BridgeBlock = BridgeTextBlock | BridgeToolCallBlock;
 
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
 type CoreModelConfig = {
 	id: string;
 	name: string;
 	reasoning: boolean;
 	contextWindow: number;
 	maxTokens: number;
+	thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 };
 
+const CLAUDE_5_THINKING_LEVELS = {
+	off: "off",
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+} as const;
+
 const CORE_MODELS: CoreModelConfig[] = [
-	{ id: "claude-opus-4-5-20251101", name: "Claude Opus 4.5", reasoning: true, contextWindow: 200_000, maxTokens: 32_768 },
-	{ id: "claude-opus-4-6", name: "Claude Opus 4.6", reasoning: true, contextWindow: 200_000, maxTokens: 32_768 },
-	{ id: "claude-opus-4-6-fast", name: "Claude Opus 4.6 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 32_768 },
-	{ id: "claude-sonnet-4-5-20250929", name: "Claude Sonnet 4.5", reasoning: true, contextWindow: 200_000, maxTokens: 32_768 },
-	{ id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6", reasoning: true, contextWindow: 200_000, maxTokens: 32_768 },
-	{ id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", reasoning: true, contextWindow: 200_000, maxTokens: 16_384 },
-	{ id: "gpt-5.2", name: "GPT-5.2", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-	{ id: "gpt-5.2-codex", name: "GPT-5.2 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-	{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", reasoning: true, contextWindow: 400_000, maxTokens: 128_000 },
-	{ id: "gpt-5.4", name: "GPT-5.4", reasoning: true, contextWindow: 922_000, maxTokens: 128_000 },
-	{ id: "gpt-5.4-fast", name: "GPT-5.4 Fast", reasoning: true, contextWindow: 922_000, maxTokens: 128_000 },
-	{ id: "gpt-5.4-mini", name: "GPT-5.4 Mini", reasoning: true, contextWindow: 256_000, maxTokens: 64_000 },
-	{ id: "gemini-3.1-pro-preview", name: "Gemini 3.1 Pro", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
-	{ id: "gemini-3-flash-preview", name: "Gemini 3 Flash", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
-	{ id: "glm-4.7", name: "Droid Core (GLM-4.7)", reasoning: false, contextWindow: 131_072, maxTokens: 65_536 },
-	{ id: "glm-5", name: "Droid Core (GLM-5)", reasoning: false, contextWindow: 200_000, maxTokens: 131_072 },
-	{ id: "kimi-k2.5", name: "Droid Core (Kimi K2.5)", reasoning: false, contextWindow: 131_072, maxTokens: 65_536 },
-	{ id: "minimax-m2.5", name: "Droid Core (MiniMax M2.5)", reasoning: true, contextWindow: 1_000_000, maxTokens: 65_536 },
+	{ id: "claude-opus-5", name: "Claude Opus 5", reasoning: true, contextWindow: 200_000, maxTokens: 32_768, thinkingLevelMap: CLAUDE_5_THINKING_LEVELS },
+	{ id: "claude-opus-5-fast", name: "Claude Opus 5 Fast", reasoning: true, contextWindow: 200_000, maxTokens: 32_768, thinkingLevelMap: CLAUDE_5_THINKING_LEVELS },
 ];
 
 let discoveredDisabledToolsArg: string | null = null;
@@ -354,28 +352,27 @@ function buildBridgePrompt(model: Model<Api>, context: Context): string {
 }
 
 function mapReasoning(model: Model<Api>, reasoning?: string): string | undefined {
-	if (!model.reasoning) {
-		return undefined;
-	}
-	if (!reasoning) {
+	if (!reasoning || !model.reasoning) {
 		return undefined;
 	}
 
-	const id = model.id.toLowerCase();
-	const isOpenAiStyle = id.startsWith("gpt-") || id.includes("codex") || id.startsWith("glm-") || id.startsWith("kimi-");
-	const isGemma4 = /(^|[-_])gemma[-_]?4([-.]|$)|\bgemma(?:\s*|[-_]?)(?:4|four)\b/i.test(id);
+	const isOpenAiStyle = model.id.startsWith("gpt-") || model.id.includes("codex") || model.id.startsWith("glm-") || model.id.startsWith("kimi-");
 
 	switch (reasoning) {
 		case "off":
 			return isOpenAiStyle ? "none" : "off";
 		case "minimal":
+			return "low";
 		case "low":
 			return "low";
 		case "medium":
-			return isGemma4 ? "medium" : "medium";
+			return "medium";
 		case "high":
-		case "xhigh":
 			return "high";
+		case "xhigh":
+			return "xhigh";
+		case "max":
+			return "max";
 		default:
 			return undefined;
 	}
@@ -511,17 +508,19 @@ function buildDroidArgs(model: Model<Api>, disabledToolsArg: string, reasoning?:
 }
 
 function parseDroidExecOutput(stdout: string, stderr: string, code: number): DroidExecJson {
+	const parsed = tryParseJson(stdout) as DroidExecJson | undefined;
+
 	if (code !== 0) {
-		throw new Error(`Factory Droid exited with code ${code}: ${stderr || stdout || "no output"}`);
+		const detail = parsed?.result || stderr || stdout || "no output";
+		throw new Error(`provider unavailable: Factory Droid exited with code ${code}: ${detail}`);
 	}
 
-	const parsed = tryParseJson(stdout) as DroidExecJson | undefined;
 	if (!parsed || typeof parsed !== "object") {
-		throw new Error(`Factory Droid returned non-JSON output: ${stdout || stderr || "<empty>"}`);
+		throw new Error(`provider unavailable: Factory Droid returned non-JSON output: ${stdout || stderr || "<empty>"}`);
 	}
 
 	if (parsed.is_error) {
-		throw new Error(`Factory Droid returned an error: ${parsed.result || stderr || stdout}`);
+		throw new Error(`provider unavailable: Factory Droid returned an error: ${parsed.result || stderr || stdout}`);
 	}
 
 	return parsed;
@@ -532,7 +531,10 @@ async function requestFactoryDroidCompletion(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): Promise<{ response: DroidExecJson; blocks: BridgeBlock[] }> {
-	const disabledToolsArg = await getDisabledToolsArg(options?.signal);
+	// Droid 0.180 rejects requests that disable its entire tool catalog. Keep
+	// exec in its default read-only mode and rely on the bridge contract to emit
+	// pi tool calls instead of performing mutations internally.
+	const disabledToolsArg = "";
 	const reasoning = mapReasoning(model, options?.reasoning);
 	const prompt = buildBridgePrompt(model, context);
 	const args = buildDroidArgs(model, disabledToolsArg, reasoning);
@@ -615,6 +617,7 @@ export default function (pi: ExtensionAPI) {
 			id: model.id,
 			name: `${model.name} (via Droid CLI)`,
 			reasoning: model.reasoning,
+			thinkingLevelMap: model.thinkingLevelMap,
 			input: [...TEXT_INPUT],
 			cost: { ...ZERO_COST },
 			contextWindow: model.contextWindow,

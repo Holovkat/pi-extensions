@@ -938,6 +938,7 @@ See [`docs/comms.md`](docs/comms.md) for deployment profiles, security notes, li
 | `theme-cycler.ts` | Registers `/theme` command for cycling between installed themes at runtime.                   |
 | `ollama-provider.ts` | Registers local and cloud-proxied Ollama models for Pi sessions.                           |
 | `apfel-provider.ts` | Registers Apple's local FoundationModels service via `apfel --serve`.                    |
+| `factory-droid-provider.ts` | Bridges verified Factory Droid models into Pi; currently exposes Opus 5 and Opus 5 Fast. |
 ---
 
 ## Agent Definitions
@@ -959,6 +960,17 @@ The extensions scan three directories for agents (first match wins):
 1. `<project>/.pi/agents/` — project-specific overrides
 2. `~/.pi/agent/agents/` — pi global agents
 3. `~/.pi-init/agents/` — custom agents (this repo)
+
+The repo-managed `agents/pi-subagents/` bundle captures the global Pi subagent routing used on configured machines:
+
+| Agents | Primary model | Thinking / fallback |
+| --- | --- | --- |
+| `planner` | `factory-droid/claude-opus-5` | `xhigh`; falls back to `openai-codex/gpt-5.6-sol` |
+| `backend-analyst`, `context-builder`, `frontend-analyst`, `issue-fix-orchestrator`, `researcher`, `senior-analyst` | `openai-codex/gpt-5.6-sol` | Agent-specific thinking levels |
+| `delegate` | `openai-codex/gpt-5.6-terra` | `high` |
+| `scout` | `openai-codex/gpt-5.3-codex-spark` | `medium` |
+
+The Factory bridge runs `droid exec` in its default read-only mode and reports Droid CLI/model failures as provider failures so `pi-subagents` can activate configured model fallbacks.
 
 ### Agent Capability Matrix
 
@@ -994,6 +1006,12 @@ git clone <repo-url> ~/workspace/pi-extensions
 ln -sf ~/workspace/pi-extensions/extensions ~/.pi-init/extensions
 ln -sf ~/workspace/pi-extensions/agents/req-qa/* ~/.pi-init/agents/
 ln -sf ~/workspace/pi-extensions/agents/dev-pipeline/* ~/.pi-init/agents/
+
+# Install the repo-managed global pi-subagents fleet and Droid provider
+mkdir -p ~/.pi/agent/agents ~/.pi/agent/extensions
+ln -sf ~/workspace/pi-extensions/agents/pi-subagents/*.md ~/.pi/agent/agents/
+ln -sf ~/workspace/pi-extensions/extensions/factory-droid-provider.ts ~/.pi/agent/extensions/factory-droid-provider.ts
+
 ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard ~/.pi-init/bin/pipeline-dashboard
 ln -sf ~/workspace/pi-extensions/bin/pipeline-dashboard-web ~/.pi-init/bin/pipeline-dashboard-web
 ln -sf ~/workspace/pi-extensions/bin/blueprint-dashboard-web ~/.pi-init/bin/blueprint-dashboard-web
@@ -1140,6 +1158,7 @@ pi-extensions/
 │   │   ├── scenario-analyst.md
 │   │   └── prd-writer.md
 │   ├── pi-blueprint/          # Repo-managed blueprint agents
+│   ├── pi-subagents/          # Repo-managed global Pi subagent model routing
 │   └── dev-pipeline/          # Development pipeline agents
 │       ├── dev.md
 │       ├── compliance.md
