@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant EXT as dev-pipeline.ts
+    participant CTL as Control Socket :3142
+    participant WEB as Steer Web UI
+
+    Note over EXT,CTL: On agent spawn
+    EXT->>CTL: {"type":"register","agentId":"fast-fix-2.3-d2",...}
+
+    Note over WEB,CTL: User steers from browser
+    WEB->>CTL: POST /api/steer {agentId, type:"steer", message:"..."}
+    CTL->>EXT: {"forward":true,"type":"steer","message":"...","agentId":"..."}
+    EXT->>EXT: Write to agent's proc.stdin
+
+    Note over EXT,CTL: Watchdog steer (automatic)
+    EXT->>EXT: Timeout approaching — steer via stdin directly

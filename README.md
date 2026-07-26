@@ -27,58 +27,15 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
 
 The system is built on two main extension pipelines that form a complete software development lifecycle:
 
-```mermaid
-graph TD
-    subgraph "Phase 1: Requirements Discovery"
-        A[pi-req] --> B[Human Interview Loop]
-        B --> C[Specialist Consultations]
-        C --> D[User Review & Refinement]
-        D -->|not ready| B
-        D -->|sign-off| E[Generate PRD + Checklist]
-        E --> F[Publish to GitHub Issues]
-    end
+Editable Mermaid sources for the pre-rendered diagrams are stored in [`docs/diagrams/`](docs/diagrams/).
 
-    subgraph "Phase 2: Sprint Development"
-        G[pi-dev] --> H[Read Checklist]
-        H --> I[Plan & Create Branch]
-        I -->|default| J2[Build → Evaluate → Fix → UAT]
-        I -->|"--multiwave"| J1[Council → Wave 0 → Wave 1 → Wave 2]
-        J1 --> L[Update Checklist + Issues]
-        J2 --> L
-        L -->|more epics| I
-        L -->|all done| M[UAT Sign-off]
-        M --> N[Squash Merge + Push]
-    end
-
-    F -.->|checklist| G
-
-    style A fill:#c4b5fd,color:#1e1b4b
-    style G fill:#86efac,color:#14532d
-```
+![Two-phase requirements discovery and sprint development lifecycle](docs/diagrams/development-lifecycle.png)
 
 ### How Agent Subprocess Execution Works
 
 Both extensions spawn agents as pi CLI subprocesses using pi's native RPC mode:
 
-```mermaid
-graph TD
-    EXT[Extension Process] -->|spawn| SUB["pi --mode rpc<br/>--no-extensions --no-skills<br/>--system-prompt '...'"]
-    EXT -->|"stdin: {type: 'prompt', message: '...'}"| SUB
-    SUB -->|stdout JSON stream| EXT
-    EXT -->|parse events| LOG[Write to .log file]
-    EXT -->|extract text| RES[Collect response]
-    EXT -.->|"stdin: {type: 'steer', message: '...'}"| SUB
-    SUB -->|agent_end| EXT
-    EXT -->|stdin.end| SUB
-
-    CTL[Control Socket :3142] -.->|forwarded commands| EXT
-    WEB[Steer Web UI] -.->|POST /api/steer| CTL
-
-    style EXT fill:#fbbf24,color:#1e1b4b
-    style SUB fill:#60a5fa,color:#1e1b4b
-    style CTL fill:#a78bfa,color:#1e1b4b
-    style WEB fill:#86efac,color:#14532d
-```
+![Pi agent subprocess execution and steering architecture](docs/diagrams/agent-subprocess-execution.png)
 
 Each agent subprocess:
 
@@ -134,77 +91,13 @@ An interactive, human-in-the-loop requirements discovery system. The pi session 
 
 #### State Machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> idle: Extension loads
-
-    idle --> interview: Session starts<br/>(fresh or resume)
-    interview --> consulting: consult_specialist tool
-    consulting --> interview: Specialist returns findings
-    interview --> review: Present consolidated findings
-    review --> interview: User wants changes
-    review --> finalizing: User signs off
-    finalizing --> done: PRD + Checklist written
-    done --> [*]
-
-    note right of idle
-        Auto-detects previous session:
-        - Has history → resume
-        - Has PRD → enhance
-        - Neither → fresh start
-    end note
-
-    note right of consulting
-        Spawns specialist as
-        pi subprocess
-    end note
-```
+![Requirements discovery extension state machine](docs/diagrams/requirements-state-machine.png)
 
 #### Consultation Flow (Sequential)
 
 When the orchestrator calls `consult_specialist`, this happens:
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant O as Orchestrator (pi session)
-    participant E as req-qa Extension
-    participant S as Specialist Subprocess
-
-    U->>O: Describe what you want to build
-    O->>O: Interview questions (one at a time)
-    U->>O: Answers and context
-
-    O->>E: consult_specialist(req-analyst, question)
-    E->>E: Build full prompt with context
-    E->>S: spawn pi --mode json -p --system-prompt "..."
-    S->>S: Analyze requirements, identify gaps
-    S-->>E: JSON stream → collect response
-    E-->>O: Return structured findings
-
-    O->>U: Present findings, ask for feedback
-    U->>O: Feedback / refinement
-
-    O->>E: consult_specialist(tech-analyst, question)
-    E->>S: spawn pi (different system prompt)
-    S-->>E: Technical analysis
-    E-->>O: Return findings
-
-    O->>E: consult_specialist(scenario-analyst, question)
-    E->>S: spawn pi
-    S-->>E: Scenario analysis
-    E-->>O: Return findings
-
-    O->>U: All findings consolidated. Ready?
-    U->>O: Sign off
-
-    O->>E: generate_artifacts(specification)
-    E->>S: spawn prd-writer agent
-    S->>S: Write PRD.md + checklist
-    S-->>E: Files written
-    E->>E: Publish to GitHub Issues
-    E-->>O: Summary with issue links
-```
+![Sequential requirements specialist consultation flow](docs/diagrams/requirements-consultation-flow.png)
 
 #### Tools
 
@@ -281,42 +174,7 @@ A command-driven sprint development lifecycle with two execution modes: the lean
 
 #### Dual-Mode Architecture
 
-```mermaid
-graph TD
-    START["/pipeline-start"] -->|default| FAST["Fast Track Mode<br/>(lean, build→eval→UAT)"]
-    START -->|"--multiwave"| WAVE["3-Wave Mode<br/>(thorough, multi-model)"]
-
-    WAVE --> W0["Wave 0: Prototype<br/>3 models build POC"]
-    W0 --> W1["Wave 1: Review<br/>Council + TODO placement"]
-    W1 --> W2["Wave 2: Dev Sprint<br/>Sequential per-task dev + compliance"]
-    W2 --> UPDATE1["Update checklist + issues"]
-
-    FAST --> BUILD["BUILD: Single model<br/>entire epic at once"]
-    BUILD --> EVAL["EVALUATE: Stronger model<br/>scores per-task"]
-    EVAL --> FIX{"Score >= 95%?"}
-    FIX -->|yes| UAT_GEN["Generate UAT scenarios"]
-    FIX -->|no| SUB["Fix with watchdog timer<br/>(10m + 5m/depth)"]
-    SUB --> YIELD{"Agent yielded<br/>(timeout)?"}
-    YIELD -->|no| EVAL
-    YIELD -->|yes| ANALYST["Analyst reviews learnings<br/>decompose / simplify /<br/>deprecate / skip"]
-    ANALYST --> EVAL
-    UAT_GEN --> UPDATE2["Update checklist + issues"]
-
-    UPDATE1 -->|"auto-chain"| NEXT1["Next epic"]
-    UPDATE2 -->|"auto-chain"| NEXT2["Next epic"]
-    NEXT1 --> W0
-    NEXT2 --> BUILD
-
-    NEXT2 -->|"all done"| UAT_EXEC["Run UAT via Playwright"]
-    UAT_EXEC --> APPROVAL{"User approval?"}
-    APPROVAL -->|"/pipeline-approve"| MERGE["Squash merge + push"]
-    APPROVAL -->|"/pipeline-reject"| FIX_UAT["Fix failed scenarios"]
-    FIX_UAT --> UAT_EXEC
-
-    style WAVE fill:#c4b5fd,color:#1e1b4b
-    style FAST fill:#86efac,color:#14532d
-    style APPROVAL fill:#fbbf24,color:#1e1b4b
-```
+![Fast Track and multiwave development pipeline architecture](docs/diagrams/dual-mode-pipeline-architecture.png)
 
 ---
 
@@ -326,94 +184,13 @@ Activated with `/pipeline-start` (no flags). A streamlined pipeline for faster i
 
 ##### Pipeline Flow
 
-```mermaid
-sequenceDiagram
-    participant CMD as /pipeline-start
-    participant EXT as dev-pipeline
-    participant BUILD as Builder (Gemini 3 Pro)
-    participant EVAL as Evaluator (Opus 4.6)
-    participant FIX as Fixer (Qwen 3.5+)
-    participant ANA as Analyst (Opus 4.6)
-    participant PW as Playwright
-    participant USER as Human
-
-    CMD->>EXT: Read checklist, create branch
-
-    loop For each epic (auto-chained)
-        Note over EXT,EVAL: Step 1: BUILD
-        EXT->>BUILD: Build entire epic (all tasks in one prompt)
-        BUILD-->>EXT: Code committed
-
-        Note over EXT,EVAL: Step 2: EVALUATE
-        EXT->>EVAL: Score each task (0-100%)
-        EVAL-->>EXT: Per-task scores + issues
-
-        Note over EXT,ANA: Step 3: FIX with watchdog (if needed)
-        EXT->>EXT: Load prior learnings from GitHub issue comments
-        loop For each task < 95% (up to 5 depths)
-            Note over EXT,FIX: Watchdog: 10m + 5m/depth timeout
-            EXT->>FIX: Fix with issues + learnings context
-            alt Agent completes in time
-                FIX-->>EXT: Targeted edits
-            else Agent yields (timeout)
-                EXT->>FIX: Steer: "Summarize blockers and yield"
-                FIX-->>EXT: {blockers, attempted, suggestion}
-                EXT->>ANA: Review learnings, decide action
-                ANA-->>EXT: decompose / simplify / deprecate / skip
-                EXT->>EXT: Post learning to GitHub issue comment
-            end
-            EXT->>EVAL: Re-score
-            EVAL-->>EXT: Updated score
-        end
-
-        Note over EXT,EVAL: Step 4: UAT SCENARIOS
-        EXT->>EVAL: Generate test scenarios for this epic
-        EVAL-->>EXT: Scenarios → GitHub issues
-
-        EXT->>EXT: Update checklist, close issues
-    end
-
-    Note over EXT,USER: After ALL epics complete
-
-    Note over EXT,PW: Step 5: UAT EXECUTION
-    EXT->>PW: Run all scenarios via browser
-    PW-->>EXT: Pass/fail results + evidence
-    EXT->>EXT: Post results to GitHub issues
-
-    Note over EXT,USER: Step 6: APPROVAL GATE
-    EXT->>USER: Dashboard: AWAITING UAT APPROVAL
-    USER->>EXT: /pipeline-approve or /pipeline-reject
-    alt Approved
-        EXT->>EXT: Close UAT epic, proceed to merge
-    else Rejected
-        EXT->>EXT: Post notes to failed issues
-        EXT->>EXT: Loop back for fixes
-    end
-```
+![Fast Track build, evaluation, fix, UAT, and approval flow](docs/diagrams/fast-track-pipeline-flow.png)
 
 ##### Fix with Watchdog Timers & Analyst Escalation
 
 When a task scores below 95%, the fast track doesn't rebuild from scratch. Each fix attempt runs under a watchdog timer — if the agent can't finish in time, it's steered to yield a structured summary, and an analyst agent decides how to proceed.
 
-```mermaid
-graph TD
-    SCORE["Task 4.2: A* pathfinding<br/>Score: 88%"] --> SEED["Load prior learnings<br/>from GitHub issue #58"]
-    SEED --> FIX1["Depth 1: Qwen 3.5+<br/>Timeout: 10 min"]
-    FIX1 --> DONE1{"Completed<br/>in time?"}
-    DONE1 -->|yes| RESCORE1["Re-score: 92%"]
-    DONE1 -->|"no (yielded)"| LEARN1["Learnings:<br/>blockers, attempted, suggestion"]
-    LEARN1 --> ANALYST1["Analyst: DECOMPOSE<br/>Split into 2 sub-tasks"]
-    ANALYST1 --> POST1["Post learning to issue #58"]
-    POST1 --> RESCORE1
-    RESCORE1 --> FIX2["Depth 2: Sonnet 4.6<br/>Timeout: 15 min<br/>(receives learnings)"]
-    FIX2 --> RESCORE2["Re-score: 97%"]
-    RESCORE2 --> PASS["Task passed"]
-
-    style SCORE fill:#fca5a5,color:#7f1d1d
-    style PASS fill:#86efac,color:#14532d
-    style ANALYST1 fill:#c4b5fd,color:#1e1b4b
-    style LEARN1 fill:#fbbf24,color:#1e1b4b
-```
+![Watchdog fix escalation and analyst learning flow](docs/diagrams/watchdog-fix-escalation.png)
 
 **Watchdog timer progression:**
 | Depth | Timeout | Model |
@@ -530,49 +307,7 @@ Activated with `/pipeline-start --multiwave`. Best for complex projects requirin
 
 ##### Pipeline Flow
 
-```mermaid
-sequenceDiagram
-    participant CMD as /pipeline-start --multiwave
-    participant EXT as dev-pipeline
-    participant ARCH as Architect Council (3 models)
-    participant PROTO as Prototype (Gemini→Haiku→Qwen)
-    participant REV as Reviewer
-    participant DEV as Dev Agent
-    participant CMP as Compliance Agent
-
-    CMD->>EXT: Read checklist, create branch
-
-    Note over EXT,CMP: Wave 1 — Foundations Council
-    EXT->>ARCH: 3 architects in parallel
-    ARCH-->>EXT: 3 design briefs
-    EXT->>EXT: Consolidate into unified spec
-
-    Note over EXT,CMP: Wave 0 — Prototype (first epic only)
-    EXT->>PROTO: Gemini: full build from spec
-    PROTO-->>EXT: Prototype v1
-    EXT->>PROTO: Haiku: enhance + polish
-    PROTO-->>EXT: Prototype v2
-    EXT->>PROTO: Qwen: fine-tune + refine
-    PROTO-->>EXT: Final prototype
-
-    Note over EXT,CMP: Wave 1 — Review + TODO Placement
-    EXT->>REV: Review prototype vs spec
-    REV-->>EXT: TODOs placed in code
-
-    Note over EXT,CMP: Wave 2 — Sequential Dev Sprint
-    loop For each task
-        EXT->>DEV: Implement task (sees TODOs + spec)
-        DEV-->>EXT: Code changes
-        EXT->>CMP: Score implementation
-        CMP-->>EXT: Score + gaps
-        alt Score < 95%
-            EXT->>DEV: Fix gaps (up to 5 retries)
-        end
-    end
-
-    EXT->>EXT: Update checklist + close issues
-    EXT->>EXT: Auto-chain to next epic
-```
+![Multiwave council, prototype, review, and development flow](docs/diagrams/multiwave-pipeline-flow.png)
 
 ##### Key Design Decisions
 
@@ -789,23 +524,7 @@ A multi-page web application for monitoring and steering agents from a browser.
 
 **TCP Control Socket** (port 3142) — programmatic interface for agent registration and command forwarding:
 
-```mermaid
-sequenceDiagram
-    participant EXT as dev-pipeline.ts
-    participant CTL as Control Socket :3142
-    participant WEB as Steer Web UI
-
-    Note over EXT,CTL: On agent spawn
-    EXT->>CTL: {"type":"register","agentId":"fast-fix-2.3-d2",...}
-
-    Note over WEB,CTL: User steers from browser
-    WEB->>CTL: POST /api/steer {agentId, type:"steer", message:"..."}
-    CTL->>EXT: {"forward":true,"type":"steer","message":"...","agentId":"..."}
-    EXT->>EXT: Write to agent's proc.stdin
-
-    Note over EXT,CTL: Watchdog steer (automatic)
-    EXT->>EXT: Timeout approaching — steer via stdin directly
-```
+![Control socket and web UI agent steering flow](docs/diagrams/agent-steering-control-flow.png)
 
 The extension auto-connects to the control socket on startup and re-registers agents on reconnect. If the web dashboard isn't running, steering still works via the watchdog timers.
 

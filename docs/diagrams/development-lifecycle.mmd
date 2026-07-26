@@ -1,0 +1,26 @@
+graph TD
+    subgraph "Phase 1: Requirements Discovery"
+        A[pi-req] --> B[Human Interview Loop]
+        B --> C[Specialist Consultations]
+        C --> D[User Review & Refinement]
+        D -->|not ready| B
+        D -->|sign-off| E[Generate PRD + Checklist]
+        E --> F[Publish to GitHub Issues]
+    end
+
+    subgraph "Phase 2: Sprint Development"
+        G[pi-dev] --> H[Read Checklist]
+        H --> I[Plan & Create Branch]
+        I -->|default| J2[Build → Evaluate → Fix → UAT]
+        I -->|"--multiwave"| J1[Council → Wave 0 → Wave 1 → Wave 2]
+        J1 --> L[Update Checklist + Issues]
+        J2 --> L
+        L -->|more epics| I
+        L -->|all done| M[UAT Sign-off]
+        M --> N[Squash Merge + Push]
+    end
+
+    F -.->|checklist| G
+
+    style A fill:#c4b5fd,color:#1e1b4b
+    style G fill:#86efac,color:#14532d

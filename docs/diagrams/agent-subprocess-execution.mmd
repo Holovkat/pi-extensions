@@ -1,0 +1,17 @@
+graph TD
+    EXT[Extension Process] -->|spawn| SUB["pi --mode rpc<br/>--no-extensions --no-skills<br/>--system-prompt '...'"]
+    EXT -->|"stdin: {type: 'prompt', message: '...'}"| SUB
+    SUB -->|stdout JSON stream| EXT
+    EXT -->|parse events| LOG[Write to .log file]
+    EXT -->|extract text| RES[Collect response]
+    EXT -.->|"stdin: {type: 'steer', message: '...'}"| SUB
+    SUB -->|agent_end| EXT
+    EXT -->|stdin.end| SUB
+
+    CTL[Control Socket :3142] -.->|forwarded commands| EXT
+    WEB[Steer Web UI] -.->|POST /api/steer| CTL
+
+    style EXT fill:#fbbf24,color:#1e1b4b
+    style SUB fill:#60a5fa,color:#1e1b4b
+    style CTL fill:#a78bfa,color:#1e1b4b
+    style WEB fill:#86efac,color:#14532d

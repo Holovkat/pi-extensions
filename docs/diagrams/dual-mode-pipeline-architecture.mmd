@@ -1,0 +1,34 @@
+graph TD
+    START["/pipeline-start"] -->|default| FAST["Fast Track Mode<br/>(lean, build→eval→UAT)"]
+    START -->|"--multiwave"| WAVE["3-Wave Mode<br/>(thorough, multi-model)"]
+
+    WAVE --> W0["Wave 0: Prototype<br/>3 models build POC"]
+    W0 --> W1["Wave 1: Review<br/>Council + TODO placement"]
+    W1 --> W2["Wave 2: Dev Sprint<br/>Sequential per-task dev + compliance"]
+    W2 --> UPDATE1["Update checklist + issues"]
+
+    FAST --> BUILD["BUILD: Single model<br/>entire epic at once"]
+    BUILD --> EVAL["EVALUATE: Stronger model<br/>scores per-task"]
+    EVAL --> FIX{"Score >= 95%?"}
+    FIX -->|yes| UAT_GEN["Generate UAT scenarios"]
+    FIX -->|no| SUB["Fix with watchdog timer<br/>(10m + 5m/depth)"]
+    SUB --> YIELD{"Agent yielded<br/>(timeout)?"}
+    YIELD -->|no| EVAL
+    YIELD -->|yes| ANALYST["Analyst reviews learnings<br/>decompose / simplify /<br/>deprecate / skip"]
+    ANALYST --> EVAL
+    UAT_GEN --> UPDATE2["Update checklist + issues"]
+
+    UPDATE1 -->|"auto-chain"| NEXT1["Next epic"]
+    UPDATE2 -->|"auto-chain"| NEXT2["Next epic"]
+    NEXT1 --> W0
+    NEXT2 --> BUILD
+
+    NEXT2 -->|"all done"| UAT_EXEC["Run UAT via Playwright"]
+    UAT_EXEC --> APPROVAL{"User approval?"}
+    APPROVAL -->|"/pipeline-approve"| MERGE["Squash merge + push"]
+    APPROVAL -->|"/pipeline-reject"| FIX_UAT["Fix failed scenarios"]
+    FIX_UAT --> UAT_EXEC
+
+    style WAVE fill:#c4b5fd,color:#1e1b4b
+    style FAST fill:#86efac,color:#14532d
+    style APPROVAL fill:#fbbf24,color:#1e1b4b

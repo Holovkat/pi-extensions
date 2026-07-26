@@ -1,0 +1,62 @@
+sequenceDiagram
+    participant CMD as /pipeline-start
+    participant EXT as dev-pipeline
+    participant BUILD as Builder (Gemini 3 Pro)
+    participant EVAL as Evaluator (Opus 4.6)
+    participant FIX as Fixer (Qwen 3.5+)
+    participant ANA as Analyst (Opus 4.6)
+    participant PW as Playwright
+    participant USER as Human
+
+    CMD->>EXT: Read checklist, create branch
+
+    loop For each epic (auto-chained)
+        Note over EXT,EVAL: Step 1: BUILD
+        EXT->>BUILD: Build entire epic (all tasks in one prompt)
+        BUILD-->>EXT: Code committed
+
+        Note over EXT,EVAL: Step 2: EVALUATE
+        EXT->>EVAL: Score each task (0-100%)
+        EVAL-->>EXT: Per-task scores + issues
+
+        Note over EXT,ANA: Step 3: FIX with watchdog (if needed)
+        EXT->>EXT: Load prior learnings from GitHub issue comments
+        loop For each task < 95% (up to 5 depths)
+            Note over EXT,FIX: Watchdog: 10m + 5m/depth timeout
+            EXT->>FIX: Fix with issues + learnings context
+            alt Agent completes in time
+                FIX-->>EXT: Targeted edits
+            else Agent yields (timeout)
+                EXT->>FIX: Steer: "Summarize blockers and yield"
+                FIX-->>EXT: {blockers, attempted, suggestion}
+                EXT->>ANA: Review learnings, decide action
+                ANA-->>EXT: decompose / simplify / deprecate / skip
+                EXT->>EXT: Post learning to GitHub issue comment
+            end
+            EXT->>EVAL: Re-score
+            EVAL-->>EXT: Updated score
+        end
+
+        Note over EXT,EVAL: Step 4: UAT SCENARIOS
+        EXT->>EVAL: Generate test scenarios for this epic
+        EVAL-->>EXT: Scenarios → GitHub issues
+
+        EXT->>EXT: Update checklist, close issues
+    end
+
+    Note over EXT,USER: After ALL epics complete
+
+    Note over EXT,PW: Step 5: UAT EXECUTION
+    EXT->>PW: Run all scenarios via browser
+    PW-->>EXT: Pass/fail results + evidence
+    EXT->>EXT: Post results to GitHub issues
+
+    Note over EXT,USER: Step 6: APPROVAL GATE
+    EXT->>USER: Dashboard: AWAITING UAT APPROVAL
+    USER->>EXT: /pipeline-approve or /pipeline-reject
+    alt Approved
+        EXT->>EXT: Close UAT epic, proceed to merge
+    else Rejected
+        EXT->>EXT: Post notes to failed issues
+        EXT->>EXT: Loop back for fixes
+    end

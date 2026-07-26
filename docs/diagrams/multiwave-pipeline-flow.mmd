@@ -1,0 +1,41 @@
+sequenceDiagram
+    participant CMD as /pipeline-start --multiwave
+    participant EXT as dev-pipeline
+    participant ARCH as Architect Council (3 models)
+    participant PROTO as Prototype (Gemini→Haiku→Qwen)
+    participant REV as Reviewer
+    participant DEV as Dev Agent
+    participant CMP as Compliance Agent
+
+    CMD->>EXT: Read checklist, create branch
+
+    Note over EXT,CMP: Wave 1 — Foundations Council
+    EXT->>ARCH: 3 architects in parallel
+    ARCH-->>EXT: 3 design briefs
+    EXT->>EXT: Consolidate into unified spec
+
+    Note over EXT,CMP: Wave 0 — Prototype (first epic only)
+    EXT->>PROTO: Gemini: full build from spec
+    PROTO-->>EXT: Prototype v1
+    EXT->>PROTO: Haiku: enhance + polish
+    PROTO-->>EXT: Prototype v2
+    EXT->>PROTO: Qwen: fine-tune + refine
+    PROTO-->>EXT: Final prototype
+
+    Note over EXT,CMP: Wave 1 — Review + TODO Placement
+    EXT->>REV: Review prototype vs spec
+    REV-->>EXT: TODOs placed in code
+
+    Note over EXT,CMP: Wave 2 — Sequential Dev Sprint
+    loop For each task
+        EXT->>DEV: Implement task (sees TODOs + spec)
+        DEV-->>EXT: Code changes
+        EXT->>CMP: Score implementation
+        CMP-->>EXT: Score + gaps
+        alt Score < 95%
+            EXT->>DEV: Fix gaps (up to 5 retries)
+        end
+    end
+
+    EXT->>EXT: Update checklist + close issues
+    EXT->>EXT: Auto-chain to next epic

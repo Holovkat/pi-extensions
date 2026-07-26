@@ -1,0 +1,39 @@
+sequenceDiagram
+    participant U as User
+    participant O as Orchestrator (pi session)
+    participant E as req-qa Extension
+    participant S as Specialist Subprocess
+
+    U->>O: Describe what you want to build
+    O->>O: Interview questions (one at a time)
+    U->>O: Answers and context
+
+    O->>E: consult_specialist(req-analyst, question)
+    E->>E: Build full prompt with context
+    E->>S: spawn pi --mode json -p --system-prompt "..."
+    S->>S: Analyze requirements, identify gaps
+    S-->>E: JSON stream → collect response
+    E-->>O: Return structured findings
+
+    O->>U: Present findings, ask for feedback
+    U->>O: Feedback / refinement
+
+    O->>E: consult_specialist(tech-analyst, question)
+    E->>S: spawn pi (different system prompt)
+    S-->>E: Technical analysis
+    E-->>O: Return findings
+
+    O->>E: consult_specialist(scenario-analyst, question)
+    E->>S: spawn pi
+    S-->>E: Scenario analysis
+    E-->>O: Return findings
+
+    O->>U: All findings consolidated. Ready?
+    U->>O: Sign off
+
+    O->>E: generate_artifacts(specification)
+    E->>S: spawn prd-writer agent
+    S->>S: Write PRD.md + checklist
+    S-->>E: Files written
+    E->>E: Publish to GitHub Issues
+    E-->>O: Summary with issue links

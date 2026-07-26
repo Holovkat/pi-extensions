@@ -1,0 +1,17 @@
+graph TD
+    SCORE["Task 4.2: A* pathfinding<br/>Score: 88%"] --> SEED["Load prior learnings<br/>from GitHub issue #58"]
+    SEED --> FIX1["Depth 1: Qwen 3.5+<br/>Timeout: 10 min"]
+    FIX1 --> DONE1{"Completed<br/>in time?"}
+    DONE1 -->|yes| RESCORE1["Re-score: 92%"]
+    DONE1 -->|"no (yielded)"| LEARN1["Learnings:<br/>blockers, attempted, suggestion"]
+    LEARN1 --> ANALYST1["Analyst: DECOMPOSE<br/>Split into 2 sub-tasks"]
+    ANALYST1 --> POST1["Post learning to issue #58"]
+    POST1 --> RESCORE1
+    RESCORE1 --> FIX2["Depth 2: Sonnet 4.6<br/>Timeout: 15 min<br/>(receives learnings)"]
+    FIX2 --> RESCORE2["Re-score: 97%"]
+    RESCORE2 --> PASS["Task passed"]
+
+    style SCORE fill:#fca5a5,color:#7f1d1d
+    style PASS fill:#86efac,color:#14532d
+    style ANALYST1 fill:#c4b5fd,color:#1e1b4b
+    style LEARN1 fill:#fbbf24,color:#1e1b4b

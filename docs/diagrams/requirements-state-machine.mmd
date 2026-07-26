@@ -1,0 +1,23 @@
+stateDiagram-v2
+    [*] --> idle: Extension loads
+
+    idle --> interview: Session starts<br/>(fresh or resume)
+    interview --> consulting: consult_specialist tool
+    consulting --> interview: Specialist returns findings
+    interview --> review: Present consolidated findings
+    review --> interview: User wants changes
+    review --> finalizing: User signs off
+    finalizing --> done: PRD + Checklist written
+    done --> [*]
+
+    note right of idle
+        Auto-detects previous session:
+        - Has history → resume
+        - Has PRD → enhance
+        - Neither → fresh start
+    end note
+
+    note right of consulting
+        Spawns specialist as
+        pi subprocess
+    end note
