@@ -42,12 +42,12 @@ When a task fails at depth 1, the pipeline escalates to the next configured mode
 | Role | Model |
 |------|-------|
 | Builder | Gemini 3 Pro Preview |
-| Evaluator | Claude Opus 4.6 |
+| Evaluator | GPT-5.6 Sol (minimal) |
 | Fixer | Qwen 3.5 Plus |
 | Fix Escalation 1 | Claude Sonnet 4.6 |
 | Fix Escalation 2 | Claude Opus 4.6 (xhigh) |
 | Analyst | Claude Opus 4.6 (xhigh) |
-| UAT Tester | Gemini 3 Pro Preview |
+| UAT Tester | GPT-5.6 Sol (minimal) |
 
 ## 3-Wave Default Assignments
 
@@ -58,7 +58,7 @@ When a task fails at depth 1, the pipeline escalates to the next configured mode
 | Prototype Step 2 | Claude Haiku 4.5 |
 | Prototype Step 3 | Qwen 3.5 Plus |
 | Dev Agent | Claude Haiku 4.5 |
-| Compliance | Qwen 3.5 Plus |
+| Compliance | GPT-5.6 Sol (low) |
 | Orchestrator Override | Claude Opus 4.6 |
 
 The Analyst role uses the strongest model by default because it needs to deeply understand failure patterns and make architectural decisions about task decomposition.

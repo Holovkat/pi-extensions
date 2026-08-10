@@ -185,14 +185,14 @@ interface PipelineModelConfig {
 const DEFAULT_CONFIG: PipelineModelConfig = {
 	fast: {
 		build: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "high" },
-		eval: { model: "anthropic/claude-opus-4-6", thinking: "high" },
+		eval: { model: "openai-codex/gpt-5.6-sol", thinking: "minimal" },
 		fix: { model: "bailian/qwen3.5-plus", thinking: "high" },
 		fixEscalation: [
 			{ model: "anthropic/claude-sonnet-4-6", thinking: "high" },
 			{ model: "anthropic/claude-opus-4-6", thinking: "xhigh" },
 		],
 		analyst: { model: "anthropic/claude-opus-4-6", thinking: "xhigh" },
-		uat: { model: "google-gemini-cli/gemini-3-pro-preview", thinking: "medium" },
+		uat: { model: "openai-codex/gpt-5.6-sol", thinking: "minimal" },
 	},
 	multiwave: {
 		council1: { model: "anthropic/claude-opus-4-6", thinking: "medium" },
@@ -202,7 +202,7 @@ const DEFAULT_CONFIG: PipelineModelConfig = {
 		proto2: { model: "anthropic/claude-haiku-4-5", thinking: "medium" },
 		proto3: { model: "bailian/qwen3.5-plus", thinking: "medium" },
 		dev: { model: "anthropic/claude-haiku-4-5", thinking: "medium" },
-		compliance: { model: "bailian/qwen3.5-plus", thinking: "medium" },
+		compliance: { model: "openai-codex/gpt-5.6-sol", thinking: "low" },
 		orchestrator: { model: "anthropic/claude-opus-4-6", thinking: "medium" },
 	},
 };

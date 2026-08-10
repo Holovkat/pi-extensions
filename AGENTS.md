@@ -37,14 +37,15 @@ When a concept's `resource` field points to a doc, follow that link to the sourc
 
 Do not move or duplicate existing docs into `knowledge/`. New knowledge that doesn't have an existing source doc is written directly as an OKF concept.
 
-### After Completing Work
+### Before Committing Work
 
-When you finish a meaningful work session:
+When you finish a meaningful work session, write a session synthesis to `knowledge/inbox/` BEFORE you commit:
 
-1. Write a session synthesis to `knowledge/inbox/` using the OKF inbox format.
+1. Write the session synthesis to `knowledge/inbox/` using the OKF inbox format.
 2. Include: what was done, decisions made, what was deprecated, lessons learned, current state.
 3. This is about the product, business logic, and application state, not just code diffs.
-4. The post-commit hook will also write lightweight commit metadata to the inbox.
+4. `git add` the inbox file along with your other changes so it's part of the commit.
+5. The post-commit hook refreshes the workspace manifest but does NOT create stubs.
 
 ### Curation
 
@@ -52,8 +53,9 @@ The curation agent processes inbox items into permanent concept files:
 
 1. Reads all unprocessed inbox items plus existing concepts and codebase context.
 2. Creates or updates concept files in the appropriate directory.
-3. Moves superseded concepts to `knowledge/deprecation/`.
+3. Moves superseded concepts to `knowledge/deprecation/` with full lesson sections.
 4. Updates all `index.md` files and `knowledge/log.md`.
+5. Auto-commits changes with `okf-curation:` prefix (the post-commit hook skips these to prevent loops).
 
 ### Concept Types
 
@@ -76,3 +78,10 @@ The curation agent processes inbox items into permanent concept files:
 - One concept per file. Do not mix types.
 - The `resource` field in frontmatter should point to the relevant code file, issue, or existing doc.
 - For legacy projects, concepts reference existing docs via `resource` rather than duplicating content.
+
+## Communication discipline
+- Communicate clearly, concisely, and in plain language.
+- Stay on track and focused on the current task or software-development conversation.
+- Do not ramble, repeat yourself, or add unnecessary background and detail.
+- Avoid excessive technical jargon. When specialized terms are necessary, explain them briefly.
+- Prioritize relevant actions, decisions, evidence, blockers, and next steps.

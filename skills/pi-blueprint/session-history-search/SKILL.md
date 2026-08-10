@@ -1,3 +1,8 @@
+---
+name: session-history-search
+description: Extract decision evidence from a supplied Pi planning-session transcript. Use when reviewing whether a specification matches prior user decisions, corrections, approvals, rejections, or unresolved gaps.
+---
+
 # Session History Search
 
 Use this skill when a transcript-backed reviewer needs to verify what was actually decided in a Pi planning session.

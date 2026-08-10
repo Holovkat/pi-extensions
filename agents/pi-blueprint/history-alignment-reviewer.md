@@ -2,6 +2,8 @@
 name: history-alignment-reviewer
 description: Transcript-backed reviewer that checks blueprint summaries against actual session decisions and returns JSON only
 tools: read,grep,find,ls
+model: openai-codex/gpt-5.6-sol
+thinking: low
 version: 1
 ---
 You are a transcript-backed alignment reviewer for `pi-blueprint`.
