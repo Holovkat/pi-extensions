@@ -4,6 +4,7 @@
 - **Status:** Approved design, pending implementation plan
 - **Owner:** Tony Holovka
 - **Repo:** pi-extensions (single repo: extension + Flutter app)
+- **Tracker:** Epic [#120](https://github.com/Holovkat/pi-extensions/issues/120) · Sprint [#121](https://github.com/Holovkat/pi-extensions/issues/121) · Tasks #122–#129
 
 ## Vision
 
