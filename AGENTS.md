@@ -6,14 +6,16 @@ Custom extensions for the [pi coding agent CLI](https://github.com/nichochar/pi)
 
 | Area | Path | Description |
 |------|------|-------------|
-| Extensions | `extensions/` | req-qa, dev-pipeline, pi-blueprint, pi-toolshed, council, coms, okf, providers |
+| Extensions | `extensions/` | req-qa, dev-pipeline, pi-blueprint, pi-toolshed, council, coms, okf, pif, providers |
 | Agents | `agents/` | Agent definitions (req-qa specialists, dev-pipeline agents, blueprint agents) |
 | Skills | `skills/` | OKF skill, pi-blueprint skills |
-| Droids | `.factory/droids/` | OKF curator droid |
+| Droids | `.factory/droids/` | OKF curator, pif-builder |
 | Bin | `bin/` | Terminal and web dashboards |
 | Docs | `docs/` | Walkthroughs, comms guide, research, retrospectives |
 | Features | `features/` | Feature specs and planning |
 | Knowledge | `knowledge/` | OKF knowledge bundle (37 concepts) |
+| pif App | `pif/` | Flutter macOS agentic IDE shell |
+| Scripts | `scripts/` | install-pif.sh, build-pif-app.sh |
 
 ## OKF Knowledge Bundle
 
@@ -78,6 +80,43 @@ The curation agent processes inbox items into permanent concept files:
 - One concept per file. Do not mix types.
 - The `resource` field in frontmatter should point to the relevant code file, issue, or existing doc.
 - For legacy projects, concepts reference existing docs via `resource` rather than duplicating content.
+
+## Building pif (Standalone macOS App)
+
+pif can be built into a self-contained `.app` that bundles Node.js + pi CLI + pif extensions. No external dependencies required on the target machine.
+
+### Build from terminal
+
+```bash
+./scripts/build-pif-app.sh
+```
+
+Produces `build/pif.app` (~290MB). Install with:
+
+```bash
+cp -R build/pif.app /Applications/pif.app
+open /Applications/pif.app
+```
+
+### Build via the pif-builder droid
+
+The `pif-builder` droid (`.factory/droids/pif-builder.md`, model: GLM-5.3) automates the full build + install cycle. It kills any running instance, runs the build script, verifies the output, and installs to `/Applications/`.
+
+Invoke it by asking: "build pif", "rebuild pif", or "update pif to the latest version".
+
+### What gets bundled
+
+```
+pif.app/Contents/
+  MacOS/pif              ← Flutter native binary
+  Resources/
+    pi/node              ← Node.js runtime
+    pi/cli/              ← pi CLI package
+    pi/extensions/       ← pif.ts + pif-shared.ts
+    app/                 ← Flutter app source (widget scanning)
+```
+
+On launch, the app shows a project picker. Select a folder and pif spawns pi with `PIF_AUTOSTART=1 PIF_NO_FLUTTER=1` — the pif extension auto-starts the hub, and the app connects via WebSocket.
 
 ## Communication discipline
 - Communicate clearly, concisely, and in plain language.
