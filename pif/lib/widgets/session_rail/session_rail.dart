@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../../core/plugin.dart';
+import '../model_manager/model_manager.dart';
 
 class SessionRailPlugin implements PifWidgetPlugin {
   @override
@@ -144,6 +145,11 @@ class _SessionRailState extends State<_SessionRail> {
                   ),
                 ),
                 const Spacer(),
+                IconButton(
+                  onPressed: () => showModelManagerDialog(context, widget.host),
+                  tooltip: 'Model Manager',
+                  icon: const Icon(Icons.tune, size: 18),
+                ),
                 IconButton(
                   onPressed: create,
                   tooltip: 'New session',

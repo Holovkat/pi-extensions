@@ -78,6 +78,9 @@ class _DockingShellState extends State<DockingShell>
       host.models = List<String>.from(
         (snapshot['models'] as List?)?.map((e) => e as String) ?? const [],
       );
+      host.modelProviders = Map<String, dynamic>.from(
+        (snapshot['modelProviders'] as Map?) ?? {},
+      );
       host.sessions.applySnapshot(
         Map<String, dynamic>.from(snapshot['sessions'] as Map? ?? {}),
       );

@@ -32,6 +32,7 @@ interface HubState {
 	catalog: Record<string, WidgetRecord>;
 	layout: Record<string, unknown>;
 	models: string[];
+	modelProviders: Record<string, any>;
 	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number };
 }
 
@@ -113,6 +114,7 @@ class FlutterSupervisor {
 class PifHub {
 	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string;
 	readonly state: HubState;
+	readonly modelsPath: string;
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
@@ -123,13 +125,15 @@ class PifHub {
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
+		this.modelsPath = path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
 		try { this.state.models = (this.ctx as any).modelRegistry?.getAvailable?.().map((m: any) => `${m.provider}/${m.id}`) ?? []; } catch { this.state.models = []; }
+		this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
 		this.createHostSession(); await this.startWebSocket(); await this.startControl();
@@ -180,6 +184,7 @@ class PifHub {
 			if (env.channel.startsWith("session/")) await this.sessionAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
+			else if (env.channel.startsWith("models/")) await this.modelsAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("shell/")) await this.layoutAction(env.type, env.payload as any);
 		} catch (error) { peer.send(createEnvelope("shell/error", "action_failed", { requestId: env.id, error: String((error as Error).message) })); }
 	}
@@ -268,6 +273,13 @@ class PifHub {
 		for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
 	}
 	private generateRegistry() { const manifests = Object.values(this.state.widgets).filter((record) => record.enabled); fs.writeFileSync(this.widgetRoots().registry, generateWidgetRegistry(manifests)); }
+	private readModelsConfig(): Record<string, any> { try { return JSON.parse(fs.readFileSync(this.modelsPath, "utf8")).providers ?? {}; } catch { return {}; } }
+	private refreshModels() { try { this.state.models = (this.ctx as any).modelRegistry?.getAvailable?.().map((m: any) => `${m.provider}/${m.id}`) ?? []; } catch { this.state.models = []; } this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
+	private async modelsAction(type: string, payload: any) {
+		if (type === "save") { const data = { providers: payload.providers ?? {} }; fs.writeFileSync(this.modelsPath, JSON.stringify(data, null, 2) + "\n"); this.refreshModels(); return { ok: true, models: this.state.models }; }
+		if (type === "refresh") { this.refreshModels(); return { models: this.state.models }; }
+		throw new Error(`Unknown models action: ${type}`);
+	}
 	createWidget(params: any) {
 		const id = String(params.id ?? ""); if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("id must be lowercase snake_case");
 		const root = this.widgetRoots().widgets; const dir = assertSafeWidgetPath(root, path.join(root, id)); if (fs.existsSync(dir)) throw new Error(`Widget already exists: ${id}`); fs.mkdirSync(dir, { recursive: false });
@@ -312,7 +324,7 @@ class PifHub {
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
 			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
-			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params);
+			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
 			default: throw new Error(`Unknown pif control method: ${method}`);
 		}
 	}

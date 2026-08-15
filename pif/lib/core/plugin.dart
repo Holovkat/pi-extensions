@@ -222,5 +222,6 @@ class PifHost {
   String activeSessionId = 'host';
   String workspace = '';
   List<String> models = const [];
+  Map<String, dynamic> modelProviders = {};
   Map<String, dynamic> snapshot = {};
 }
