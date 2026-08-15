@@ -110,12 +110,14 @@ class PiLauncher {
     final extension = _findExtension();
     final appDir = _findAppDir();
 
-    // Build the command: either "node cli.js -e ext" or "pi -e ext"
+    // Build the command: either "node cli.js --mode rpc -e ext" or "pi --mode rpc -e ext"
+    // --mode rpc is required so pi doesn't exit when stdin isn't a TTY.
+    // The Flutter app keeps stdin open (Process.start pipes) so pi stays alive.
     final List<String> cmd;
     if (piCli.isNotEmpty) {
-      cmd = [nodeBin, piCli, '-e', extension];
+      cmd = [nodeBin, piCli, '--mode', 'rpc', '-e', extension];
     } else {
-      cmd = ['pi', '-e', extension];
+      cmd = ['pi', '--mode', 'rpc', '-e', extension];
     }
 
     final env = {
