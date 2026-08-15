@@ -132,8 +132,7 @@ class PifHub {
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
-		try { this.state.models = (this.ctx as any).modelRegistry?.getAvailable?.().map((m: any) => `${m.provider}/${m.id}`) ?? []; } catch { this.state.models = []; }
-		this.state.modelProviders = this.readModelsConfig();
+		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
 		this.createHostSession(); await this.startWebSocket(); await this.startControl();
@@ -274,7 +273,14 @@ class PifHub {
 	}
 	private generateRegistry() { const manifests = Object.values(this.state.widgets).filter((record) => record.enabled); fs.writeFileSync(this.widgetRoots().registry, generateWidgetRegistry(manifests)); }
 	private readModelsConfig(): Record<string, any> { try { return JSON.parse(fs.readFileSync(this.modelsPath, "utf8")).providers ?? {}; } catch { return {}; } }
-	private refreshModels() { try { this.state.models = (this.ctx as any).modelRegistry?.getAvailable?.().map((m: any) => `${m.provider}/${m.id}`) ?? []; } catch { this.state.models = []; } this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
+	private readModelsList(): string[] {
+		const models = new Set<string>();
+		try { for (const m of ((this.ctx as any).modelRegistry?.getAvailable?.() ?? [])) models.add(`${m.provider}/${m.id}`); } catch {}
+		try { const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8")); for (const m of (settings.enabledModels ?? [])) models.add(m); } catch {}
+		try { const providers = this.readModelsConfig(); for (const [provider, config] of Object.entries(providers)) { for (const m of ((config as any).models ?? [])) models.add(`${provider}/${m.id}`); } } catch {}
+		return [...models].sort();
+	}
+	private refreshModels() { this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
 	private async modelsAction(type: string, payload: any) {
 		if (type === "save") { const data = { providers: payload.providers ?? {} }; fs.writeFileSync(this.modelsPath, JSON.stringify(data, null, 2) + "\n"); this.refreshModels(); return { ok: true, models: this.state.models }; }
 		if (type === "refresh") { this.refreshModels(); return { models: this.state.models }; }
