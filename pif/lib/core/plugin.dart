@@ -221,5 +221,6 @@ class PifHost {
   final PifTheme theme;
   String activeSessionId = 'host';
   String workspace = '';
+  List<String> models = const [];
   Map<String, dynamic> snapshot = {};
 }

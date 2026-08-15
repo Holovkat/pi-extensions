@@ -27,9 +27,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
   final controller = TextEditingController();
   final scroll = ScrollController();
   late StreamSubscription subscription;
-  final eventsBySession = <String, List<Map<String, dynamic>>>{};
+  final entriesBySession = <String, List<Map<String, dynamic>>>{};
   final runningBySession = <String, bool>{};
-  List<Map<String, dynamic>> get events => eventsBySession.putIfAbsent(
+  List<Map<String, dynamic>> get entries => entriesBySession.putIfAbsent(
     widget.host.activeSessionId,
     () => <Map<String, dynamic>>[],
   );
@@ -57,23 +57,91 @@ class _AgentConsoleState extends State<_AgentConsole> {
   void _hydrate(List<PifSession> sessions) {
     for (final session in sessions) {
       runningBySession[session.id] = session.state == 'running';
-      eventsBySession[session.id] = session.transcript.whereType<Map>().map((
-        entry,
-      ) {
-        final value = Map<String, dynamic>.from(entry);
-        final event = value['payload'] ?? value;
-        return <String, dynamic>{
-          'type': value['type'] as String? ?? 'event',
-          'payload': <String, dynamic>{'sessionId': session.id, 'event': event},
-        };
-      }).toList();
+      entriesBySession[session.id] = _buildEntries(session.transcript);
     }
-    eventsBySession.removeWhere(
+    entriesBySession.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
     );
     runningBySession.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
     );
+  }
+
+  List<Map<String, dynamic>> _buildEntries(List<dynamic> transcript) {
+    final entries = <Map<String, dynamic>>[];
+    for (final raw in transcript) {
+      if (raw is! Map) continue;
+      final event = Map<String, dynamic>.from(raw);
+      final type = event['type'] as String? ?? 'event';
+      final data = event['payload'] is Map
+          ? event['payload'] as Map<String, dynamic>
+          : event;
+
+      if (type == 'input') {
+        entries.add({
+          'kind': 'user',
+          'text': data['content'] ?? event['content'] ?? '',
+        });
+      } else if (type == 'message_update' || type == 'message_start') {
+        final delta = _extractDelta(data);
+        if (delta != null && delta.isNotEmpty) {
+          if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
+            entries.last['text'] = '${entries.last['text']}$delta';
+          } else {
+            entries.add({'kind': 'assistant', 'text': delta});
+          }
+        }
+      } else if (type == 'message_end' || type == 'message') {
+        final text = _extractFullText(data);
+        if (text != null && text.isNotEmpty) {
+          if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
+            entries.last['text'] = text;
+          } else {
+            entries.add({'kind': 'assistant', 'text': text});
+          }
+        }
+      } else if (type.contains('tool')) {
+        entries.add({
+          'kind': 'tool',
+          'name': data['toolName'] ?? data['name'] ?? type,
+          'status': type.contains('end') ? 'done' : 'running',
+          'detail': data['args'] ?? data['result'] ?? '',
+        });
+      } else if (type == 'agent_start') {
+        entries.add({'kind': 'status', 'text': 'Agent started'});
+      } else if (type == 'agent_end') {
+        entries.add({'kind': 'status', 'text': 'Agent finished'});
+      } else if (type == 'stderr' || type == 'output') {
+        final text = data['data']?.toString() ?? '';
+        if (text.trim().isNotEmpty) {
+          entries.add({'kind': 'raw', 'text': text.trim()});
+        }
+      }
+    }
+    return entries;
+  }
+
+  String? _extractDelta(Map<String, dynamic> data) {
+    if (data['delta'] is String) return data['delta'] as String;
+    final ame = data['assistantMessageEvent'];
+    if (ame is Map && ame['delta'] is String) return ame['delta'] as String;
+    final msg = data['message'];
+    if (msg is Map) {
+      final content = msg['content'];
+      if (content is List) {
+        return content
+            .whereType<Map>()
+            .where((c) => c['type'] == 'text')
+            .map((c) => c['text'] as String? ?? '')
+            .join();
+      }
+    }
+    return null;
+  }
+
+  String? _extractFullText(Map<String, dynamic> data) {
+    if (data['text'] is String) return data['text'] as String;
+    return _extractDelta(data);
   }
 
   @override
@@ -91,10 +159,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
         ? widget.host.sessions.steer(widget.host.activeSessionId, value)
         : widget.host.sessions.input(widget.host.activeSessionId, value);
     setState(() {
-      events.add({
-        'type': 'input',
-        'payload': {'content': value},
-      });
+      entries.add({'kind': 'user', 'text': value});
       controller.clear();
     });
   }
@@ -111,7 +176,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
           padding: const EdgeInsets.symmetric(horizontal: 14),
           decoration: BoxDecoration(
             color: widget.host.theme.panelRaised,
-            border: Border(bottom: BorderSide(color: widget.host.theme.border)),
+            border: Border(
+              bottom: BorderSide(color: widget.host.theme.border),
+            ),
           ),
           child: Row(
             children: [
@@ -144,7 +211,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
               children: widget.host.sessions.current
                   .map(
                     (session) => TextButton(
-                      onPressed: () => widget.host.sessions.select(session.id),
+                      onPressed: () =>
+                          widget.host.sessions.select(session.id),
                       style: TextButton.styleFrom(
                         backgroundColor:
                             session.id == widget.host.activeSessionId
@@ -158,20 +226,23 @@ class _AgentConsoleState extends State<_AgentConsole> {
             ),
           ),
         Expanded(
-          child: events.isEmpty
+          child: entries.isEmpty
               ? const _ConsoleEmpty()
               : ListView.builder(
                   controller: scroll,
                   padding: const EdgeInsets.all(18),
-                  itemCount: events.length,
-                  itemBuilder: (_, index) => _EventCard(event: events[index]),
+                  itemCount: entries.length,
+                  itemBuilder: (_, index) =>
+                      _EntryCard(entry: entries[index]),
                 ),
         ),
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
             color: widget.host.theme.panelRaised,
-            border: Border(top: BorderSide(color: widget.host.theme.border)),
+            border: Border(
+              top: BorderSide(color: widget.host.theme.border),
+            ),
           ),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -198,7 +269,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
               const SizedBox(width: 8),
               IconButton.filled(
                 onPressed: submit,
-                icon: Icon(running ? Icons.turn_right : Icons.arrow_upward),
+                icon: Icon(
+                  running ? Icons.turn_right : Icons.arrow_upward,
+                ),
               ),
             ],
           ),
@@ -234,48 +307,129 @@ class _ConsoleEmpty extends StatelessWidget {
   );
 }
 
-class _EventCard extends StatelessWidget {
-  const _EventCard({required this.event});
-  final Map<String, dynamic> event;
+class _EntryCard extends StatelessWidget {
+  const _EntryCard({required this.entry});
+  final Map<String, dynamic> entry;
   @override
   Widget build(BuildContext context) {
-    final type = event['type'] as String;
-    final payload = event['payload'] as Map<String, dynamic>;
-    final data = payload['event'] ?? payload['content'] ?? payload;
-    final isTool = type.contains('tool');
-    final content = data is String
-        ? data
-        : data is Map && data['delta'] is String
-        ? data['delta'] as String
-        : data.toString();
+    final kind = entry['kind'] as String? ?? 'raw';
+    final text = entry['text'] as String? ?? '';
+
+    if (kind == 'user') {
+      return Align(
+        alignment: Alignment.centerRight,
+        child: Container(
+          margin: const EdgeInsets.only(bottom: 10, left: 40),
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xff222936),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: SelectableText(text),
+        ),
+      );
+    }
+
+    if (kind == 'assistant') {
+      return Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xff151922),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xff2c3547)),
+        ),
+        child: MarkdownBody(data: text),
+      );
+    }
+
+    if (kind == 'tool') {
+      final name = entry['name'] as String? ?? 'tool';
+      final status = entry['status'] as String? ?? 'running';
+      final detail = entry['detail'] as String? ?? '';
+      return Container(
+        margin: const EdgeInsets.only(bottom: 10),
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xff17241f),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: const Color(0xff315844)),
+        ),
+        child: ExpansionTile(
+          tilePadding: EdgeInsets.zero,
+          leading: Icon(
+            Icons.build_outlined,
+            size: 18,
+            color: status == 'done'
+                ? const Color(0xff78dba9)
+                : Colors.amber,
+          ),
+          title: Text(
+            name,
+            style: const TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          trailing: status == 'done'
+              ? const Icon(
+                  Icons.check_circle,
+                  size: 16,
+                  color: Color(0xff78dba9),
+                )
+              : const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+          children: [
+            SelectableText(
+              detail,
+              style: const TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 11,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (kind == 'status') {
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 6),
+        child: Row(
+          children: [
+            const Icon(Icons.circle, size: 6, color: Color(0xff78dba9)),
+            const SizedBox(width: 6),
+            Text(
+              text,
+              style: const TextStyle(
+                fontSize: 11,
+                color: Color(0xff8b96aa),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // raw
     return Container(
-      margin: const EdgeInsets.only(bottom: 10),
-      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: isTool
-            ? const Color(0xff17241f)
-            : type == 'input'
-            ? const Color(0xff222936)
-            : const Color(0xff151922),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(
-          color: isTool ? const Color(0xff315844) : const Color(0xff2c3547),
+        color: const Color(0xff10141c),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: SelectableText(
+        text,
+        style: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 11,
+          color: Color(0xff8b96aa),
         ),
       ),
-      child: isTool
-          ? ExpansionTile(
-              tilePadding: EdgeInsets.zero,
-              leading: const Icon(Icons.build_outlined, size: 18),
-              title: Text(
-                type,
-                style: const TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              children: [SelectableText(content)],
-            )
-          : MarkdownBody(data: content),
     );
   }
 }

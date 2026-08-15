@@ -6,12 +6,16 @@ import 'widgets/session_rail/session_rail.dart';
 import 'widgets/status_bar/status_bar.dart';
 import 'widgets/terminal/terminal.dart';
 import 'widgets/widget_store/widget_store.dart';
+import 'widgets/workspace_clock/workspace_clock.dart';
 
-final Map<String, PifWidgetPlugin Function()> pifWidgetFactories = {
-  'agent_console': () => AgentConsolePlugin(),
-  'diff_viewer': () => DiffViewerPlugin(),
-  'session_rail': () => SessionRailPlugin(),
-  'status_bar': () => StatusBarPlugin(),
-  'terminal': () => TerminalPlugin(),
-  'widget_store': () => WidgetStorePlugin(),
-};
+Map<String, PifWidgetPlugin Function()> pifWidgetFactories() {
+  return {
+    'agent_console': () => AgentConsolePlugin(),
+    'diff_viewer': () => DiffViewerPlugin(),
+    'session_rail': () => SessionRailPlugin(),
+    'status_bar': () => StatusBarPlugin(),
+    'terminal': () => TerminalPlugin(),
+    'widget_store': () => WidgetStorePlugin(),
+    'workspace_clock': () => WorkspaceClockPlugin(),
+  };
+}

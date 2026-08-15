@@ -29,6 +29,10 @@ class _DockingShellState extends State<DockingShell>
     'diff_viewer',
   };
   bool centerSplit = false;
+  Map<String, PifWidgetPlugin Function()> _factories = pifWidgetFactories();
+  void _refreshFactories() => _factories = pifWidgetFactories();
+  @override
+  void reassemble() { super.reassemble(); _refreshFactories(); }
 
   @override
   void initState() {
@@ -70,6 +74,9 @@ class _DockingShellState extends State<DockingShell>
           ((snapshot['health'] as Map?)?['workspace'] as String?) ??
           host.workspace;
       host.storage.workspace = host.workspace;
+      host.models = List<String>.from(
+        (snapshot['models'] as List?)?.map((e) => e as String) ?? const [],
+      );
       host.sessions.applySnapshot(
         Map<String, dynamic>.from(snapshot['sessions'] as Map? ?? {}),
       );
@@ -79,13 +86,14 @@ class _DockingShellState extends State<DockingShell>
       enabled = widgets.entries
           .where((entry) => (entry.value as Map)['enabled'] == true)
           .map((entry) => entry.key)
-          .where(pifWidgetFactories.containsKey)
+          .where(_factories.containsKey)
           .toSet();
       _applyLayout(Map<String, dynamic>.from(snapshot['layout'] as Map? ?? {}));
       if (mounted) setState(() {});
       return;
     }
     if (envelope.channel == 'widget/registry' && envelope.payload is Map) {
+      _refreshFactories();
       final widgets = Map<String, dynamic>.from(
         (envelope.payload as Map)['widgets'] as Map? ?? {},
       );
@@ -93,7 +101,7 @@ class _DockingShellState extends State<DockingShell>
       enabled = widgets.entries
           .where((entry) => (entry.value as Map)['enabled'] == true)
           .map((entry) => entry.key)
-          .where(pifWidgetFactories.containsKey)
+          .where(_factories.containsKey)
           .toSet();
       if (mounted) setState(() {});
     }
@@ -134,7 +142,7 @@ class _DockingShellState extends State<DockingShell>
   List<PifWidgetPlugin> inSlot(PifSlot slot) {
     final plugins = enabled
         .where((id) => !hiddenPanels.contains(id))
-        .map((id) => pifWidgetFactories[id]?.call())
+        .map((id) => _factories[id]?.call())
         .whereType<PifWidgetPlugin>()
         .where(
           (plugin) =>

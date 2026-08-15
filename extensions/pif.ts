@@ -31,6 +31,7 @@ interface HubState {
 	widgets: Record<string, WidgetRecord>;
 	catalog: Record<string, WidgetRecord>;
 	layout: Record<string, unknown>;
+	models: string[];
 	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number };
 }
 
@@ -117,14 +118,18 @@ class PifHub {
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
 	constructor(readonly pi: ExtensionAPI, readonly ctx: ExtensionContext, readonly workspace: string, readonly port: number) {
-		this.appDir = path.join(workspace, "pif"); this.pifDir = path.join(workspace, ".pi", "pif");
+		const globalApp = path.join(os.homedir(), ".pi", "pif", "app");
+		const localApp = path.join(workspace, "pif");
+		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
+		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
+		try { this.state.models = (this.ctx as any).modelRegistry?.getAvailable?.().map((m: any) => `${m.provider}/${m.id}`) ?? []; } catch { this.state.models = []; }
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
 		this.createHostSession(); await this.startWebSocket(); await this.startControl();
@@ -181,8 +186,24 @@ class PifHub {
 	hostEvent(type: string, payload: unknown) {
 		const host = this.state.sessions.host; if (!host) return;
 		if (type === "agent_start") host.state = "running"; if (type === "agent_end") host.state = "idle";
-		host.transcript.push({ type, payload, ts: new Date().toISOString() }); if (host.transcript.length > 2_000) host.transcript.shift();
-		this.broadcast("session/host", type, { sessionId: "host", state: host.state, event: payload });
+		const entry = this.normalizeEntry(type, payload); host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
+		this.broadcast("session/host", type, { sessionId: "host", state: host.state, event: entry });
+	}
+	private normalizeEntry(type: string, payload: any): Record<string, unknown> {
+		const p = payload ?? {};
+		if (type === "input") return { type: "input", content: String(p.content ?? p.prompt ?? "") };
+		if (type === "message_update" || type === "message_start" || type === "message" || type === "message_end") {
+			const delta = p.assistantMessageEvent?.delta ?? p.delta;
+			if (delta) return { type: "message_update", delta: String(delta) };
+			const content = p.message?.content;
+			if (Array.isArray(content)) { const text = content.filter((c: any) => c?.type === "text").map((c: any) => c?.text ?? "").join(""); if (text) return { type: "message", text }; }
+			if (typeof content === "string" && content) return { type: "message", text: content };
+			return { type: "message_update", delta: "" };
+		}
+		if (type.includes("tool")) return { type, toolName: String(p.toolName ?? p.name ?? "tool"), toolCallId: String(p.toolCallId ?? p.id ?? ""), args: p.args ? JSON.stringify(p.args).slice(0, 300) : undefined, result: p.result ? String(p.result).slice(0, 300) : undefined };
+		if (type === "agent_start" || type === "agent_end") return { type, state: type === "agent_start" ? "running" : "idle" };
+		if (type === "stderr" || type === "output") return { type, data: String(p.data ?? p).slice(0, 500) };
+		return { type, data: JSON.stringify(p).slice(0, 500) };
 	}
 	private async sessionAction(type: string, payload: any) {
 		if (type === "spawn") return this.spawnSession(payload);
@@ -220,7 +241,7 @@ class PifHub {
 	private childEvent(session: PifSession, line: string) {
 		let event: any; try { event = JSON.parse(line); } catch { event = { type: "output", data: line }; }
 		const kind = String(event.type ?? event.event ?? "event"); if (/start|delta|tool/.test(kind)) session.state = "running"; if (/agent_end|turn_end|result/.test(kind)) session.state = "idle"; if (/input_required/.test(kind)) session.state = "awaiting-input";
-		session.transcript.push(event); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event });
+		const entry = this.normalizeEntry(kind, event); session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
 	}
 	private loadLayout() { try { this.state.layout = JSON.parse(fs.readFileSync(this.layoutPath, "utf8")); } catch { this.state.layout = { panels: {} }; } }
 	private saveLayout() { fs.mkdirSync(path.dirname(this.layoutPath), { recursive: true }); fs.writeFileSync(this.layoutPath, JSON.stringify(this.state.layout, null, 2) + "\n"); }
@@ -242,7 +263,9 @@ class PifHub {
 	}
 	scanWidgets() {
 		const roots = this.widgetRoots(); const oldEnabled = new Set(Object.values(this.state.widgets).filter((w) => w.enabled).map((w) => w.id)); this.enabled = new Set([...this.enabled, ...oldEnabled]);
-		this.state.widgets = this.scanDirectory(roots.widgets, true); this.state.catalog = this.scanDirectory(roots.catalog, false); this.installed = new Set(Object.keys(this.state.widgets)); for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
+		this.state.widgets = this.scanDirectory(roots.widgets, true); this.state.catalog = this.scanDirectory(roots.catalog, false); this.installed = new Set(Object.keys(this.state.widgets));
+		for (const id of Object.keys(this.state.widgets)) delete this.state.catalog[id];
+		for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
 	}
 	private generateRegistry() { const manifests = Object.values(this.state.widgets).filter((record) => record.enabled); fs.writeFileSync(this.widgetRoots().registry, generateWidgetRegistry(manifests)); }
 	createWidget(params: any) {

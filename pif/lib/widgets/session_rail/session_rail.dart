@@ -39,54 +39,86 @@ class _SessionRailState extends State<_SessionRail> {
 
   Future<void> create() async {
     final cwd = TextEditingController(text: widget.host.workspace);
-    final model = TextEditingController();
     final prompt = TextEditingController();
+    final modelController = TextEditingController();
+    String? selectedModel;
     await showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('New session'),
-        content: SizedBox(
-          width: 420,
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: cwd,
-                decoration: const InputDecoration(
-                  labelText: 'Working directory',
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('New session'),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: cwd,
+                  decoration: const InputDecoration(
+                    labelText: 'Working directory',
+                  ),
                 ),
-              ),
-              TextField(
-                controller: model,
-                decoration: const InputDecoration(
-                  labelText: 'Model (optional)',
+                const SizedBox(height: 12),
+                if (widget.host.models.isNotEmpty)
+                  DropdownButtonFormField<String>(
+                    decoration: const InputDecoration(labelText: 'Model'),
+                    initialValue: selectedModel,
+                    items: [
+                      const DropdownMenuItem(
+                        value: '',
+                        child: Text('Default'),
+                      ),
+                      ...widget.host.models.map(
+                        (m) => DropdownMenuItem(
+                          value: m,
+                          child: Text(m.split('/').last),
+                        ),
+                      ),
+                    ],
+                    onChanged: (v) =>
+                        setDialogState(() => selectedModel = v),
+                  )
+                else
+                  TextField(
+                    controller: modelController,
+                    decoration: const InputDecoration(
+                      labelText: 'Model (optional)',
+                    ),
+                  ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: prompt,
+                  maxLines: 3,
+                  decoration: const InputDecoration(labelText: 'Prompt preset'),
                 ),
-              ),
-              TextField(
-                controller: prompt,
-                maxLines: 3,
-                decoration: const InputDecoration(labelText: 'Prompt preset'),
-              ),
-            ],
+              ],
+            ),
           ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final model = widget.host.models.isNotEmpty
+                    ? (selectedModel?.isEmpty ?? true
+                        ? null
+                        : selectedModel)
+                    : (modelController.text.isEmpty
+                        ? null
+                        : modelController.text);
+                widget.host.sessions.spawn(
+                  cwd: cwd.text,
+                  model: model,
+                  prompt: prompt.text.isEmpty ? null : prompt.text,
+                );
+                Navigator.pop(context);
+              },
+              child: const Text('Spawn'),
+            ),
+          ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () {
-              widget.host.sessions.spawn(
-                cwd: cwd.text,
-                model: model.text.isEmpty ? null : model.text,
-                prompt: prompt.text.isEmpty ? null : prompt.text,
-              );
-              Navigator.pop(context);
-            },
-            child: const Text('Spawn'),
-          ),
-        ],
       ),
     );
   }

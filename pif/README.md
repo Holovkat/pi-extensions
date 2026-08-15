@@ -28,3 +28,13 @@ flutter build macos --debug
 ```
 
 Widget source belongs in `lib/widgets/<id>/` with `widget.yaml`. Available but uninstalled source belongs in `catalog/`. The generated `lib/widget_registry.g.dart` is owned by the hub install pipeline.
+
+## Install globally
+
+To use pif as the host environment in any project:
+
+```bash
+./scripts/install-pif.sh
+```
+
+This copies the Flutter shell to `~/.pi/pif/app/` and the hub extension to `~/.pi/agent/extensions/`. After install, run `pi` in any project directory and type `/pif` to launch the shell with that project as the workspace. Widget installs and layout persist per-project in `.pi/pif/`.
