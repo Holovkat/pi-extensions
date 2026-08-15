@@ -7,8 +7,9 @@ import 'panel_error_boundary.dart';
 import 'plugin.dart';
 
 class DockingShell extends StatefulWidget {
-  const DockingShell({super.key, required this.bus});
+  const DockingShell({super.key, required this.bus, this.workspace});
   final PifBus bus;
+  final String? workspace;
   @override
   State<DockingShell> createState() => _DockingShellState();
 }
@@ -39,7 +40,7 @@ class _DockingShellState extends State<DockingShell>
     super.initState();
     host = PifHost(bus: widget.bus)
       ..workspace =
-          Platform.environment['PIF_WORKSPACE'] ?? Directory.current.path;
+          widget.workspace ?? Platform.environment['PIF_WORKSPACE'] ?? Directory.current.path;
     host.storage.workspace = host.workspace;
     events = widget.bus.events.listen(_event, onError: (_) {});
     widget.bus.connect();
