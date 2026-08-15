@@ -1,0 +1,8 @@
+id: agent_console
+name: "Agent Console"
+version: 0.1.0
+description: "Streaming conversations and live tool calls"
+slot: center
+core: true
+tags: [core, sessions]
+dart_dependencies: []

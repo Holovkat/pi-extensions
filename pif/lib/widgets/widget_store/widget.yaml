@@ -1,0 +1,8 @@
+id: widget_store
+name: "Widget Store"
+version: 0.1.0
+description: "Installed widgets and local catalog"
+slot: right
+core: true
+tags: [core, store]
+dart_dependencies: []

@@ -1,0 +1,8 @@
+id: session_rail
+name: "Session Rail"
+version: 0.1.0
+description: "Host and child session navigation"
+slot: left
+core: true
+tags: [core, sessions]
+dart_dependencies: []

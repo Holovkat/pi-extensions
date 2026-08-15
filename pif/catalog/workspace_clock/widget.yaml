@@ -1,0 +1,8 @@
+id: workspace_clock
+name: "Workspace Clock"
+version: 0.1.0
+description: "Example local-catalog clock widget"
+slot: right
+core: false
+tags: [example, catalog]
+dart_dependencies: []

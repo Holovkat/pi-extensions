@@ -21,7 +21,8 @@
   ],
   "scripts": {
     "build": "node scripts/build-council-package.mjs",
-    "test:council": "node --test extensions/coms.test.mjs scripts/council-server.test.mjs scripts/council-package-smoke.test.mjs"
+    "test:council": "node --test extensions/coms.test.mjs scripts/council-server.test.mjs scripts/council-package-smoke.test.mjs",
+    "test:pif": "node --test --test-concurrency=1 extensions/pif.test.mjs extensions/pif.integration.test.mjs && cd pif && dart analyze && flutter test"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

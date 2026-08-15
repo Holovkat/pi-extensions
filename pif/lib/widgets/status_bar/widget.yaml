@@ -1,0 +1,8 @@
+id: status_bar
+name: "Status Bar"
+version: 0.1.0
+description: "Hub, reload, model, token, and workspace status"
+slot: status
+core: true
+tags: [core, status]
+dart_dependencies: []
