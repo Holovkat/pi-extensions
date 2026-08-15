@@ -82,7 +82,7 @@ class _DiffViewerState extends State<_DiffViewer> {
               SizedBox(width: 8),
               Text(
                 'Diff Viewer',
-                style: TextStyle(fontWeight: FontWeight.w600),
+                style: TextStyle(fontWeight: FontWeight.w300),
               ),
               Spacer(),
               Text(

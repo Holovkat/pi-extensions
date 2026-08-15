@@ -69,7 +69,7 @@ class _StoreState extends State<_Store> {
         const Text(
           'WIDGET STORE',
           style: TextStyle(
-            fontWeight: FontWeight.w700,
+            fontWeight: FontWeight.w300,
             letterSpacing: 1,
             fontSize: 12,
           ),
@@ -104,7 +104,7 @@ class _StoreState extends State<_Store> {
       style: const TextStyle(
         color: Color(0xff8b96aa),
         fontSize: 11,
-        fontWeight: FontWeight.w600,
+        fontWeight: FontWeight.w300,
       ),
     ),
   );
@@ -119,7 +119,7 @@ class _StoreState extends State<_Store> {
               children: [
                 Text(
                   '${item['name'] ?? id}',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
+                  style: const TextStyle(fontWeight: FontWeight.w300),
                 ),
                 Text(
                   '${item['description'] ?? ''}',

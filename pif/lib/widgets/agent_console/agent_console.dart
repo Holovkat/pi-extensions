@@ -190,16 +190,68 @@ class _AgentConsoleState extends State<_AgentConsole> {
               const SizedBox(width: 8),
               Text(
                 selected?.name ?? 'Host session',
-                style: const TextStyle(fontWeight: FontWeight.w600),
+                style: const TextStyle(fontWeight: FontWeight.w300),
               ),
               const Spacer(),
-              if (running)
+              // On-the-fly model selector
+              SizedBox(
+                width: 140,
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    isDense: true,
+                    iconSize: 14,
+                    style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                    value: (selected != null &&
+                            selected.model.isNotEmpty &&
+                            widget.host.models.contains(selected.model)
+                        ? selected.model
+                        : null),
+                    hint: const Text('Default', style: TextStyle(fontSize: 11, color: Color(0xff69758a))),
+                    items: [
+                      const DropdownMenuItem(value: '', child: Text('Default')),
+                      ...widget.host.models.map(
+                        (m) => DropdownMenuItem(
+                          value: m,
+                          child: Text(m.split('/').last),
+                        ),
+                      ),
+                    ],
+                    onChanged: (v) => widget.host.sessions
+                        .setModel(widget.host.activeSessionId, v ?? ''),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              // On-the-fly thinking selector
+              SizedBox(
+                width: 90,
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    isDense: true,
+                    iconSize: 14,
+                    style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                    value: selected?.thinking ?? 'medium',
+                    items: const [
+                      DropdownMenuItem(value: 'none', child: Text('None')),
+                      DropdownMenuItem(value: 'low', child: Text('Low')),
+                      DropdownMenuItem(value: 'medium', child: Text('Medium')),
+                      DropdownMenuItem(value: 'high', child: Text('High')),
+                      DropdownMenuItem(value: 'max', child: Text('Max')),
+                    ],
+                    onChanged: (v) => widget.host.sessions
+                        .setThinking(widget.host.activeSessionId, v ?? 'medium'),
+                  ),
+                ),
+              ),
+              if (running) ...[
+                const SizedBox(width: 8),
                 TextButton.icon(
                   onPressed: () =>
                       widget.host.sessions.abort(widget.host.activeSessionId),
                   icon: const Icon(Icons.stop_circle_outlined, size: 16),
                   label: const Text('Abort'),
                 ),
+              ],
             ],
           ),
         ),
@@ -294,7 +346,7 @@ class _ConsoleEmpty extends StatelessWidget {
           SizedBox(height: 12),
           Text(
             'Build the workspace with Pi',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.w300),
           ),
           SizedBox(height: 4),
           Text(
@@ -368,7 +420,7 @@ class _EntryCard extends StatelessWidget {
             name,
             style: const TextStyle(
               fontSize: 13,
-              fontWeight: FontWeight.w600,
+              fontWeight: FontWeight.w300,
             ),
           ),
           trailing: status == 'done'

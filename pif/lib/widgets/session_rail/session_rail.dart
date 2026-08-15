@@ -41,8 +41,8 @@ class _SessionRailState extends State<_SessionRail> {
   Future<void> create() async {
     final cwd = TextEditingController(text: widget.host.workspace);
     final prompt = TextEditingController();
-    final modelController = TextEditingController();
     String? selectedModel;
+    String selectedThinking = 'medium';
     await showDialog<void>(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -60,32 +60,35 @@ class _SessionRailState extends State<_SessionRail> {
                   ),
                 ),
                 const SizedBox(height: 12),
-                if (widget.host.models.isNotEmpty)
-                  DropdownButtonFormField<String>(
-                    decoration: const InputDecoration(labelText: 'Model'),
-                    initialValue: selectedModel,
-                    items: [
-                      const DropdownMenuItem(
-                        value: '',
-                        child: Text('Default'),
+                DropdownButtonFormField<String>(
+                  decoration: const InputDecoration(labelText: 'Model'),
+                  initialValue: selectedModel,
+                  items: [
+                    const DropdownMenuItem(value: '', child: Text('Default')),
+                    ...widget.host.models.map(
+                      (m) => DropdownMenuItem(
+                        value: m,
+                        child: Text(m.split('/').last),
                       ),
-                      ...widget.host.models.map(
-                        (m) => DropdownMenuItem(
-                          value: m,
-                          child: Text(m.split('/').last),
-                        ),
-                      ),
-                    ],
-                    onChanged: (v) =>
-                        setDialogState(() => selectedModel = v),
-                  )
-                else
-                  TextField(
-                    controller: modelController,
-                    decoration: const InputDecoration(
-                      labelText: 'Model (optional)',
                     ),
+                  ],
+                  onChanged: (v) => setDialogState(() => selectedModel = v),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  decoration: const InputDecoration(labelText: 'Thinking'),
+                  initialValue: selectedThinking,
+                  items: const [
+                    DropdownMenuItem(value: 'none', child: Text('None')),
+                    DropdownMenuItem(value: 'low', child: Text('Low')),
+                    DropdownMenuItem(value: 'medium', child: Text('Medium')),
+                    DropdownMenuItem(value: 'high', child: Text('High')),
+                    DropdownMenuItem(value: 'max', child: Text('Max')),
+                  ],
+                  onChanged: (v) => setDialogState(
+                    () => selectedThinking = v ?? 'medium',
                   ),
+                ),
                 const SizedBox(height: 12),
                 TextField(
                   controller: prompt,
@@ -102,16 +105,12 @@ class _SessionRailState extends State<_SessionRail> {
             ),
             FilledButton(
               onPressed: () {
-                final model = widget.host.models.isNotEmpty
-                    ? (selectedModel?.isEmpty ?? true
-                        ? null
-                        : selectedModel)
-                    : (modelController.text.isEmpty
-                        ? null
-                        : modelController.text);
                 widget.host.sessions.spawn(
                   cwd: cwd.text,
-                  model: model,
+                  model: selectedModel?.isEmpty == true
+                      ? null
+                      : selectedModel,
+                  thinking: selectedThinking,
                   prompt: prompt.text.isEmpty ? null : prompt.text,
                 );
                 Navigator.pop(context);
@@ -139,7 +138,7 @@ class _SessionRailState extends State<_SessionRail> {
                   'SESSIONS',
                   style: TextStyle(
                     fontSize: 11,
-                    fontWeight: FontWeight.w700,
+                    fontWeight: FontWeight.w300,
                     letterSpacing: 1.2,
                     color: Color(0xff8b96aa),
                   ),

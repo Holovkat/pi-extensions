@@ -216,7 +216,7 @@ class _DockingShellState extends State<DockingShell>
       children: [
         const Text(
           'pif',
-          style: TextStyle(fontWeight: FontWeight.w800, letterSpacing: 1),
+          style: TextStyle(fontWeight: FontWeight.w300, letterSpacing: 1),
         ),
         const SizedBox(width: 10),
         const Text(
@@ -354,7 +354,7 @@ class _DockingShellState extends State<DockingShell>
           const SizedBox(width: 5),
           Text(
             plugin.meta.name,
-            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
           ),
           const Spacer(),
           if (!plugin.meta.core)

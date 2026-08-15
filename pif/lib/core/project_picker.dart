@@ -105,7 +105,7 @@ class _ProjectPickerState extends State<ProjectPicker> {
           'pif',
           style: TextStyle(
             fontSize: 32,
-            fontWeight: FontWeight.w800,
+            fontWeight: FontWeight.w300,
             letterSpacing: 1,
           ),
         ),
@@ -138,7 +138,7 @@ class _ProjectPickerState extends State<ProjectPicker> {
             'Recent Projects',
             style: TextStyle(
               fontSize: 12,
-              fontWeight: FontWeight.w600,
+              fontWeight: FontWeight.w300,
               color: Color(0xff69758a),
             ),
           ),

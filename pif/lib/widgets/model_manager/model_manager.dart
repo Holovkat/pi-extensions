@@ -106,7 +106,7 @@ class _ModelManagerDialogState extends State<_ModelManagerDialog> {
               'AVAILABLE MODELS',
               style: TextStyle(
                 fontSize: 11,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w300,
                 letterSpacing: 1.2,
                 color: Color(0xff8b96aa),
               ),
@@ -143,7 +143,7 @@ class _ModelManagerDialogState extends State<_ModelManagerDialog> {
               'CUSTOM PROVIDERS',
               style: TextStyle(
                 fontSize: 11,
-                fontWeight: FontWeight.w700,
+                fontWeight: FontWeight.w300,
                 letterSpacing: 1.2,
                 color: Color(0xff8b96aa),
               ),
@@ -204,7 +204,7 @@ class _ModelManagerDialogState extends State<_ModelManagerDialog> {
       color: const Color(0xff1a1f2a),
       margin: const EdgeInsets.only(bottom: 8),
       child: ExpansionTile(
-        title: Text(name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+        title: Text(name, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w300)),
         subtitle: Text(
           '${provider['api'] ?? 'unknown'} · ${models.length} model${models.length == 1 ? '' : 's'}',
           style: const TextStyle(fontSize: 11, color: Color(0xff69758a)),
@@ -263,7 +263,7 @@ class _ModelManagerDialogState extends State<_ModelManagerDialog> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('New Provider', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+            const Text('New Provider', style: TextStyle(fontSize: 13, fontWeight: FontWeight.w300)),
             const SizedBox(height: 12),
             TextField(
               controller: _newProviderName,

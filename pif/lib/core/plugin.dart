@@ -33,6 +33,7 @@ class PifSession {
     required this.host,
     required this.state,
     required this.model,
+    required this.thinking,
     required this.cwd,
     this.transcript = const [],
   });
@@ -41,6 +42,7 @@ class PifSession {
   final bool host;
   final String state;
   final String model;
+  final String thinking;
   final String cwd;
   final List<dynamic> transcript;
 
@@ -50,6 +52,7 @@ class PifSession {
     host: json['host'] as bool? ?? false,
     state: json['state'] as String? ?? 'idle',
     model: json['model'] as String? ?? 'default',
+    thinking: json['thinking'] as String? ?? 'medium',
     cwd: json['cwd'] as String? ?? '',
     transcript: json['transcript'] as List<dynamic>? ?? const [],
   );
@@ -120,10 +123,10 @@ class PifSessions {
     _state.add(current);
   }
 
-  void spawn({required String cwd, String? model, String? prompt}) => bus.send(
+  void spawn({required String cwd, String? model, String? thinking, String? prompt}) => bus.send(
     'session/control',
     'spawn',
-    {'cwd': cwd, 'model': model, 'prompt': prompt},
+    {'cwd': cwd, 'model': model, 'thinking': thinking, 'prompt': prompt},
   );
   void input(String sessionId, String content) => bus.send(
     'session/control',
@@ -139,6 +142,16 @@ class PifSessions {
       bus.send('session/control', 'abort', {'sessionId': sessionId});
   void select(String sessionId) =>
       bus.send('session/control', 'select', {'sessionId': sessionId});
+  void setModel(String sessionId, String model) => bus.send(
+    'session/control',
+    'setModel',
+    {'sessionId': sessionId, 'model': model},
+  );
+  void setThinking(String sessionId, String thinking) => bus.send(
+    'session/control',
+    'setThinking',
+    {'sessionId': sessionId, 'thinking': thinking},
+  );
 }
 
 class PifLayout {

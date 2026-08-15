@@ -22,7 +22,7 @@ import {
 
 type SessionState = "idle" | "running" | "awaiting-input" | "ended";
 interface PifSession {
-	id: string; name: string; host: boolean; state: SessionState; model: string;
+	id: string; name: string; host: boolean; state: SessionState; model: string; thinking: string;
 	cwd: string; transcript: unknown[]; sessionFile?: string; exit?: { code: number | null; signal: string | null };
 }
 interface WidgetRecord extends PifWidgetManifest { enabled: boolean; installed: boolean; }
@@ -148,7 +148,7 @@ class PifHub {
 	}
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
-		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: (this.ctx as any).model?.id ?? "host", cwd: this.workspace, transcript: [] };
+		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: (this.ctx as any).model?.id ?? "host", thinking: (this.ctx as any).thinkingLevel ?? "medium", cwd: this.workspace, transcript: [] };
 	}
 	private startWebSocket() {
 		return new Promise<void>((resolve, reject) => {
@@ -217,6 +217,14 @@ class PifHub {
 			this.broadcast("session/selection", "selected", { sessionId: id });
 			return this.state.sessions[id];
 		}
+		if (type === "setModel") {
+			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
+			session.model = String(payload.model ?? ""); this.broadcast("session/state", "updated", session); return session;
+		}
+		if (type === "setThinking") {
+			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
+			session.thinking = String(payload.thinking ?? "medium"); this.broadcast("session/state", "updated", session); return session;
+		}
 		if (id === "host") {
 			if (type === "abort") return (this.ctx as any).abort?.();
 			const content = String(payload.content ?? payload.prompt ?? ""); if (!content) throw new Error("Session content is required");
@@ -233,9 +241,9 @@ class PifHub {
 		const id = `session_${crypto.randomUUID().slice(0, 8)}`; const sessionsDir = path.join(this.pifDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
 		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); const cwd = path.resolve(payload.cwd || this.workspace);
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
-		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (payload.model) args.push("--model", String(payload.model));
+		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (payload.model) args.push("--model", String(payload.model)); if (payload.thinking && payload.thinking !== "none") args.push("--thinking", String(payload.thinking));
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
-		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: payload.model || "default", cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
+		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: payload.model || "default", thinking: payload.thinking || "medium", cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
 		child.on("exit", (code, signal) => { this.children.delete(id); session.state = "ended"; session.exit = { code, signal }; this.broadcast("session/state", "ended", session); });
