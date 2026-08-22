@@ -295,9 +295,7 @@ class _DockingShellState extends State<DockingShell>
                 child: TabBar(
                   isScrollable: true,
                   tabAlignment: TabAlignment.start,
-                  tabs: plugins
-                      .map((plugin) => Tab(text: plugin.meta.name))
-                      .toList(),
+                  tabs: plugins.map(_draggableTab).toList(),
                 ),
               ),
             Expanded(
@@ -310,6 +308,40 @@ class _DockingShellState extends State<DockingShell>
           ],
         ),
       );
+
+  /// Tabbed panels have no panel-header chrome, so the tab itself is the
+  /// drag affordance for moving the widget to another slot.
+  Widget _draggableTab(PifWidgetPlugin plugin) => Draggable<String>(
+    data: plugin.meta.id,
+    feedback: Material(
+      color: Colors.transparent,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xff273143),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Text(
+          plugin.meta.name,
+          style: const TextStyle(fontSize: 12, color: Colors.white),
+        ),
+      ),
+    ),
+    childWhenDragging: Opacity(
+      opacity: 0.4,
+      child: _tabLabel(plugin.meta.name),
+    ),
+    child: _tabLabel(plugin.meta.name),
+  );
+
+  Widget _tabLabel(String name) => Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+      const Icon(Icons.drag_indicator, size: 12, color: Color(0xff69758a)),
+      const SizedBox(width: 4),
+      Text(name),
+    ],
+  );
 
   Widget _panel(PifWidgetPlugin plugin, {bool chrome = true}) => Container(
     color: host.theme.panel,

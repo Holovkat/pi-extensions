@@ -80,14 +80,21 @@ class _DiffViewerState extends State<_DiffViewer> {
             children: [
               Icon(Icons.difference_outlined, size: 18),
               SizedBox(width: 8),
-              Text(
-                'Diff Viewer',
-                style: TextStyle(fontWeight: FontWeight.w300),
+              Flexible(
+                child: Text(
+                  'Diff Viewer',
+                  style: TextStyle(fontWeight: FontWeight.w300),
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
-              Spacer(),
-              Text(
-                'Phase 1 dogfood',
-                style: TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+              SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'Phase 1 dogfood',
+                  style: TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.right,
+                ),
               ),
             ],
           ),

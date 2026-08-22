@@ -32,7 +32,7 @@ class MockHubBus extends PifBus {
   @override
   void send(String channel, String type, Object? payload) =>
       sent.add('$channel:$type');
-  void emitSnapshot() => eventController.add(
+  void emitSnapshot({Map<String, dynamic>? widgets, Map<String, dynamic>? layout}) => eventController.add(
     PifEnvelope(
       v: 1,
       id: 'snapshot',
@@ -50,14 +50,16 @@ class MockHubBus extends PifBus {
             'cwd': '/tmp',
           },
         },
-        'widgets': {
-          'agent_console': {'enabled': true},
-          'session_rail': {'enabled': true},
-          'widget_store': {'enabled': true},
-          'status_bar': {'enabled': true},
-        },
+        'widgets':
+            widgets ??
+            {
+              'agent_console': {'enabled': true},
+              'session_rail': {'enabled': true},
+              'widget_store': {'enabled': true},
+              'status_bar': {'enabled': true},
+            },
         'catalog': {},
-        'layout': {'panels': {}},
+        'layout': layout ?? {'panels': {}},
         'health': {'workspace': '/tmp'},
       },
     ),
@@ -188,6 +190,40 @@ void main() {
 
     await bus.dispose();
     await server.kill();
+  });
+
+  testWidgets('tabbed panels drag into empty slots', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    bus.emitSnapshot(
+      widgets: {
+        'agent_console': {'enabled': true},
+        'diff_viewer': {'enabled': true},
+        'session_rail': {'enabled': true},
+        'terminal': {'enabled': true},
+        'widget_store': {'enabled': true},
+        'status_bar': {'enabled': true},
+      },
+      layout: {
+        'panels': {'session_rail': {'open': false, 'action': 'close'}},
+      },
+    );
+    await tester.pumpAndSettle();
+    // Center holds Agent Console + Diff Viewer as tabs; left dock is empty.
+    expect(find.text('Diff Viewer'), findsOneWidget);
+    expect(find.text('Drop widget in left'), findsOneWidget);
+
+    final tab = find.text('Diff Viewer');
+    final target = find.text('Drop widget in left');
+    await tester.drag(tab, tester.getCenter(target) - tester.getCenter(tab));
+    await tester.pumpAndSettle();
+
+    expect(bus.sent, contains('shell/layout:move'));
+    expect(find.text('Drop widget in left'), findsNothing,
+        reason: 'Diff Viewer should now occupy the left dock');
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
   });
 
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
