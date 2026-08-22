@@ -29,6 +29,7 @@ aliases; they are not Markdown command files.
 | ----- | ----------- |
 | `/sanity-check` | Verify app loads without errors |
 | `/code-review` | Get a second agent review on recent changes |
+| `/end-session-checks` | Run sanity check + code review before ending a session (distinct from the `/end-session` command) |
 
 ### Worktree Session Backend
 
@@ -46,11 +47,8 @@ aliases; they are not Markdown command files.
 
 | Skill | Description |
 | ----- | ----------- |
-| `worktree-toolkit-init` | Audit and update project-specific worktree lifecycle tooling |
-| `worktree-session-lifecycle` | Operate the start/end session lifecycle through the backend scripts |
 | `plan-review` | Review planning artifacts against Q&A/intake before build approval |
 | `release-assess` | Infer release intent/confidence and route active vectors to specialists |
-| `vibe-fix` | Handle small observed behavior fixes with live verification |
 
 ### Worktree Guidance
 
@@ -305,6 +303,7 @@ With agent-aware hook aliases enabled, you may also see:
 
 - `/sanity-check` - Verify app loads without errors
 - `/code-review` - Get second agent review on changes
+- `/end-session-checks` - Run sanity check and code review before ending a session
 
 To verify hooks are active:
 
@@ -351,13 +350,7 @@ your-project/
 │   ├── README.md
 │   ├── plan-review/
 │   │   └── SKILL.md
-│   ├── release-assess/
-│   │   └── SKILL.md
-│   ├── vibe-fix/
-│   │   └── SKILL.md
-│   ├── worktree-toolkit-init/
-│   │   └── SKILL.md
-│   └── worktree-session-lifecycle/
+│   └── release-assess/
 │       └── SKILL.md
 ├── .worktrees/
 │   ├── .gitignore

@@ -64,9 +64,9 @@
       "command": "\"${WORKFLOW_PROJECT_DIR:-${FACTORY_PROJECT_DIR:-$PWD}}\"/hooks/code-review-checkpoint.sh",
       "description": "Get a second agent review on recent changes"
     },
-    "end-session": {
+    "end-session-checks": {
       "command": "\"${WORKFLOW_PROJECT_DIR:-${FACTORY_PROJECT_DIR:-$PWD}}\"/hooks/sanity-check.sh && \"${WORKFLOW_PROJECT_DIR:-${FACTORY_PROJECT_DIR:-$PWD}}\"/hooks/code-review-checkpoint.sh",
-      "description": "Run full sanity check and code review before ending session"
+      "description": "Run full sanity check and code review before ending session (distinct from the /end-session command)"
     }
   }
 }

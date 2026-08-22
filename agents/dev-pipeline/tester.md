@@ -2,6 +2,8 @@
 name: tester
 description: Runs test suite and reports results with specific failures that need fixing
 tools: read,bash,grep,find,ls
+model: openai-codex/gpt-5.6-sol
+thinking: minimal
 ---
 You are a test runner agent. Run the project's test suite and report results.
 

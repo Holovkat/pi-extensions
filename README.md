@@ -240,7 +240,7 @@ A horizontal status bar displayed in the pipeline widget shows real-time progres
 
 ```
 Build ✓ │ Eval ● │ Fix ○ │ UAT Auto ○ │ UAT ○
-gemini-3-pro  opus-4.6  qwen-3.5+  gemini-3-pro  playwright
+gemini-3-pro  gpt-5.6-sol  qwen-3.5+  gpt-5.6-sol  playwright
               Task 4.2: A* pathfinding
 ```
 
@@ -270,12 +270,12 @@ UAT Epic #101: "UAT Test Suite"                          [uat]
 | Role             | Model                   | Purpose                                                   |
 | ---------------- | ----------------------- | --------------------------------------------------------- |
 | Builder          | Gemini 3 Pro Preview    | Build entire epic in one shot                             |
-| Evaluator        | Claude Opus 4.6         | Per-task scoring + UAT scenario generation                |
+| Evaluator        | GPT-5.6 Sol             | Per-task scoring + UAT scenario generation                |
 | Fixer            | Qwen 3.5 Plus (Bailian) | Surgical subtask fixes (depth 1)                          |
 | Fix Escalation 1 | Claude Sonnet 4.6       | Stronger model for depth 2+                               |
 | Fix Escalation 2 | Claude Opus 4.6 (xhigh) | Maximum capability for deep escalation                    |
 | Analyst          | Claude Opus 4.6 (xhigh) | Reviews yielded agents, decomposes/deprecates stuck tasks |
-| UAT Tester       | Gemini 3 Pro Preview    | Playwright browser automation                             |
+| UAT Tester       | GPT-5.6 Sol             | Playwright browser automation                             |
 
 ##### Dashboard — Approval State
 
@@ -363,13 +363,13 @@ Each role shows its model and thinking level (e.g. `gemini-3-pro · high`). Pres
 
 → [Fast Track]  3-Wave        Tab/← → to switch
   Builder                     gemini-3-pro · high
-  Evaluator                   claude-opus-4-6 · high
+  Evaluator                   gpt-5.6-sol · minimal
   Fixer                       qwen3.5-plus · high
     ↳ Escalation 1            claude-sonnet-4-6 · high
     ↳ Escalation 2            claude-opus-4-6 · xhigh
     ↳ + Add escalation step
   Analyst                     claude-opus-4-6 · xhigh
-  UAT Tester                  gemini-3-pro · medium
+  UAT Tester                  gpt-5.6-sol · minimal
 
   Reviews yielded agents · Space to cycle thinking · Del to remove
 

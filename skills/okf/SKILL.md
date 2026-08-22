@@ -14,7 +14,7 @@ Use this skill when working on a project that has a `knowledge/` OKF bundle, whe
 
 ## What OKF Is
 
-OKF is a convention for maintaining project knowledge as markdown files with YAML frontmatter, stored in git alongside code. Git is canonical. Agents read the bundle before starting work; the post-commit hook writes compact Tier 1 captures and `end-session` writes one complementary Tier 2 synthesis at session close.
+OKF is a convention for maintaining project knowledge as markdown files with YAML frontmatter, stored in git alongside code. Git is canonical. Agents read the bundle before starting work; at the end of a meaningful work session the agent writes one session synthesis to `knowledge/inbox/` before committing and `git add`s it with the change (AGENTS.md is the authority on this flow). The repository's post-commit hook only pushes — it does not write inbox items.
 
 ## Locating the OKF Source Repo
 
@@ -72,7 +72,7 @@ Read the runbook for detailed instructions for each phase.
 knowledge/
 ├── index.md          # Root index with concept group counts
 ├── log.md            # Chronological update history
-├── inbox/            # Staging area for commit-time captures
+├── inbox/            # Session syntheses awaiting curation
 │   ├── index.md
 │   └── <timestamp>-<slug>.md
 ├── architecture/     # How the system is structured
@@ -123,36 +123,28 @@ investigating the codebase or proposing a course of action:
 
 ## Writing Inbox Items
 
-The inbox has two complementary capture tiers. They must not restate each
-other; Git remains the source for changed files.
+The agent writes session syntheses directly; Git remains the source for
+changed files. AGENTS.md is the authority on this flow: write the synthesis
+BEFORE committing and `git add` it with your changes so it is part of the
+commit. The repository's post-commit hook only pushes — it never writes
+inbox items.
 
-### Tier 1: Commit Capture
+### Tier 1: Commit Capture (not installed in this repository)
 
-The repository post-commit hook writes one compact `capture_tier: commit` item
-for each ordinary commit. Supply its rationale through a commit body that says
-why/how and includes an `Impact:` trailer:
-
-```text
-type(scope): subject
-
-<why and how>
-
-Impact: <what this affects>
-```
-
-The hook extracts the rationale, impact, commit SHA, branch, issue references,
-and generated provenance. It normalizes tags and safely quotes dynamic fields.
-Oversized, raw-dump, malformed, or repeated low-signal content becomes a compact
-Git-reference capture; an explicit quality override may retain reviewed content
-but cannot bypass structural safety or one-record-per-commit provenance. A
-subject-only commit is captured with explicit gaps so authors can correct future
-commit bodies.
+The full OKF install from the designs repo can ship a post-commit hook that
+writes one compact `capture_tier: commit` item per ordinary commit. That
+capture hook is **not installed in this repository** — the only post-commit
+hook here (`hooks/post-commit-push.sh`) just pushes the current branch. Do
+not expect Tier 1 items in this inbox, and do not rely on commit messages
+being captured automatically; put durable knowledge (decisions, rejected
+paths, lessons) into the session synthesis instead.
 
 ### Tier 2: Session Synthesis
 
-At session close, `end-session` writes exactly one `capture_tier: session` item
-after work is committed. It references the session commit SHAs instead of
-repeating Tier 1 detail:
+When you finish a meaningful work session, write exactly one
+`capture_tier: session` item BEFORE committing, and `git add` it with your
+changes so it lands in the same commit. It records what was done, decisions,
+deprecations, lessons, and current state in product terms — not code diffs:
 
 ```yaml
 ---
@@ -162,14 +154,16 @@ description: <one line>
 tags: [lowercase, consistent]
 timestamp: <ISO-8601>
 generated_at: <ISO-8601>
-generated_by: end-session
+generated_by: <session-type>          # e.g. dev-session, planning-session
 session_id: <session-uuid>
-commit_sha: [<sha>, <sha>]
+commit_sha: []                        # earlier session SHAs if any; empty when written pre-commit
 branch: <branch-name>
 issue_refs: [<n>]
 epic_refs: [<n>]
 capture_tier: session
 ---
+
+# What Was Done
 
 # Decisions Made
 
