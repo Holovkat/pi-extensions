@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath } from './pif-shared.ts';
+import { createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment } from './pif-shared.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 
@@ -32,6 +32,15 @@ test('widget path guard line-stops traversal outside managed roots', () => {
   const root = path.join(os.tmpdir(), 'pif', 'lib', 'widgets');
   assert.equal(assertSafeWidgetPath(root, path.join(root, 'safe')), path.join(root, 'safe'));
   assert.throws(() => assertSafeWidgetPath(root, path.join(root, '..', '..', 'main.dart')), /escapes/);
+});
+
+test('child environment scrubs hub lifecycle variables', () => {
+  const child = childEnvironment({PIF_AUTOSTART: '1', PIF_NO_FLUTTER: '1', PIF_PORT: '31415', PIF_PI_BIN: '/fake/pi', PATH: '/usr/bin'});
+  assert.equal(child.PIF_AUTOSTART, undefined);
+  assert.equal(child.PIF_NO_FLUTTER, undefined);
+  assert.equal(child.PIF_PORT, undefined);
+  assert.equal(child.PIF_PI_BIN, '/fake/pi');
+  assert.equal(child.PATH, '/usr/bin');
 });
 
 test('hub source preserves phase-one process and analyze gates', async () => {

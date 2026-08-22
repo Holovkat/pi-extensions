@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
 	PIF_DEFAULT_PORT,
 	assertSafeWidgetPath,
+	childEnvironment,
 	createEnvelope,
 	decodeEnvelope,
 	generateWidgetRegistry,
@@ -140,11 +141,16 @@ class PifHub {
 		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace });
 	}
 	async stop() {
-		for (const child of this.children.values()) { child.kill("SIGTERM"); setTimeout(() => { if (!child.killed) child.kill("SIGKILL"); }, 1_000).unref(); }
+		for (const child of this.children.values()) this.terminateChild(child);
 		this.children.clear(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
 		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
 		this.state.health.hub = "stopped"; this.setStatus();
+	}
+	private terminateChild(child: ChildProcessWithoutNullStreams) {
+		let exited = false; child.once("exit", () => { exited = true; });
+		child.kill("SIGTERM");
+		setTimeout(() => { if (!exited) { try { child.kill("SIGKILL"); } catch { /* already gone */ } } }, 1_000).unref();
 	}
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
@@ -242,7 +248,7 @@ class PifHub {
 		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); const cwd = path.resolve(payload.cwd || this.workspace);
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
 		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (payload.model) args.push("--model", String(payload.model)); if (payload.thinking && payload.thinking !== "none") args.push("--thinking", String(payload.thinking));
-		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: payload.model || "default", thinking: payload.thinking || "medium", cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
@@ -377,7 +383,7 @@ async function callControl(workspace: string, method: string, params: unknown) {
 
 export default function pifExtension(pi: ExtensionAPI) {
 	let currentCtx: ExtensionContext | null = null; let workspace = process.cwd();
-	const ensure = async (ctx: ExtensionContext, launch = true) => { currentCtx = ctx; workspace = (ctx as any).cwd || process.cwd(); if (!hub) { hub = new PifHub(pi, ctx, workspace, Number(process.env.PIF_PORT) || PIF_DEFAULT_PORT); await hub.start(launch); } else if (launch) hub.relaunchShell(); return hub; };
+	const ensure = async (ctx: ExtensionContext, launch = true) => { currentCtx = ctx; workspace = (ctx as any).cwd || process.cwd(); if (!hub) { const created = new PifHub(pi, ctx, workspace, Number(process.env.PIF_PORT) || PIF_DEFAULT_PORT); try { await created.start(launch); } catch (error) { await created.stop().catch(() => { /* partial startup */ }); throw error; } hub = created; } else if (launch) hub.relaunchShell(); return hub; };
 	pi.registerCommand("pif", { description: "Launch or focus the pif Flutter shell", handler: async (_args, ctx) => { try { await ensure(ctx, true); ctx.ui.notify(`pif running on ws://127.0.0.1:${hub!.port}/pif`, "info"); } catch (error) { ctx.ui.notify(`pif failed: ${String(error)}`, "error"); } } });
 	pi.registerCommand("pif-stop", { description: "Stop pif and all child sessions", handler: async (_args, ctx) => { if (hub) await hub.stop(); hub = null; ctx.ui.notify("pif stopped", "info"); } });
 	pi.registerCommand("pif-status", { description: "Show pif hub status", handler: async (_args, ctx) => { ctx.ui.notify(hub ? JSON.stringify(hub.snapshot().health) : "pif is stopped", "info"); } });

@@ -66,7 +66,7 @@ function copyFixture(workspace, removeDogfood = true) {
 
 function fakePi(workspace) {
   const file = path.join(workspace, 'fake-pi.mjs');
-  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);process.stdout.write(JSON.stringify({type:'message_update',delta:q.message||'',command:q.type})+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
+  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);process.stdout.write(JSON.stringify({type:'message_update',delta:q.message||'',command:q.type})+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
   fs.chmodSync(file, 0o755); return file;
 }
 
@@ -101,6 +101,8 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket, 'session/control', 'spawn', {cwd: workspace, model: 'fake'});
   const created = await createdPromise;
   const sessionId = created.payload.id; assert.match(sessionId, /^session_/);
+  const childEnv = JSON.parse(await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.env.json')) ? fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8') : false, 'child env dump'));
+  assert.equal(childEnv.autostart, null); assert.equal(childEnv.noFlutter, null); assert.equal(childEnv.port, null);
   const streamPromise = nextMessage(socket, (value) => value.channel === 'session/event' && value.payload.sessionId === sessionId && value.type === 'message_update');
   send(socket, 'session/control', 'input', {sessionId, content: 'hello'});
   const streamed = await streamPromise; checkpoint('child streamed'); assert.equal(streamed.payload.event.delta, 'hello');

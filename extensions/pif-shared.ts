@@ -100,4 +100,14 @@ export function assertSafeWidgetPath(root: string, candidate: string): string {
 	return resolved;
 }
 
+const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT"] as const;
+
+/** Environment for spawned child sessions: hub lifecycle vars must not
+ * propagate, or every child tries to autostart a second hub on our port. */
+export function childEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const child = { ...env };
+	for (const key of CHILD_SCRUBBED_ENV_KEYS) delete child[key];
+	return child;
+}
+
 export const __test = { scalar };
