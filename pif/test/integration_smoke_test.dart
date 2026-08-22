@@ -264,6 +264,28 @@ void main() {
     await tester.binding.setSurfaceSize(null);
   });
 
+  testWidgets('shell recovers state emitted before it subscribed', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    // Connect and emit a snapshot BEFORE the shell exists — the shell must
+    // re-request after subscribing instead of missing it forever.
+    await bus.connect();
+    bus.emitSnapshot();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    expect(
+      bus.sent.where((event) => event == 'shell/state:snapshot_request').length,
+      greaterThanOrEqualTo(2),
+      reason: 'initState re-requests after subscribing',
+    );
+    bus.emitSnapshot(); // the hub's reply to the re-request
+    await tester.pump();
+    expect(find.text('Mock Host'), findsWidgets);
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
     tester,
   ) async {
@@ -290,14 +312,15 @@ void main() {
     expect(find.text('WIDGET STORE'), findsOneWidget);
     expect(
       bus.sent.where((event) => event == 'shell/state:snapshot_request'),
-      hasLength(1),
+      hasLength(2),
+      reason: 'connect() plus the initState re-request',
     );
     bus.disconnectAndReconnect();
     await tester.pump();
     expect(find.text('Mock Host'), findsWidgets);
     expect(
       bus.sent.where((event) => event == 'shell/state:snapshot_request'),
-      hasLength(2),
+      hasLength(3),
     );
     await tester.pumpWidget(const SizedBox());
     await tester.binding.setSurfaceSize(null);

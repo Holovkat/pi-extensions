@@ -13,6 +13,10 @@ void main() {
 
 /// Root widget that manages the standalone app lifecycle:
 /// project picker → spawn pi → connect to hub → show shell.
+///
+/// The app owns the pi session: a watchdog restarts it when the hub does
+/// not deliver state or the connection drops, rather than requiring the
+/// user to clean up manually.
 class PifApp extends StatefulWidget {
   const PifApp({super.key});
   @override
@@ -24,6 +28,12 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   PifBus? _bus;
   String? _workspace;
   String? _adoptedWorkspace;
+  StreamSubscription<PifEnvelope>? _busEvents;
+  Timer? _watchdog;
+  bool _snapshotSeen = false;
+  int _recoverAttempts = 0;
+  static const int _maxRecoverAttempts = 3;
+  static const Duration _watchdogTimeout = Duration(seconds: 12);
 
   @override
   void initState() {
@@ -53,53 +63,106 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     if (await PiLauncher.isHubRunning()) {
       final bus = PifBus();
       _bus = bus;
+      _watchBus(bus);
       await bus.connect();
-      try {
-        final snapshot = await bus.events
-            .firstWhere((event) => event.type == 'snapshot')
-            .timeout(const Duration(seconds: 5));
-        final health = (snapshot.payload as Map?)?['health'] as Map?;
-        if (health?['origin'] == 'standalone') {
-          _adoptedWorkspace = health?['workspace'] as String?;
-        }
-      } catch (_) {
-        // snapshot never arrived — the shell will show reconnect state
-      }
       if (mounted) setState(() {});
+      _armWatchdog();
     }
   }
 
   /// Called when the user selects a project in the picker.
   /// Throws on failure — the picker catches and displays the error.
   Future<void> _launchProject(String workspace) async {
+    _workspace = workspace;
+    await _startPiSession();
+  }
+
+  Future<void> _startPiSession() async {
+    final workspace = _workspace;
+    if (workspace == null) return;
     _launcher = PiLauncher();
     await _launcher!.start(workspace: workspace);
-
-    final ready = await PiLauncher.waitForHub();
+    final ready = await PiLauncher.waitForHub(
+      timeout: const Duration(seconds: 20),
+    );
     if (!ready) {
-      await _launcher!.stop();
-      _launcher = null;
-      throw Exception('Hub did not start within 30 seconds. '
-          'Make sure pi is installed and configured.');
+      await _cleanup();
+      return _recover('hub did not start within 20 seconds');
     }
-
-    _bus = PifBus(token: _launcher!.token);
-    await _bus!.connect();
-    _workspace = workspace;
+    final bus = PifBus(token: _launcher!.token);
+    _bus = bus;
+    _watchBus(bus);
+    await bus.connect();
     if (mounted) setState(() {});
+    _armWatchdog();
+  }
+
+  void _watchBus(PifBus bus) {
+    _busEvents?.cancel();
+    _snapshotSeen = false;
+    _busEvents = bus.events.listen((event) {
+      if (event.type == 'snapshot') {
+        _snapshotSeen = true;
+        _recoverAttempts = 0;
+        _watchdog?.cancel();
+        final health = (event.payload as Map?)?['health'] as Map?;
+        if (health?['origin'] == 'standalone') {
+          _adoptedWorkspace = health?['workspace'] as String?;
+        }
+        if (mounted) setState(() {});
+      }
+    }, onError: (_) {});
+  }
+
+  /// The pi session is unhealthy if we are connected but no snapshot has
+  /// arrived (state never delivered), or if the connection itself dropped.
+  void _armWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = Timer(_watchdogTimeout, () {
+      final connected = _bus?.connected ?? false;
+      if (connected && _snapshotSeen) return;
+      _recover(
+        connected
+            ? 'hub did not deliver state'
+            : 'hub connection lost',
+      );
+    });
+  }
+
+  Future<void> _recover(String reason) async {
+    if (!mounted) return;
+    if (_recoverAttempts >= _maxRecoverAttempts) {
+      debugPrint('pif: giving up after $_recoverAttempts recovery attempts ($reason)');
+      await _cleanup();
+      if (mounted) setState(() {}); // back to the project picker
+      return;
+    }
+    _recoverAttempts++;
+    debugPrint(
+      'pif: restarting pi session — $reason '
+      '(attempt $_recoverAttempts/$_maxRecoverAttempts)',
+    );
+    await _cleanup();
+    if (!mounted) return;
+    await _startPiSession();
   }
 
   Future<void> _cleanup() async {
+    _watchdog?.cancel();
+    _watchdog = null;
+    await _busEvents?.cancel();
+    _busEvents = null;
     // An adopted standalone hub (we connected, never spawned) is asked to
     // stop itself over the authenticated bus so it does not leak as an
     // orphan holding the port. Terminal-origin hubs are never touched.
     if (_launcher == null && _adoptedWorkspace != null) {
       _bus?.send('shell/state', 'shutdown_request', const {});
-      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await Future<void>.delayed(const Duration(milliseconds: 150));
     }
     await _bus?.dispose();
     _bus = null;
     _adoptedWorkspace = null;
+    _snapshotSeen = false;
     await _launcher?.stop();
     _launcher = null;
   }

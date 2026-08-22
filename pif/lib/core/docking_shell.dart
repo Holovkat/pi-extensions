@@ -44,6 +44,10 @@ class _DockingShellState extends State<DockingShell>
     host.storage.workspace = host.workspace;
     events = widget.bus.events.listen(_event, onError: (_) {});
     widget.bus.connect();
+    // The snapshot triggered by connect() can arrive before this shell
+    // subscribed (broadcast streams do not replay); ask again now that the
+    // listener is attached so state always lands.
+    widget.bus.send('shell/state', 'snapshot_request', const {});
   }
 
   void _applyLayout(Map<String, dynamic> layout) {
