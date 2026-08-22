@@ -23,6 +23,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   PiLauncher? _launcher;
   PifBus? _bus;
   String? _workspace;
+  String? _adoptedWorkspace;
 
   @override
   void initState() {
@@ -45,11 +46,25 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   }
 
   /// If a hub is already running (e.g. from a terminal pi session),
-  /// connect to it directly without showing the project picker.
+  /// connect to it directly without showing the project picker. A
+  /// standalone-origin hub (left over from a previous app launch that
+  /// died without cleanup) is adopted so we shut it down on quit.
   Future<void> _checkExistingHub() async {
     if (await PiLauncher.isHubRunning()) {
-      _bus = PifBus();
-      await _bus!.connect();
+      final bus = PifBus();
+      _bus = bus;
+      await bus.connect();
+      try {
+        final snapshot = await bus.events
+            .firstWhere((event) => event.type == 'snapshot')
+            .timeout(const Duration(seconds: 5));
+        final health = (snapshot.payload as Map?)?['health'] as Map?;
+        if (health?['origin'] == 'standalone') {
+          _adoptedWorkspace = health?['workspace'] as String?;
+        }
+      } catch (_) {
+        // snapshot never arrived — the shell will show reconnect state
+      }
       if (mounted) setState(() {});
     }
   }
@@ -75,8 +90,16 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   }
 
   Future<void> _cleanup() async {
+    // An adopted standalone hub (we connected, never spawned) is asked to
+    // stop itself over the authenticated bus so it does not leak as an
+    // orphan holding the port. Terminal-origin hubs are never touched.
+    if (_launcher == null && _adoptedWorkspace != null) {
+      _bus?.send('shell/state', 'shutdown_request', const {});
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
     await _bus?.dispose();
     _bus = null;
+    _adoptedWorkspace = null;
     await _launcher?.stop();
     _launcher = null;
   }

@@ -48,20 +48,26 @@ class PifEnvelope {
 }
 
 class PifBus {
-  PifBus({Uri? uri, String? token})
+  PifBus({Uri? uri, String? token, String? Function()? tokenResolver})
     : uri =
           uri ??
           Uri.parse(
             'ws://127.0.0.1:${Platform.environment['PIF_PORT'] ?? '31415'}/pif',
-          ) {
-    _token = token ?? _resolveToken();
+          ),
+      _fixedToken = token,
+      _tokenSource = tokenResolver {
+    _token = _fixedToken ?? _resolveToken();
   }
   final Uri uri;
+  final String? _fixedToken;
+  final String? Function()? _tokenSource;
   String? _token;
 
   /// Per-launch hub token: env first, then the token file the hub drops
   /// next to its state for clients the supervisor did not launch.
-  static String? _resolveToken() {
+  String? _resolveToken() {
+    final fromSource = _tokenSource?.call();
+    if (fromSource != null && fromSource.isNotEmpty) return fromSource;
     final env = Platform.environment['PIF_TOKEN'];
     if (env != null && env.isNotEmpty) return env;
     final workspace = Platform.environment['PIF_WORKSPACE'];
@@ -111,6 +117,9 @@ class PifBus {
 
   Future<void> _connect() async {
     try {
+      // Re-resolve the token each attempt: a launch can outlive the hub
+      // that minted its token, and the token file is the recovery path.
+      if (_fixedToken == null) _token = _resolveToken();
       final socket = await WebSocket.connect(connectUri.toString());
       if (_disposed) return socket.close();
       _socket = socket;

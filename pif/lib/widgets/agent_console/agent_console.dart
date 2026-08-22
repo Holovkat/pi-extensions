@@ -189,6 +189,21 @@ class _AgentConsoleState extends State<_AgentConsole> {
     });
   }
 
+  /// The session's model as a dropdown value: session ids sometimes lack
+  /// the provider prefix (gpt-5.6-sol vs openai-codex/gpt-5.6-sol), so a
+  /// unique suffix match resolves to the full id; a set-but-unknown model
+  /// still displays instead of silently falling back to "Default".
+  String? _resolvedModelValue(dynamic selected) {
+    final model = selected?.model as String? ?? '';
+    if (model.isEmpty) return null;
+    if (widget.host.models.contains(model)) return model;
+    final matches = widget.host.models
+        .where((m) => m.endsWith('/$model'))
+        .toList();
+    if (matches.length == 1) return matches.single;
+    return model;
+  }
+
   @override
   Widget build(BuildContext context) {
     final selected = widget.host.sessions.current
@@ -222,27 +237,34 @@ class _AgentConsoleState extends State<_AgentConsole> {
               SizedBox(
                 width: 140,
                 child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    isDense: true,
-                    iconSize: 14,
-                    style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
-                    value: (selected != null &&
-                            selected.model.isNotEmpty &&
-                            widget.host.models.contains(selected.model)
-                        ? selected.model
-                        : null),
-                    hint: const Text('Default', style: TextStyle(fontSize: 11, color: Color(0xff69758a))),
-                    items: [
-                      const DropdownMenuItem(value: '', child: Text('Default')),
-                      ...widget.host.models.map(
-                        (m) => DropdownMenuItem(
-                          value: m,
-                          child: Text(m.split('/').last),
-                        ),
-                      ),
-                    ],
-                    onChanged: (v) => widget.host.sessions
-                        .setModel(widget.host.activeSessionId, v ?? ''),
+                  child: Builder(
+                    builder: (context) {
+                      final resolved = _resolvedModelValue(selected);
+                      return DropdownButton<String>(
+                        isDense: true,
+                        iconSize: 14,
+                        style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                        value: resolved,
+                        hint: const Text('Default', style: TextStyle(fontSize: 11, color: Color(0xff69758a))),
+                        items: [
+                          const DropdownMenuItem(value: '', child: Text('Default')),
+                          ...widget.host.models.map(
+                            (m) => DropdownMenuItem(
+                              value: m,
+                              child: Text(m.split('/').last),
+                            ),
+                          ),
+                          if (resolved != null &&
+                              !widget.host.models.contains(resolved))
+                            DropdownMenuItem(
+                              value: resolved,
+                              child: Text(resolved.split('/').last),
+                            ),
+                        ],
+                        onChanged: (v) => widget.host.sessions
+                            .setModel(widget.host.activeSessionId, v ?? ''),
+                      );
+                    },
                   ),
                 ),
               ),

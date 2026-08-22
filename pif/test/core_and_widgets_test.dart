@@ -124,6 +124,59 @@ void main() {
     expect(bus.sent.single['type'], 'input');
     await bus.dispose();
   });
+  testWidgets('model dropdown lists available models and reflects selection', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus)
+      ..models = ['openai-codex/gpt-5.6-sol', 'fixture/fast'];
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'fixture/fast',
+        'thinking': 'low',
+        'cwd': '/tmp',
+        'transcript': <dynamic>[],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    // Selected model shown by its short name.
+    expect(find.text('fast'), findsOneWidget);
+    // Opening the dropdown lists every available model.
+    await tester.tap(find.text('fast'));
+    await tester.pumpAndSettle();
+    expect(find.text('gpt-5.6-sol'), findsOneWidget);
+    expect(find.text('Default'), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('model dropdown resolves provider-less session model', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus)
+      ..models = ['openai-codex/gpt-5.6-sol', 'fixture/fast'];
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'gpt-5.6-sol',
+        'thinking': 'low',
+        'cwd': '/tmp',
+        'transcript': <dynamic>[],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    expect(find.text('gpt-5.6-sol'), findsOneWidget);
+    expect(find.text('Default'), findsNothing);
+    await bus.dispose();
+  });
+
   testWidgets('Agent Console conversation is unboxed and light', (tester) async {
     final bus = FakeBus();
     final host = PifHost(bus: bus);

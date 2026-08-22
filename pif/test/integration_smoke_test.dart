@@ -192,6 +192,44 @@ void main() {
     await server.kill();
   });
 
+  test('PifBus re-reads the token between reconnect attempts', () async {
+    const port = 31878;
+    var currentToken = 'stale-token';
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+    server.listen((request) async {
+      if (request.uri.queryParameters['token'] != 'good-token') {
+        request.response.statusCode = 401;
+        await request.response.close();
+        return;
+      }
+      final socket = await WebSocketTransformer.upgrade(request);
+      socket.add(
+        jsonEncode({
+          'v': 1,
+          'id': 'snapshot',
+          'ts': DateTime.now().toUtc().toIso8601String(),
+          'channel': 'shell/state',
+          'type': 'snapshot',
+          'payload': const {},
+        }),
+      );
+    });
+    final bus = PifBus(
+      uri: Uri.parse('ws://127.0.0.1:$port/pif'),
+      tokenResolver: () => currentToken,
+    );
+    await bus.connect();
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    expect(bus.connected, isFalse, reason: 'stale token must be rejected');
+    currentToken = 'good-token';
+    await bus.connection
+        .firstWhere((online) => online)
+        .timeout(const Duration(seconds: 5));
+    expect(bus.connected, isTrue, reason: 'corrected token self-heals');
+    await bus.dispose();
+    await server.close(force: true);
+  });
+
   testWidgets('tabbed panels drag into empty slots', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();

@@ -102,6 +102,7 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket, 'shell/state', 'snapshot_request', {}); const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   checkpoint('snapshot received');
   assert.equal(snapshot.payload.health.hub, 'running'); assert.equal(snapshot.payload.widgets.agent_console.core, true); assert.equal(snapshot.payload.widgets.diff_viewer, undefined);
+  assert.equal(snapshot.payload.health.origin, 'standalone');
 
   const createdPromise = nextMessage(socket, (value) => value.type === 'created');
   send(socket, 'session/control', 'spawn', {cwd: workspace, model: 'fake'});
@@ -175,10 +176,10 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const restarted = await nextMessage(socket2, (value) => value.type === 'snapshot');
   assert.equal(restarted.payload.sessions.host.model, 'fixture/fast');
   assert.equal(restarted.payload.sessions.host.thinking, 'low');
+  send(socket2, 'shell/state', 'shutdown_request', {});
+  await waitFor(() => pi2.exitCode != null ? true : false, 'pi2 shutdown via shutdown_request', 15_000);
   socket2.close();
-  await rpc(pi2, {type: 'prompt', message: '/pif-stop'});
-  pi2.kill('SIGTERM'); await new Promise((resolve) => pi2.once('exit', resolve));
-  checkpoint('model/thinking prefs survive hub restarts');
+  checkpoint('adopted standalone hub shuts down over the bus');
 
   await rpc(pi, {type: 'prompt', message: '/pif-stop'});
   await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.stopped')), 'child termination');

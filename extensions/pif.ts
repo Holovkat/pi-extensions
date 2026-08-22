@@ -35,7 +35,7 @@ interface HubState {
 	layout: Record<string, unknown>;
 	models: string[];
 	modelProviders: Record<string, any>;
-	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number };
+	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number; origin: "standalone" | "terminal" };
 }
 
 const text = (value: unknown, details: unknown = value) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], details });
@@ -129,7 +129,7 @@ class PifHub {
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -161,7 +161,14 @@ class PifHub {
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
 		const prefs = this.loadPrefs();
-		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: prefs.model || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
+		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
+	}
+	/** Session model ids sometimes lack the provider prefix; resolve to the
+	 * full id from the available models when the suffix match is unique. */
+	private canonicalModel(model: string | undefined): string {
+		if (!model || this.state.models.includes(model)) return model ?? "";
+		const matches = this.state.models.filter((candidate) => candidate.endsWith(`/${model}`));
+		return matches.length === 1 ? matches[0] : model;
 	}
 	private loadPrefs(): { model?: string; thinking?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string }) {
@@ -203,6 +210,7 @@ class PifHub {
 		let env: PifEnvelope; try { env = decodeEnvelope(raw); } catch (error) { peer.send(createEnvelope("shell/error", "invalid_envelope", { error: String(error) })); return; }
 		try {
 			if (env.channel === "shell/state" && env.type === "snapshot_request") return peer.send(this.snapshotEnvelope());
+			if (env.channel === "shell/state" && env.type === "shutdown_request") return void this.shutdown();
 			if (env.channel.startsWith("session/")) await this.sessionAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
@@ -385,10 +393,14 @@ class PifHub {
 	private async storeAction(type: string, payload: any) { if (type === "install") return this.installWidget(payload); if (type === "refresh") { this.scanWidgets(); this.broadcastSnapshot(); } }
 	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
 	async reload(restart = false) { this.state.health.reload = "running"; this.broadcast("shell/health", "health", this.state.health); try { const result = await this.supervisor.reload(restart); this.state.health.reload = "idle"; return result; } catch (error) { this.state.health.reload = "failed"; throw error; } finally { this.broadcast("shell/health", "health", this.state.health); } }
+	/** Stop the hub and exit the pi process — used by app clients adopting a
+	 * standalone hub and by the shell.shutdown control method. */
+	shutdown() { this.stop().catch(() => { /* partial startup */ }); setTimeout(() => process.exit(0), 250).unref(); return Promise.resolve({ ok: true, stopping: true }); }
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
 			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
+			case "shell.shutdown": return this.shutdown();
 			default: throw new Error(`Unknown pif control method: ${method}`);
 		}
 	}
