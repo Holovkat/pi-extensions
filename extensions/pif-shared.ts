@@ -110,4 +110,23 @@ export function childEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	return child;
 }
 
+export function extractPifToken(requestUrl: string): string | null {
+	const query = requestUrl.split("?")[1] ?? "";
+	for (const pair of query.split("&")) {
+		const at = pair.indexOf("=");
+		if (at > 0 && decodeURIComponent(pair.slice(0, at)) === "token") return decodeURIComponent(pair.slice(at + 1));
+	}
+	return null;
+}
+
+/** Hub upgrade authorization: a per-launch token is always required, and a
+ * browser-supplied Origin (the Dart WebSocket client sends none) must be
+ * explicitly allowlisted via PIF_ALLOWED_ORIGINS. */
+export function pifUpgradeAuthorized(requestUrl: string, origin: string | undefined, token: string, allowedOrigins: readonly string[] = []): boolean {
+	if (origin !== undefined && !allowedOrigins.includes(origin)) return false;
+	const provided = extractPifToken(requestUrl);
+	if (!provided || provided.length !== token.length) return false;
+	return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(token));
+}
+
 export const __test = { scalar };

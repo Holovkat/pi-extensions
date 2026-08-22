@@ -68,7 +68,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
           'Make sure pi is installed and configured.');
     }
 
-    _bus = PifBus();
+    _bus = PifBus(token: _launcher!.token);
     await _bus!.connect();
     _workspace = workspace;
     if (mounted) setState(() {});

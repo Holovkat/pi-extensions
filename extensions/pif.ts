@@ -16,6 +16,7 @@ import {
 	decodeEnvelope,
 	generateWidgetRegistry,
 	parseWidgetManifest,
+	pifUpgradeAuthorized,
 	type PifEnvelope,
 	type PifWidgetManifest,
 	widgetClassName,
@@ -116,6 +117,8 @@ class PifHub {
 	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string;
 	readonly state: HubState;
 	readonly modelsPath: string;
+	readonly token: string;
+	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
@@ -128,17 +131,20 @@ class PifHub {
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
+		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
+		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
+		fs.writeFileSync(path.join(this.pifDir, "token"), this.token, { mode: 0o600 }); try { fs.chmodSync(path.join(this.pifDir, "token"), 0o600); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
 		this.createHostSession(); await this.startWebSocket(); await this.startControl();
 		this.state.health.hub = "running"; this.setStatus(); this.broadcastSnapshot();
-		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace });
+		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token });
 	}
 	async stop() {
 		for (const child of this.children.values()) this.terminateChild(child);
@@ -160,7 +166,12 @@ class PifHub {
 		return new Promise<void>((resolve, reject) => {
 			const server = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ name: "pif", status: this.state.health })); });
 			server.on("upgrade", (req, socket) => {
-				if (req.url !== "/pif" || !req.headers["sec-websocket-key"]) return socket.destroy();
+				const pathname = (req.url ?? "/").split("?")[0];
+				if (pathname !== "/pif" || !req.headers["sec-websocket-key"]) return socket.destroy();
+				const origin = req.headers.origin;
+				if (!pifUpgradeAuthorized(req.url ?? "/", typeof origin === "string" ? origin : undefined, this.token, this.allowedOrigins)) {
+					socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); return socket.destroy();
+				}
 				const accept = crypto.createHash("sha1").update(String(req.headers["sec-websocket-key"]) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
 				socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
 				let peer!: WsPeer; peer = new WsPeer(socket, (raw) => this.receive(raw, peer), () => this.peers.delete(peer)); this.peers.add(peer); peer.send(this.snapshotEnvelope());
@@ -174,7 +185,7 @@ class PifHub {
 			const server = net.createServer((socket) => {
 				let input = ""; socket.on("data", (chunk) => { input += chunk; const at = input.indexOf("\n"); if (at < 0) return; const raw = input.slice(0, at); input = input.slice(at + 1); Promise.resolve().then(async () => { const req = JSON.parse(raw); return this.control(req.method, req.params ?? {}); }).then((result) => socket.end(JSON.stringify({ ok: true, result }) + "\n"), (error) => socket.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }) + "\n")); });
 			});
-			server.once("error", reject); server.listen(this.controlPath, () => { server.off("error", reject); this.controlServer = server; resolve(); });
+			server.once("error", reject); server.listen(this.controlPath, () => { server.off("error", reject); this.controlServer = server; try { fs.chmodSync(this.controlPath, 0o600); } catch { /* perms best-effort */ } resolve(); });
 		});
 	}
 	private snapshotEnvelope() { return createEnvelope("shell/state", "snapshot", this.snapshot()); }
@@ -362,7 +373,7 @@ class PifHub {
 	async uninstallWidget(params: any) { const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); if (widget.core) throw new Error(`Core widget ${id} cannot be uninstalled`); const roots = this.widgetRoots(); const source = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); const target = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target); this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot(); if (this.supervisor.process) await this.supervisor.reload(); return { ok: true, id, archived: target }; }
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
 	private async storeAction(type: string, payload: any) { if (type === "install") return this.installWidget(payload); if (type === "refresh") { this.scanWidgets(); this.broadcastSnapshot(); } }
-	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace }); }
+	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
 	async reload(restart = false) { this.state.health.reload = "running"; this.broadcast("shell/health", "health", this.state.health); try { const result = await this.supervisor.reload(restart); this.state.health.reload = "idle"; return result; } catch (error) { this.state.health.reload = "failed"; throw error; } finally { this.broadcast("shell/health", "health", this.state.health); } }
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {

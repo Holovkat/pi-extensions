@@ -70,8 +70,8 @@ function fakePi(workspace) {
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi(workspace, port, piBin, launchFlutter = false, modelsPath = null) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, token = 'integration-token'}) {
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -91,8 +91,14 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   checkpoint('setup');
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-smoke-')); copyFixture(workspace); const piBin = fakePi(workspace); const port = 32000 + Math.floor(Math.random() * 1000);
   const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
-  const pi = await startPi(workspace, port, piBin, false, modelsPath); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
+  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  const tokenFile = path.join(workspace, '.pi', 'pif', 'token');
+  assert.equal(fs.readFileSync(tokenFile, 'utf8'), 'integration-token');
+  const openFail = (url) => new Promise((resolve, reject) => { const socket = new WebSocket(url); socket.addEventListener('open', () => { socket.close(); resolve(); }, {once: true}); socket.addEventListener('error', () => reject(new Error('connection rejected')), {once: true}); });
+  await assert.rejects(() => openFail(`ws://127.0.0.1:${port}/pif`), /rejected/);
+  await assert.rejects(() => openFail(`ws://127.0.0.1:${port}/pif?token=wrong-token-value`), /rejected/);
+  checkpoint('unauthenticated connections rejected');
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {}); const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   checkpoint('snapshot received');
   assert.equal(snapshot.payload.health.hub, 'running'); assert.equal(snapshot.payload.widgets.agent_console.core, true); assert.equal(snapshot.payload.widgets.diff_viewer, undefined);
@@ -161,7 +167,7 @@ test('real Flutter supervisor boots the macOS shell and performs a machine-proto
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-flutter-smoke-'));
   copyFixture(workspace, false);
   const port = 33000 + Math.floor(Math.random() * 1000);
-  const pi = await startPi(workspace, port, fakePi(workspace), true);
+  const pi = await startPi({workspace, port, piBin: fakePi(workspace), launchFlutter: true});
   t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
   const status = await waitFor(async () => {
@@ -172,7 +178,7 @@ test('real Flutter supervisor boots the macOS shell and performs a machine-proto
   assert.equal(status.health.flutter, 'running');
   const reload = await control(controlPath, 'shell.reload', {restart: false});
   assert.equal(reload.error, undefined);
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif`);
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {});
   const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');

@@ -48,13 +48,44 @@ class PifEnvelope {
 }
 
 class PifBus {
-  PifBus({Uri? uri})
+  PifBus({Uri? uri, String? token})
     : uri =
           uri ??
           Uri.parse(
             'ws://127.0.0.1:${Platform.environment['PIF_PORT'] ?? '31415'}/pif',
-          );
+          ) {
+    _token = token ?? _resolveToken();
+  }
   final Uri uri;
+  String? _token;
+
+  /// Per-launch hub token: env first, then the token file the hub drops
+  /// next to its state for clients the supervisor did not launch.
+  static String? _resolveToken() {
+    final env = Platform.environment['PIF_TOKEN'];
+    if (env != null && env.isNotEmpty) return env;
+    final workspace = Platform.environment['PIF_WORKSPACE'];
+    final candidates = <String>[
+      if (workspace != null && workspace.isNotEmpty) workspace,
+      Directory.current.path,
+      '${Directory.current.path}/..',
+    ];
+    for (final base in candidates) {
+      try {
+        final token = File('$base/.pi/pif/token').readAsStringSync().trim();
+        if (token.isNotEmpty) return token;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Uri get connectUri =>
+      _token == null
+          ? uri
+          : uri.replace(queryParameters: {
+            ...uri.queryParameters,
+            'token': _token,
+          });
   final _events = StreamController<PifEnvelope>.broadcast();
   final _connection = StreamController<bool>.broadcast();
   WebSocket? _socket;
@@ -71,7 +102,7 @@ class PifBus {
   Future<void> connect() async {
     if (_disposed || _socket != null) return;
     try {
-      final socket = await WebSocket.connect(uri.toString());
+      final socket = await WebSocket.connect(connectUri.toString());
       if (_disposed) return socket.close();
       _socket = socket;
       _attempt = 0;

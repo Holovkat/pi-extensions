@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment } from './pif-shared.ts';
+import { createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifUpgradeAuthorized } from './pif-shared.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 
@@ -41,6 +41,18 @@ test('child environment scrubs hub lifecycle variables', () => {
   assert.equal(child.PIF_PORT, undefined);
   assert.equal(child.PIF_PI_BIN, '/fake/pi');
   assert.equal(child.PATH, '/usr/bin');
+});
+
+test('hub upgrade authorization requires token and allowlisted browser origins', () => {
+  const token = 'a'.repeat(64);
+  assert.equal(extractPifToken('/pif?token=' + token), token);
+  assert.equal(extractPifToken('/pif'), null);
+  assert.equal(extractPifToken('/pif?other=1'), null);
+  assert.equal(pifUpgradeAuthorized('/pif?token=' + token, undefined, token), true);
+  assert.equal(pifUpgradeAuthorized('/pif?token=' + 'b'.repeat(64), undefined, token), false);
+  assert.equal(pifUpgradeAuthorized('/pif', undefined, token), false);
+  assert.equal(pifUpgradeAuthorized('/pif?token=' + token, 'https://evil.example', token), false);
+  assert.equal(pifUpgradeAuthorized('/pif?token=' + token, 'https://app.local', token, ['https://app.local']), true);
 });
 
 test('hub source preserves phase-one process and analyze gates', async () => {

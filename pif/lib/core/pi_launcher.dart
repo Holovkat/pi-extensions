@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 /// Manages the pi subprocess for standalone app mode.
 ///
@@ -10,9 +11,23 @@ import 'dart:io';
 class PiLauncher {
   Process? _process;
   String? _workspace;
+  String? _token;
   final int port;
 
   PiLauncher({this.port = 31415});
+
+  String? get token => _token;
+
+  /// Per-launch hub token. The app generates it, passes it to pi via
+  /// PIF_TOKEN, and connects with it — so no unauthenticated client on
+  /// the machine can reach the hub's snapshot or controls.
+  static String _generateToken() {
+    final random = math.Random.secure();
+    return List.generate(
+      32,
+      (_) => random.nextInt(256).toRadixString(16).padLeft(2, '0'),
+    ).join();
+  }
 
   /// Find the Resources directory inside a packaged .app bundle.
   /// Returns null when running from source (dev mode).
@@ -104,6 +119,7 @@ class PiLauncher {
   /// Spawn pi with the pif extension in standalone mode.
   Future<void> start({required String workspace}) async {
     _workspace = workspace;
+    _token = _generateToken();
 
     final nodeBin = _findNode();
     final piCli = _findPiCli();
@@ -127,6 +143,7 @@ class PiLauncher {
       'PIF_PORT': port.toString(),
       'PIF_WORKSPACE': workspace,
       'PIF_APP_DIR': appDir,
+      'PIF_TOKEN': _token!,
     };
 
     _process = await Process.start(
