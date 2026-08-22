@@ -3,6 +3,8 @@
 #
 # Usage: ./scripts/install-pif.sh
 #
+# Prerequisites: flutter on PATH (for `flutter pub get` in the global app).
+#
 # Installs:
 #   ~/.pi/pif/app/        Flutter shell (shared across projects)
 #   ~/.pi/agent/extensions/pif.ts + pif-shared.ts  Hub extension
@@ -10,6 +12,11 @@
 # After install, run `pi` in any project directory and type /pif to launch the shell.
 
 set -euo pipefail
+
+if ! command -v flutter > /dev/null 2>&1; then
+  echo "ERROR: flutter not found on PATH — the global app needs it for 'flutter pub get'."
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -19,6 +26,12 @@ GLOBAL_EXT="$HOME/.pi/agent/extensions"
 
 echo "Installing pif Flutter shell to $GLOBAL_APP ..."
 mkdir -p "$GLOBAL_APP"
+if [ -d "$GLOBAL_APP" ] && [ -n "$(ls -A "$GLOBAL_APP" 2>/dev/null)" ]; then
+  BACKUP="$HOME/.pi/pif/app.bak-$(date +%Y%m%d-%H%M%S)"
+  echo "  Existing install found — backing it up to $BACKUP before replacing."
+  echo "  (rsync --delete would otherwise discard any local modifications.)"
+  cp -R "$GLOBAL_APP" "$BACKUP"
+fi
 rsync -a --delete \
   --exclude='.dart_tool' \
   --exclude='build' \

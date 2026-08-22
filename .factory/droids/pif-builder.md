@@ -16,25 +16,33 @@ You are the pif build agent. Your job is to build the pif standalone macOS appli
    pkill -f "pif.app" 2>/dev/null || true
    ```
 
-2. **Run the build script** from the repo root:
+2. **Run the build script** from the pi-extensions repo root (the directory
+   containing `scripts/build-pif-app.sh` — resolve it from the current
+   checkout rather than assuming a fixed path):
    ```bash
-   cd /Users/tonyholovka/workspace/pi-extensions && ./scripts/build-pif-app.sh
+   ./scripts/build-pif-app.sh
    ```
    This runs `flutter build macos --release`, then bundles:
    - Node.js binary → `Contents/Resources/pi/node`
    - pi CLI package → `Contents/Resources/pi/cli/`
    - pif extensions → `Contents/Resources/pi/extensions/`
    - Flutter app source → `Contents/Resources/app/`
+   The script re-signs the bundle after inserting resources (modifying a
+   signed .app invalidates its seal) and fails if `codesign --verify`
+   does not pass. Missing `node`/`pi` on PATH, or an unresolvable pi
+   package, produce explicit errors.
 
-3. **Verify the build output** exists at `build/pif.app`:
+3. **Verify the build output** exists at `build/pif.app` and is validly signed:
    ```bash
    test -d build/pif.app && echo "Build OK" || echo "Build FAILED"
+   codesign --verify --deep --strict build/pif.app && echo "Signature OK"
    ```
 
-4. **Install to /Applications**:
+4. **Install to /Applications** (use `ditto`, not `cp -R`, so the .app keeps
+   its metadata, extended attributes, and signature):
    ```bash
    rm -rf /Applications/pif.app
-   cp -R build/pif.app /Applications/pif.app
+   ditto build/pif.app /Applications/pif.app
    ```
 
 5. **Report the result**: state whether the build succeeded, the app size, and the install path.
