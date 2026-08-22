@@ -147,6 +147,10 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const installed = await control(controlPath, 'widget.install', {id: 'workspace_clock'}); checkpoint('catalog installed'); assert.equal(installed.ok, true); assert.ok(fs.existsSync(path.join(workspace, 'pif', 'lib', 'widgets', 'workspace_clock')));
   await assert.rejects(() => control(controlPath, 'widget.uninstall', {id: 'agent_console'}), /Core widget/);
   await control(controlPath, 'layout', {action: 'move', widgetId: 'diff_viewer', slot: 'right'}); assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels.diff_viewer.slot, 'right');
+  const resetState = nextMessage(socket, (value) => value.type === 'layout_state' && Object.keys(value.payload.panels ?? {}).length === 0);
+  await control(controlPath, 'layout', {action: 'reset'});
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels, {});
+  await resetState; checkpoint('layout reset verified');
 
   await assert.rejects(() => control(controlPath, 'widget.install', {id: '../../escape'}), /snake_case/);
   await assert.rejects(() => control(controlPath, 'models.save', {providers: 'not-an-object'}), /providers object/);

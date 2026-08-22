@@ -60,6 +60,31 @@ class _StatusState extends State<_Status> {
     super.dispose();
   }
 
+  Future<void> _confirmReset(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: const Text('Reset layout?'),
+            content: const Text(
+              'Panels return to the default docking design. '
+              'Your current arrangement is discarded.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Reset'),
+              ),
+            ],
+          ),
+    );
+    if (confirmed == true) widget.host.layout.reset();
+  }
+
   @override
   Widget build(BuildContext context) => Container(
     color: const Color(0xff18231f),
@@ -80,6 +105,17 @@ class _StatusState extends State<_Status> {
         const Icon(Icons.refresh, size: 13),
         const SizedBox(width: 4),
         Text(reload, style: const TextStyle(fontSize: 11)),
+        const SizedBox(width: 14),
+        Tooltip(
+          message: 'Reset layout to default',
+          child: InkWell(
+            onTap: () => _confirmReset(context),
+            child: const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 4),
+              child: Icon(Icons.restore, size: 13),
+            ),
+          ),
+        ),
         const Spacer(),
         Text(
           '$model · $tokens tokens',

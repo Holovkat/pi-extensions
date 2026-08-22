@@ -170,6 +170,9 @@ class PifLayout {
   });
   void close(String widgetId) =>
       bus.send('shell/layout', 'close', {'widgetId': widgetId});
+  /// Discard the persisted arrangement and return every panel to its
+  /// default slot from the widget registry.
+  void reset() => bus.send('shell/layout', 'reset', const {});
   void changed(Map<String, dynamic> layout) =>
       bus.send('shell/layout', 'layout_change', layout);
 }

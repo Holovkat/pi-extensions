@@ -280,6 +280,7 @@ class PifHub {
 		const presetsDir = path.join(this.pifDir, "presets");
 		if (type === "save") { if (!payload.preset) throw new Error("preset is required to save a layout"); fs.mkdirSync(presetsDir, { recursive: true }); fs.writeFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), JSON.stringify(this.state.layout, null, 2) + "\n"); }
 		else if (type === "load") { if (!payload.preset) throw new Error("preset is required to load a layout"); this.state.layout = JSON.parse(fs.readFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), "utf8")); }
+		else if (type === "reset") this.state.layout = { panels: {} };
 		else if (type === "layout_change") this.state.layout = payload;
 		else { const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), ...payload, open: type !== "close", action: type }; }
 		this.saveLayout(); this.broadcast("shell/layout", "layout_state", this.state.layout); return this.state.layout;
@@ -404,7 +405,7 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_widget_toggle", "pif widget toggle", "Enable or disable an installed widget.", Type.Object({ id: Type.String(), enabled: Type.Optional(Type.Boolean()) }), "widget.toggle");
 	register("pif_widget_uninstall", "pif widget uninstall", "Archive a non-core widget back into the local catalog.", Type.Object({ id: Type.String() }), "widget.uninstall");
 	register("pif_widget_list", "pif widget list", "List installed and local catalog widgets.", Type.Object({}), "widget.list");
-	register("pif_layout", "pif layout", "Open, focus, move, close, save, or load pif panels.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()) }), "layout");
+	register("pif_layout", "pif layout", "Open, focus, move, close, reset, save, or load pif panels; reset restores the default docking design.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("reset"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()) }), "layout");
 	register("pif_shell_status", "pif shell status", "Return pif hub, shell, sessions, widgets, and layout health.", Type.Object({}), "shell.status");
 	register("pif_reload", "pif reload", "Hot reload or hot restart the pif Flutter shell.", Type.Object({ restart: Type.Optional(Type.Boolean()) }), "shell.reload");
 	const events = ["agent_start", "agent_end", "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end"];

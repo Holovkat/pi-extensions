@@ -173,6 +173,30 @@ void main() {
     expect(find.text('/workspace'), findsOneWidget);
     await bus.dispose();
   });
+  testWidgets('Status Bar reset confirms then emits layout reset', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    await tester.pumpWidget(panel(StatusBarPlugin(), host));
+    await tester.tap(find.byIcon(Icons.restore));
+    await tester.pumpAndSettle();
+    expect(find.text('Reset layout?'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(
+      bus.sent.where((event) => event['type'] == 'reset'),
+      isEmpty,
+      reason: 'cancel must not reset',
+    );
+    await tester.tap(find.byIcon(Icons.restore));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reset'));
+    await tester.pumpAndSettle();
+    final reset = bus.sent.singleWhere((event) => event['type'] == 'reset');
+    expect(reset['channel'], 'shell/layout');
+    await bus.dispose();
+  });
   testWidgets('Widget Store renders installed and catalog records', (
     tester,
   ) async {
