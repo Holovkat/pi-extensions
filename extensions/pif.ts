@@ -126,7 +126,7 @@ class PifHub {
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
-		this.modelsPath = path.join(os.homedir(), ".pi", "agent", "models.json");
+		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
 	}
 	async start(launchFlutter = true) {
@@ -290,9 +290,30 @@ class PifHub {
 	}
 	private refreshModels() { this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
 	private async modelsAction(type: string, payload: any) {
-		if (type === "save") { const data = { providers: payload.providers ?? {} }; fs.writeFileSync(this.modelsPath, JSON.stringify(data, null, 2) + "\n"); this.refreshModels(); return { ok: true, models: this.state.models }; }
+		if (type === "save") {
+			const providers = this.validateModelProviders(payload.providers);
+			let existing: Record<string, unknown> = {};
+			try { const parsed = JSON.parse(fs.readFileSync(this.modelsPath, "utf8")); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existing = parsed; } catch { /* absent or unreadable */ }
+			if (fs.existsSync(this.modelsPath)) this.backupModelsFile();
+			fs.writeFileSync(this.modelsPath, JSON.stringify({ ...existing, providers }, null, 2) + "\n");
+			this.refreshModels(); return { ok: true, models: this.state.models };
+		}
 		if (type === "refresh") { this.refreshModels(); return { models: this.state.models }; }
 		throw new Error(`Unknown models action: ${type}`);
+	}
+	private validateModelProviders(providers: unknown): Record<string, any> {
+		if (!providers || typeof providers !== "object" || Array.isArray(providers)) throw new Error("models/save requires a providers object");
+		for (const [name, config] of Object.entries(providers)) {
+			if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error(`Provider ${name} must be an object`);
+			if (config.models !== undefined && !Array.isArray(config.models)) throw new Error(`Provider ${name} models must be an array`);
+		}
+		return providers as Record<string, any>;
+	}
+	private backupModelsFile() {
+		const backup = `${this.modelsPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+		fs.copyFileSync(this.modelsPath, backup);
+		const backups = fs.readdirSync(path.dirname(this.modelsPath)).filter((name) => name.startsWith(`${path.basename(this.modelsPath)}.bak-`)).sort();
+		for (const stale of backups.slice(0, Math.max(0, backups.length - 4))) fs.rmSync(path.join(path.dirname(this.modelsPath), stale), { force: true });
 	}
 	createWidget(params: any) {
 		const id = String(params.id ?? ""); if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("id must be lowercase snake_case");
@@ -305,7 +326,9 @@ class PifHub {
 	private analyzeWidget(dir: string) { const result = spawnSync("dart", ["analyze", dir], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); return { ok: result.status === 0, diagnostics: `${result.stdout || ""}${result.stderr || ""}`.trim() }; }
 	private restoreFile(file: string, previous: Buffer | null) { if (previous) fs.writeFileSync(file, previous); else fs.rmSync(file, { force: true }); }
 	async installWidget(params: any) {
-		const id = String(params.id ?? ""); const roots = this.widgetRoots(); let dir = path.join(roots.widgets, id); let copied = false;
+		const id = String(params.id ?? "");
+		if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("Widget id must be lowercase snake_case");
+		const roots = this.widgetRoots(); const dir = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); let copied = false;
 		if (!fs.existsSync(dir)) { const source = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (!fs.existsSync(source)) throw new Error(`Widget not found in widgets or catalog: ${id}`); fs.cpSync(source, dir, { recursive: true, errorOnExist: true }); copied = true; }
 		const manifest = parseWidgetManifest(fs.readFileSync(path.join(dir, "widget.yaml"), "utf8")); if (manifest.id !== id) throw new Error("Manifest id does not match folder");
 		const pubspecPath = path.join(this.appDir, "pubspec.yaml"), lockPath = path.join(this.appDir, "pubspec.lock");

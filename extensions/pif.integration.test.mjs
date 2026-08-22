@@ -70,8 +70,8 @@ function fakePi(workspace) {
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi(workspace, port, piBin, launchFlutter = false) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi(workspace, port, piBin, launchFlutter = false, modelsPath = null) {
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -90,7 +90,8 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const checkpoint = (name) => console.error(`[pif-smoke] ${name}`);
   checkpoint('setup');
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-smoke-')); copyFixture(workspace); const piBin = fakePi(workspace); const port = 32000 + Math.floor(Math.random() * 1000);
-  const pi = await startPi(workspace, port, piBin); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
+  const pi = await startPi(workspace, port, piBin, false, modelsPath); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
   const socket = new WebSocket(`ws://127.0.0.1:${port}/pif`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {}); const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   checkpoint('snapshot received');
@@ -138,6 +139,16 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const installed = await control(controlPath, 'widget.install', {id: 'workspace_clock'}); checkpoint('catalog installed'); assert.equal(installed.ok, true); assert.ok(fs.existsSync(path.join(workspace, 'pif', 'lib', 'widgets', 'workspace_clock')));
   await assert.rejects(() => control(controlPath, 'widget.uninstall', {id: 'agent_console'}), /Core widget/);
   await control(controlPath, 'layout', {action: 'move', widgetId: 'diff_viewer', slot: 'right'}); assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels.diff_viewer.slot, 'right');
+
+  await assert.rejects(() => control(controlPath, 'widget.install', {id: '../../escape'}), /snake_case/);
+  await assert.rejects(() => control(controlPath, 'models.save', {providers: 'not-an-object'}), /providers object/);
+  await assert.rejects(() => control(controlPath, 'models.save', {providers: {broken: {models: 'nope'}}}), /models must be an array/);
+  const savedModels = await control(controlPath, 'models.save', {providers: {fixture: {models: [{id: 'new'}]}}});
+  assert.equal(savedModels.ok, true);
+  const savedFile = JSON.parse(fs.readFileSync(modelsPath, 'utf8'));
+  assert.equal(savedFile.customKey, 'keep-me'); assert.equal(savedFile.providers.fixture.models[0].id, 'new');
+  assert.ok(fs.readdirSync(workspace).some((name) => name.startsWith('models-fixture.json.bak-')), 'backup written');
+  checkpoint('input hardening verified');
 
   await rpc(pi, {type: 'prompt', message: '/pif-stop'});
   await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.stopped')), 'child termination');
