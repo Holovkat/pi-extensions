@@ -10,6 +10,7 @@ import 'package:pif/widgets/diff_viewer/diff_viewer.dart';
 import 'package:pif/widgets/session_rail/session_rail.dart';
 import 'package:pif/widgets/status_bar/status_bar.dart';
 import 'package:pif/widgets/terminal/terminal.dart';
+import 'package:pif/widgets/tracker_board/tracker_board.dart';
 import 'package:pif/widgets/widget_store/widget_store.dart';
 
 class FakeBus extends PifBus {
@@ -461,6 +462,97 @@ void main() {
     expect(plugin.meta.core, isTrue);
     expect(plugin.meta.slot, PifSlot.bottom);
   });
+  testWidgets('tracker board renders columns, counts, badges, and stale state', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture(stale: true)};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    expect(find.text('ACME/WIDGETS'), findsOneWidget);
+    expect(find.text('To Do  2'), findsOneWidget);
+    expect(find.text('Doing  0'), findsOneWidget);
+    expect(find.text('Shipped  1'), findsOneWidget);
+    expect(find.text('EPIC'), findsOneWidget);
+    expect(find.text('TASK'), findsOneWidget);
+    expect(find.text('cached'), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board opens a markdown detail for a card', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Epic: tracker panel'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('acme/widgets/issues/10'), findsNothing);
+    expect(find.text('Epic body heading'), findsOneWidget);
+    expect(find.textContaining('Detailed epic description'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+    expect(find.text('Epic body heading'), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board moves a card optimistically and reverts on failure', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    final card = find.text('Task: build board');
+    final doing = find.text('Doing  0');
+    await tester.drag(card, tester.getCenter(doing) - tester.getCenter(card));
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  1'), findsOneWidget);
+    expect(find.text('Doing  1'), findsOneWidget);
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'move') {
+          return false;
+        }
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['column'] == 'doing';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/move', 'move_result', {'ok': false});
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  2'), findsOneWidget);
+    expect(find.text('Doing  0'), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board replaces state from hub tracker events and refreshes', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    bus.emit('tracker/state', 'state', _trackerFixture(stale: false, error: 'gh offline'));
+    await tester.pumpAndSettle();
+    expect(find.text('cached'), findsNothing);
+    expect(find.textContaining('gh offline'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.refresh));
+    await tester.pump();
+    expect(
+      bus.sent.where(
+        (sent) => sent['channel'] == 'tracker/control' && sent['type'] == 'refresh',
+      ),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
+
   testWidgets('panel error boundary contains a throwing widget', (
     tester,
   ) async {
@@ -477,6 +569,53 @@ void main() {
     await bus.dispose();
   });
 }
+
+Map<String, dynamic> _trackerFixture({bool stale = false, String? error}) => {
+  'repo': 'acme/widgets',
+  'stale': stale,
+  'fetchedAt': '2026-08-23T01:00:00Z',
+  'error': error,
+  'columns': [
+    {'id': 'todo', 'name': 'To Do'},
+    {'id': 'doing', 'name': 'Doing'},
+    {'id': 'shipped', 'name': 'Shipped'},
+  ],
+  'cards': [
+    {
+      'number': 10,
+      'title': 'Epic: tracker panel',
+      'type': 'epic',
+      'state': 'open',
+      'labels': ['epic'],
+      'body': '# Epic body heading\n\nDetailed epic description',
+      'updatedAt': '2026-08-23T01:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/10',
+      'column': 'todo',
+    },
+    {
+      'number': 11,
+      'title': 'Task: build board',
+      'type': 'task',
+      'state': 'open',
+      'labels': ['task', 'status:todo'],
+      'body': 'Task body',
+      'updatedAt': '2026-08-23T02:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/11',
+      'column': 'todo',
+    },
+    {
+      'number': 12,
+      'title': 'Shipped thing',
+      'type': 'issue',
+      'state': 'closed',
+      'labels': [],
+      'body': '',
+      'updatedAt': '2026-08-22T00:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/12',
+      'column': 'shipped',
+    },
+  ],
+};
 
 class _ThrowingPlugin implements PifWidgetPlugin {
   @override
