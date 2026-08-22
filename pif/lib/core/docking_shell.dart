@@ -196,15 +196,23 @@ class _DockingShellState extends State<DockingShell>
                 Expanded(
                   child: Column(
                     children: [
-                      Expanded(child: _center(center)),
-                      if (bottom.isEmpty)
-                        _collapsedEdge(PifSlot.bottom)
-                      else ...[
-                        const Divider(height: 1),
-                        SizedBox(
-                          height: 245,
-                          child: _dock(PifSlot.bottom, bottom),
-                        ),
+                      if (center.isEmpty && bottom.isNotEmpty) ...[
+                        // No center widgets: the bottom dock expands into
+                        // the freed stage; a slim edge keeps the center
+                        // slot droppable.
+                        _collapsedEdge(PifSlot.center),
+                        Expanded(child: _dock(PifSlot.bottom, bottom)),
+                      ] else ...[
+                        Expanded(child: _center(center)),
+                        if (bottom.isEmpty)
+                          _collapsedEdge(PifSlot.bottom)
+                        else ...[
+                          const Divider(height: 1),
+                          SizedBox(
+                            height: 245,
+                            child: _dock(PifSlot.bottom, bottom),
+                          ),
+                        ],
                       ],
                     ],
                   ),
@@ -218,10 +226,13 @@ class _DockingShellState extends State<DockingShell>
               ],
             ),
           ),
-          SizedBox(
-            height: 25,
-            child: _dock(PifSlot.status, status, chrome: false),
-          ),
+          if (status.isEmpty)
+            _collapsedEdge(PifSlot.status)
+          else
+            SizedBox(
+              height: 25,
+              child: _dock(PifSlot.status, status, chrome: false),
+            ),
         ],
       ),
     );
@@ -248,6 +259,26 @@ class _DockingShellState extends State<DockingShell>
         ),
         const Spacer(),
         IconButton(
+          onPressed: () {
+            final visible = enabled.contains('widget_store');
+            widget.bus.send(
+              'widget/control',
+              'toggle',
+              {'id': 'widget_store', 'enabled': !visible},
+            );
+          },
+          tooltip: enabled.contains('widget_store')
+              ? 'Hide widget store'
+              : 'Show widget store',
+          icon: Icon(
+            Icons.widgets,
+            size: 18,
+            color: enabled.contains('widget_store')
+                ? const Color(0xff78dba9)
+                : null,
+          ),
+        ),
+        IconButton(
           onPressed: () => setState(() => centerSplit = !centerSplit),
           tooltip: centerSplit ? 'Tabbed center' : 'Split center',
           icon: Icon(centerSplit ? Icons.tab : Icons.vertical_split, size: 18),
@@ -266,10 +297,13 @@ class _DockingShellState extends State<DockingShell>
   /// accepts drops into the (now empty) slot, which re-expands the dock.
   Widget _collapsedEdge(PifSlot slot) {
     final vertical = slot == PifSlot.left || slot == PifSlot.right;
+    final horizontal =
+        slot == PifSlot.bottom || slot == PifSlot.center ||
+        slot == PifSlot.status;
     return SizedBox(
       key: Key('pif_dock_edge_${slot.name}'),
       width: vertical ? 7 : double.infinity,
-      height: slot == PifSlot.bottom ? 7 : double.infinity,
+      height: horizontal ? 7 : double.infinity,
       child: DragTarget<String>(
         onAcceptWithDetails: (details) => move(details.data, slot),
         builder: (context, candidates, _) => AnimatedContainer(

@@ -339,6 +339,64 @@ void main() {
     await tester.binding.setSurfaceSize(null);
   });
 
+  testWidgets('bottom dock expands into an empty center stage', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    // No center widgets (agent console off): terminal takes the stage.
+    bus.emitSnapshot(
+      widgets: {
+        'terminal': {'enabled': true},
+        'widget_store': {'enabled': true},
+        'status_bar': {'enabled': true},
+      },
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_center')), findsNothing);
+    expect(find.byKey(const Key('pif_dock_edge_center')), findsOneWidget);
+    final bottom = find.byKey(const Key('pif_dock_bottom'));
+    expect(bottom, findsOneWidget);
+    expect(
+      tester.getSize(bottom).height,
+      greaterThan(600),
+      reason: 'terminal expands into the freed center space',
+    );
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('status slot collapses and the title bar recovers the store', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    final widgets = {
+      'agent_console': {'enabled': true},
+      'status_bar': {'enabled': true},
+    };
+    bus.emitSnapshot(widgets: widgets);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_status')), findsOneWidget);
+
+    // All status widgets off: the strip collapses to an edge.
+    bus.emit('widget/registry', 'registry_state', {
+      'widgets': {'agent_console': widgets['agent_console']},
+    });
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_status')), findsNothing);
+    expect(find.byKey(const Key('pif_dock_edge_status')), findsOneWidget);
+
+    // The widget store (off) is recoverable from the title bar button.
+    await tester.tap(find.byIcon(Icons.widgets));
+    await tester.pumpAndSettle();
+    expect(bus.sent, contains('widget/control:toggle'));
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
     tester,
   ) async {
