@@ -3,6 +3,6 @@ name: "Tracker"
 version: 0.1.0
 description: "Repo-synced Kanban board for the workspace's GitHub issues, sprints, and epics"
 slot: center
-core: false
+core: true
 tags: [tracker, kanban, github]
 dart_dependencies: []

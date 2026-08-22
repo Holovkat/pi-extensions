@@ -9,6 +9,7 @@ class TrackerBoardPlugin implements PifWidgetPlugin {
     id: 'tracker_board',
     name: 'Tracker',
     slot: PifSlot.center,
+    core: true,
     description:
         'Repo-synced Kanban board for the workspace\'s GitHub issues, sprints, and epics',
   );
