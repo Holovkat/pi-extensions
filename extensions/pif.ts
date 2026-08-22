@@ -198,14 +198,14 @@ class PifHub {
 		if (type === "input") return { type: "input", content: String(p.content ?? p.prompt ?? "") };
 		if (type === "message_update" || type === "message_start" || type === "message" || type === "message_end") {
 			const delta = p.assistantMessageEvent?.delta ?? p.delta;
-			if (delta) return { type: "message_update", delta: String(delta) };
+			if (delta) return { type: "message_update", delta: String(delta), ...(p.command !== undefined ? { command: String(p.command) } : {}) };
 			const content = p.message?.content;
 			if (Array.isArray(content)) { const text = content.filter((c: any) => c?.type === "text").map((c: any) => c?.text ?? "").join(""); if (text) return { type: "message", text }; }
 			if (typeof content === "string" && content) return { type: "message", text: content };
 			return { type: "message_update", delta: "" };
 		}
 		if (type.includes("tool")) return { type, toolName: String(p.toolName ?? p.name ?? "tool"), toolCallId: String(p.toolCallId ?? p.id ?? ""), args: p.args ? JSON.stringify(p.args).slice(0, 300) : undefined, result: p.result ? String(p.result).slice(0, 300) : undefined };
-		if (type === "agent_start" || type === "agent_end") return { type, state: type === "agent_start" ? "running" : "idle" };
+		if (type === "agent_start" || type === "agent_end") return { type, state: type === "agent_start" ? "running" : "idle", ...(p.aborted !== undefined ? { aborted: Boolean(p.aborted) } : {}) };
 		if (type === "stderr" || type === "output") return { type, data: String(p.data ?? p).slice(0, 500) };
 		return { type, data: JSON.stringify(p).slice(0, 500) };
 	}
