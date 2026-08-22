@@ -298,6 +298,7 @@ class PifHub {
 		if (type === "save") { if (!payload.preset) throw new Error("preset is required to save a layout"); fs.mkdirSync(presetsDir, { recursive: true }); fs.writeFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), JSON.stringify(this.state.layout, null, 2) + "\n"); }
 		else if (type === "load") { if (!payload.preset) throw new Error("preset is required to load a layout"); this.state.layout = JSON.parse(fs.readFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), "utf8")); }
 		else if (type === "reset") this.state.layout = { panels: {} };
+		else if (type === "resize") { const sizes = ((this.state.layout as any).sizes ??= {}); for (const slot of ["left", "right", "bottom"]) { const value = payload?.sizes?.[slot]; if (typeof value === "number" && Number.isFinite(value)) sizes[slot] = Math.min(Math.max(value, 80), 2_000); } }
 		else if (type === "layout_change") this.state.layout = payload;
 		else { const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), ...payload, open: type !== "close", action: type }; }
 		this.saveLayout(); this.broadcast("shell/layout", "layout_state", this.state.layout); return this.state.layout;

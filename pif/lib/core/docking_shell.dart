@@ -30,6 +30,13 @@ class _DockingShellState extends State<DockingShell>
     'diff_viewer',
   };
   bool centerSplit = false;
+  // Dock sizes — user-resizable via the dividers, persisted per project
+  // through the shell/layout resize action.
+  static const double _minSide = 140;
+  static const double _minBottom = 80;
+  double _left = 230;
+  double _right = 300;
+  double _bottom = 245;
   Map<String, PifWidgetPlugin Function()> _factories = pifWidgetFactories();
   void _refreshFactories() => _factories = pifWidgetFactories();
   @override
@@ -52,6 +59,15 @@ class _DockingShellState extends State<DockingShell>
 
   void _applyLayout(Map<String, dynamic> layout) {
     final panels = Map<String, dynamic>.from(layout['panels'] as Map? ?? {});
+    final sizes = layout['sizes'] as Map?;
+    if (sizes != null) {
+      final left = (sizes['left'] as num?)?.toDouble();
+      final right = (sizes['right'] as num?)?.toDouble();
+      final bottom = (sizes['bottom'] as num?)?.toDouble();
+      if (left != null) _left = left.clamp(_minSide, 2000);
+      if (right != null) _right = right.clamp(_minSide, 2000);
+      if (bottom != null) _bottom = bottom.clamp(_minBottom, 2000);
+    }
     slotOverrides.clear();
     hiddenPanels.clear();
     focusedWidgetId = null;
@@ -170,68 +186,155 @@ class _DockingShellState extends State<DockingShell>
     host.layout.move(id, slot);
   }
 
+  void _saveSizes() {
+    widget.bus.send('shell/layout', 'resize', {
+      'sizes': {'left': _left, 'right': _right, 'bottom': _bottom},
+    });
+  }
+
+  /// Draggable divider between two visible docks: a 6px hit area with a
+  /// hairline, a resize cursor, and the neighbour (the center stage)
+  /// absorbing whatever is added or released.
+  Widget _divider({
+    required Key key,
+    required bool horizontal,
+    required void Function(double delta) onDelta,
+  }) => GestureDetector(
+    key: key,
+    onHorizontalDragUpdate: horizontal
+        ? null
+        : (details) => onDelta(details.delta.dx),
+    onVerticalDragUpdate: horizontal
+        ? (details) => onDelta(details.delta.dy)
+        : null,
+    onHorizontalDragEnd: (_) => _saveSizes(),
+    onVerticalDragEnd: (_) => _saveSizes(),
+    child: MouseRegion(
+      cursor: horizontal
+          ? SystemMouseCursors.resizeRow
+          : SystemMouseCursors.resizeColumn,
+      child: SizedBox(
+        width: horizontal ? double.infinity : 6,
+        height: horizontal ? 6 : double.infinity,
+        child: Center(
+          child: Container(
+            width: horizontal ? double.infinity : 1,
+            height: horizontal ? 1 : double.infinity,
+            color: host.theme.border,
+          ),
+        ),
+      ),
+    ),
+  );
+
   @override
   Widget build(BuildContext context) {
-    final left = inSlot(PifSlot.left),
-        center = inSlot(PifSlot.center),
-        right = inSlot(PifSlot.right),
-        bottom = inSlot(PifSlot.bottom),
-        status = inSlot(PifSlot.status);
+    final leftWidgets = inSlot(PifSlot.left),
+        centerWidgets = inSlot(PifSlot.center),
+        rightWidgets = inSlot(PifSlot.right),
+        bottomWidgets = inSlot(PifSlot.bottom),
+        statusWidgets = inSlot(PifSlot.status);
     return Scaffold(
       body: Column(
         children: [
           _titleBar(),
           Expanded(
-            child: Row(
-              children: [
-                // Docks with no visible widgets collapse so adjacent
-                // panels reclaim the space; a slim edge remains as the
-                // drop target that re-expands the slot.
-                if (left.isEmpty)
-                  _collapsedEdge(PifSlot.left)
-                else ...[
-                  SizedBox(width: 230, child: _dock(PifSlot.left, left)),
-                  const VerticalDivider(width: 1),
-                ],
-                Expanded(
-                  child: Column(
-                    children: [
-                      if (center.isEmpty && bottom.isNotEmpty) ...[
-                        // No center widgets: the bottom dock expands into
-                        // the freed stage; a slim edge keeps the center
-                        // slot droppable.
-                        _collapsedEdge(PifSlot.center),
-                        Expanded(child: _dock(PifSlot.bottom, bottom)),
-                      ] else ...[
-                        Expanded(child: _center(center)),
-                        if (bottom.isEmpty)
-                          _collapsedEdge(PifSlot.bottom)
-                        else ...[
-                          const Divider(height: 1),
-                          SizedBox(
-                            height: 245,
-                            child: _dock(PifSlot.bottom, bottom),
-                          ),
-                        ],
-                      ],
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // Keep the center stage livable no matter how far the
+                // dividers are dragged.
+                final maxSide = (constraints.maxWidth - 240) / 2;
+                final left = _left.clamp(_minSide, maxSide);
+                final right = _right.clamp(_minSide, maxSide);
+                final bottom = _bottom.clamp(
+                  _minBottom,
+                  constraints.maxHeight - 120,
+                );
+                return Row(
+                  children: [
+                    // Docks with no visible widgets collapse so adjacent
+                    // panels reclaim the space; a slim edge remains as the
+                    // drop target that re-expands the slot.
+                    if (leftWidgets.isEmpty)
+                      _collapsedEdge(PifSlot.left)
+                    else ...[
+                      SizedBox(
+                        width: left,
+                        child: _dock(PifSlot.left, leftWidgets),
+                      ),
+                      _divider(
+                        key: const Key('pif_divider_left'),
+                        horizontal: false,
+                        onDelta: (dx) => setState(
+                          () => _left = (_left + dx).clamp(_minSide, maxSide),
+                        ),
+                      ),
                     ],
-                  ),
-                ),
-                if (right.isEmpty)
-                  _collapsedEdge(PifSlot.right)
-                else ...[
-                  const VerticalDivider(width: 1),
-                  SizedBox(width: 300, child: _dock(PifSlot.right, right)),
-                ],
-              ],
+                    Expanded(
+                      child: Column(
+                        children: [
+                          if (centerWidgets.isEmpty &&
+                              bottomWidgets.isNotEmpty) ...[
+                            // No center widgets: the bottom dock expands
+                            // into the freed stage; a slim edge keeps the
+                            // center slot droppable.
+                            _collapsedEdge(PifSlot.center),
+                            Expanded(child: _dock(PifSlot.bottom, bottomWidgets)),
+                          ] else ...[
+                            Expanded(child: _center(centerWidgets)),
+                            if (bottomWidgets.isEmpty)
+                              _collapsedEdge(PifSlot.bottom)
+                            else if (centerWidgets.isEmpty)
+                              SizedBox(
+                                height: bottom,
+                                child: _dock(PifSlot.bottom, bottomWidgets),
+                              )
+                            else ...[
+                              _divider(
+                                key: const Key('pif_divider_bottom'),
+                                horizontal: true,
+                                onDelta: (dy) => setState(
+                                  () => _bottom = (_bottom - dy).clamp(
+                                    _minBottom,
+                                    constraints.maxHeight - 120,
+                                  ),
+                                ),
+                              ),
+                              SizedBox(
+                                height: bottom,
+                                child: _dock(PifSlot.bottom, bottomWidgets),
+                              ),
+                            ],
+                          ],
+                        ],
+                      ),
+                    ),
+                    if (rightWidgets.isEmpty)
+                      _collapsedEdge(PifSlot.right)
+                    else ...[
+                      _divider(
+                        key: const Key('pif_divider_right'),
+                        horizontal: false,
+                        onDelta: (dx) => setState(
+                          () => _right = (_right - dx).clamp(_minSide, maxSide),
+                        ),
+                      ),
+                      SizedBox(
+                        width: right,
+                        child: _dock(PifSlot.right, rightWidgets),
+                      ),
+                    ],
+                  ],
+                );
+              },
             ),
           ),
-          if (status.isEmpty)
+          if (statusWidgets.isEmpty)
             _collapsedEdge(PifSlot.status)
           else
             SizedBox(
               height: 25,
-              child: _dock(PifSlot.status, status, chrome: false),
+              child: _dock(PifSlot.status, statusWidgets, chrome: false),
             ),
         ],
       ),

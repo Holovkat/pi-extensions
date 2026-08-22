@@ -152,6 +152,13 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await control(controlPath, 'layout', {action: 'reset'});
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels, {});
   await resetState; checkpoint('layout reset verified');
+  const resizeState = nextMessage(socket, (value) => value.type === 'layout_state' && value.payload.sizes?.left === 300);
+  send(socket, 'shell/layout', 'resize', {sizes: {left: 300, right: 280, bottom: 200}});
+  await resizeState;
+  assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).sizes.left, 300);
+  await control(controlPath, 'layout', {action: 'reset'});
+  assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).sizes, undefined);
+  checkpoint('dock sizes persist and reset');
 
   await assert.rejects(() => control(controlPath, 'widget.install', {id: '../../escape'}), /snake_case/);
   await assert.rejects(() => control(controlPath, 'models.save', {providers: 'not-an-object'}), /providers object/);

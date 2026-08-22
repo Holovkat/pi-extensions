@@ -397,6 +397,50 @@ void main() {
     await tester.binding.setSurfaceSize(null);
   });
 
+  testWidgets('dividers resize docks and persist the sizes', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    final widgets = {
+      'agent_console': {'enabled': true},
+      'session_rail': {'enabled': true},
+      'terminal': {'enabled': true},
+      'widget_store': {'enabled': true},
+      'status_bar': {'enabled': true},
+    };
+    bus.emitSnapshot(widgets: widgets);
+    await tester.pumpAndSettle();
+    final dock = find.byKey(const Key('pif_dock_left'));
+    final before = tester.getSize(dock).width;
+    expect(before, closeTo(230, 0.5));
+
+    await tester.drag(
+      find.byKey(const Key('pif_divider_left')),
+      const Offset(60, 0),
+    );
+    await tester.pumpAndSettle();
+    expect(
+      tester.getSize(dock).width,
+      greaterThan(before),
+      reason: 'dragging the divider widens the dock',
+    );
+    expect(bus.sent, contains('shell/layout:resize'));
+
+    // Sizes restore from a snapshot's layout state.
+    bus.emitSnapshot(
+      widgets: widgets,
+      layout: {
+        'sizes': {'left': 320, 'right': 260, 'bottom': 180},
+      },
+    );
+    await tester.pumpAndSettle();
+    expect(tester.getSize(dock).width, closeTo(320, 0.5));
+    expect(tester.getSize(find.byKey(const Key('pif_dock_right'))).width, closeTo(260, 0.5));
+    expect(tester.getSize(find.byKey(const Key('pif_dock_bottom'))).height, closeTo(180, 0.5));
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
     tester,
   ) async {
