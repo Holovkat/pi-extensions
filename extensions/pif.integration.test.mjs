@@ -159,6 +159,12 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await control(controlPath, 'layout', {action: 'reset'});
   assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).sizes, undefined);
   checkpoint('dock sizes persist and reset');
+  const pinState = nextMessage(socket, (value) => value.type === 'layout_state' && value.payload.panels?.widget_store?.pinned === false);
+  send(socket, 'shell/layout', 'pin', {widgetId: 'widget_store', pinned: false});
+  await pinState;
+  assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels.widget_store.pinned, false);
+  send(socket, 'shell/layout', 'pin', {widgetId: 'widget_store', pinned: true});
+  checkpoint('pin state persists');
 
   await assert.rejects(() => control(controlPath, 'widget.install', {id: '../../escape'}), /snake_case/);
   await assert.rejects(() => control(controlPath, 'models.save', {providers: 'not-an-object'}), /providers object/);

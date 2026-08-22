@@ -441,6 +441,57 @@ void main() {
     await tester.binding.setSurfaceSize(null);
   });
 
+  testWidgets('unpinned panels slide from edge grabbers and re-pin', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    final widgets = {
+      'agent_console': {'enabled': true},
+      'session_rail': {'enabled': true},
+      'widget_store': {'enabled': true},
+      'status_bar': {'enabled': true},
+    };
+    bus.emitSnapshot(widgets: widgets);
+    await tester.pumpAndSettle();
+    // Both side panels show pin controls; center panels do not.
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('pif_dock_right')),
+        matching: find.byIcon(Icons.push_pin),
+      ),
+      findsOneWidget,
+    );
+
+    // Unpin the store: layout space freed, grabber appears on the right.
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const Key('pif_dock_right')),
+        matching: find.byIcon(Icons.push_pin),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(bus.sent, contains('shell/layout:pin'));
+    expect(find.byKey(const Key('pif_dock_right')), findsNothing);
+    final grabber = find.byKey(const Key('pif_grabber_right_widget_store'));
+    expect(grabber, findsOneWidget);
+
+    // Slide in over the other panels, then pin back into the layout.
+    await tester.tap(grabber);
+    await tester.pumpAndSettle();
+    final overlay = find.byKey(const Key('pif_overlay_widget_store'));
+    expect(overlay, findsOneWidget);
+    await tester.tap(
+      find.descendant(of: overlay, matching: find.byIcon(Icons.push_pin)),
+    );
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_right')), findsOneWidget);
+    expect(grabber, findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
     tester,
   ) async {

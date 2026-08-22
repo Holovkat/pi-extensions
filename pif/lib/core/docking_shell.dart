@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../widget_registry.g.dart';
 import 'bus.dart';
@@ -20,6 +21,10 @@ class _DockingShellState extends State<DockingShell>
   late StreamSubscription events;
   final slotOverrides = <String, PifSlot>{};
   final hiddenPanels = <String>{};
+  // Unpinned panels leave the layout (neighbours reclaim the space) and
+  // live as slide-in overlays with an edge grabber instead.
+  final unpinnedIds = <String>{};
+  final slidIn = <String>{};
   String? focusedWidgetId;
   Set<String> enabled = {
     'agent_console',
@@ -75,6 +80,12 @@ class _DockingShellState extends State<DockingShell>
       final value = Map<String, dynamic>.from(entry.value as Map);
       final slot = value['slot'] as String?;
       if (value['open'] == false) hiddenPanels.add(entry.key);
+      if (value['pinned'] == false) {
+        unpinnedIds.add(entry.key);
+      } else {
+        unpinnedIds.remove(entry.key);
+        slidIn.remove(entry.key);
+      }
       if (value['action'] == 'focus' || value['action'] == 'open') {
         focusedWidgetId = entry.key;
       }
@@ -166,6 +177,7 @@ class _DockingShellState extends State<DockingShell>
   List<PifWidgetPlugin> inSlot(PifSlot slot) {
     final plugins = enabled
         .where((id) => !hiddenPanels.contains(id))
+        .where((id) => !unpinnedIds.contains(id))
         .map((id) => _factories[id]?.call())
         .whereType<PifWidgetPlugin>()
         .where(
@@ -184,6 +196,33 @@ class _DockingShellState extends State<DockingShell>
   void move(String id, PifSlot slot) {
     setState(() => slotOverrides[id] = slot);
     host.layout.move(id, slot);
+  }
+
+  static const _pinnableIds = {'widget_store', 'session_rail'};
+
+  bool _pinnable(PifWidgetPlugin plugin) {
+    if (!_pinnableIds.contains(plugin.meta.id)) return false;
+    final slot = slotOverrides[plugin.meta.id] ?? plugin.meta.slot;
+    return slot == PifSlot.left || slot == PifSlot.right;
+  }
+
+  PifSlot _effectiveSlot(String id, PifSlot fallback) =>
+      slotOverrides[id] ?? fallback;
+
+  void pin(String id, bool pinned) {
+    setState(() {
+      if (pinned) {
+        unpinnedIds.remove(id);
+        slidIn.remove(id);
+      } else {
+        unpinnedIds.add(id);
+        slidIn.remove(id);
+      }
+    });
+    widget.bus.send('shell/layout', 'pin', {
+      'widgetId': id,
+      'pinned': pinned,
+    });
   }
 
   void _saveSizes() {
@@ -239,8 +278,10 @@ class _DockingShellState extends State<DockingShell>
         children: [
           _titleBar(),
           Expanded(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
+            child: Stack(
+              children: [
+                LayoutBuilder(
+                  builder: (context, constraints) {
                 // Keep the center stage livable no matter how far the
                 // dividers are dragged.
                 final maxSide = (constraints.maxWidth - 240) / 2;
@@ -327,6 +368,10 @@ class _DockingShellState extends State<DockingShell>
                   ],
                 );
               },
+                ),
+                ..._overlayPanels(),
+                ..._edgeGrabbers(),
+              ],
             ),
           ),
           if (statusWidgets.isEmpty)
@@ -339,6 +384,167 @@ class _DockingShellState extends State<DockingShell>
         ],
       ),
     );
+  }
+
+  /// Slide-in overlay panels for unpinned widgets, anchored to the edge
+  /// they were docked on and floating over the other panels.
+  List<Widget> _overlayPanels() {
+    final overlays = <Widget>[];
+    for (final id in unpinnedIds) {
+      final factory = _factories[id];
+      if (factory == null) continue;
+      final plugin = factory();
+      final side = _effectiveSlot(id, plugin.meta.slot);
+      if (side != PifSlot.left && side != PifSlot.right) continue;
+      final open = slidIn.contains(id);
+      final width = (side == PifSlot.left ? _left : _right)
+          .clamp(_minSide, 520)
+          .toDouble();
+      overlays.add(
+        Positioned(
+          key: Key('pif_overlay_$id'),
+          top: 0,
+          bottom: 0,
+          left: side == PifSlot.left ? 0 : null,
+          right: side == PifSlot.right ? 0 : null,
+          width: width,
+          child: AnimatedSlide(
+            duration: const Duration(milliseconds: 200),
+            curve: Curves.easeOutCubic,
+            offset: open
+                ? Offset.zero
+                : side == PifSlot.left
+                ? const Offset(-1.05, 0)
+                : const Offset(1.05, 0),
+            child: Container(
+              decoration: BoxDecoration(
+                color: host.theme.panel,
+                border: Border(
+                  left: side == PifSlot.right
+                      ? BorderSide(color: host.theme.border)
+                      : BorderSide.none,
+                  right: side == PifSlot.left
+                      ? BorderSide(color: host.theme.border)
+                      : BorderSide.none,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.5),
+                    blurRadius: 18,
+                    offset: side == PifSlot.left
+                        ? const Offset(6, 0)
+                        : const Offset(-6, 0),
+                  ),
+                ],
+              ),
+              child: Column(
+                children: [
+                  _overlayHeader(plugin, side),
+                  Expanded(
+                    child: PanelErrorBoundary(
+                      key: ValueKey('overlay-${plugin.meta.id}'),
+                      plugin: plugin,
+                      host: host,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+    return overlays;
+  }
+
+  Widget _overlayHeader(PifWidgetPlugin plugin, PifSlot side) => Container(
+    height: 32,
+    padding: const EdgeInsets.symmetric(horizontal: 10),
+    decoration: BoxDecoration(
+      color: host.theme.panelRaised,
+      border: Border(bottom: BorderSide(color: host.theme.border)),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.drag_indicator, size: 14, color: Color(0xff69758a)),
+        const SizedBox(width: 5),
+        Text(
+          plugin.meta.name,
+          style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
+        ),
+        const Spacer(),
+        IconButton(
+          onPressed: () => pin(plugin.meta.id, true),
+          tooltip: 'Pin panel back into the layout',
+          icon: Transform.rotate(
+            angle: math.pi / 4,
+            child: const Icon(Icons.push_pin, size: 13),
+          ),
+        ),
+        IconButton(
+          onPressed: () => setState(() => slidIn.remove(plugin.meta.id)),
+          tooltip: 'Slide out',
+          icon: Icon(
+            side == PifSlot.left
+                ? Icons.keyboard_double_arrow_left
+                : Icons.keyboard_double_arrow_right,
+            size: 14,
+          ),
+        ),
+      ],
+    ),
+  );
+
+  /// Grabber tabs on the viewport border, one per unpinned panel, on the
+  /// side it was docked. Tapping slides the panel in over the others.
+  List<Widget> _edgeGrabbers() {
+    final grabbers = <Widget>[];
+    for (final side in [PifSlot.left, PifSlot.right]) {
+      var row = 0;
+      for (final id in unpinnedIds) {
+        if (slidIn.contains(id)) continue;
+        final factory = _factories[id];
+        if (factory == null) continue;
+        final slot = _effectiveSlot(id, factory().meta.slot);
+        if (slot != side) continue;
+        grabbers.add(
+          Positioned(
+            key: Key('pif_grabber_${side.name}_$id'),
+            top: 120 + row * 72,
+            left: side == PifSlot.left ? 0 : null,
+            right: side == PifSlot.right ? 0 : null,
+            child: Material(
+              elevation: 6,
+              color: host.theme.panelRaised,
+              borderRadius: BorderRadius.horizontal(
+                left: side == PifSlot.right
+                    ? const Radius.circular(6)
+                    : Radius.zero,
+                right: side == PifSlot.left
+                    ? const Radius.circular(6)
+                    : Radius.zero,
+              ),
+              child: InkWell(
+                onTap: () => setState(() => slidIn.add(id)),
+                child: SizedBox(
+                  width: 18,
+                  height: 60,
+                  child: Icon(
+                    side == PifSlot.left
+                        ? Icons.keyboard_double_arrow_right
+                        : Icons.keyboard_double_arrow_left,
+                    size: 15,
+                    color: const Color(0xff8b96aa),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+        row++;
+      }
+    }
+    return grabbers;
   }
 
   Widget _titleBar() => Container(
@@ -571,6 +777,12 @@ class _DockingShellState extends State<DockingShell>
             style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
           ),
           const Spacer(),
+          if (_pinnable(plugin))
+            IconButton(
+              onPressed: () => pin(plugin.meta.id, false),
+              tooltip: 'Unpin panel (slides to the edge)',
+              icon: const Icon(Icons.push_pin, size: 13),
+            ),
           if (!plugin.meta.core)
             IconButton(
               onPressed: () => host.layout.close(plugin.meta.id),
