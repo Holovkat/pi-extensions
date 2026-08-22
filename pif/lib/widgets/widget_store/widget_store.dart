@@ -133,12 +133,15 @@ class _StoreState extends State<_Store> {
               ],
             ),
           ),
-          Switch(
-            value: item['enabled'] as bool? ?? false,
-            onChanged: (value) => widget.host.bus.send(
-              'widget/control',
-              'toggle',
-              {'id': id, 'enabled': value},
+          Transform.scale(
+            scale: 0.5,
+            child: Switch(
+              value: item['enabled'] as bool? ?? false,
+              onChanged: (value) => widget.host.bus.send(
+                'widget/control',
+                'toggle',
+                {'id': id, 'enabled': value},
+              ),
             ),
           ),
           IconButton(
