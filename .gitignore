@@ -9,3 +9,10 @@
 .githooks/
 
 dist/
+
+# macOS
+.DS_Store
+
+# pif runtime + build output
+build/
+.pi-subagents/
