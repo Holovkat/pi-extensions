@@ -92,14 +92,21 @@ class PiLauncher {
     return 'pif';
   }
 
-  /// Quick check whether a hub is already listening on the given port.
+  /// Whether an actual pif hub is answering on the given port. Probes the
+  /// HTTP identity endpoint rather than just opening a TCP connection, so
+  /// any unrelated listener on the port is not mistaken for the hub.
   static Future<bool> isHubRunning({int port = 31415}) async {
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
     try {
-      final socket = await Socket.connect('127.0.0.1', port);
-      socket.destroy();
-      return true;
+      final request = await client.getUrl(Uri.parse('http://127.0.0.1:$port/'));
+      final response = await request.close();
+      if (response.statusCode != 200) return false;
+      final body = await response.transform(utf8.decoder).join();
+      return body.contains('"name":"pif"');
     } catch (_) {
       return false;
+    } finally {
+      client.close();
     }
   }
 

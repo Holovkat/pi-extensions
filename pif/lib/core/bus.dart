@@ -92,6 +92,9 @@ class PifBus {
   Timer? _retry;
   int _attempt = 0;
   bool _disposed = false;
+  Future<void>? _connecting;
+  final List<String> _pending = [];
+  static const int _maxPending = 200;
 
   Stream<PifEnvelope> get events => _events.stream;
   Stream<bool> get connection => _connection.stream;
@@ -99,8 +102,14 @@ class PifBus {
   Stream<PifEnvelope> channel(String prefix) =>
       events.where((event) => event.channel.startsWith(prefix));
 
-  Future<void> connect() async {
-    if (_disposed || _socket != null) return;
+  Future<void> connect() {
+    if (_disposed || _socket != null) return Future.value();
+    // Memoize so concurrent callers share one connection attempt instead
+    // of racing WebSocket.connect and leaking a socket.
+    return _connecting ??= _connect().whenComplete(() => _connecting = null);
+  }
+
+  Future<void> _connect() async {
     try {
       final socket = await WebSocket.connect(connectUri.toString());
       if (_disposed) return socket.close();
@@ -114,8 +123,18 @@ class PifBus {
         cancelOnError: true,
       );
       send('shell/state', 'snapshot_request', const {});
+      _flushPending();
     } catch (_) {
       _scheduleReconnect();
+    }
+  }
+
+  void _flushPending() {
+    if (_pending.isEmpty) return;
+    final queued = List.of(_pending);
+    _pending.clear();
+    for (final raw in queued) {
+      _socket?.add(raw);
     }
   }
 
@@ -129,7 +148,7 @@ class PifBus {
   }
 
   void _disconnected() {
-    if (_socket == null) return;
+    if (_socket == null || _disposed) return;
     _socket = null;
     _connection.add(false);
     _scheduleReconnect();
@@ -150,13 +169,35 @@ class PifBus {
       type: type,
       payload: payload,
     );
-    _socket?.add(jsonEncode(envelope.toJson()));
+    final raw = jsonEncode(envelope.toJson());
+    final socket = _socket;
+    if (socket != null) {
+      socket.add(raw);
+    } else {
+      _enqueue(raw);
+    }
+  }
+
+  /// Envelopes sent while disconnected are queued and flushed in order on
+  /// reconnect, so user input typed during a hub restart is never lost
+  /// silently. Overflow drops the oldest and surfaces an error.
+  void _enqueue(String raw) {
+    if (_disposed) return;
+    if (_pending.length >= _maxPending) {
+      _pending.removeAt(0);
+      _events.addError(
+        StateError('pif bus queue overflow: $_maxPending pending envelopes, oldest dropped'),
+      );
+    }
+    _pending.add(raw);
   }
 
   Future<void> dispose() async {
     _disposed = true;
     _retry?.cancel();
-    await _socket?.close();
+    final socket = _socket;
+    _socket = null;
+    await socket?.close();
     await _events.close();
     await _connection.close();
   }

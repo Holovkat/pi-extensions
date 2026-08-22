@@ -1,4 +1,7 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pif/core/bus.dart';
@@ -85,7 +88,108 @@ class MockHubBus extends PifBus {
   }
 }
 
+/// Minimal hub-like WebSocket server used by the reconnect test.
+/// dart:io's server.close(force) does not terminate upgraded sockets, so
+/// kill() closes them explicitly.
+class HubLikeServer {
+  HubLikeServer(this.server);
+  final HttpServer server;
+  final List<WebSocket> sockets = [];
+  Future<void> kill() async {
+    for (final socket in sockets) {
+      await socket.close();
+    }
+    await server.close(force: true);
+  }
+}
+
+Future<HubLikeServer> startHubLikeServer(int port, List<String> received) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, port);
+  final hub = HubLikeServer(server);
+  server.listen((request) async {
+    if (request.uri.path != '/pif') {
+      request.response.statusCode = 404;
+      await request.response.close();
+      return;
+    }
+    final socket = await WebSocketTransformer.upgrade(request);
+    hub.sockets.add(socket);
+    socket.listen(
+      (raw) {
+        received.add(raw as String);
+        if (socket.readyState == WebSocket.open) {
+          try {
+            socket.add(
+              jsonEncode({
+                'v': 1,
+                'id': 'ack-${received.length}',
+                'ts': DateTime.now().toUtc().toIso8601String(),
+                'channel': 'shell/state',
+                'type': 'ack',
+                'payload': {},
+              }),
+            );
+          } catch (_) {/* client closed mid-ack */}
+        }
+      },
+      onDone: () => hub.sockets.remove(socket),
+    );
+  });
+  return hub;
+}
+
 void main() {
+  test('PifBus queues sends while disconnected and flushes in order on reconnect', () async {
+    const port = 31877;
+    var server = await startHubLikeServer(port, []);
+    final received = <String>[];
+    final errors = <Object>[];
+    final bus = PifBus(
+      uri: Uri.parse('ws://127.0.0.1:$port/pif'),
+      token: 'reconnect-test-token',
+    );
+    bus.events.listen(null, onError: errors.add);
+    await bus.connect();
+    expect(bus.connected, true);
+
+    final offline = bus.connection.firstWhere((online) => !online);
+    await server.kill();
+    await offline;
+    expect(bus.connected, false);
+
+    // Input typed during the outage is queued, never dropped silently.
+    bus.send('session/control', 'input', {'content': 'queued-1'});
+    bus.send('session/control', 'input', {'content': 'queued-2'});
+    for (var i = 3; i <= 210; i++) {
+      bus.send('session/control', 'input', {'content': 'queued-$i'});
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(errors, isNotEmpty, reason: 'queue overflow should surface an error');
+
+    server = await startHubLikeServer(port, received);
+    final online = bus.connection.firstWhere((value) => value);
+    await online;
+    await Future.doWhile(() async {
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      return received.length < 201; // snapshot request + 200 queued envelopes
+    });
+    final payloads =
+        received
+            .map((raw) => (jsonDecode(raw) as Map<String, dynamic>)['payload'] as Map)
+            .map((payload) => payload['content'] as String?)
+            .whereType<String>()
+            .toList();
+    expect(payloads.length, 200, reason: 'overflow should keep the newest 200');
+    final indexes = payloads.map((content) => int.parse(content.split('-')[1])).toList();
+    for (var i = 1; i < indexes.length; i++) {
+      expect(indexes[i], indexes[i - 1] + 1, reason: 'queued envelopes flush in order');
+    }
+    expect(indexes.first, 11, reason: 'overflow drops the oldest');
+
+    await bus.dispose();
+    await server.kill();
+  });
+
   testWidgets('mock hub snapshot boots shell and reconnect resyncs', (
     tester,
   ) async {
