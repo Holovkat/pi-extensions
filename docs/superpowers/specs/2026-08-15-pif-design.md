@@ -5,6 +5,7 @@
 - **Owner:** Tony Holovka
 - **Repo:** pi-extensions (single repo: extension + Flutter app)
 - **Tracker:** Epic [#120](https://github.com/Holovkat/pi-extensions/issues/120) · Sprint [#121](https://github.com/Holovkat/pi-extensions/issues/121) · Tasks #122–#129
+- **Successor (app builder):** Epic [#152](https://github.com/Holovkat/pi-extensions/issues/152) · Sprint [#153](https://github.com/Holovkat/pi-extensions/issues/153) · Tasks #154–#160 — pif as the foundation applications are built on; rewrites the Phase 2/3 direction (Task #154 owns the spec update)
 
 ## Vision
 
