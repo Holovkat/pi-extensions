@@ -36,6 +36,7 @@ Reused the two weeks of prior work as the foundation: install pipeline + analyze
 - Export uses a pinned registry (AOT freezes the widget set); installing new widgets into shipped apps stays deferred to the RFW lane.
 - Bundled pi ships without dev models/API keys; first-run provisioning on the target machine; secrets scan is export acceptance.
 - Largest recorded risk: the export template consuming shell core ("shell-as-package") — if it forces extracting a `pif_core` package, that is a line-stop and replan, not improvisation.
+- Roadmap realigned on the tracker (follow-up pass): the spec's original Phase 2 → 3 order is superseded on epic #152's "Roadmap Realignment" section — layout presets and diff viewer recorded as already done; Phase 3 packaging pulled forward into #159; Phase 2 on-demand builds subsumed by #158; the remainder re-sequenced as deferred Sprint 2 (Ecosystem: remote git catalogs on #155's layered sources, per-widget settings, theming, file-explorer via the agentic flow) and Sprint 3 (Platform & sharing: coms/council sharing depending on epic #112, trust/signing, RFW lane for shipped AOT apps, multi-window). Task #154 owns writing this into the spec so spec and tracker tell one story; linkage comments left on #120 and #112.
 
 # Lessons Learned
 
