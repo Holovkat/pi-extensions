@@ -178,6 +178,23 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.ok(fs.readdirSync(workspace).some((name) => name.startsWith('models-fixture.json.bak-')), 'backup written');
   checkpoint('input hardening verified');
 
+  // models/* envelopes over the WS bus previously failed channel validation.
+  const modelsRefreshed = nextMessage(socket, (value) => value.type === 'snapshot' && Array.isArray(value.payload.models));
+  send(socket, 'models/control', 'refresh', {});
+  await modelsRefreshed; checkpoint('models channel envelope accepted');
+
+  // Tracker surface: the temp workspace has no GitHub remote — errors surface over the bus and the empty cache stays stale.
+  assert.equal(snapshot.payload.tracker.repo, null);
+  const trackerState = nextMessage(socket, (value) => value.channel === 'tracker/state');
+  const refreshed = await control(controlPath, 'tracker.refresh');
+  assert.equal(refreshed.ok, false); assert.match(refreshed.error, /no GitHub origin remote/);
+  await trackerState; checkpoint('tracker error surfaced');
+  const board = await control(controlPath, 'tracker.list');
+  assert.deepEqual(board.columns, []); assert.equal(board.cards.length, 0); assert.equal(board.stale, true);
+  const moveReject = await control(controlPath, 'tracker.move', {number: 1, column: 'todo'});
+  assert.equal(moveReject.ok, false); assert.match(moveReject.error, /Unknown card/);
+  checkpoint('tracker controls verified');
+
   send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
   send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');

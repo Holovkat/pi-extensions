@@ -1,0 +1,15 @@
+# pif tracker board — the repo is the source of truth.
+# Columns map to GitHub: status:* labels for progress, issue state for done.
+# Move a card in pif and the hub writes the matching label / state back via gh.
+column todo:
+  name: To Do
+  label: status:todo
+column in_progress:
+  name: In Progress
+  label: status:in-progress
+column blocked:
+  name: Blocked
+  label: status:blocked
+column done:
+  name: Done
+  state: closed
