@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import '../../core/plugin.dart';
 
@@ -69,6 +70,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
 
   List<Map<String, dynamic>> _buildEntries(List<dynamic> transcript) {
     final entries = <Map<String, dynamic>>[];
+    var turnStartIndex = -1;
+    String? turnStartTs;
     for (final raw in transcript) {
       if (raw is! Map) continue;
       final event = Map<String, dynamic>.from(raw);
@@ -108,9 +111,26 @@ class _AgentConsoleState extends State<_AgentConsole> {
           'detail': data['args'] ?? data['result'] ?? '',
         });
       } else if (type == 'agent_start') {
+        turnStartTs = event['ts'] as String? ?? data['ts'] as String?;
+        turnStartIndex = entries.length;
         entries.add({'kind': 'status', 'text': 'Agent started'});
       } else if (type == 'agent_end') {
-        entries.add({'kind': 'status', 'text': 'Agent finished'});
+        final response = entries
+            .skip(turnStartIndex + 1)
+            .where((entry) => entry['kind'] == 'assistant')
+            .map((entry) => entry['text'] as String? ?? '')
+            .where((text) => text.isNotEmpty)
+            .join('\n\n');
+        final endTs = event['ts'] as String? ?? data['ts'] as String?;
+        entries.add({
+          'kind': 'turn_end',
+          if (turnStartTs != null && endTs != null)
+            'duration': _durationBetween(turnStartTs, endTs),
+          'response': response,
+          'aborted': event['aborted'] == true || data['aborted'] == true,
+        });
+        turnStartIndex = -1;
+        turnStartTs = null;
       } else if (type == 'stderr' || type == 'output') {
         final text = data['data']?.toString() ?? '';
         if (text.trim().isNotEmpty) {
@@ -119,6 +139,11 @@ class _AgentConsoleState extends State<_AgentConsole> {
       }
     }
     return entries;
+  }
+
+  Duration? _durationBetween(String start, String end) {
+    final duration = DateTime.tryParse(end)?.difference(DateTime.tryParse(start) ?? DateTime.now());
+    return duration == null || duration.isNegative ? null : duration;
   }
 
   String? _extractDelta(Map<String, dynamic> data) {
@@ -466,6 +491,10 @@ class _EntryCard extends StatelessWidget {
       );
     }
 
+    if (kind == 'turn_end') {
+      return _TurnEndCard(entry: entry);
+    }
+
     // raw
     return Container(
       margin: const EdgeInsets.only(bottom: 6),
@@ -483,5 +512,112 @@ class _EntryCard extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// Compact footer at the end of an agent turn: ✓ + duration + copy actions
+/// for the turn's response, Codex-style.
+class _TurnEndCard extends StatefulWidget {
+  const _TurnEndCard({required this.entry});
+  final Map<String, dynamic> entry;
+  @override
+  State<_TurnEndCard> createState() => _TurnEndCardState();
+}
+
+class _TurnEndCardState extends State<_TurnEndCard> {
+  String? copied;
+
+  @override
+  Widget build(BuildContext context) {
+    final entry = widget.entry;
+    final duration = entry['duration'] as Duration?;
+    final response = entry['response'] as String? ?? '';
+    final aborted = entry['aborted'] == true;
+    final codeBlocks = _codeBlocks(response);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Row(
+        children: [
+          Icon(
+            aborted ? Icons.stop_outlined : Icons.check_circle,
+            size: 13,
+            color: aborted ? Colors.amber : const Color(0xff78dba9),
+          ),
+          if (duration != null) ...[
+            const SizedBox(width: 6),
+            Text(
+              _formatDuration(duration),
+              style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+            ),
+          ],
+          if (aborted) ...[
+            const SizedBox(width: 6),
+            const Text(
+              'aborted',
+              style: TextStyle(fontSize: 11, color: Colors.amber),
+            ),
+          ],
+          const Spacer(),
+          if (response.isNotEmpty)
+            _copyAction(
+              key: 'response',
+              tooltip: 'Copy response',
+              icon: Icons.content_copy,
+              onCopy: () => response,
+            ),
+          if (codeBlocks != null && codeBlocks.isNotEmpty)
+            _copyAction(
+              key: 'code',
+              tooltip: 'Copy code blocks',
+              icon: Icons.code,
+              onCopy: () => codeBlocks,
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _copyAction({
+    required String key,
+    required String tooltip,
+    required IconData icon,
+    required String Function() onCopy,
+  }) => Tooltip(
+    message: tooltip,
+    child: InkWell(
+      borderRadius: BorderRadius.circular(4),
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: onCopy()));
+        setState(() => copied = key);
+        Future.delayed(const Duration(seconds: 1), () {
+          if (mounted) setState(() => copied = null);
+        });
+      },
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Icon(
+          copied == key ? Icons.check : icon,
+          size: 13,
+          color: const Color(0xff8b96aa),
+        ),
+      ),
+    ),
+  );
+
+  String? _codeBlocks(String markdown) {
+    final blocks = RegExp(r'```[^\n]*\n([\s\S]*?)```')
+        .allMatches(markdown)
+        .map((match) => match.group(1)?.trim() ?? '')
+        .where((block) => block.isNotEmpty)
+        .toList();
+    return blocks.isEmpty ? null : blocks.join('\n\n');
+  }
+
+  String _formatDuration(Duration duration) {
+    if (duration.inSeconds < 60) return '${duration.inSeconds}s';
+    if (duration.inMinutes < 60) {
+      return '${duration.inMinutes}m ${duration.inSeconds % 60}s';
+    }
+    return '${duration.inHours}h ${duration.inMinutes % 60}m';
   }
 }

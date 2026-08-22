@@ -124,6 +124,36 @@ void main() {
     expect(bus.sent.single['type'], 'input');
     await bus.dispose();
   });
+  testWidgets('Agent Console shows one start tag and a duration footer with copy actions', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+        'transcript': [
+          {'type': 'input', 'content': 'build it'},
+          {'type': 'agent_start', 'ts': '2026-08-22T10:00:00.000Z'},
+          {'type': 'message_update', 'delta': 'here is the code'},
+          {'type': 'message', 'text': 'here is the code\n```dart\nvoid main() {}\n```'},
+          {'type': 'agent_end', 'ts': '2026-08-22T10:01:23.000Z'},
+        ],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    expect(find.text('Agent started'), findsOneWidget);
+    expect(find.text('Agent finished'), findsNothing);
+    expect(find.text('1m 23s'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy), findsOneWidget);
+    expect(find.byIcon(Icons.code), findsOneWidget);
+    await bus.dispose();
+  });
   test('session deltas are idempotent by envelope id', () {
     final bus = FakeBus();
     final sessions = PifSessions(bus);

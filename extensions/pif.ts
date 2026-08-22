@@ -207,7 +207,7 @@ class PifHub {
 	hostEvent(type: string, payload: unknown) {
 		const host = this.state.sessions.host; if (!host) return;
 		if (type === "agent_start") host.state = "running"; if (type === "agent_end") host.state = "idle";
-		const entry = this.normalizeEntry(type, payload); host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
+		const entry = { ...this.normalizeEntry(type, payload), ts: new Date().toISOString() }; host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
 		this.broadcast("session/host", type, { sessionId: "host", state: host.state, event: entry });
 	}
 	private normalizeEntry(type: string, payload: any): Record<string, unknown> {
@@ -270,7 +270,7 @@ class PifHub {
 	private childEvent(session: PifSession, line: string) {
 		let event: any; try { event = JSON.parse(line); } catch { event = { type: "output", data: line }; }
 		const kind = String(event.type ?? event.event ?? "event"); if (/start|delta|tool/.test(kind)) session.state = "running"; if (/agent_end|turn_end|result/.test(kind)) session.state = "idle"; if (/input_required/.test(kind)) session.state = "awaiting-input";
-		const entry = this.normalizeEntry(kind, event); session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
+		const entry = { ...this.normalizeEntry(kind, event), ts: event.ts ?? new Date().toISOString() }; session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
 	}
 	private loadLayout() { try { this.state.layout = JSON.parse(fs.readFileSync(this.layoutPath, "utf8")); } catch { this.state.layout = { panels: {} }; } }
 	private saveLayout() { fs.mkdirSync(path.dirname(this.layoutPath), { recursive: true }); fs.writeFileSync(this.layoutPath, JSON.stringify(this.state.layout, null, 2) + "\n"); }
