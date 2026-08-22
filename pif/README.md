@@ -47,7 +47,7 @@ column done:
   state: closed
 ```
 
-Moving a card to a column adds its label, clears competing `status:*` labels, and sets the issue state (`state: closed` closes it). Agents can read the board through the `pif_tracker_list` pi tool.
+Moving a card in pif and the hub writes the matching label / state back via gh. Cards can also be created, edited (title/body), moved between lanes (drag or the sheet's lane dropdown), and deleted from the resizable ticket sheet — its preferred size is remembered. Agents get the same operations through the `pif_tracker_list` / `pif_tracker_create` / `pif_tracker_update` / `pif_tracker_delete` pi tools.
 
 ## Install globally
 

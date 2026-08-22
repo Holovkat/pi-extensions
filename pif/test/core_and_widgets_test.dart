@@ -553,6 +553,146 @@ void main() {
     await bus.dispose();
   });
 
+  testWidgets('ticket sheet creates a ticket through the hub', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Fresh ticket');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'create') return false;
+        final payload = sent['payload'] as Map;
+        return payload['title'] == 'Fresh ticket' && payload['type'] == 'task' && payload['column'] == 'todo';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': true, 'number': 21});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet surfaces create failures and stays open', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Doomed ticket');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': false, 'error': 'gh: label not found'});
+    await tester.pumpAndSettle();
+    expect(find.textContaining('gh: label not found'), findsOneWidget);
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet edits a card and returns to view mode on success', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    expect(find.text('Task body'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Task: renamed');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'update') return false;
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['title'] == 'Task: renamed';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'update', 'ok': true, 'number': 11});
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Task: renamed'), findsOneWidget);
+    expect(find.byKey(const Key('tracker_sheet_title')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet moves a card via the lane dropdown', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('tracker_sheet_move')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Doing').last);
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  1'), findsOneWidget);
+    expect(find.text('Doing  1'), findsOneWidget);
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'move') return false;
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['column'] == 'doing';
+      }),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet deletes a card after confirmation', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Shipped thing'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('permanently deleted'), findsOneWidget);
+    await tester.tap(find.text('Delete'));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'delete') return false;
+        return (sent['payload'] as Map)['number'] == 12;
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'delete', 'ok': true, 'number': 12});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet resizes from the corner handle', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    final before = tester.getSize(find.byKey(const Key('tracker_sheet_box')));
+    await tester.drag(find.byKey(const Key('tracker_sheet_resize')), const Offset(90, 60));
+    await tester.pump();
+    final after = tester.getSize(find.byKey(const Key('tracker_sheet_box')));
+    expect(after.width, greaterThan(before.width));
+    await bus.dispose();
+  });
+
   testWidgets('panel error boundary contains a throwing widget', (
     tester,
   ) async {

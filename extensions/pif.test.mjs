@@ -217,6 +217,90 @@ test('tracker move writes back through gh and reverts nothing on failure', async
   fs.rmSync(workspace, {recursive: true, force: true});
 });
 
+test('tracker create writes through gh, falls back without labels, and prepends the card', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
+  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\ncolumn doing:\n  name: Doing\n  label: status:doing\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  const runner = stubRunner([
+    {match: (command) => command === 'git', stdout: 'git@github.com:acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[0] === 'issue' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+    {match: (command, args) => command === 'gh' && args[1] === 'create' && args.includes('status:todo'), status: 1, stderr: "could not add label: 'status:todo' not found"},
+    {match: (command, args) => command === 'gh' && args[1] === 'create', stdout: 'https://github.com/acme/widgets/issues/20\n'},
+  ]);
+  const tracker = new TrackerSync(workspace, () => {}, runner, true);
+  await tracker.init();
+  tracker.refresh();
+  const missingTitle = tracker.create({body: 'no title'});
+  assert.equal(missingTitle.ok, false);
+  assert.match(missingTitle.error, /Title is required/);
+  const badColumn = tracker.create({title: 'X', column: 'nowhere'});
+  assert.equal(badColumn.ok, false);
+  assert.match(badColumn.error, /Unknown column/);
+  const created = tracker.create({title: 'New ticket', body: 'Body text', type: 'task', column: 'todo'});
+  assert.equal(created.ok, true);
+  assert.equal(created.number, 20);
+  const createArgs = runner.calls.filter((call) => call.args[1] === 'create');
+  assert.equal(createArgs.length, 2);
+  assert.ok(createArgs[0].args.includes('status:todo'));
+  assert.ok(!createArgs[1].args.includes('--label'));
+  const card = tracker.state.cards.find((candidate) => candidate.number === 20);
+  assert.equal(card.title, 'New ticket');
+  assert.equal(card.type, 'task');
+  assert.equal(card.column, 'todo');
+  assert.equal(tracker.state.cards[0].number, 20);
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker update edits title and body through gh and patches locally', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const runner = onlineRunner();
+  const tracker = new TrackerSync(workspace, () => {}, runner, true);
+  await tracker.init();
+  tracker.refresh();
+  const empty = tracker.update({number: 11, title: '  '});
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /Title cannot be empty/);
+  const nothing = tracker.update({number: 11});
+  assert.equal(nothing.ok, false);
+  const unknown = tracker.update({number: 999, title: 'x'});
+  assert.equal(unknown.ok, false);
+  const updated = tracker.update({number: 11, title: 'Task: renamed', body: 'New body'});
+  assert.equal(updated.ok, true);
+  const edit = runner.calls.filter((call) => call.args[1] === 'edit').pop();
+  assert.deepEqual(edit.args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--title', 'Task: renamed', '--body', 'New body']);
+  const card = tracker.state.cards.find((candidate) => candidate.number === 11);
+  assert.equal(card.title, 'Task: renamed');
+  assert.equal(card.body, 'New body');
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker delete removes the card through gh and keeps state on failure', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const failing = stubRunner([
+    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+    {match: (command, args) => command === 'gh' && args[1] === 'delete', status: 1, stderr: 'gh: no delete permission'},
+  ]);
+  const tracker = new TrackerSync(workspace, () => {}, failing, true);
+  await tracker.init();
+  tracker.refresh();
+  const failed = tracker.delete({number: 11});
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /no delete permission/);
+  assert.ok(tracker.state.cards.some((candidate) => candidate.number === 11));
+
+  const runner = onlineRunner();
+  const working = new TrackerSync(workspace, () => {}, runner, true);
+  await working.init();
+  working.refresh();
+  const removed = working.delete({number: 11});
+  assert.equal(removed.ok, true);
+  const deleteCall = runner.calls.filter((call) => call.args[1] === 'delete').pop();
+  assert.deepEqual(deleteCall.args, ['issue', 'delete', '11', '-R', 'acme/widgets', '--yes']);
+  assert.ok(!working.state.cards.some((candidate) => candidate.number === 11));
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
 test('tracker surfaces invalid board config and missing github remote as errors', async () => {
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
   fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});

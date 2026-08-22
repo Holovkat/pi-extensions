@@ -265,6 +265,62 @@ export class TrackerSync {
 		return { ok: true, number, column: columnId };
 	}
 	list() { return { repo: this.state.repo, columns: this.state.columns, stale: this.state.stale, fetchedAt: this.state.fetchedAt, error: this.state.error, cards: this.state.cards.map(({ body, ...card }) => card) }; }
+	create(params: any): { ok: boolean; number?: number; error?: string } {
+		const title = String(params.title ?? "").trim(); if (!title) return { ok: false, error: "Title is required" };
+		const type = TRACKER_TYPES.find((candidate) => candidate === String(params.type ?? "")) ?? "issue";
+		const repo = this.state.repo ?? this.resolveRepo();
+		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
+		let config: PifBoardConfig; try { config = this.boardConfig(); } catch (error) { return { ok: false, error: `Invalid board.yaml: ${String((error as Error).message)}` }; }
+		const column = params.column !== undefined && params.column !== null && String(params.column) !== "" ? config.columns.find((candidate) => candidate.id === String(params.column)) : undefined;
+		if (params.column && !column) return { ok: false, error: `Unknown column: ${params.column}` };
+		const labels = [...(type === "issue" ? [] : [type]), ...(column?.label ? [column.label] : [])];
+		const run = (withLabels: boolean) => {
+			const args = ["issue", "create", "-R", repo, "--title", title, "--body", String(params.body ?? "")];
+			if (withLabels) for (const label of labels) args.push("--label", label);
+			return this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
+		};
+		let created = run(labels.length > 0);
+		if (created.status !== 0 && labels.length > 0) created = run(false);
+		if (created.status !== 0) return { ok: false, error: `${created.stderr || created.stdout}`.trim() || "gh issue create failed" };
+		const number = Number(/issues\/(\d+)/.exec(created.stdout)?.[1] ?? 0);
+		if (!number) return { ok: false, error: `Could not parse the created issue number: ${created.stdout.trim()}` };
+		const card: PifTrackerCard = { number, title, type, state: "open", labels, body: String(params.body ?? "").slice(0, 20_000), updatedAt: new Date().toISOString(), url: `https://github.com/${repo}/issues/${number}`, column: columnForCard(labels, "open", config) };
+		this.state.cards = [card, ...this.state.cards]; this.writeCache(); this.changed(this.state);
+		return { ok: true, number };
+	}
+	update(params: any): { ok: boolean; number?: number; error?: string } {
+		const number = Number(params.number);
+		const card = this.state.cards.find((candidate) => candidate.number === number);
+		if (!card) return { ok: false, error: `Unknown card #${number}` };
+		const title = params.title !== undefined ? String(params.title).trim() : undefined;
+		if (title !== undefined && !title) return { ok: false, error: "Title cannot be empty" };
+		const body = params.body !== undefined ? String(params.body) : undefined;
+		if (title === undefined && body === undefined) return { ok: false, error: "Nothing to update" };
+		const repo = this.state.repo ?? this.resolveRepo();
+		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
+		const args = ["issue", "edit", String(number), "-R", repo];
+		if (title !== undefined) args.push("--title", title);
+		if (body !== undefined) args.push("--body", body);
+		const edit = this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
+		if (edit.status !== 0) return { ok: false, error: `${edit.stderr || edit.stdout}`.trim() || "gh issue edit failed" };
+		if (title !== undefined) card.title = title;
+		if (body !== undefined) card.body = body.slice(0, 20_000);
+		card.updatedAt = new Date().toISOString();
+		this.writeCache(); this.changed(this.state);
+		return { ok: true, number };
+	}
+	delete(params: any): { ok: boolean; number?: number; error?: string } {
+		const number = Number(params.number);
+		const card = this.state.cards.find((candidate) => candidate.number === number);
+		if (!card) return { ok: false, error: `Unknown card #${number}` };
+		const repo = this.state.repo ?? this.resolveRepo();
+		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
+		const removed = this.runner(this.ghBin(), ["issue", "delete", String(number), "-R", repo, "--yes"], { cwd: this.workspace, timeout: 30_000 });
+		if (removed.status !== 0) return { ok: false, error: `${removed.stderr || removed.stdout}`.trim() || "gh issue delete failed" };
+		this.state.cards = this.state.cards.filter((candidate) => candidate.number !== number);
+		this.writeCache(); this.changed(this.state);
+		return { ok: true, number };
+	}
 	private loadCache() {
 		if (this.db) {
 			try { const row = this.db.prepare("SELECT repo, fetched_at, cards FROM tracker WHERE id = 1").get(); if (row) { this.applyCache(String(row.repo ?? "") || null, String(row.fetched_at ?? "") || null, JSON.parse(String(row.cards ?? "[]"))); return; } } catch { /* fall through to json */ }

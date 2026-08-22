@@ -105,6 +105,18 @@ class _BoardState extends State<_Board> {
     super.dispose();
   }
 
+  void _openSheet({Map<String, dynamic>? card}) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => _TicketSheet(
+        host: widget.host,
+        card: card,
+        columns: columns,
+        onMove: _moveCard,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = widget.host.theme;
@@ -158,6 +170,11 @@ class _BoardState extends State<_Board> {
           ),
         ],
         const Spacer(),
+        IconButton(
+          tooltip: 'New ticket',
+          icon: const Icon(Icons.add, size: 20),
+          onPressed: columns.isEmpty ? null : () => _openSheet(card: null),
+        ),
         IconButton(
           tooltip: 'Refresh board',
           icon: const Icon(Icons.refresh, size: 18),
@@ -257,7 +274,7 @@ class _BoardState extends State<_Board> {
         child: _cardSurface(card, theme, number, type),
       ),
       child: InkWell(
-        onTap: () => _openDetail(context, card),
+        onTap: () => _openSheet(card: card),
         child: _cardSurface(card, theme, number, type),
       ),
     );
@@ -323,65 +340,488 @@ class _BoardState extends State<_Board> {
     'task' => const Color(0x6678dba9),
     _ => const Color(0x668b96aa),
   };
+}
 
-  void _openDetail(BuildContext context, Map<String, dynamic> card) {
+/// Resizable ticket sheet: view / edit / create a card, move it between
+/// lanes, or delete it. Every operation is optimistic locally and reverted
+/// when the hub reports a failure via `tracker/op` op_result.
+class _TicketSheet extends StatefulWidget {
+  const _TicketSheet({
+    required this.host,
+    required this.card,
+    required this.columns,
+    required this.onMove,
+  });
+  final PifHost host;
+  final Map<String, dynamic>? card;
+  final List<Map<String, dynamic>> columns;
+  final void Function(int number, String column) onMove;
+  @override
+  State<_TicketSheet> createState() => _TicketSheetState();
+}
+
+class _TicketSheetState extends State<_TicketSheet> {
+  late final Map<String, dynamic>? _card;
+  late final bool _creating;
+  bool _editing = false;
+  bool _busy = false;
+  String? _error;
+  late final TextEditingController _title;
+  late final TextEditingController _body;
+  String _type = 'task';
+  late String _createColumn;
+  Size _size = const Size(660, 560);
+  String? _revertColumn;
+  late StreamSubscription _subscription;
+  static const _minSize = Size(460, 360);
+
+  @override
+  void initState() {
+    super.initState();
+    _card = widget.card == null
+        ? null
+        : Map<String, dynamic>.from(widget.card!);
+    _creating = _card == null;
+    _editing = _creating;
+    _title = TextEditingController(text: '${_card?['title'] ?? ''}');
+    _body = TextEditingController(text: '${_card?['body'] ?? ''}');
+    final openColumns = widget.columns
+        .where((column) => column['id'] != null)
+        .toList();
+    _createColumn = openColumns.isNotEmpty ? '${openColumns.first['id']}' : '';
+    _type = '${_card?['type'] ?? 'task'}';
+    _restoreSize();
+    _subscription = widget.host.bus.events.listen((event) {
+      if (event.channel == 'tracker/op' && event.type == 'op_result') {
+        _onOpResult(event.payload);
+      } else if (event.channel == 'tracker/move' &&
+          event.type == 'move_result') {
+        _onMoveResult(event.payload);
+      }
+    });
+  }
+
+  void _restoreSize() {
+    final width = widget.host.storage.read('tracker_board', 'sheet_w');
+    final height = widget.host.storage.read('tracker_board', 'sheet_h');
+    _size = Size(
+      width is num ? width.toDouble() : _size.width,
+      height is num ? height.toDouble() : _size.height,
+    );
+  }
+
+  void _persistSize() {
+    widget.host.storage
+        .write('tracker_board', 'sheet_w', _size.width)
+        .catchError((Object _) {});
+    widget.host.storage
+        .write('tracker_board', 'sheet_h', _size.height)
+        .catchError((Object _) {});
+  }
+
+  void _onOpResult(Object? payload) {
+    if (!mounted || payload is! Map) return;
+    final op = '${payload['op'] ?? ''}';
+    final ok = payload['ok'] == true;
+    if (op == 'create' && _creating) {
+      if (ok) return Navigator.of(context).pop();
+      setState(() {
+        _busy = false;
+        _error = '${payload['error'] ?? 'create failed'}';
+      });
+    } else if (op == 'update' && _editing && !_creating) {
+      if (ok) {
+        setState(() {
+          _card!['title'] = _title.text.trim();
+          _card['body'] = _body.text;
+          _busy = false;
+          _editing = false;
+        });
+      } else {
+        setState(() {
+          _busy = false;
+          _error = '${payload['error'] ?? 'update failed'}';
+        });
+      }
+    } else if (op == 'delete' && !_creating) {
+      if (ok) return Navigator.of(context).pop();
+      setState(() {
+        _busy = false;
+        _error = '${payload['error'] ?? 'delete failed'}';
+      });
+    }
+  }
+
+  void _onMoveResult(Object? payload) {
+    if (!mounted || payload is! Map || _card == null) return;
+    if (payload['number'] != _card['number']) return;
+    if (payload['ok'] == true) {
+      setState(() => _revertColumn = null);
+    } else if (_revertColumn != null) {
+      setState(() {
+        _card['column'] = _revertColumn;
+        _revertColumn = null;
+        _error = '${payload['error'] ?? 'move failed'}';
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _subscription.cancel();
+    _title.dispose();
+    _body.dispose();
+    super.dispose();
+  }
+
+  void _send(String op, Map<String, Object?> payload) {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    widget.host.bus.send('tracker/control', op, payload);
+  }
+
+  void _submitCreate() {
+    if (_title.text.trim().isEmpty) {
+      setState(() => _error = 'Title is required');
+      return;
+    }
+    _send('create', {
+      'title': _title.text.trim(),
+      'body': _body.text,
+      'type': _type,
+      'column': _createColumn,
+    });
+  }
+
+  void _submitUpdate() {
+    if (_title.text.trim().isEmpty) {
+      setState(() => _error = 'Title cannot be empty');
+      return;
+    }
+    _send('update', {
+      'number': _card!['number'],
+      'title': _title.text.trim(),
+      'body': _body.text,
+    });
+  }
+
+  void _moveTo(String columnId) {
+    if (_card == null || columnId == '${_card['column']}') return;
+    _revertColumn = '${_card['column']}';
+    setState(() => _card['column'] = columnId);
+    widget.onMove(_card['number'] as int, columnId);
+  }
+
+  void _confirmDelete() {
     showDialog<void>(
       context: context,
-      builder: (context) => Dialog(
+      builder: (dialogContext) => AlertDialog(
         backgroundColor: widget.host.theme.panelRaised,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 640, maxHeight: 640),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 8, 0),
-                child: Row(
-                  children: [
-                    Expanded(
+        title: const Text('Delete ticket?', style: TextStyle(fontSize: 15)),
+        content: Text(
+          '#${_card!['number']} will be permanently deleted from GitHub.',
+          style: const TextStyle(fontSize: 12),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+              _send('delete', {'number': _card['number']});
+            },
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = widget.host.theme;
+    final maxSize = Size(
+      MediaQuery.of(context).size.width - 80,
+      MediaQuery.of(context).size.height - 80,
+    );
+    return Dialog(
+      backgroundColor: theme.panelRaised,
+      child: SizedBox(
+        key: const Key('tracker_sheet_box'),
+        width: _size.width.clamp(_minSize.width, maxSize.width),
+        height: _size.height.clamp(_minSize.height, maxSize.height),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  _topBar(theme),
+                  if (_error != null)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
                       child: Text(
-                        '#${card['number']}  ${card['title'] ?? ''}',
+                        _error!,
                         style: const TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w300,
+                          color: Color(0xffe2a4a4),
+                          fontSize: 11,
                         ),
                       ),
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.close, size: 18),
-                      onPressed: () => Navigator.of(context).pop(),
-                    ),
-                  ],
+                  Expanded(child: _content(theme)),
+                  if (_creating || _editing) _footer(theme),
+                ],
+              ),
+            ),
+            Positioned(
+              bottom: 4,
+              right: 4,
+              child: _resizeHandle(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _topBar(PifTheme theme) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 12, 8, 0),
+    child: Row(
+      children: [
+        Expanded(
+          child: Text(
+            _creating
+                ? 'New ticket'
+                : '#${_card!['number']}  ${_card['title'] ?? ''}',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w300),
+          ),
+        ),
+        if (!_creating) ...[
+          if (!_editing) _moveDropdown(theme),
+          IconButton(
+            tooltip: _editing ? 'Cancel editing' : 'Edit',
+            icon: Icon(_editing ? Icons.close : Icons.edit_outlined, size: 17),
+            onPressed: _busy
+                ? null
+                : () {
+                    setState(() {
+                      _editing = !_editing;
+                      if (!_editing) {
+                        _title.text = '${_card!['title'] ?? ''}';
+                        _body.text = '${_card['body'] ?? ''}';
+                      }
+                    });
+                  },
+          ),
+          IconButton(
+            tooltip: 'Delete ticket',
+            icon: const Icon(Icons.delete_outline, size: 18),
+            onPressed: _busy ? null : _confirmDelete,
+          ),
+        ],
+        IconButton(
+          icon: const Icon(Icons.close, size: 18),
+          onPressed: () => Navigator.of(context).pop(),
+        ),
+      ],
+    ),
+  );
+
+  Widget _moveDropdown(PifTheme theme) => SizedBox(
+    key: const Key('tracker_sheet_move'),
+    height: 34,
+    child: DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        value: '${_card!['column']}',
+        items: widget.columns
+            .map(
+              (column) => DropdownMenuItem(
+                value: '${column['id']}',
+                child: Text(
+                  '${column['name']}',
+                  style: const TextStyle(fontSize: 12),
                 ),
               ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Text(
-                  [
-                    '${card['type'] ?? 'issue'} · ${card['state'] ?? 'open'}',
-                    if ((card['labels'] as List?)?.isNotEmpty == true)
-                      ...((card['labels'] as List)
-                          .map((label) => '$label')),
-                  ].join('  ·  '),
-                  style: TextStyle(
-                    color: widget.host.theme.textMuted,
-                    fontSize: 11,
+            )
+            .toList(),
+        onChanged: (value) {
+          if (value != null) _moveTo(value);
+        },
+      ),
+    ),
+  );
+
+  Widget _content(PifTheme theme) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+    child: _creating || _editing
+        ? SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                if (_creating)
+                  Row(
+                    children: [
+                      _typeDropdown(theme),
+                      const SizedBox(width: 12),
+                      Expanded(child: _columnDropdown(theme)),
+                    ],
+                  ),
+                const SizedBox(height: 8),
+                TextField(
+                  key: const Key('tracker_sheet_title'),
+                  controller: _title,
+                  style: const TextStyle(fontSize: 13),
+                  decoration: const InputDecoration(
+                    labelText: 'Title',
+                    isDense: true,
                   ),
                 ),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 240,
+                  child: TextField(
+                    key: const Key('tracker_sheet_body'),
+                    controller: _body,
+                    maxLines: null,
+                    expands: true,
+                    textAlignVertical: TextAlignVertical.top,
+                    style: const TextStyle(fontSize: 12),
+                    decoration: const InputDecoration(
+                      labelText: 'Body (Markdown)',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          )
+        : Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  [
+                    '${_card!['type'] ?? 'issue'} · ${_card['state'] ?? 'open'}',
+                    if ((_card['labels'] as List?)?.isNotEmpty == true)
+                      ...(_card['labels'] as List).map((label) => '$label'),
+                  ].join('  ·  '),
+                  style: TextStyle(color: theme.textMuted, fontSize: 11),
+                ),
               ),
-              const Divider(height: 12),
+              const Divider(height: 8),
               Expanded(
                 child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
                   child: SelectionArea(
-                    child: MarkdownBody(data: '${card['body'] ?? ''}'),
+                    child: MarkdownBody(data: '${_card['body'] ?? ''}'),
                   ),
                 ),
               ),
             ],
           ),
+  );
+
+  Widget _typeDropdown(PifTheme theme) => SizedBox(
+    key: const Key('tracker_sheet_type'),
+    height: 34,
+    child: DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        value: _type,
+        items: const ['epic', 'sprint', 'task', 'issue']
+            .map(
+              (type) => DropdownMenuItem(
+                value: type,
+                child: Text(
+                  type.toUpperCase(),
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+            )
+            .toList(),
+        onChanged: (value) {
+          if (value != null) setState(() => _type = value);
+        },
+      ),
+    ),
+  );
+
+  Widget _columnDropdown(PifTheme theme) => SizedBox(
+    key: const Key('tracker_sheet_column'),
+    height: 34,
+    child: DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        value: _createColumn,
+        items: widget.columns
+            .map(
+              (column) => DropdownMenuItem(
+                value: '${column['id']}',
+                child: Text(
+                  '${column['name']}',
+                  style: const TextStyle(fontSize: 12),
+                ),
+              ),
+            )
+            .toList(),
+        onChanged: (value) {
+          if (value != null) setState(() => _createColumn = value);
+        },
+      ),
+    ),
+  );
+
+  Widget _footer(PifTheme theme) => Padding(
+    padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+    child: Row(
+      mainAxisAlignment: MainAxisAlignment.end,
+      children: [
+        if (_creating)
+          TextButton(
+            onPressed: _busy ? null : () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+        const SizedBox(width: 8),
+        FilledButton.tonal(
+          key: const Key('tracker_sheet_submit'),
+          onPressed: _busy ? null : (_creating ? _submitCreate : _submitUpdate),
+          child: Text(
+            _busy ? 'Saving…' : (_creating ? 'Create' : 'Save'),
+          ),
+        ),
+      ],
+    ),
+  );
+
+  Widget _resizeHandle() => MouseRegion(
+    cursor: SystemMouseCursors.resizeDownRight,
+    child: GestureDetector(
+      key: const Key('tracker_sheet_resize'),
+      onPanUpdate: (details) {
+        setState(() {
+          _size = Size(
+            (_size.width + details.delta.dx).clamp(_minSize.width, 4000),
+            (_size.height + details.delta.dy).clamp(_minSize.height, 4000),
+          );
+        });
+      },
+      onPanEnd: (_) => _persistSize(),
+      child: Padding(
+        padding: const EdgeInsets.all(4),
+        child: Transform.rotate(
+          angle: -0.785398,
+          child: Icon(
+            Icons.drag_indicator,
+            size: 15,
+            color: widget.host.theme.textMuted,
+          ),
         ),
       ),
-    );
-  }
+    ),
+  );
 }

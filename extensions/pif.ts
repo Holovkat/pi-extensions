@@ -435,6 +435,7 @@ class PifHub {
 	private trackerAction(type: string, payload: any) {
 		if (type === "refresh") return this.tracker.refresh();
 		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
+		if (type === "create" || type === "update" || type === "delete") { const result = this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result }); return result; }
 		throw new Error(`Unknown tracker action: ${type}`);
 	}
 	private async modelsAction(type: string, payload: any) {
@@ -513,7 +514,7 @@ class PifHub {
 		switch (method) {
 			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
-			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list();
+			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list(); case "tracker.create": return this.trackerAction("create", params); case "tracker.update": return this.trackerAction("update", params); case "tracker.delete": return this.trackerAction("delete", params);
 			case "shell.shutdown": return this.shutdown();
 			default: throw new Error(`Unknown pif control method: ${method}`);
 		}
@@ -541,6 +542,9 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_widget_uninstall", "pif widget uninstall", "Archive a non-core widget back into the local catalog.", Type.Object({ id: Type.String() }), "widget.uninstall");
 	register("pif_widget_list", "pif widget list", "List installed and local catalog widgets.", Type.Object({}), "widget.list");
 	register("pif_tracker_list", "pif tracker list", "List the workspace repo's board cards (epics, sprints, tasks, issues) with their columns, without bodies.", Type.Object({}), "tracker.list");
+	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
+	register("pif_tracker_update", "pif tracker update", "Update a ticket's title and/or body by issue number.", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()) }), "tracker.update");
+	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");
 	register("pif_layout", "pif layout", "Open, focus, move, close, reset, pin, save, or load pif panels; reset restores the default docking design and pin controls slide-in overlay mode.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("reset"), Type.Literal("pin"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()), pinned: Type.Optional(Type.Boolean()) }), "layout");
 	register("pif_shell_status", "pif shell status", "Return pif hub, shell, sessions, widgets, and layout health.", Type.Object({}), "shell.status");
 	register("pif_reload", "pif reload", "Hot reload or hot restart the pif Flutter shell.", Type.Object({ restart: Type.Optional(Type.Boolean()) }), "shell.reload");
