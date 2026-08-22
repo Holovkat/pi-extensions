@@ -39,9 +39,12 @@ class _DockingShellState extends State<DockingShell>
   // through the shell/layout resize action.
   static const double _minSide = 140;
   static const double _minBottom = 80;
-  double _left = 230;
-  double _right = 300;
-  double _bottom = 245;
+  static const double _defaultLeft = 230;
+  static const double _defaultRight = 300;
+  static const double _defaultBottom = 245;
+  double _left = _defaultLeft;
+  double _right = _defaultRight;
+  double _bottom = _defaultBottom;
   Map<String, PifWidgetPlugin Function()> _factories = pifWidgetFactories();
   void _refreshFactories() => _factories = pifWidgetFactories();
   @override
@@ -233,13 +236,19 @@ class _DockingShellState extends State<DockingShell>
 
   /// Draggable divider between two visible docks: a 6px hit area with a
   /// hairline, a resize cursor, and the neighbour (the center stage)
-  /// absorbing whatever is added or released.
+  /// absorbing whatever is added or released. Double-click snaps the dock
+  /// back to its default size.
   Widget _divider({
     required Key key,
     required bool horizontal,
     required void Function(double delta) onDelta,
+    required VoidCallback onReset,
   }) => GestureDetector(
     key: key,
+    onDoubleTap: () {
+      onReset();
+      _saveSizes();
+    },
     onHorizontalDragUpdate: horizontal
         ? null
         : (details) => onDelta(details.delta.dx),
@@ -309,6 +318,7 @@ class _DockingShellState extends State<DockingShell>
                         onDelta: (dx) => setState(
                           () => _left = (_left + dx).clamp(_minSide, maxSide),
                         ),
+                        onReset: () => setState(() => _left = _defaultLeft),
                       ),
                     ],
                     Expanded(
@@ -340,6 +350,8 @@ class _DockingShellState extends State<DockingShell>
                                     constraints.maxHeight - 120,
                                   ),
                                 ),
+                                onReset: () =>
+                                    setState(() => _bottom = _defaultBottom),
                               ),
                               SizedBox(
                                 height: bottom,
@@ -359,6 +371,7 @@ class _DockingShellState extends State<DockingShell>
                         onDelta: (dx) => setState(
                           () => _right = (_right - dx).clamp(_minSide, maxSide),
                         ),
+                        onReset: () => setState(() => _right = _defaultRight),
                       ),
                       SizedBox(
                         width: right,
@@ -369,6 +382,15 @@ class _DockingShellState extends State<DockingShell>
                 );
               },
                 ),
+                // Tapping outside an open overlay slides it back out.
+                if (slidIn.isNotEmpty)
+                  Positioned.fill(
+                    key: const Key('pif_overlay_barrier'),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(slidIn.clear),
+                    ),
+                  ),
                 ..._overlayPanels(),
                 ..._edgeGrabbers(),
               ],

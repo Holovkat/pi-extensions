@@ -477,17 +477,63 @@ void main() {
     final grabber = find.byKey(const Key('pif_grabber_right_widget_store'));
     expect(grabber, findsOneWidget);
 
-    // Slide in over the other panels, then pin back into the layout.
+    // Slide in over the other panels, dismiss by tapping outside.
     await tester.tap(grabber);
     await tester.pumpAndSettle();
     final overlay = find.byKey(const Key('pif_overlay_widget_store'));
     expect(overlay, findsOneWidget);
+    await tester.tap(find.byKey(const Key('pif_overlay_barrier')));
+    await tester.pumpAndSettle();
+    expect(grabber, findsOneWidget, reason: 'outside tap slides the overlay out');
+
+    // Slide in again and pin back into the layout.
+    await tester.tap(grabber);
+    await tester.pumpAndSettle();
     await tester.tap(
       find.descendant(of: overlay, matching: find.byIcon(Icons.push_pin)),
     );
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('pif_dock_right')), findsOneWidget);
     expect(grabber, findsNothing);
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('double-clicking a divider snaps the dock to default size', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    bus.emitSnapshot(
+      widgets: {
+        'agent_console': {'enabled': true},
+        'session_rail': {'enabled': true},
+        'terminal': {'enabled': true},
+        'widget_store': {'enabled': true},
+        'status_bar': {'enabled': true},
+      },
+      layout: {
+        'sizes': {'left': 380},
+      },
+    );
+    await tester.pumpAndSettle();
+    final dock = find.byKey(const Key('pif_dock_left'));
+    expect(tester.getSize(dock).width, closeTo(380, 0.5));
+    bus.sent.clear();
+
+    await tester.tap(
+      find.byKey(const Key('pif_divider_left')),
+      warnIfMissed: false,
+    );
+    await tester.pump(const Duration(milliseconds: 50));
+    await tester.tap(
+      find.byKey(const Key('pif_divider_left')),
+      warnIfMissed: false,
+    );
+    await tester.pumpAndSettle();
+    expect(tester.getSize(dock).width, closeTo(230, 0.5));
+    expect(bus.sent, contains('shell/layout:resize'));
     await tester.pumpWidget(const SizedBox());
     await tester.binding.setSurfaceSize(null);
   });
