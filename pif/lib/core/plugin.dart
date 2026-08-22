@@ -142,6 +142,11 @@ class PifSessions {
       bus.send('session/control', 'abort', {'sessionId': sessionId});
   void select(String sessionId) =>
       bus.send('session/control', 'select', {'sessionId': sessionId});
+  void rename(String sessionId, String name) => bus.send(
+    'session/control',
+    'rename',
+    {'sessionId': sessionId, 'name': name},
+  );
   void setModel(String sessionId, String model) => bus.send(
     'session/control',
     'setModel',

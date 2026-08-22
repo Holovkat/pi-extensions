@@ -153,6 +153,43 @@ void main() {
     await bus.dispose();
   });
 
+  testWidgets('console title renames inline on double-click', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host session',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+        'transcript': <dynamic>[],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    expect(find.text('Host session'), findsOneWidget);
+
+    await tester.tap(find.text('Host session'));
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.tap(find.text('Host session'));
+    await tester.pump();
+    final field = find.widgetWithText(TextField, 'Host session');
+    expect(field, findsOneWidget, reason: 'double-click enters edit mode');
+
+    await tester.enterText(field, 'Renamed');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    expect(
+      bus.sent.any((entry) => entry['type'] == 'rename'),
+      isTrue,
+      reason: 'rename envelope sent',
+    );
+    expect((bus.sent.last['payload'] as Map)['name'], 'Renamed');
+    await tester.pump(const Duration(milliseconds: 400));
+    await bus.dispose();
+  });
+
   testWidgets('model dropdown resolves provider-less session model', (
     tester,
   ) async {

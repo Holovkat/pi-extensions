@@ -179,8 +179,10 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
   send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');
+  send(socket, 'session/control', 'rename', {sessionId: 'host', name: 'My Workspace'});
+  await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.name === 'My Workspace');
   const prefs = JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'prefs.json'), 'utf8'));
-  assert.equal(prefs.model, 'fixture/fast'); assert.equal(prefs.thinking, 'low');
+  assert.equal(prefs.model, 'fixture/fast'); assert.equal(prefs.thinking, 'low'); assert.equal(prefs.name, 'My Workspace');
   const port2 = 34000 + Math.floor(Math.random() * 500);
   const pi2 = await startPi({workspace, port: port2, piBin});
   const socket2 = new WebSocket(`ws://127.0.0.1:${port2}/pif?token=integration-token`);
@@ -189,6 +191,7 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const restarted = await nextMessage(socket2, (value) => value.type === 'snapshot');
   assert.equal(restarted.payload.sessions.host.model, 'fixture/fast');
   assert.equal(restarted.payload.sessions.host.thinking, 'low');
+  assert.equal(restarted.payload.sessions.host.name, 'My Workspace');
   send(socket2, 'shell/state', 'shutdown_request', {});
   await waitFor(() => pi2.exitCode != null ? true : false, 'pi2 shutdown via shutdown_request', 15_000);
   socket2.close();

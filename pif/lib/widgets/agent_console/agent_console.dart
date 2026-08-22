@@ -28,6 +28,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
   final controller = TextEditingController();
   final scroll = ScrollController();
   late StreamSubscription subscription;
+  bool editingName = false;
+  final nameController = TextEditingController();
+  final nameFocus = FocusNode();
   final entriesBySession = <String, List<Map<String, dynamic>>>{};
   final runningBySession = <String, bool>{};
   List<Map<String, dynamic>> get entries => entriesBySession.putIfAbsent(
@@ -40,6 +43,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
   void initState() {
     super.initState();
     _hydrate(widget.host.sessions.current);
+    nameFocus.addListener(() {
+      if (!nameFocus.hasFocus && editingName) _commitName();
+    });
     subscription = widget.host.sessions.changes.listen((sessions) {
       _hydrate(sessions);
       if (mounted) setState(() {});
@@ -173,8 +179,23 @@ class _AgentConsoleState extends State<_AgentConsole> {
   void dispose() {
     subscription.cancel();
     controller.dispose();
+    nameController.dispose();
+    nameFocus.dispose();
     scroll.dispose();
     super.dispose();
+  }
+
+  void _startRename(String current) {
+    nameController.text = current;
+    setState(() => editingName = true);
+  }
+
+  void _commitName() {
+    final name = nameController.text.trim();
+    setState(() => editingName = false);
+    if (name.isNotEmpty) {
+      widget.host.sessions.rename(widget.host.activeSessionId, name);
+    }
   }
 
   void submit() {
@@ -228,10 +249,35 @@ class _AgentConsoleState extends State<_AgentConsole> {
                 color: running ? Colors.amber : widget.host.theme.accent,
               ),
               const SizedBox(width: 8),
-              Text(
-                selected?.name ?? 'Host session',
-                style: const TextStyle(fontWeight: FontWeight.w300),
-              ),
+              // The session title; double-click renames it inline — the
+              // editing field keeps the same typography, just a caret.
+              if (editingName)
+                SizedBox(
+                  width: 220,
+                  child: TextField(
+                    controller: nameController,
+                    focusNode: nameFocus,
+                    autofocus: true,
+                    style: const TextStyle(fontWeight: FontWeight.w300),
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      isCollapsed: true,
+                      border: InputBorder.none,
+                    ),
+                    onSubmitted: (_) => _commitName(),
+                  ),
+                )
+              else
+                GestureDetector(
+                  onDoubleTap:
+                      selected == null
+                          ? null
+                          : () => _startRename(selected.name),
+                  child: Text(
+                    selected?.name ?? 'Host session',
+                    style: const TextStyle(fontWeight: FontWeight.w300),
+                  ),
+                ),
               const Spacer(),
               // On-the-fly model selector
               SizedBox(
@@ -302,28 +348,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
             ],
           ),
         ),
-        if (widget.host.sessions.current.isNotEmpty)
-          SizedBox(
-            height: 34,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              children: widget.host.sessions.current
-                  .map(
-                    (session) => TextButton(
-                      onPressed: () =>
-                          widget.host.sessions.select(session.id),
-                      style: TextButton.styleFrom(
-                        backgroundColor:
-                            session.id == widget.host.activeSessionId
-                            ? const Color(0xff222c36)
-                            : Colors.transparent,
-                      ),
-                      child: Text(session.name),
-                    ),
-                  )
-                  .toList(),
-            ),
-          ),
+        // No per-session strip: the Session Rail switches sessions; the
+        // header title carries the active name.
         Expanded(
           child: entries.isEmpty
               ? const _ConsoleEmpty()

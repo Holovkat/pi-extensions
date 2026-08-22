@@ -161,7 +161,7 @@ class PifHub {
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
 		const prefs = this.loadPrefs();
-		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
+		this.state.sessions.host = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
 	}
 	/** Session model ids sometimes lack the provider prefix; resolve to the
 	 * full id from the available models when the suffix match is unique. */
@@ -170,8 +170,8 @@ class PifHub {
 		const matches = this.state.models.filter((candidate) => candidate.endsWith(`/${model}`));
 		return matches.length === 1 ? matches[0] : model;
 	}
-	private loadPrefs(): { model?: string; thinking?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
-	private savePrefs(patch: { model?: string; thinking?: string }) {
+	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
+	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
 		fs.mkdirSync(path.dirname(this.prefsPath), { recursive: true });
 		fs.writeFileSync(this.prefsPath, JSON.stringify({ ...this.loadPrefs(), ...patch }, null, 2) + "\n");
 	}
@@ -247,6 +247,11 @@ class PifHub {
 			if (!this.state.sessions[id]) throw new Error(`Unknown session ${id}`);
 			this.broadcast("session/selection", "selected", { sessionId: id });
 			return this.state.sessions[id];
+		}
+		if (type === "rename") {
+			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
+			const name = String(payload.name ?? "").trim().slice(0, 80); if (!name) throw new Error("Session name is required");
+			session.name = name; if (id === "host") this.savePrefs({ name }); this.broadcast("session/state", "updated", session); return session;
 		}
 		if (type === "setModel") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
