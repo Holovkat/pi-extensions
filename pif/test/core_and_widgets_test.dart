@@ -124,6 +124,45 @@ void main() {
     expect(bus.sent.single['type'], 'input');
     await bus.dispose();
   });
+  testWidgets('Agent Console conversation is unboxed and light', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+        'transcript': [
+          {'type': 'input', 'content': 'plain question'},
+          {'type': 'message_update', 'delta': 'plain answer'},
+        ],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    final userText = tester.widget<SelectableText>(
+      find.widgetWithText(SelectableText, 'plain question'),
+    );
+    expect(userText.style?.fontSize, 13);
+    expect(userText.style?.fontWeight, FontWeight.w300);
+    expect(userText.style?.color, const Color(0xffc9d3df));
+    expect(
+      tester.widget<SelectableText>(find.widgetWithText(SelectableText, 'plain question')).style,
+      isNotNull,
+    );
+    // No decorated container wraps the conversation entries anymore.
+    expect(
+      find.descendant(
+        of: find.widgetWithText(Align, 'plain question'),
+        matching: find.byType(Container),
+      ),
+      findsNothing,
+    );
+    await bus.dispose();
+  });
+
   testWidgets('Agent Console shows one start tag and a duration footer with copy actions', (
     tester,
   ) async {

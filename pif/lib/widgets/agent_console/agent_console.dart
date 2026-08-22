@@ -387,6 +387,15 @@ class _ConsoleEmpty extends StatelessWidget {
 class _EntryCard extends StatelessWidget {
   const _EntryCard({required this.entry});
   final Map<String, dynamic> entry;
+
+  /// Conversation text: small, light, and unboxed — no paneling around
+  /// host-session messages.
+  static const TextStyle _conversationStyle = TextStyle(
+    fontSize: 13,
+    fontWeight: FontWeight.w300,
+    color: Color(0xffc9d3df),
+  );
+
   @override
   Widget build(BuildContext context) {
     final kind = entry['kind'] as String? ?? 'raw';
@@ -395,28 +404,28 @@ class _EntryCard extends StatelessWidget {
     if (kind == 'user') {
       return Align(
         alignment: Alignment.centerRight,
-        child: Container(
-          margin: const EdgeInsets.only(bottom: 10, left: 40),
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: const Color(0xff222936),
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: SelectableText(text),
+        child: Padding(
+          padding: const EdgeInsets.only(bottom: 10, left: 40),
+          child: SelectableText(text, style: _conversationStyle),
         ),
       );
     }
 
     if (kind == 'assistant') {
-      return Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: const Color(0xff151922),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: const Color(0xff2c3547)),
+      return Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: MarkdownBody(
+          data: text,
+          styleSheet: MarkdownStyleSheet.fromTheme(
+            Theme.of(context),
+          ).copyWith(
+            p: _conversationStyle,
+            listBullet: _conversationStyle,
+            blockquote: _conversationStyle.copyWith(
+              color: const Color(0xff8b96aa),
+            ),
+          ),
         ),
-        child: MarkdownBody(data: text),
       );
     }
 
