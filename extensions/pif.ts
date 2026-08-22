@@ -114,7 +114,7 @@ class FlutterSupervisor {
 }
 
 class PifHub {
-	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string;
+	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string; readonly prefsPath: string;
 	readonly state: HubState;
 	readonly modelsPath: string;
 	readonly token: string;
@@ -128,7 +128,7 @@ class PifHub {
 		const localApp = path.join(workspace, "pif");
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
 		this.pifDir = path.join(workspace, ".pi", "pif");
-		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json");
+		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
@@ -160,7 +160,13 @@ class PifHub {
 	}
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
-		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: (this.ctx as any).model?.id ?? "host", thinking: (this.ctx as any).thinkingLevel ?? "medium", cwd: this.workspace, transcript: [] };
+		const prefs = this.loadPrefs();
+		this.state.sessions.host = { id: "host", name: "Host session", host: true, state: "idle", model: prefs.model || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
+	}
+	private loadPrefs(): { model?: string; thinking?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
+	private savePrefs(patch: { model?: string; thinking?: string }) {
+		fs.mkdirSync(path.dirname(this.prefsPath), { recursive: true });
+		fs.writeFileSync(this.prefsPath, JSON.stringify({ ...this.loadPrefs(), ...patch }, null, 2) + "\n");
 	}
 	private startWebSocket() {
 		return new Promise<void>((resolve, reject) => {
@@ -236,11 +242,11 @@ class PifHub {
 		}
 		if (type === "setModel") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
-			session.model = String(payload.model ?? ""); this.broadcast("session/state", "updated", session); return session;
+			session.model = String(payload.model ?? ""); if (id === "host") this.savePrefs({ model: session.model }); this.broadcast("session/state", "updated", session); return session;
 		}
 		if (type === "setThinking") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
-			session.thinking = String(payload.thinking ?? "medium"); this.broadcast("session/state", "updated", session); return session;
+			session.thinking = String(payload.thinking ?? "medium"); if (id === "host") this.savePrefs({ thinking: session.thinking }); this.broadcast("session/state", "updated", session); return session;
 		}
 		if (id === "host") {
 			if (type === "abort") return (this.ctx as any).abort?.();
@@ -258,9 +264,12 @@ class PifHub {
 		const id = `session_${crypto.randomUUID().slice(0, 8)}`; const sessionsDir = path.join(this.pifDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
 		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); const cwd = path.resolve(payload.cwd || this.workspace);
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
-		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (payload.model) args.push("--model", String(payload.model)); if (payload.thinking && payload.thinking !== "none") args.push("--thinking", String(payload.thinking));
+		const prefs = this.loadPrefs();
+		const model = String(payload.model || prefs.model || "");
+		const thinking = String(payload.thinking || prefs.thinking || "medium");
+		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
-		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: payload.model || "default", thinking: payload.thinking || "medium", cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
+		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
 		child.on("exit", (code, signal) => { this.children.delete(id); session.state = "ended"; session.exit = { code, signal }; this.broadcast("session/state", "ended", session); });

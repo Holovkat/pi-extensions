@@ -162,6 +162,24 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.ok(fs.readdirSync(workspace).some((name) => name.startsWith('models-fixture.json.bak-')), 'backup written');
   checkpoint('input hardening verified');
 
+  send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
+  send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
+  await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');
+  const prefs = JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'prefs.json'), 'utf8'));
+  assert.equal(prefs.model, 'fixture/fast'); assert.equal(prefs.thinking, 'low');
+  const port2 = 34000 + Math.floor(Math.random() * 500);
+  const pi2 = await startPi({workspace, port: port2, piBin});
+  const socket2 = new WebSocket(`ws://127.0.0.1:${port2}/pif?token=integration-token`);
+  await new Promise((resolve, reject) => { socket2.addEventListener('open', resolve, {once: true}); socket2.addEventListener('error', reject, {once: true}); });
+  send(socket2, 'shell/state', 'snapshot_request', {});
+  const restarted = await nextMessage(socket2, (value) => value.type === 'snapshot');
+  assert.equal(restarted.payload.sessions.host.model, 'fixture/fast');
+  assert.equal(restarted.payload.sessions.host.thinking, 'low');
+  socket2.close();
+  await rpc(pi2, {type: 'prompt', message: '/pif-stop'});
+  pi2.kill('SIGTERM'); await new Promise((resolve) => pi2.once('exit', resolve));
+  checkpoint('model/thinking prefs survive hub restarts');
+
   await rpc(pi, {type: 'prompt', message: '/pif-stop'});
   await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.stopped')), 'child termination');
   socket.close(); pi.kill('SIGTERM'); checkpoint('waiting pi exit'); await new Promise((resolve) => pi.once('exit', resolve)); checkpoint('pi exited');
