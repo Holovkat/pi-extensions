@@ -214,13 +214,21 @@ void main() {
     });
     await tester.pumpWidget(panel(SessionRailPlugin(), host));
 
-    // Right-click the child card: rename + delete offered (host gets no delete).
+    // Right-click the child card: rename, resume (ended), delete offered.
     await tester.tap(find.text('Researcher'), buttons: kSecondaryButton);
     await tester.pumpAndSettle();
     expect(find.text('Rename'), findsOneWidget);
+    expect(find.text('Resume'), findsOneWidget);
     expect(find.text('Delete'), findsOneWidget);
 
+    // Resume sends the resume envelope.
+    await tester.tap(find.text('Resume').last);
+    await tester.pumpAndSettle();
+    expect(bus.sent.any((entry) => entry['type'] == 'resume'), isTrue);
+
     // Delete confirms first, then sends the delete envelope.
+    await tester.tap(find.text('Researcher'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
     await tester.tap(find.text('Delete').last);
     await tester.pumpAndSettle();
     expect(find.textContaining('Delete Researcher?'), findsOneWidget);

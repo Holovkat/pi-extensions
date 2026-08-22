@@ -198,6 +198,17 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(restored.name, 'Researcher');
   assert.equal(restored.state, 'ended');
   assert.ok(restored.transcript.length > 0, 'restored session carries its transcript');
+  // Resume: pi respawns against the same session file and streams again.
+  const sessionFile = path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`);
+  if (!fs.existsSync(sessionFile)) fs.writeFileSync(sessionFile, '');
+  const resumedMsg = nextMessage(socket2, (value) => value.type === 'updated' && value.payload?.id === sessionId && value.payload?.state === 'idle');
+  send(socket2, 'session/control', 'resume', {sessionId});
+  await resumedMsg;
+  const resumedStream = nextMessage(socket2, (value) => value.channel === 'session/event' && value.payload.sessionId === sessionId && value.type === 'message_update');
+  send(socket2, 'session/control', 'input', {sessionId, content: 'back again'});
+  const streamedAgain = await resumedStream;
+  assert.equal(streamedAgain.payload.event.delta, 'back again');
+  checkpoint('session resumed from history');
   const removedMsg = nextMessage(socket2, (value) => value.type === 'removed' && value.payload?.sessionId === sessionId);
   send(socket2, 'session/control', 'delete', {sessionId});
   await removedMsg;

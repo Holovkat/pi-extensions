@@ -67,6 +67,8 @@ class _SessionRailState extends State<_SessionRail> {
       ),
       items: [
         const PopupMenuItem(value: 'rename', child: Text('Rename')),
+        if (session.state == 'ended')
+          const PopupMenuItem(value: 'resume', child: Text('Resume')),
         if (!session.host)
           const PopupMenuItem(value: 'delete', child: Text('Delete')),
       ],
@@ -75,6 +77,8 @@ class _SessionRailState extends State<_SessionRail> {
     if (selected == 'rename') {
       renameController.text = session.name;
       setState(() => renamingId = session.id);
+    } else if (selected == 'resume') {
+      widget.host.sessions.resume(session.id);
     } else if (selected == 'delete') {
       await _confirmDelete(session);
     }

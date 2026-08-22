@@ -152,6 +152,11 @@ class PifSessions {
     'delete',
     {'sessionId': sessionId},
   );
+  void resume(String sessionId) => bus.send(
+    'session/control',
+    'resume',
+    {'sessionId': sessionId},
+  );
   /// Local removal when the hub reports session/state removed.
   void remove(String id) {
     current = current.where((session) => session.id != id).toList();

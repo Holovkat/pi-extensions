@@ -302,6 +302,7 @@ class PifHub {
 	}
 	private async sessionAction(type: string, payload: any) {
 		if (type === "spawn") return this.spawnSession(payload);
+		if (type === "resume") return this.resumeSession(payload);
 		const id = payload.sessionId ?? "host";
 		if (type === "select") {
 			if (!this.state.sessions[id]) throw new Error(`Unknown session ${id}`);
@@ -337,7 +338,7 @@ class PifHub {
 			const event = { type: "input", content, mode: type, ts: new Date().toISOString() }; this.state.sessions.host.transcript.push(event); this.broadcast("session/event", "input", { sessionId: "host", state: this.state.sessions.host.state, event });
 			this.pi.sendMessage({ customType: "pif-input", content, display: true }, { deliverAs: type === "steer" ? "steer" : "followUp", triggerTurn: true }); return;
 		}
-		const child = this.children.get(id); if (!child) throw new Error(`Unknown child session ${id}`);
+		const child = this.children.get(id); if (!child) throw new Error(this.state.sessions[id] ? "Session has ended — resume it from the session panel first" : `Unknown child session ${id}`);
 		const command = type === "input" ? (this.state.sessions[id].state === "running" ? "follow_up" : "prompt") : type;
 		const content = String(payload.content ?? payload.prompt ?? "");
 		if (type !== "abort") { const event = { type: "input", content, mode: command, ts: new Date().toISOString() }; this.state.sessions[id].transcript.push(event); this.broadcast("session/event", "input", { sessionId: id, state: this.state.sessions[id].state, event }); }
@@ -353,10 +354,33 @@ class PifHub {
 		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.upsert(session);
+		this.wireChild(session, child);
+		this.broadcast("session/state", "created", session); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
+		return session;
+	}
+	/** (Re)attach event wiring for a live child process. */
+	private wireChild(session: PifSession, child: ChildProcessWithoutNullStreams) {
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
-		child.on("exit", (code, signal) => { this.children.delete(id); session.state = "ended"; session.exit = { code, signal }; this.store.upsert(session); this.broadcast("session/state", "ended", session); });
-		this.broadcast("session/state", "created", session); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
+		child.on("exit", (code, signal) => { this.children.delete(session.id); session.state = "ended"; session.exit = { code, signal }; this.store.upsert(session); this.broadcast("session/state", "ended", session); });
+	}
+	resumeSession(payload: any) {
+		const id = String(payload.sessionId ?? ""); const session = this.state.sessions[id];
+		if (!session) throw new Error(`Unknown session ${id}`);
+		if (session.host) throw new Error("The host session is always live");
+		if (this.children.has(id)) throw new Error("Session is already running");
+		if (!session.sessionFile || !fs.existsSync(session.sessionFile)) throw new Error("Session transcript file is missing — cannot resume");
+		const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : this.workspace;
+		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
+		const model = session.model !== "default" ? session.model : "";
+		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", session.sessionFile, "--name", session.name];
+		if (model) args.push("--model", model); if (session.thinking && session.thinking !== "none") args.push("--thinking", session.thinking);
+		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
+		session.state = "idle"; session.exit = undefined;
+		this.children.set(id, child);
+		this.wireChild(session, child);
+		this.store.upsert(session);
+		this.broadcast("session/state", "updated", session);
 		return session;
 	}
 	private childEvent(session: PifSession, line: string) {
