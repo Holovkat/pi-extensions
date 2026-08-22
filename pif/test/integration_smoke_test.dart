@@ -32,6 +32,17 @@ class MockHubBus extends PifBus {
   @override
   void send(String channel, String type, Object? payload) =>
       sent.add('$channel:$type');
+  void emit(String channel, String type, Object? payload) => eventController.add(
+    PifEnvelope(
+      v: 1,
+      id: 'event-${DateTime.now().microsecondsSinceEpoch}',
+      ts: DateTime.now(),
+      channel: channel,
+      type: type,
+      payload: payload,
+    ),
+  );
+
   void emitSnapshot({Map<String, dynamic>? widgets, Map<String, dynamic>? layout}) => eventController.add(
     PifEnvelope(
       v: 1,
@@ -230,7 +241,7 @@ void main() {
     await server.close(force: true);
   });
 
-  testWidgets('tabbed panels drag into empty slots', (tester) async {
+  testWidgets('tabbed panels drag into collapsed dock edges', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
     await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
@@ -248,18 +259,60 @@ void main() {
       },
     );
     await tester.pumpAndSettle();
-    // Center holds Agent Console + Diff Viewer as tabs; left dock is empty.
+    // Center holds Agent Console + Diff Viewer as tabs; the empty left
+    // dock has collapsed to its drop edge.
     expect(find.text('Diff Viewer'), findsOneWidget);
-    expect(find.text('Drop widget in left'), findsOneWidget);
+    expect(find.byKey(const Key('pif_dock_left')), findsNothing);
+    final edge = find.byKey(const Key('pif_dock_edge_left'));
+    expect(edge, findsOneWidget);
 
     final tab = find.text('Diff Viewer');
-    final target = find.text('Drop widget in left');
-    await tester.drag(tab, tester.getCenter(target) - tester.getCenter(tab));
+    await tester.drag(tab, tester.getCenter(edge) - tester.getCenter(tab));
     await tester.pumpAndSettle();
 
     expect(bus.sent, contains('shell/layout:move'));
-    expect(find.text('Drop widget in left'), findsNothing,
-        reason: 'Diff Viewer should now occupy the left dock');
+    expect(
+      find.byKey(const Key('pif_dock_left')),
+      findsOneWidget,
+      reason: 'dropping on the edge re-expands the dock',
+    );
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('empty docks collapse and restore when widgets return', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    final widgets = {
+      'agent_console': {'enabled': true},
+      'terminal': {'enabled': true},
+      'widget_store': {'enabled': true},
+      'status_bar': {'enabled': true},
+    };
+    bus.emitSnapshot(widgets: widgets);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_bottom')), findsOneWidget);
+    expect(find.byKey(const Key('pif_dock_edge_bottom')), findsNothing);
+
+    // Terminal toggled off — bottom dock collapses, no reserved space.
+    bus.emit('widget/registry', 'registry_state', {
+      'widgets': {
+        ...widgets,
+        'terminal': {'enabled': false},
+      },
+    });
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_bottom')), findsNothing);
+    expect(find.byKey(const Key('pif_dock_edge_bottom')), findsOneWidget);
+
+    // Terminal toggled back on — the dock re-expands at default size.
+    bus.emit('widget/registry', 'registry_state', {'widgets': widgets});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_dock_bottom')), findsOneWidget);
+    expect(find.byKey(const Key('pif_dock_edge_bottom')), findsNothing);
     await tester.pumpWidget(const SizedBox());
     await tester.binding.setSurfaceSize(null);
   });

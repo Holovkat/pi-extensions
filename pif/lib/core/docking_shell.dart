@@ -184,22 +184,37 @@ class _DockingShellState extends State<DockingShell>
           Expanded(
             child: Row(
               children: [
-                SizedBox(width: 230, child: _dock(PifSlot.left, left)),
-                const VerticalDivider(width: 1),
+                // Docks with no visible widgets collapse so adjacent
+                // panels reclaim the space; a slim edge remains as the
+                // drop target that re-expands the slot.
+                if (left.isEmpty)
+                  _collapsedEdge(PifSlot.left)
+                else ...[
+                  SizedBox(width: 230, child: _dock(PifSlot.left, left)),
+                  const VerticalDivider(width: 1),
+                ],
                 Expanded(
                   child: Column(
                     children: [
                       Expanded(child: _center(center)),
-                      const Divider(height: 1),
-                      SizedBox(
-                        height: 245,
-                        child: _dock(PifSlot.bottom, bottom),
-                      ),
+                      if (bottom.isEmpty)
+                        _collapsedEdge(PifSlot.bottom)
+                      else ...[
+                        const Divider(height: 1),
+                        SizedBox(
+                          height: 245,
+                          child: _dock(PifSlot.bottom, bottom),
+                        ),
+                      ],
                     ],
                   ),
                 ),
-                const VerticalDivider(width: 1),
-                SizedBox(width: 300, child: _dock(PifSlot.right, right)),
+                if (right.isEmpty)
+                  _collapsedEdge(PifSlot.right)
+                else ...[
+                  const VerticalDivider(width: 1),
+                  SizedBox(width: 300, child: _dock(PifSlot.right, right)),
+                ],
               ],
             ),
           ),
@@ -247,6 +262,31 @@ class _DockingShellState extends State<DockingShell>
     ),
   );
 
+  /// A collapsed dock's slim drop edge: invisible until a drag hovers it,
+  /// accepts drops into the (now empty) slot, which re-expands the dock.
+  Widget _collapsedEdge(PifSlot slot) {
+    final vertical = slot == PifSlot.left || slot == PifSlot.right;
+    return SizedBox(
+      key: Key('pif_dock_edge_${slot.name}'),
+      width: vertical ? 7 : double.infinity,
+      height: slot == PifSlot.bottom ? 7 : double.infinity,
+      child: DragTarget<String>(
+        onAcceptWithDetails: (details) => move(details.data, slot),
+        builder: (context, candidates, _) => AnimatedContainer(
+          duration: const Duration(milliseconds: 120),
+          decoration: BoxDecoration(
+            color: candidates.isNotEmpty
+                ? const Color(0xff1e342b)
+                : Colors.transparent,
+            border: candidates.isNotEmpty
+                ? Border.all(color: const Color(0xff78dba9))
+                : null,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _dock(
     PifSlot slot,
     List<PifWidgetPlugin> plugins, {
@@ -254,6 +294,7 @@ class _DockingShellState extends State<DockingShell>
   }) => DragTarget<String>(
     onAcceptWithDetails: (details) => move(details.data, slot),
     builder: (context, candidates, _) => AnimatedContainer(
+      key: Key('pif_dock_${slot.name}'),
       duration: const Duration(milliseconds: 120),
       decoration: BoxDecoration(
         color: candidates.isNotEmpty
