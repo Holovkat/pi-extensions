@@ -1,9 +1,11 @@
 import * as crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 export const PIF_PROTOCOL_VERSION = 1 as const;
 export const PIF_DEFAULT_PORT = 31415;
-export const PIF_CHANNELS = ["session", "widget", "store", "shell"] as const;
+export const PIF_CHANNELS = ["session", "widget", "store", "models", "tracker", "shell"] as const;
 export type PifChannel = (typeof PIF_CHANNELS)[number];
 
 export interface PifEnvelope<T = unknown> {
@@ -98,6 +100,186 @@ export function assertSafeWidgetPath(root: string, candidate: string): string {
 	const resolved = path.resolve(candidate);
 	if (resolved !== resolvedRoot && !resolved.startsWith(`${resolvedRoot}${path.sep}`)) throw new Error(`Path escapes pif widget boundary: ${candidate}`);
 	return resolved;
+}
+
+export interface PifBoardColumn { id: string; name: string; state?: "open" | "closed"; label?: string; status?: "any" | "none"; }
+export interface PifBoardConfig { columns: PifBoardColumn[]; }
+export interface PifTrackerCard { number: number; title: string; type: "epic" | "sprint" | "task" | "issue"; state: "open" | "closed"; labels: string[]; body: string; updatedAt: string; url: string; column: string; }
+
+/** Repo-versioned board definition (`.pif/board.yaml`): a `column <id>:` block
+ * per column with `name`, an optional `state` (open|closed), an optional exact
+ * `label` to match and write back, and `status: any|none` for presence of any
+ * `status:*` label. The first column whose rules all hold claims the card. */
+export function parseBoardConfig(raw: string): PifBoardConfig {
+	const columns: PifBoardColumn[] = [];
+	let current: PifBoardColumn | null = null;
+	for (const source of raw.split(/\r?\n/)) {
+		const line = source.replace(/\s+#.*$/, "");
+		if (!line.trim() || line.trim().startsWith("#")) continue;
+		const header = /^column\s+([a-z][a-z0-9_-]*)\s*:\s*$/.exec(line.trim());
+		if (header) { current = { id: header[1], name: "" }; columns.push(current); continue; }
+		const at = line.indexOf(":");
+		const key = at > 0 ? line.slice(0, at).trim() : "";
+		if (!/^[\w-]+$/.test(key)) throw new Error(`Unexpected board.yaml line: ${line.trim()}`);
+		if (!current) throw new Error("board.yaml properties must follow a column header");
+		const value = scalar(line.slice(at + 1));
+		if (key === "name") current.name = value;
+		else if (key === "state") { if (value !== "open" && value !== "closed") throw new Error(`Invalid column state: ${value}`); current.state = value; }
+		else if (key === "label") current.label = value;
+		else if (key === "status") { if (value !== "any" && value !== "none") throw new Error(`Invalid column status rule: ${value}`); current.status = value; }
+		else throw new Error(`Unknown board.yaml column key: ${key}`);
+	}
+	if (!columns.length) throw new Error("board.yaml requires at least one column");
+	for (const column of columns) {
+		if (!column.name) throw new Error(`Column ${column.id} is missing a name`);
+		if (columns.filter((candidate) => candidate.id === column.id).length > 1) throw new Error(`Duplicate column id: ${column.id}`);
+	}
+	return { columns };
+}
+
+/** Zero-config board for repos without `.pif/board.yaml`. */
+export function defaultBoardConfig(): PifBoardConfig {
+	return { columns: [
+		{ id: "backlog", name: "Backlog", state: "open", status: "none" },
+		{ id: "in_progress", name: "In Progress", state: "open", status: "any" },
+		{ id: "done", name: "Done", state: "closed" },
+	] };
+}
+
+export function columnForCard(labels: string[], state: string, config: PifBoardConfig): string {
+	for (const column of config.columns) {
+		if (column.state && column.state !== state) continue;
+		if (column.label && !labels.includes(column.label)) continue;
+		if (column.status === "any" && !labels.some((label) => label.startsWith("status:"))) continue;
+		if (column.status === "none" && labels.some((label) => label.startsWith("status:"))) continue;
+		return column.id;
+	}
+	return config.columns[0].id;
+}
+
+const TRACKER_TYPES = ["epic", "sprint", "task"] as const;
+
+export function normalizeGhIssue(issue: any, config: PifBoardConfig): PifTrackerCard {
+	const labels = Array.isArray(issue.labels) ? issue.labels.map((label: any) => String(label?.name ?? label)).filter(Boolean) : [];
+	const type = TRACKER_TYPES.find((candidate) => labels.includes(candidate)) ?? "issue";
+	const state = String(issue.state ?? "").toLowerCase() === "closed" ? "closed" : "open";
+	return { number: Number(issue.number), title: String(issue.title ?? ""), type, state, labels, body: String(issue.body ?? "").slice(0, 20_000), updatedAt: String(issue.updatedAt ?? ""), url: String(issue.url ?? ""), column: columnForCard(labels, state, config) };
+}
+
+/** Write-back plan for dropping a card on a column: ensure the column's exact
+ * label, clear competing `status:*` labels, and land in the column's state. */
+export function plannedTrackerMove(card: PifTrackerCard, column: PifBoardColumn): { add: string[]; remove: string[]; state: "open" | "closed" } {
+	const remove = card.labels.filter((candidate) => candidate.startsWith("status:") && candidate !== column.label);
+	const add = column.label && !card.labels.includes(column.label) ? [column.label] : [];
+	return { add, remove, state: column.state === "closed" ? "closed" : "open" };
+}
+
+export interface TrackerState { repo: string | null; columns: { id: string; name: string }[]; cards: PifTrackerCard[]; stale: boolean; fetchedAt: string | null; error: string | null; }
+export type SpawnRunner = (command: string, args: string[], options: { cwd: string; timeout: number }) => { status: number | null; stdout: string; stderr: string };
+
+const trackerRunner: SpawnRunner = (command, args, options) => { const result = spawnSync(command, args, { ...options, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }); return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" }; };
+
+/** Board data for the tracker widget: reads the workspace repo's issues via
+ * the ambient gh session, writes card moves back per the repo's board rules
+ * (`.pif/board.yaml`, default board when absent), and caches to SQLite (JSON
+ * fallback) so the board stays readable when the tracker is unreachable. */
+export class TrackerSync {
+	readonly state: TrackerState = { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null };
+	private workspace: string;
+	private changed: (state: TrackerState) => void;
+	private runner: SpawnRunner;
+	private preferJsonCache: boolean;
+	private repoCache: string | null | undefined;
+	private timer: NodeJS.Timeout | null = null;
+	private db: any = null; private jsonPath = "";
+	constructor(workspace: string, changed: (state: TrackerState) => void, runner: SpawnRunner = trackerRunner, preferJsonCache = false) {
+		this.workspace = workspace; this.changed = changed; this.runner = runner; this.preferJsonCache = preferJsonCache;
+	}
+	async init() {
+		const cacheDir = path.join(this.workspace, ".pi", "pif", "cache");
+		if (!this.preferJsonCache) {
+			try {
+				const { DatabaseSync } = await import("node:sqlite");
+				fs.mkdirSync(cacheDir, { recursive: true });
+				this.db = new DatabaseSync(path.join(cacheDir, "tracker.db"));
+				this.db.exec("CREATE TABLE IF NOT EXISTS tracker (id INTEGER PRIMARY KEY, repo TEXT, fetched_at TEXT, cards TEXT)");
+			} catch { this.db = null; }
+		}
+		this.jsonPath = path.join(cacheDir, "tracker-cache.json");
+		this.loadCache();
+	}
+	start() { const kick = setTimeout(() => this.refresh(), 250); kick.unref?.(); this.timer = setInterval(() => this.refresh(), 300_000); this.timer.unref?.(); }
+	stop() { if (this.timer) clearInterval(this.timer); this.timer = null; }
+	private ghBin() { return process.env.PIF_GH_BIN || "gh"; }
+	private boardPath() { return path.join(this.workspace, ".pif", "board.yaml"); }
+	private boardConfig(): PifBoardConfig { try { return parseBoardConfig(fs.readFileSync(this.boardPath(), "utf8")); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultBoardConfig(); throw error; } }
+	private columnNames(config: PifBoardConfig) { return config.columns.map(({ id, name }) => ({ id, name })); }
+	private resolveRepo(): string | null {
+		if (this.repoCache !== undefined) return this.repoCache;
+		const git = this.runner("git", ["remote", "get-url", "origin"], { cwd: this.workspace, timeout: 10_000 });
+		const match = git.status === 0 ? /github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/.exec(git.stdout.trim()) : null;
+		this.repoCache = match ? `${match[1]}/${match[2]}` : null;
+		return this.repoCache;
+	}
+	refresh(): { ok: boolean; error?: string } {
+		let config: PifBoardConfig;
+		try { config = this.boardConfig(); } catch (error) { this.state.error = `Invalid board.yaml: ${String((error as Error).message)}`; this.changed(this.state); return { ok: false, error: this.state.error }; }
+		const repo = this.resolveRepo();
+		if (!repo) { this.state.error = "Workspace has no GitHub origin remote"; this.state.stale = true; this.changed(this.state); return { ok: false, error: this.state.error }; }
+		const list = this.runner(this.ghBin(), ["issue", "list", "-R", repo, "--state", "all", "--limit", "300", "--json", "number,title,state,labels,updatedAt,url,body"], { cwd: this.workspace, timeout: 30_000 });
+		this.state.repo = repo; this.state.columns = this.columnNames(config);
+		if (list.status !== 0) {
+			this.state.stale = true; this.state.error = `${list.stderr || list.stdout}`.trim() || "gh issue list failed";
+			this.changed(this.state); return { ok: false, error: this.state.error };
+		}
+		let issues: any[] = []; try { const parsed = JSON.parse(list.stdout); if (Array.isArray(parsed)) issues = parsed; } catch { /* empty board */ }
+		this.state.cards = issues.map((issue) => normalizeGhIssue(issue, config)).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+		this.state.stale = false; this.state.fetchedAt = new Date().toISOString(); this.state.error = null;
+		this.writeCache(); this.changed(this.state);
+		return { ok: true };
+	}
+	move(params: any): { ok: boolean; number?: number; column?: string; error?: string } {
+		const number = Number(params.number); const columnId = String(params.column ?? "");
+		const card = this.state.cards.find((candidate) => candidate.number === number);
+		if (!card) return { ok: false, error: `Unknown card #${number}` };
+		let config: PifBoardConfig; try { config = this.boardConfig(); } catch (error) { return { ok: false, error: `Invalid board.yaml: ${String((error as Error).message)}` }; }
+		const column = config.columns.find((candidate) => candidate.id === columnId);
+		if (!column) return { ok: false, error: `Unknown column: ${columnId}` };
+		const repo = this.state.repo ?? this.resolveRepo();
+		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
+		const plan = plannedTrackerMove(card, column);
+		if (plan.add.length || plan.remove.length) {
+			const args = ["issue", "edit", String(number), "-R", repo];
+			for (const label of plan.add) args.push("--add-label", label);
+			for (const label of plan.remove) args.push("--remove-label", label);
+			const edit = this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
+			if (edit.status !== 0) return { ok: false, error: `${edit.stderr || edit.stdout}`.trim() || "gh issue edit failed" };
+		}
+		if (plan.state !== card.state) {
+			const flip = this.runner(this.ghBin(), ["issue", plan.state === "closed" ? "close" : "reopen", String(number), "-R", repo], { cwd: this.workspace, timeout: 30_000 });
+			if (flip.status !== 0) return { ok: false, error: `${flip.stderr || flip.stdout}`.trim() || `gh issue ${plan.state} failed` };
+		}
+		card.labels = [...card.labels.filter((label) => !plan.remove.includes(label)), ...plan.add];
+		card.state = plan.state; card.column = columnForCard(card.labels, card.state, config);
+		this.writeCache(); this.changed(this.state);
+		return { ok: true, number, column: columnId };
+	}
+	list() { return { repo: this.state.repo, columns: this.state.columns, stale: this.state.stale, fetchedAt: this.state.fetchedAt, error: this.state.error, cards: this.state.cards.map(({ body, ...card }) => card) }; }
+	private loadCache() {
+		if (this.db) {
+			try { const row = this.db.prepare("SELECT repo, fetched_at, cards FROM tracker WHERE id = 1").get(); if (row) { this.applyCache(String(row.repo ?? "") || null, String(row.fetched_at ?? "") || null, JSON.parse(String(row.cards ?? "[]"))); return; } } catch { /* fall through to json */ }
+		}
+		try { const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8")); this.applyCache(parsed.repo ?? null, parsed.fetchedAt ?? null, Array.isArray(parsed.cards) ? parsed.cards : []); } catch { /* absent */ }
+	}
+	private applyCache(repo: string | null, fetchedAt: string | null, cards: any[]) {
+		if (!Array.isArray(cards) || !cards.length) return;
+		this.state.repo = repo; this.state.cards = cards; this.state.fetchedAt = fetchedAt; this.state.stale = true;
+		if (!this.state.columns.length) this.state.columns = this.columnNames(defaultBoardConfig());
+	}
+	private writeCache() {
+		if (this.db) { this.db.prepare("INSERT INTO tracker (id, repo, fetched_at, cards) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET repo = excluded.repo, fetched_at = excluded.fetched_at, cards = excluded.cards").run(this.state.repo, this.state.fetchedAt, JSON.stringify(this.state.cards)); return; }
+		fs.mkdirSync(path.dirname(this.jsonPath), { recursive: true }); fs.writeFileSync(this.jsonPath, JSON.stringify({ repo: this.state.repo, fetchedAt: this.state.fetchedAt, cards: this.state.cards }, null, 2) + "\n");
+	}
 }
 
 const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT"] as const;

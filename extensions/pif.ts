@@ -17,8 +17,10 @@ import {
 	generateWidgetRegistry,
 	parseWidgetManifest,
 	pifUpgradeAuthorized,
+	TrackerSync,
 	type PifEnvelope,
 	type PifWidgetManifest,
+	type TrackerState,
 	widgetClassName,
 } from "./pif-shared.ts";
 
@@ -35,6 +37,7 @@ interface HubState {
 	layout: Record<string, unknown>;
 	models: string[];
 	modelProviders: Record<string, any>;
+	tracker: TrackerState;
 	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number; origin: "standalone" | "terminal" };
 }
 
@@ -168,6 +171,7 @@ class PifHub {
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
+	private tracker: TrackerSync;
 	readonly store: SessionStore;
 	constructor(readonly pi: ExtensionAPI, readonly ctx: ExtensionContext, readonly workspace: string, readonly port: number) {
 		const globalApp = path.join(os.homedir(), ".pi", "pif", "app");
@@ -175,17 +179,19 @@ class PifHub {
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
+		this.tracker = new TrackerSync(workspace, (state) => { this.state.tracker = state; this.broadcast("tracker/state", "state", state); });
+		this.state.tracker = this.tracker.state;
 		this.store = new SessionStore(this.pifDir);
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
-		await this.store.init();
+		await this.store.init(); await this.tracker.init(); this.tracker.start();
 		fs.writeFileSync(path.join(this.pifDir, "token"), this.token, { mode: 0o600 }); try { fs.chmodSync(path.join(this.pifDir, "token"), 0o600); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
@@ -197,7 +203,7 @@ class PifHub {
 	async stop() {
 		for (const child of this.children.values()) this.terminateChild(child);
 		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.upsert(session);
-		this.children.clear(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
+		this.children.clear(); this.tracker.stop(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
 		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
 		this.state.health.hub = "stopped"; this.setStatus();
@@ -275,6 +281,7 @@ class PifHub {
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("models/")) await this.modelsAction(env.type, env.payload as any);
+			else if (env.channel.startsWith("tracker/")) this.trackerAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("shell/")) await this.layoutAction(env.type, env.payload as any);
 		} catch (error) { peer.send(createEnvelope("shell/error", "action_failed", { requestId: env.id, error: String((error as Error).message) })); }
 	}
@@ -425,6 +432,11 @@ class PifHub {
 		return [...models].sort();
 	}
 	private refreshModels() { this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
+	private trackerAction(type: string, payload: any) {
+		if (type === "refresh") return this.tracker.refresh();
+		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
+		throw new Error(`Unknown tracker action: ${type}`);
+	}
 	private async modelsAction(type: string, payload: any) {
 		if (type === "save") {
 			const providers = this.validateModelProviders(payload.providers);
@@ -501,6 +513,7 @@ class PifHub {
 		switch (method) {
 			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
+			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list();
 			case "shell.shutdown": return this.shutdown();
 			default: throw new Error(`Unknown pif control method: ${method}`);
 		}
@@ -527,6 +540,7 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_widget_toggle", "pif widget toggle", "Enable or disable an installed widget.", Type.Object({ id: Type.String(), enabled: Type.Optional(Type.Boolean()) }), "widget.toggle");
 	register("pif_widget_uninstall", "pif widget uninstall", "Archive a non-core widget back into the local catalog.", Type.Object({ id: Type.String() }), "widget.uninstall");
 	register("pif_widget_list", "pif widget list", "List installed and local catalog widgets.", Type.Object({}), "widget.list");
+	register("pif_tracker_list", "pif tracker list", "List the workspace repo's board cards (epics, sprints, tasks, issues) with their columns, without bodies.", Type.Object({}), "tracker.list");
 	register("pif_layout", "pif layout", "Open, focus, move, close, reset, pin, save, or load pif panels; reset restores the default docking design and pin controls slide-in overlay mode.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("reset"), Type.Literal("pin"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()), pinned: Type.Optional(Type.Boolean()) }), "layout");
 	register("pif_shell_status", "pif shell status", "Return pif hub, shell, sessions, widgets, and layout health.", Type.Object({}), "shell.status");
 	register("pif_reload", "pif reload", "Hot reload or hot restart the pif Flutter shell.", Type.Object({ restart: Type.Optional(Type.Boolean()) }), "shell.reload");
