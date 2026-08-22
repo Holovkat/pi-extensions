@@ -9,7 +9,7 @@ generated_by: planning-session
 session_id: pending
 commit_sha: []
 branch: master
-issue_refs: [152, 153, 154, 155, 156, 157, 158, 159, 160]
+issue_refs: [152, 153, 154, 155, 156, 157, 158, 159, 160, 163, 164, 165, 166]
 epic_refs: [152]
 capture_tier: session
 ---
@@ -37,6 +37,7 @@ Reused the two weeks of prior work as the foundation: install pipeline + analyze
 - Bundled pi ships without dev models/API keys; first-run provisioning on the target machine; secrets scan is export acceptance.
 - Largest recorded risk: the export template consuming shell core ("shell-as-package") — if it forces extracting a `pif_core` package, that is a line-stop and replan, not improvisation.
 - Roadmap realigned on the tracker (follow-up pass): the spec's original Phase 2 → 3 order is superseded on epic #152's "Roadmap Realignment" section — layout presets and diff viewer recorded as already done; Phase 3 packaging pulled forward into #159; Phase 2 on-demand builds subsumed by #158; the remainder re-sequenced as deferred Sprint 2 (Ecosystem: remote git catalogs on #155's layered sources, per-widget settings, theming, file-explorer via the agentic flow) and Sprint 3 (Platform & sharing: coms/council sharing depending on epic #112, trust/signing, RFW lane for shipped AOT apps, multi-window). Task #154 owns writing this into the spec so spec and tracker tell one story; linkage comments left on #120 and #112.
+- Tracker panel planned as a precursor sprint under #152: sprint #163, tasks #164 (hub sync layer), #165 (board widget), #166 (verification). A repo-synced Kanban board in the center stage — GitHub via the ambient `gh` session, card bodies as rendered Markdown, drag-between-columns with write-back to the tracker, columns defined by a versioned `.pif/board.yaml` in the repo (zero-config default board when absent), and a local offline cache (SQLite preferred, JSON fallback if a driver can't load in the pi runtime — no hosted DB; the tracker stays the single source of truth). Positioned as the Sprint-2 "dogfooded widget" idea pulled forward: it tracks the epic itself from inside pif and is the first large non-console panel.
 
 # Lessons Learned
 
