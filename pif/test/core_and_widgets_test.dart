@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pif/core/bus.dart';
@@ -186,6 +187,59 @@ void main() {
       reason: 'rename envelope sent',
     );
     expect((bus.sent.last['payload'] as Map)['name'], 'Renamed');
+    await tester.pump(const Duration(milliseconds: 400));
+    await bus.dispose();
+  });
+
+  testWidgets('session cards context menu renames and deletes', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus)..workspace = '/tmp';
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+      },
+      'child': {
+        'id': 'child',
+        'name': 'Researcher',
+        'host': false,
+        'state': 'ended',
+        'model': 'test',
+        'cwd': '/tmp',
+      },
+    });
+    await tester.pumpWidget(panel(SessionRailPlugin(), host));
+
+    // Right-click the child card: rename + delete offered (host gets no delete).
+    await tester.tap(find.text('Researcher'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    expect(find.text('Rename'), findsOneWidget);
+    expect(find.text('Delete'), findsOneWidget);
+
+    // Delete confirms first, then sends the delete envelope.
+    await tester.tap(find.text('Delete').last);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Delete Researcher?'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+    await tester.pumpAndSettle();
+    expect(bus.sent.any((entry) => entry['type'] == 'delete'), isTrue);
+
+    // Rename edits the card inline and commits on submit.
+    await tester.tap(find.text('Researcher'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Rename').last);
+    await tester.pump();
+    final field = find.widgetWithText(TextField, 'Researcher');
+    expect(field, findsOneWidget);
+    await tester.enterText(field, 'Historian');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    expect(bus.sent.any((entry) => entry['type'] == 'rename'), isTrue);
+    expect((bus.sent.last['payload'] as Map)['name'], 'Historian');
     await tester.pump(const Duration(milliseconds: 400));
     await bus.dispose();
   });

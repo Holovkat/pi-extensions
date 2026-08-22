@@ -40,6 +40,51 @@ interface HubState {
 
 const text = (value: unknown, details: unknown = value) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], details });
 
+/** Per-project session persistence. SQLite via node:sqlite when the
+ * runtime provides it, JSON file fallback otherwise. Stores child
+ * sessions (name, model, transcript) so reopened projects recall them. */
+class SessionStore {
+	private db: any = null;
+	private jsonPath: string = "";
+	private json: { sessions: any[] } = { sessions: [] };
+	constructor(private pifDir: string) {}
+	async init() {
+		try {
+			const { DatabaseSync } = await import("node:sqlite");
+			this.db = new DatabaseSync(path.join(this.pifDir, "sessions.db"));
+			this.db.exec("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT, thinking TEXT, cwd TEXT, session_file TEXT, transcript TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+		} catch {
+			this.jsonPath = path.join(this.pifDir, "sessions.json");
+			try { const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8")); if (parsed && Array.isArray(parsed.sessions)) this.json = parsed; } catch { /* absent */ }
+		}
+	}
+	upsert(session: PifSession) {
+		const now = new Date().toISOString();
+		if (this.db) {
+			this.db.prepare("INSERT INTO sessions (id, name, model, thinking, cwd, session_file, transcript, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, model = excluded.model, thinking = excluded.thinking, transcript = excluded.transcript, updated_at = excluded.updated_at")
+				.run(session.id, session.name, session.model, session.thinking, session.cwd, session.sessionFile ?? null, JSON.stringify(session.transcript), now, now);
+		} else {
+			const record = { id: session.id, name: session.name, model: session.model, thinking: session.thinking, cwd: session.cwd, session_file: session.sessionFile ?? null, transcript: session.transcript, created_at: now, updated_at: now };
+			const at = this.json.sessions.findIndex((row) => row.id === session.id);
+			if (at >= 0) this.json.sessions[at] = { ...this.json.sessions[at], ...record }; else this.json.sessions.push(record);
+			this.saveJson();
+		}
+	}
+	rename(id: string, name: string) {
+		if (this.db) this.db.prepare("UPDATE sessions SET name = ?, updated_at = ? WHERE id = ?").run(name, new Date().toISOString(), id);
+		else { const row = this.json.sessions.find((entry) => entry.id === id); if (row) { row.name = name; row.updated_at = new Date().toISOString(); this.saveJson(); } }
+	}
+	remove(id: string) {
+		if (this.db) this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+		else { this.json.sessions = this.json.sessions.filter((entry) => entry.id !== id); this.saveJson(); }
+	}
+	list(): any[] {
+		if (this.db) return this.db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all();
+		return [...this.json.sessions].sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+	}
+	private saveJson() { fs.mkdirSync(this.pifDir, { recursive: true }); fs.writeFileSync(this.jsonPath, JSON.stringify(this.json, null, 2) + "\n"); }
+}
+
 class WsPeer {
 	private buffer = Buffer.alloc(0);
 	constructor(private socket: net.Socket, private onMessage: (raw: string) => void, private onClose: () => void) {
@@ -123,6 +168,7 @@ class PifHub {
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
+	readonly store: SessionStore;
 	constructor(readonly pi: ExtensionAPI, readonly ctx: ExtensionContext, readonly workspace: string, readonly port: number) {
 		const globalApp = path.join(os.homedir(), ".pi", "pif", "app");
 		const localApp = path.join(workspace, "pif");
@@ -134,20 +180,23 @@ class PifHub {
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
+		this.store = new SessionStore(this.pifDir);
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
+		await this.store.init();
 		fs.writeFileSync(path.join(this.pifDir, "token"), this.token, { mode: 0o600 }); try { fs.chmodSync(path.join(this.pifDir, "token"), 0o600); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
-		this.createHostSession(); await this.startWebSocket(); await this.startControl();
+		this.createHostSession(); this.loadPersistedSessions(); await this.startWebSocket(); await this.startControl();
 		this.state.health.hub = "running"; this.setStatus(); this.broadcastSnapshot();
 		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token });
 	}
 	async stop() {
 		for (const child of this.children.values()) this.terminateChild(child);
+		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.upsert(session);
 		this.children.clear(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
 		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
@@ -169,6 +218,17 @@ class PifHub {
 		if (!model || this.state.models.includes(model)) return model ?? "";
 		const matches = this.state.models.filter((candidate) => candidate.endsWith(`/${model}`));
 		return matches.length === 1 ? matches[0] : model;
+	}
+	/** Restored child sessions from the store: read-only history — their
+	 * processes are gone, so they load as ended. */
+	private loadPersistedSessions() {
+		for (const row of this.store.list()) {
+			const id = String(row.id);
+			if (id === "host" || this.state.sessions[id]) continue;
+			let transcript: unknown[] = [];
+			try { const parsed = JSON.parse(String(row.transcript ?? "[]")); if (Array.isArray(parsed)) transcript = parsed; } catch { /* corrupt */ }
+			this.state.sessions[id] = { id, name: String(row.name ?? "Agent"), host: false, state: "ended", model: String(row.model ?? "default"), thinking: String(row.thinking ?? "medium"), cwd: String(row.cwd ?? this.workspace), transcript, sessionFile: row.session_file ? String(row.session_file) : undefined, exit: { code: null, signal: null } };
+		}
 	}
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
@@ -251,7 +311,17 @@ class PifHub {
 		if (type === "rename") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
 			const name = String(payload.name ?? "").trim().slice(0, 80); if (!name) throw new Error("Session name is required");
-			session.name = name; if (id === "host") this.savePrefs({ name }); this.broadcast("session/state", "updated", session); return session;
+			session.name = name; if (id === "host") this.savePrefs({ name }); else this.store.upsert(session); this.broadcast("session/state", "updated", session); return session;
+		}
+		if (type === "delete") {
+			if (id === "host") throw new Error("The host session cannot be deleted");
+			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
+			const child = this.children.get(id); if (child) { this.children.delete(id); this.terminateChild(child); }
+			this.store.remove(id);
+			if (session.sessionFile) { try { fs.rmSync(session.sessionFile, { force: true }); } catch { /* absent */ } }
+			delete this.state.sessions[id];
+			this.broadcast("session/state", "removed", { sessionId: id });
+			return { ok: true, id };
 		}
 		if (type === "setModel") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
@@ -282,10 +352,10 @@ class PifHub {
 		const thinking = String(payload.thinking || prefs.thinking || "medium");
 		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
-		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child);
+		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.upsert(session);
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
-		child.on("exit", (code, signal) => { this.children.delete(id); session.state = "ended"; session.exit = { code, signal }; this.broadcast("session/state", "ended", session); });
+		child.on("exit", (code, signal) => { this.children.delete(id); session.state = "ended"; session.exit = { code, signal }; this.store.upsert(session); this.broadcast("session/state", "ended", session); });
 		this.broadcast("session/state", "created", session); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
 		return session;
 	}

@@ -24,9 +24,15 @@ class _SessionRail extends StatefulWidget {
 
 class _SessionRailState extends State<_SessionRail> {
   late StreamSubscription subscription;
+  String? renamingId;
+  final renameController = TextEditingController();
+  final renameFocus = FocusNode();
   @override
   void initState() {
     super.initState();
+    renameFocus.addListener(() {
+      if (!renameFocus.hasFocus && renamingId != null) _commitRename();
+    });
     subscription = widget.host.sessions.changes.listen((_) {
       if (mounted) setState(() {});
     });
@@ -35,7 +41,68 @@ class _SessionRailState extends State<_SessionRail> {
   @override
   void dispose() {
     subscription.cancel();
+    renameController.dispose();
+    renameFocus.dispose();
     super.dispose();
+  }
+
+  void _commitRename() {
+    final name = renameController.text.trim();
+    final id = renamingId;
+    setState(() => renamingId = null);
+    if (id != null && name.isNotEmpty) {
+      widget.host.sessions.rename(id, name);
+    }
+  }
+
+  Future<void> _cardMenu(Offset position, PifSession session) async {
+    final overlay = Overlay.of(context).context.findRenderObject() as RenderBox;
+    final selected = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        overlay.size.width - position.dx,
+        overlay.size.height - position.dy,
+      ),
+      items: [
+        const PopupMenuItem(value: 'rename', child: Text('Rename')),
+        if (!session.host)
+          const PopupMenuItem(value: 'delete', child: Text('Delete')),
+      ],
+    );
+    if (!mounted) return;
+    if (selected == 'rename') {
+      renameController.text = session.name;
+      setState(() => renamingId = session.id);
+    } else if (selected == 'delete') {
+      await _confirmDelete(session);
+    }
+  }
+
+  Future<void> _confirmDelete(PifSession session) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder:
+          (context) => AlertDialog(
+            title: Text('Delete ${session.name}?'),
+            content: const Text(
+              'This permanently removes the session — its transcript and '
+              'history cannot be recovered.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: const Text('Delete'),
+              ),
+            ],
+          ),
+    );
+    if (confirmed == true) widget.host.sessions.delete(session.id);
   }
 
   Future<void> create() async {
@@ -161,37 +228,57 @@ class _SessionRailState extends State<_SessionRail> {
             child: ListView(
               children: sessions.map((session) {
                 final selected = session.id == widget.host.activeSessionId;
-                return ListTile(
-                  selected: selected,
-                  selectedTileColor: const Color(0xff222c36),
-                  dense: true,
-                  onTap: () {
-                    setState(() => widget.host.activeSessionId = session.id);
-                    widget.host.sessions.select(session.id);
-                    widget.host.layout.open('agent_console');
-                  },
-                  leading: Icon(
-                    session.host ? Icons.home_filled : Icons.smart_toy_outlined,
-                    size: 18,
-                    color: _stateColor(session.state),
-                  ),
-                  title: Text(
-                    session.name,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text(
-                    session.model,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                  trailing: Container(
-                    width: 7,
-                    height: 7,
-                    decoration: BoxDecoration(
+                return GestureDetector(
+                  onSecondaryTapUp:
+                      (details) => _cardMenu(details.globalPosition, session),
+                  child: ListTile(
+                    selected: selected,
+                    selectedTileColor: const Color(0xff222c36),
+                    dense: true,
+                    onTap: () {
+                      setState(() => widget.host.activeSessionId = session.id);
+                      widget.host.sessions.select(session.id);
+                      widget.host.layout.open('agent_console');
+                    },
+                    leading: Icon(
+                      session.host
+                          ? Icons.home_filled
+                          : Icons.smart_toy_outlined,
+                      size: 18,
                       color: _stateColor(session.state),
-                      shape: BoxShape.circle,
+                    ),
+                    title:
+                        renamingId == session.id
+                            ? TextField(
+                              controller: renameController,
+                              focusNode: renameFocus,
+                              autofocus: true,
+                              style: const TextStyle(fontSize: 14),
+                              decoration: const InputDecoration(
+                                isDense: true,
+                                isCollapsed: true,
+                                border: InputBorder.none,
+                              ),
+                              onSubmitted: (_) => _commitRename(),
+                            )
+                            : Text(
+                              session.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                    subtitle: Text(
+                      session.model,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                    trailing: Container(
+                      width: 7,
+                      height: 7,
+                      decoration: BoxDecoration(
+                        color: _stateColor(session.state),
+                        shape: BoxShape.circle,
+                      ),
                     ),
                   ),
                 );

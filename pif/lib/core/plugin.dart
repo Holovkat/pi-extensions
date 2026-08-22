@@ -147,6 +147,16 @@ class PifSessions {
     'rename',
     {'sessionId': sessionId, 'name': name},
   );
+  void delete(String sessionId) => bus.send(
+    'session/control',
+    'delete',
+    {'sessionId': sessionId},
+  );
+  /// Local removal when the hub reports session/state removed.
+  void remove(String id) {
+    current = current.where((session) => session.id != id).toList();
+    _state.add(current);
+  }
   void setModel(String sessionId, String model) => bus.send(
     'session/control',
     'setModel',

@@ -160,6 +160,13 @@ class _DockingShellState extends State<DockingShell>
       final payload = Map<String, dynamic>.from(envelope.payload as Map);
       host.activeSessionId = payload['sessionId'] as String? ?? 'host';
       if (mounted) setState(() {});
+    } else if (envelope.channel == 'session/state' &&
+        envelope.type == 'removed') {
+      final payload = Map<String, dynamic>.from(envelope.payload as Map);
+      final removed = payload['sessionId'] as String? ?? '';
+      host.sessions.remove(removed);
+      if (host.activeSessionId == removed) host.activeSessionId = 'host';
+      if (mounted) setState(() {});
     } else if (envelope.channel.startsWith('session/') &&
         envelope.payload is Map) {
       host.sessions.applyEvent(

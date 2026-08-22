@@ -119,6 +119,8 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const abortPromise = nextMessage(socket, (value) => value.channel === 'session/event' && value.payload.event?.aborted === true);
   send(socket, 'session/control', 'abort', {sessionId});
   await abortPromise; checkpoint('child controls complete');
+  send(socket, 'session/control', 'rename', {sessionId, name: 'Researcher'});
+  await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.id === sessionId && value.payload?.name === 'Researcher');
 
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
   const scaffold = await control(controlPath, 'widget.create', {id: 'diff_viewer', name: 'Diff Viewer', slot: 'center', spec: 'Compare before and after text'});
@@ -192,6 +194,17 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(restarted.payload.sessions.host.model, 'fixture/fast');
   assert.equal(restarted.payload.sessions.host.thinking, 'low');
   assert.equal(restarted.payload.sessions.host.name, 'My Workspace');
+  const restored = restarted.payload.sessions[sessionId];
+  assert.equal(restored.name, 'Researcher');
+  assert.equal(restored.state, 'ended');
+  assert.ok(restored.transcript.length > 0, 'restored session carries its transcript');
+  const removedMsg = nextMessage(socket2, (value) => value.type === 'removed' && value.payload?.sessionId === sessionId);
+  send(socket2, 'session/control', 'delete', {sessionId});
+  await removedMsg;
+  send(socket2, 'shell/state', 'snapshot_request', {});
+  const afterDelete = await nextMessage(socket2, (value) => value.type === 'snapshot');
+  assert.equal(afterDelete.payload.sessions[sessionId], undefined);
+  checkpoint('sessions persist, restore, and delete');
   send(socket2, 'shell/state', 'shutdown_request', {});
   await waitFor(() => pi2.exitCode != null ? true : false, 'pi2 shutdown via shutdown_request', 15_000);
   socket2.close();
