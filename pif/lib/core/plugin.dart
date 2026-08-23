@@ -88,11 +88,8 @@ class PifSessions {
   /// Request the authoritative transcript for a session (the hub reads
   /// its `.jsonl`). Response arrives as a `session/transcript` history
   /// envelope handled by the shell/host wiring.
-  void fetchTranscript(String sessionId) => bus.send(
-    'session/control',
-    'transcript',
-    {'sessionId': sessionId},
-  );
+  void fetchTranscript(String sessionId) =>
+      bus.send('session/control', 'transcript', {'sessionId': sessionId});
 
   /// Install a fetched history (lazy hydration) into the matching session.
   void replaceTranscript(String sessionId, List<dynamic> transcript) {
@@ -123,26 +120,33 @@ class PifSessions {
     final id = payload['sessionId'] as String? ?? payload['id'] as String?;
     if (id == null) return;
     final existing = current.where((session) => session.id == id).firstOrNull;
-    // Streaming events append one entry; metadata patches (rename,
-    // setModel…) carry no event. Neither rebuilds the transcript array.
-    final hasFullRecord = payload.containsKey('transcript');
-    final source = payload.containsKey('id')
-        ? payload
+    // The slim hub snapshot sends both streaming events and state changes as
+    // partial records. Preserve the current session fields/history when a
+    // patch omits them; otherwise PifSession.fromJson defaults transcript to
+    // an empty list and the console loses the conversation after every live
+    // update.
+    final inherited = existing == null
+        ? const <String, dynamic>{}
         : <String, dynamic>{
-            if (existing != null) ...{
-              'id': existing.id,
-              'name': existing.name,
-              'host': existing.host,
-              'model': existing.model,
-              'cwd': existing.cwd,
-              if (hasFullRecord)
-                'transcript': [
-                  ...existing.transcript,
-                  if (payload['event'] != null) payload['event'],
-                ],
-            },
+            'id': existing.id,
+            'name': existing.name,
+            'host': existing.host,
+            'state': existing.state,
+            'model': existing.model,
+            'thinking': existing.thinking,
+            'cwd': existing.cwd,
+            'transcript': existing.transcript,
+          };
+    final source = payload.containsKey('id')
+        ? <String, dynamic>{...inherited, ...payload}
+        : <String, dynamic>{
+            ...inherited,
             'id': id,
             'state': payload['state'] ?? existing?.state ?? 'idle',
+            'transcript': [
+              ...(existing?.transcript ?? const <dynamic>[]),
+              if (payload['event'] != null) payload['event'],
+            ],
           };
     final replacement = PifSession.fromJson(source);
     // Pure transcript events keep the rail order untouched — no re-sort
@@ -170,11 +174,17 @@ class PifSessions {
     _sorted = true;
   }
 
-  void spawn({required String cwd, String? model, String? thinking, String? prompt}) => bus.send(
-    'session/control',
-    'spawn',
-    {'cwd': cwd, 'model': model, 'thinking': thinking, 'prompt': prompt},
-  );
+  void spawn({
+    required String cwd,
+    String? model,
+    String? thinking,
+    String? prompt,
+  }) => bus.send('session/control', 'spawn', {
+    'cwd': cwd,
+    'model': model,
+    'thinking': thinking,
+    'prompt': prompt,
+  });
   void input(String sessionId, String content) => bus.send(
     'session/control',
     'input',
@@ -194,21 +204,17 @@ class PifSessions {
     'rename',
     {'sessionId': sessionId, 'name': name},
   );
-  void delete(String sessionId) => bus.send(
-    'session/control',
-    'delete',
-    {'sessionId': sessionId},
-  );
-  void resume(String sessionId) => bus.send(
-    'session/control',
-    'resume',
-    {'sessionId': sessionId},
-  );
+  void delete(String sessionId) =>
+      bus.send('session/control', 'delete', {'sessionId': sessionId});
+  void resume(String sessionId) =>
+      bus.send('session/control', 'resume', {'sessionId': sessionId});
+
   /// Local removal when the hub reports session/state removed.
   void remove(String id) {
     current = current.where((session) => session.id != id).toList();
     _state.add(current);
   }
+
   void setModel(String sessionId, String model) => bus.send(
     'session/control',
     'setModel',
@@ -237,6 +243,7 @@ class PifLayout {
   });
   void close(String widgetId) =>
       bus.send('shell/layout', 'close', {'widgetId': widgetId});
+
   /// Discard the persisted arrangement and return every panel to its
   /// default slot from the widget registry.
   void reset() => bus.send('shell/layout', 'reset', const {});
@@ -315,8 +322,30 @@ class PifHost {
         .where((candidate) => candidate.id == sessionId)
         .firstOrNull;
     if (session == null) return;
-    if (session.transcript.isNotEmpty || sessionId == 'host') return;
+    if (session.transcript.isNotEmpty) return;
     sessions.fetchTranscript(sessionId);
+  }
+
+  /// Make a newly-created card the active console session immediately.
+  void activateSession(String sessionId) {
+    if (!sessions.current.any((session) => session.id == sessionId)) return;
+    activeSessionId = sessionId;
+    sessions.select(sessionId);
+    layout.open('agent_console');
+    requestTranscript(sessionId);
+  }
+
+  /// Keep the console pointed at a real card after its active card is
+  /// removed. An empty rail is valid; the composer disables itself until a
+  /// new session is created.
+  void activateFallbackSession(String removedSessionId) {
+    if (activeSessionId != removedSessionId) return;
+    final fallback = sessions.current.firstOrNull?.id;
+    activeSessionId = fallback ?? '';
+    if (fallback != null) {
+      sessions.select(fallback);
+      requestTranscript(fallback);
+    }
   }
 
   /// Shell-wide escape signal (Esc pressed): inline rename fields listen

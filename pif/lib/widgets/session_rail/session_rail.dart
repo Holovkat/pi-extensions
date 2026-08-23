@@ -80,8 +80,7 @@ class _SessionRailState extends State<_SessionRail> {
         const PopupMenuItem(value: 'rename', child: Text('Rename')),
         if (session.state == 'ended')
           const PopupMenuItem(value: 'resume', child: Text('Resume')),
-        if (!session.host)
-          const PopupMenuItem(value: 'delete', child: Text('Delete')),
+        const PopupMenuItem(value: 'delete', child: Text('Delete')),
       ],
     );
     if (!mounted) return;
@@ -98,24 +97,23 @@ class _SessionRailState extends State<_SessionRail> {
   Future<void> _confirmDelete(PifSession session) async {
     final confirmed = await showDialog<bool>(
       context: context,
-      builder:
-          (context) => AlertDialog(
-            title: Text('Delete ${session.name}?'),
-            content: const Text(
-              'This permanently removes the session — its transcript and '
-              'history cannot be recovered.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('Cancel'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.of(context).pop(true),
-                child: const Text('Delete'),
-              ),
-            ],
+      builder: (context) => AlertDialog(
+        title: Text('Delete ${session.name}?'),
+        content: const Text(
+          'This permanently removes the session — its transcript and '
+          'history cannot be recovered.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
           ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
     );
     if (confirmed == true) widget.host.sessions.delete(session.id);
   }
@@ -167,9 +165,8 @@ class _SessionRailState extends State<_SessionRail> {
                     DropdownMenuItem(value: 'high', child: Text('High')),
                     DropdownMenuItem(value: 'max', child: Text('Max')),
                   ],
-                  onChanged: (v) => setDialogState(
-                    () => selectedThinking = v ?? 'medium',
-                  ),
+                  onChanged: (v) =>
+                      setDialogState(() => selectedThinking = v ?? 'medium'),
                 ),
                 const SizedBox(height: 12),
                 TextField(
@@ -189,9 +186,7 @@ class _SessionRailState extends State<_SessionRail> {
               onPressed: () {
                 widget.host.sessions.spawn(
                   cwd: cwd.text,
-                  model: selectedModel?.isEmpty == true
-                      ? null
-                      : selectedModel,
+                  model: selectedModel?.isEmpty == true ? null : selectedModel,
                   thinking: selectedThinking,
                   prompt: prompt.text.isEmpty ? null : prompt.text,
                 );
@@ -248,8 +243,8 @@ class _SessionRailState extends State<_SessionRail> {
               children: sessions.map((session) {
                 final selected = session.id == widget.host.activeSessionId;
                 return GestureDetector(
-                  onSecondaryTapUp:
-                      (details) => _cardMenu(details.globalPosition, session),
+                  onSecondaryTapUp: (details) =>
+                      _cardMenu(details.globalPosition, session),
                   child: ListTile(
                     selected: selected,
                     selectedTileColor: const Color(0xff222c36),
@@ -266,25 +261,24 @@ class _SessionRailState extends State<_SessionRail> {
                       size: 18,
                       color: _stateColor(session.state),
                     ),
-                    title:
-                        renamingId == session.id
-                            ? TextField(
-                              controller: renameController,
-                              focusNode: renameFocus,
-                              autofocus: true,
-                              style: const TextStyle(fontSize: 14),
-                              decoration: const InputDecoration(
-                                isDense: true,
-                                isCollapsed: true,
-                                border: InputBorder.none,
-                              ),
-                              onSubmitted: (_) => _commitRename(),
-                            )
-                            : Text(
-                              session.name,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
+                    title: renamingId == session.id
+                        ? TextField(
+                            controller: renameController,
+                            focusNode: renameFocus,
+                            autofocus: true,
+                            style: const TextStyle(fontSize: 14),
+                            decoration: const InputDecoration(
+                              isDense: true,
+                              isCollapsed: true,
+                              border: InputBorder.none,
                             ),
+                            onSubmitted: (_) => _commitRename(),
+                          )
+                        : Text(
+                            session.name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                     subtitle: Text(
                       session.model,
                       maxLines: 1,

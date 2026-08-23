@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:pif/core/bus.dart';
 import 'package:pif/core/panel_error_boundary.dart';
 import 'package:pif/core/plugin.dart';
@@ -10,6 +11,7 @@ import 'package:pif/widgets/diff_viewer/diff_viewer.dart';
 import 'package:pif/widgets/session_rail/session_rail.dart';
 import 'package:pif/widgets/status_bar/status_bar.dart';
 import 'package:pif/widgets/terminal/terminal.dart';
+import 'package:pif/widgets/tracker_board/tracker_board.dart';
 import 'package:pif/widgets/widget_store/widget_store.dart';
 
 class FakeBus extends PifBus {
@@ -101,6 +103,50 @@ void main() {
     });
     expect(host.sessions.current.first.id, 'host');
     expect(host.sessions.current.last.state, 'running');
+    host.requestTranscript('host');
+    expect(bus.sent.single['type'], 'transcript');
+  });
+  test('host follows a created session and falls back after deletion', () {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+      },
+    });
+    host.sessions.applyEvent({
+      'id': 'child',
+      'name': 'Agent',
+      'host': false,
+      'state': 'idle',
+      'model': 'test',
+      'cwd': '/tmp',
+    });
+    host.activateSession('child');
+    expect(host.activeSessionId, 'child');
+    expect(
+      bus.sent.any(
+        (message) =>
+            message['channel'] == 'session/control' &&
+            message['type'] == 'select',
+      ),
+      isTrue,
+    );
+
+    host.sessions.remove('child');
+    host.activateFallbackSession('child');
+    expect(host.activeSessionId, 'host');
+
+    host.sessions.remove('host');
+    host.activateFallbackSession('host');
+    expect(host.activeSessionId, isEmpty);
+    host.activateSession('missing');
+    expect(host.activeSessionId, isEmpty);
   });
   testWidgets('Agent Console renders streams and emits input', (tester) async {
     final bus = FakeBus();
@@ -123,6 +169,52 @@ void main() {
     await tester.enterText(find.byType(TextField), 'hello');
     await tester.tap(find.byIcon(Icons.arrow_upward));
     expect(bus.sent.single['type'], 'input');
+    await bus.dispose();
+  });
+  testWidgets('Agent Console renders authoritative turns once', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+        'transcript': <dynamic>[],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+    await tester.enterText(find.byType(TextField), 'hi');
+    await tester.tap(find.byIcon(Icons.arrow_upward));
+    expect(bus.sent.single['type'], 'input');
+
+    // The hub echoes the input, streams a delta, then sends the final
+    // authoritative message. The console must render one copy of each.
+    host.sessions.applyEvent({
+      'sessionId': 'host',
+      'state': 'running',
+      'event': {'type': 'input', 'content': 'hi'},
+    }, envelopeId: 'input');
+    host.sessions.applyEvent({
+      'sessionId': 'host',
+      'state': 'running',
+      'event': {'type': 'message_update', 'delta': 'Hi!'},
+    }, envelopeId: 'delta');
+    host.sessions.applyEvent({
+      'sessionId': 'host',
+      'state': 'running',
+      'event': {'type': 'message', 'text': 'Hi! How can I help?'},
+    }, envelopeId: 'final');
+    await tester.pump();
+
+    expect(find.widgetWithText(SelectableText, 'hi'), findsOneWidget);
+    expect(find.byType(MarkdownBody), findsOneWidget);
+    expect(
+      tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data,
+      'Hi! How can I help?',
+    );
     await bus.dispose();
   });
   testWidgets('model dropdown lists available models and reflects selection', (
@@ -236,6 +328,24 @@ void main() {
     await tester.pumpAndSettle();
     expect(bus.sent.any((entry) => entry['type'] == 'delete'), isTrue);
 
+    // The default host card exposes the same delete action as every child.
+    await tester.tap(find.text('Host'), buttons: kSecondaryButton);
+    await tester.pumpAndSettle();
+    expect(find.text('Delete'), findsOneWidget);
+    await tester.tap(find.text('Delete').last);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Delete Host?'), findsOneWidget);
+    await tester.tap(find.widgetWithText(FilledButton, 'Delete'));
+    await tester.pumpAndSettle();
+    expect(
+      bus.sent.any(
+        (entry) =>
+            entry['type'] == 'delete' &&
+            (entry['payload'] as Map)['sessionId'] == 'host',
+      ),
+      isTrue,
+    );
+
     // Rename edits the card inline and commits on submit.
     await tester.tap(find.text('Researcher'), buttons: kSecondaryButton);
     await tester.pumpAndSettle();
@@ -276,7 +386,9 @@ void main() {
     await bus.dispose();
   });
 
-  testWidgets('Agent Console conversation is unboxed and light', (tester) async {
+  testWidgets('Agent Console conversation is unboxed and light', (
+    tester,
+  ) async {
     final bus = FakeBus();
     final host = PifHost(bus: bus);
     host.sessions.applySnapshot({
@@ -301,7 +413,11 @@ void main() {
     expect(userText.style?.fontWeight, FontWeight.w300);
     expect(userText.style?.color, const Color(0xffc9d3df));
     expect(
-      tester.widget<SelectableText>(find.widgetWithText(SelectableText, 'plain question')).style,
+      tester
+          .widget<SelectableText>(
+            find.widgetWithText(SelectableText, 'plain question'),
+          )
+          .style,
       isNotNull,
     );
     // No decorated container wraps the conversation entries anymore.
@@ -315,36 +431,40 @@ void main() {
     await bus.dispose();
   });
 
-  testWidgets('Agent Console shows one start tag and a duration footer with copy actions', (
-    tester,
-  ) async {
-    final bus = FakeBus();
-    final host = PifHost(bus: bus);
-    host.sessions.applySnapshot({
-      'host': {
-        'id': 'host',
-        'name': 'Host',
-        'host': true,
-        'state': 'idle',
-        'model': 'test',
-        'cwd': '/tmp',
-        'transcript': [
-          {'type': 'input', 'content': 'build it'},
-          {'type': 'agent_start', 'ts': '2026-08-22T10:00:00.000Z'},
-          {'type': 'message_update', 'delta': 'here is the code'},
-          {'type': 'message', 'text': 'here is the code\n```dart\nvoid main() {}\n```'},
-          {'type': 'agent_end', 'ts': '2026-08-22T10:01:23.000Z'},
-        ],
-      },
-    });
-    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
-    expect(find.text('Agent started'), findsOneWidget);
-    expect(find.text('Agent finished'), findsNothing);
-    expect(find.text('1m 23s'), findsOneWidget);
-    expect(find.byIcon(Icons.content_copy), findsOneWidget);
-    expect(find.byIcon(Icons.code), findsOneWidget);
-    await bus.dispose();
-  });
+  testWidgets(
+    'Agent Console shows one start tag and a duration footer with copy actions',
+    (tester) async {
+      final bus = FakeBus();
+      final host = PifHost(bus: bus);
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host',
+          'name': 'Host',
+          'host': true,
+          'state': 'idle',
+          'model': 'test',
+          'cwd': '/tmp',
+          'transcript': [
+            {'type': 'input', 'content': 'build it'},
+            {'type': 'agent_start', 'ts': '2026-08-22T10:00:00.000Z'},
+            {'type': 'message_update', 'delta': 'here is the code'},
+            {
+              'type': 'message',
+              'text': 'here is the code\n```dart\nvoid main() {}\n```',
+            },
+            {'type': 'agent_end', 'ts': '2026-08-22T10:01:23.000Z'},
+          ],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      expect(find.text('Agent started'), findsOneWidget);
+      expect(find.text('Agent finished'), findsNothing);
+      expect(find.text('1m 23s'), findsOneWidget);
+      expect(find.byIcon(Icons.content_copy), findsOneWidget);
+      expect(find.byIcon(Icons.code), findsOneWidget);
+      await bus.dispose();
+    },
+  );
   test('session deltas are idempotent by envelope id', () async {
     final bus = FakeBus();
     final sessions = PifSessions(bus);
@@ -372,15 +492,14 @@ void main() {
     sessions.applyEvent(payload, envelopeId: 'same');
     await Future<void>.delayed(Duration.zero);
     expect(emissions, 1, reason: 'duplicate envelope must be dropped');
+    expect(sessions.current.single.transcript, hasLength(1));
+    expect((sessions.current.single.transcript.single as Map)['delta'], 'once');
     // Metadata patches rename without duplicating the session card.
-    sessions.applyEvent({
-      'id': 'host',
-      'name': 'Renamed',
-      'state': 'idle',
-    });
+    sessions.applyEvent({'id': 'host', 'name': 'Renamed', 'state': 'idle'});
     await Future<void>.delayed(Duration.zero);
     expect(sessions.current.single.name, 'Renamed');
     expect(sessions.current, hasLength(1));
+    expect(sessions.current.single.transcript, hasLength(1));
   });
   testWidgets('Session Rail pins host and exposes New Session', (tester) async {
     final bus = FakeBus();
@@ -475,6 +594,237 @@ void main() {
     expect(plugin.meta.core, isTrue);
     expect(plugin.meta.slot, PifSlot.bottom);
   });
+  testWidgets('tracker board renders columns, counts, badges, and stale state', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture(stale: true)};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    expect(find.text('ACME/WIDGETS'), findsOneWidget);
+    expect(find.text('To Do  2'), findsOneWidget);
+    expect(find.text('Doing  0'), findsOneWidget);
+    expect(find.text('Shipped  1'), findsOneWidget);
+    expect(find.text('EPIC'), findsOneWidget);
+    expect(find.text('TASK'), findsOneWidget);
+    expect(find.text('cached'), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board opens a markdown detail for a card', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Epic: tracker panel'));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('acme/widgets/issues/10'), findsNothing);
+    expect(find.text('Epic body heading'), findsOneWidget);
+    expect(find.textContaining('Detailed epic description'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.close));
+    await tester.pumpAndSettle();
+    expect(find.text('Epic body heading'), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board moves a card optimistically and reverts on failure', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    final card = find.text('Task: build board');
+    final doing = find.text('Doing  0');
+    await tester.drag(card, tester.getCenter(doing) - tester.getCenter(card));
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  1'), findsOneWidget);
+    expect(find.text('Doing  1'), findsOneWidget);
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'move') {
+          return false;
+        }
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['column'] == 'doing';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/move', 'move_result', {'ok': false});
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  2'), findsOneWidget);
+    expect(find.text('Doing  0'), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('tracker board replaces state from hub tracker events and refreshes', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    bus.emit('tracker/state', 'state', _trackerFixture(stale: false, error: 'gh offline'));
+    await tester.pumpAndSettle();
+    expect(find.text('cached'), findsNothing);
+    expect(find.textContaining('gh offline'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.refresh));
+    await tester.pump();
+    expect(
+      bus.sent.where(
+        (sent) => sent['channel'] == 'tracker/control' && sent['type'] == 'refresh',
+      ),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet creates a ticket through the hub', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Fresh ticket');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'create') return false;
+        final payload = sent['payload'] as Map;
+        return payload['title'] == 'Fresh ticket' && payload['type'] == 'task' && payload['column'] == 'todo';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': true, 'number': 21});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet surfaces create failures and stays open', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.add));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Doomed ticket');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': false, 'error': 'gh: label not found'});
+    await tester.pumpAndSettle();
+    expect(find.textContaining('gh: label not found'), findsOneWidget);
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet edits a card and returns to view mode on success', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    expect(find.text('Task body'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Task: renamed');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'update') return false;
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['title'] == 'Task: renamed';
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'update', 'ok': true, 'number': 11});
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Task: renamed'), findsOneWidget);
+    expect(find.byKey(const Key('tracker_sheet_title')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet moves a card via the lane dropdown', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('tracker_sheet_move')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Doing').last);
+    await tester.pumpAndSettle();
+    expect(find.text('To Do  1'), findsOneWidget);
+    expect(find.text('Doing  1'), findsOneWidget);
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'move') return false;
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 && payload['column'] == 'doing';
+      }),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet deletes a card after confirmation', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Shipped thing'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.delete_outline));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('permanently deleted'), findsOneWidget);
+    await tester.tap(find.text('Delete'));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'delete') return false;
+        return (sent['payload'] as Map)['number'] == 12;
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'delete', 'ok': true, 'number': 12});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('ticket sheet resizes from the corner handle', (tester) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.snapshot = {'tracker': _trackerFixture()};
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.text('Task: build board'));
+    await tester.pumpAndSettle();
+    final before = tester.getSize(find.byKey(const Key('tracker_sheet_box')));
+    await tester.drag(find.byKey(const Key('tracker_sheet_resize')), const Offset(90, 60));
+    await tester.pump();
+    final after = tester.getSize(find.byKey(const Key('tracker_sheet_box')));
+    expect(after.width, greaterThan(before.width));
+    await bus.dispose();
+  });
+
   testWidgets('panel error boundary contains a throwing widget', (
     tester,
   ) async {
@@ -491,6 +841,53 @@ void main() {
     await bus.dispose();
   });
 }
+
+Map<String, dynamic> _trackerFixture({bool stale = false, String? error}) => {
+  'repo': 'acme/widgets',
+  'stale': stale,
+  'fetchedAt': '2026-08-23T01:00:00Z',
+  'error': error,
+  'columns': [
+    {'id': 'todo', 'name': 'To Do'},
+    {'id': 'doing', 'name': 'Doing'},
+    {'id': 'shipped', 'name': 'Shipped'},
+  ],
+  'cards': [
+    {
+      'number': 10,
+      'title': 'Epic: tracker panel',
+      'type': 'epic',
+      'state': 'open',
+      'labels': ['epic'],
+      'body': '# Epic body heading\n\nDetailed epic description',
+      'updatedAt': '2026-08-23T01:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/10',
+      'column': 'todo',
+    },
+    {
+      'number': 11,
+      'title': 'Task: build board',
+      'type': 'task',
+      'state': 'open',
+      'labels': ['task', 'status:todo'],
+      'body': 'Task body',
+      'updatedAt': '2026-08-23T02:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/11',
+      'column': 'todo',
+    },
+    {
+      'number': 12,
+      'title': 'Shipped thing',
+      'type': 'issue',
+      'state': 'closed',
+      'labels': [],
+      'body': '',
+      'updatedAt': '2026-08-22T00:00:00Z',
+      'url': 'https://github.com/acme/widgets/issues/12',
+      'column': 'shipped',
+    },
+  ],
+};
 
 class _ThrowingPlugin implements PifWidgetPlugin {
   @override

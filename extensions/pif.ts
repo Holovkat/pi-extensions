@@ -18,8 +18,10 @@ import {
 	parseWidgetManifest,
 	pifProbeProof,
 	pifUpgradeAuthorized,
+	TrackerSync,
 	type PifEnvelope,
 	type PifWidgetManifest,
+	type TrackerState,
 	widgetClassName,
 } from "./pif-shared.ts";
 
@@ -36,10 +38,18 @@ interface HubState {
 	layout: Record<string, unknown>;
 	models: string[];
 	modelProviders: Record<string, any>;
+	tracker: TrackerState;
 	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number; origin: "standalone" | "terminal" };
 }
 
 const text = (value: unknown, details: unknown = value) => ({ content: [{ type: "text" as const, text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }], details });
+
+function resolvePiInvocation(extensionPath: string) {
+	if (process.env.PIF_PI_BIN) return { command: process.env.PIF_PI_BIN, args: [] as string[] };
+	const resources = path.resolve(path.dirname(extensionPath), "..");
+	const node = path.join(resources, "node"); const cli = path.join(resources, "cli", "dist", "cli.js");
+	return fs.existsSync(node) && fs.existsSync(cli) ? { command: node, args: [cli] } : { command: "pi", args: [] as string[] };
+}
 
 /** Per-project session persistence. SQLite via node:sqlite when the
  * runtime provides it, JSON file fallback otherwise. Stores child
@@ -213,6 +223,7 @@ class PifHub {
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
+	private tracker: TrackerSync;
 	readonly store: SessionStore;
 	constructor(readonly pi: ExtensionAPI, readonly ctx: ExtensionContext, readonly workspace: string, readonly port: number) {
 		const globalApp = path.join(os.homedir(), ".pi", "pif", "app");
@@ -220,17 +231,20 @@ class PifHub {
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
+		this.tracker = new TrackerSync(workspace, (state) => { this.state.tracker = state; this.broadcast("tracker/state", "state", state); });
+		this.state.tracker = this.tracker.state;
 		this.store = new SessionStore(this.pifDir);
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
 		await this.store.init();
+		await this.tracker.init(); this.tracker.start();
 		// Ephemeral control-socket credential: same-user processes can read
 		// any 0600 file, but requiring a per-launch secret in the handshake
 		// stops accidental/unwitting tool calls from other local processes.
@@ -248,7 +262,7 @@ class PifHub {
 	async stop() {
 		for (const child of this.children.values()) this.terminateChild(child);
 		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.safe("upsert", () => this.store.upsert(session));
-		this.children.clear(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
+		this.children.clear(); this.tracker.stop(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
 		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
 		this.state.health.hub = "stopped"; this.setStatus();
@@ -261,7 +275,10 @@ class PifHub {
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
 		const prefs = this.loadPrefs();
-		this.state.sessions.host = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [] };
+		const sessionFile = process.env.PIF_HOST_SESSION_FILE || undefined;
+		const host: PifSession = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [], ...(sessionFile ? { sessionFile } : {}) };
+		this.state.sessions.host = host;
+		if (sessionFile) { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); this.hydrateTranscript(host); }
 	}
 	/** Session model ids sometimes lack the provider prefix; resolve to the
 	 * full id from the available models when the suffix match is unique. */
@@ -302,6 +319,7 @@ class PifHub {
 			}
 		} catch { /* absent or unreadable — keep empty */ }
 	}
+	private isUserBoundaryEcho(type: string, payload: any) { return (type === "message_start" || type === "message_end") && payload?.message?.role === "user"; }
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
 		fs.mkdirSync(path.dirname(this.prefsPath), { recursive: true });
@@ -392,11 +410,13 @@ class PifHub {
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("models/")) await this.modelsAction(env.type, env.payload as any);
+			else if (env.channel.startsWith("tracker/")) this.trackerAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("shell/")) await this.layoutAction(env.type, env.payload as any);
 		} catch (error) { peer.send(createEnvelope("shell/error", "action_failed", { requestId: env.id, error: String((error as Error).message) })); }
 	}
 	hostEvent(type: string, payload: unknown) {
 		const host = this.state.sessions.host; if (!host) return;
+		if (this.isUserBoundaryEcho(type, payload)) return;
 		if (type === "agent_start") host.state = "running"; if (type === "agent_end") host.state = "idle";
 		const entry = { ...this.normalizeEntry(type, payload), ts: new Date().toISOString() }; host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
 		this.broadcast("session/host", type, { sessionId: "host", state: host.state, event: entry });
@@ -404,12 +424,13 @@ class PifHub {
 	private normalizeEntry(type: string, payload: any): Record<string, unknown> {
 		const p = payload ?? {};
 		if (type === "input") return { type: "input", content: String(p.content ?? p.prompt ?? "") };
+		if (type === "custom_message" && p.customType === "pif-input") return { type: "input", content: String(p.content ?? "") };
 		if (type === "message_update" || type === "message_start" || type === "message" || type === "message_end") {
 			const delta = p.assistantMessageEvent?.delta ?? p.delta;
 			if (delta) return { type: "message_update", delta: String(delta), ...(p.command !== undefined ? { command: String(p.command) } : {}) };
 			const content = p.message?.content;
-			if (Array.isArray(content)) { const text = content.filter((c: any) => c?.type === "text").map((c: any) => c?.text ?? "").join(""); if (text) return { type: "message", text }; }
-			if (typeof content === "string" && content) return { type: "message", text: content };
+			const messageText = Array.isArray(content) ? content.filter((c: any) => c?.type === "text").map((c: any) => c?.text ?? "").join("") : typeof content === "string" ? content : "";
+			if (messageText) return p.message?.role === "user" ? { type: "input", content: messageText } : { type: "message", text: messageText };
 			return { type: "message_update", delta: "" };
 		}
 		if (type.includes("tool")) return { type, toolName: String(p.toolName ?? p.name ?? "tool"), toolCallId: String(p.toolCallId ?? p.id ?? ""), args: p.args ? JSON.stringify(p.args).slice(0, 300) : undefined, result: p.result ? String(p.result).slice(0, 300) : undefined };
@@ -453,11 +474,12 @@ class PifHub {
 			session.name = name; if (id === "host") this.savePrefs({ name }); else this.store.safe("upsert", () => this.store.upsert(session)); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (type === "delete") {
-			if (id === "host") throw new Error("The host session cannot be deleted");
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
 			const child = this.children.get(id); if (child) { this.children.delete(id); this.terminateChild(child); }
 			this.store.safe("remove", () => this.store.remove(id));
-			if (session.sessionFile) { try { fs.rmSync(session.sessionFile, { force: true }); } catch { /* absent */ } }
+			// The host transcript belongs to the live parent pi process. Removing
+			// its card must not unlink the file that process is still writing.
+			if (!session.host && session.sessionFile) { try { fs.rmSync(session.sessionFile, { force: true }); } catch { /* absent */ } }
 			delete this.state.sessions[id];
 			this.broadcast("session/state", "removed", { sessionId: id });
 			return { ok: true, id };
@@ -471,12 +493,19 @@ class PifHub {
 			session.thinking = String(payload.thinking ?? "medium"); if (id === "host") this.savePrefs({ thinking: session.thinking }); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (id === "host") {
+			const host = this.state.sessions.host;
+			if (!host) throw new Error("Host session has been deleted — create a new session to continue");
 			if (type === "abort") return (this.ctx as any).abort?.();
 			const content = String(payload.content ?? payload.prompt ?? ""); if (!content) throw new Error("Session content is required");
-			const event = { type: "input", content, mode: type, ts: new Date().toISOString() }; this.state.sessions.host.transcript.push(event); this.broadcast("session/event", "input", { sessionId: "host", state: this.state.sessions.host.state, event });
+			const event = { type: "input", content, mode: type, ts: new Date().toISOString() }; host.transcript.push(event); this.broadcast("session/event", "input", { sessionId: "host", state: host.state, event });
 			this.pi.sendMessage({ customType: "pif-input", content, display: true }, { deliverAs: type === "steer" ? "steer" : "followUp", triggerTurn: true }); return;
 		}
-		const child = this.children.get(id); if (!child) throw new Error(this.state.sessions[id] ? "Session has ended — resume it from the session panel first" : `Unknown child session ${id}`);
+		let child = this.children.get(id);
+		if (!child && (type === "input" || type === "steer") && this.state.sessions[id]?.state === "ended") {
+			this.resumeSession({ sessionId: id });
+			child = this.children.get(id);
+		}
+		if (!child) throw new Error(this.state.sessions[id] ? "Session has ended — resume it from the session panel first" : `Unknown child session ${id}`);
 		const command = type === "input" ? (this.state.sessions[id].state === "running" ? "follow_up" : "prompt") : type;
 		const content = String(payload.content ?? payload.prompt ?? "");
 		if (type !== "abort") { const event = { type: "input", content, mode: command, ts: new Date().toISOString() }; this.state.sessions[id].transcript.push(event); this.broadcast("session/event", "input", { sessionId: id, state: this.state.sessions[id].state, event }); }
@@ -484,13 +513,14 @@ class PifHub {
 	}
 	private spawnSession(payload: any) {
 		const id = `session_${crypto.randomUUID().slice(0, 8)}`; const sessionsDir = path.join(this.pifDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
-		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); const cwd = path.resolve(payload.cwd || this.workspace);
+		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); const cwd = path.resolve(payload.cwd || this.workspace);
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
+		const pi = resolvePiInvocation(extensionPath);
 		const prefs = this.loadPrefs();
 		const model = String(payload.model || prefs.model || "");
 		const thinking = String(payload.thinking || prefs.thinking || "medium");
-		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
-		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
+		const args = [...pi.args, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
+		const child = spawn(pi.command, args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.safe("upsert", () => this.store.upsert(session));
 		this.wireChild(session, child);
 		this.broadcast("session/state", "created", this.sessionPatch(session)); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
@@ -524,10 +554,11 @@ class PifHub {
 		if (!session.sessionFile || !fs.existsSync(session.sessionFile)) throw new Error("Session transcript file is missing — cannot resume");
 		const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : this.workspace;
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
+		const pi = resolvePiInvocation(extensionPath);
 		const model = session.model !== "default" ? session.model : "";
-		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", session.sessionFile, "--name", session.name];
+		const args = [...pi.args, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", session.sessionFile, "--name", session.name];
 		if (model) args.push("--model", model); if (session.thinking && session.thinking !== "none") args.push("--thinking", session.thinking);
-		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(pi.command, args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		this.hydrateTranscript(session);
 		session.state = "idle"; session.exit = undefined;
 		this.children.set(id, child);
@@ -539,6 +570,7 @@ class PifHub {
 	private childEvent(session: PifSession, line: string) {
 		let event: any; try { event = JSON.parse(line); } catch { event = { type: "output", data: line }; }
 		const kind = String(event.type ?? event.event ?? "event"); if (/start|delta|tool/.test(kind)) session.state = "running"; if (/agent_end|turn_end|result/.test(kind)) session.state = "idle"; if (/input_required/.test(kind)) session.state = "awaiting-input";
+		if (this.isUserBoundaryEcho(kind, event)) return;
 		const entry = { ...this.normalizeEntry(kind, event), ts: event.ts ?? new Date().toISOString() }; session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
 	}
 	private loadLayout() { try { this.state.layout = JSON.parse(fs.readFileSync(this.layoutPath, "utf8")); } catch { this.state.layout = { panels: {} }; } }
@@ -584,6 +616,12 @@ class PifHub {
 		return [...models].sort();
 	}
 	private refreshModels() { this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
+	private trackerAction(type: string, payload: any) {
+		if (type === "refresh") return this.tracker.refresh();
+		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
+		if (type === "create" || type === "update" || type === "delete") { const result = this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result }); return result; }
+		throw new Error(`Unknown tracker action: ${type}`);
+	}
 	private async modelsAction(type: string, payload: any) {
 		if (type === "save") {
 			const providers = this.validateModelProviders(payload.providers);
@@ -660,6 +698,7 @@ class PifHub {
 		switch (method) {
 			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
+			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list(); case "tracker.create": return this.trackerAction("create", params); case "tracker.update": return this.trackerAction("update", params); case "tracker.delete": return this.trackerAction("delete", params);
 			case "shell.shutdown": return this.shutdown();
 			default: throw new Error(`Unknown pif control method: ${method}`);
 		}
@@ -688,6 +727,10 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_widget_toggle", "pif widget toggle", "Enable or disable an installed widget.", Type.Object({ id: Type.String(), enabled: Type.Optional(Type.Boolean()) }), "widget.toggle");
 	register("pif_widget_uninstall", "pif widget uninstall", "Archive a non-core widget back into the local catalog.", Type.Object({ id: Type.String() }), "widget.uninstall");
 	register("pif_widget_list", "pif widget list", "List installed and local catalog widgets.", Type.Object({}), "widget.list");
+	register("pif_tracker_list", "pif tracker list", "List the workspace repo's board cards (epics, sprints, tasks, issues) with their columns, without bodies.", Type.Object({}), "tracker.list");
+	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
+	register("pif_tracker_update", "pif tracker update", "Update a ticket's title and/or body by issue number.", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()) }), "tracker.update");
+	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");
 	register("pif_layout", "pif layout", "Open, focus, move, close, reset, pin, save, or load pif panels; reset restores the default docking design and pin controls slide-in overlay mode.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("reset"), Type.Literal("pin"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()), pinned: Type.Optional(Type.Boolean()) }), "layout");
 	register("pif_shell_status", "pif shell status", "Return pif hub, shell, sessions, widgets, and layout health.", Type.Object({}), "shell.status");
 	register("pif_reload", "pif reload", "Hot reload or hot restart the pif Flutter shell.", Type.Object({ restart: Type.Optional(Type.Boolean()) }), "shell.reload");
@@ -697,4 +740,4 @@ export default function pifExtension(pi: ExtensionAPI) {
 	(pi.on as any)("session_shutdown", async () => { if (hub) await hub.stop(); hub = null; currentCtx = null; });
 }
 
-export const __test = { WsPeer, FlutterSupervisor, PifHub };
+export const __test = { WsPeer, FlutterSupervisor, PifHub, resolvePiInvocation };

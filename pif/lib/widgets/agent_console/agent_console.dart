@@ -123,15 +123,18 @@ class _AgentConsoleState extends State<_AgentConsole> {
   /// Extend already-built entries with new raw transcript items.
   void _appendEntries(List<dynamic> rawItems, List<Map<String, dynamic>> into) {
     final fresh = _buildEntries(rawItems);
-    // A delta continues the previous assistant message rather than
-    // starting a new card.
+    // Streaming deltas continue the current assistant card. A final
+    // message/message_end is authoritative and replaces the streamed text
+    // instead of duplicating it.
     for (final entry in fresh) {
-      if ((entry['kind'] == 'assistant' ||
-              entry['kind'] == 'turn_end') &&
+      if (entry['kind'] == 'assistant' &&
           into.isNotEmpty &&
-          into.last['kind'] == entry['kind'] &&
-          entry['kind'] == 'assistant') {
-        into.last['text'] = '${into.last['text']}${entry['text']}';
+          into.last['kind'] == 'assistant') {
+        if (entry['replace'] == true) {
+          into.last['text'] = entry['text'];
+        } else {
+          into.last['text'] = '${into.last['text']}${entry['text']}';
+        }
       } else {
         into.add(entry);
       }
@@ -161,7 +164,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
           if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
             entries.last['text'] = '${entries.last['text']}$delta';
           } else {
-            entries.add({'kind': 'assistant', 'text': delta});
+            entries.add({'kind': 'assistant', 'text': delta, 'replace': false});
           }
         }
       } else if (type == 'message_end' || type == 'message') {
@@ -169,8 +172,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
         if (text != null && text.isNotEmpty) {
           if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
             entries.last['text'] = text;
+            entries.last['replace'] = true;
           } else {
-            entries.add({'kind': 'assistant', 'text': text});
+            entries.add({'kind': 'assistant', 'text': text, 'replace': true});
           }
         }
       } else if (type.contains('tool')) {
@@ -212,7 +216,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
   }
 
   Duration? _durationBetween(String start, String end) {
-    final duration = DateTime.tryParse(end)?.difference(DateTime.tryParse(start) ?? DateTime.now());
+    final duration = DateTime.tryParse(
+      end,
+    )?.difference(DateTime.tryParse(start) ?? DateTime.now());
     return duration == null || duration.isNegative ? null : duration;
   }
 
@@ -276,13 +282,16 @@ class _AgentConsoleState extends State<_AgentConsole> {
   void submit() {
     final value = controller.text.trim();
     if (value.isEmpty) return;
+    final selected = widget.host.sessions.current
+        .where((session) => session.id == widget.host.activeSessionId)
+        .firstOrNull;
+    if (selected == null) return;
     running
         ? widget.host.sessions.steer(widget.host.activeSessionId, value)
         : widget.host.sessions.input(widget.host.activeSessionId, value);
-    setState(() {
-      entries.add({'kind': 'user', 'text': value});
-      controller.clear();
-    });
+    // The hub echoes the authoritative input event back through the session
+    // stream. Do not add a second optimistic copy here.
+    controller.clear();
   }
 
   /// The session's model as a dropdown value: session ids sometimes lack
@@ -312,9 +321,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
           padding: const EdgeInsets.symmetric(horizontal: 14),
           decoration: BoxDecoration(
             color: widget.host.theme.panelRaised,
-            border: Border(
-              bottom: BorderSide(color: widget.host.theme.border),
-            ),
+            border: Border(bottom: BorderSide(color: widget.host.theme.border)),
           ),
           child: Row(
             children: [
@@ -344,12 +351,11 @@ class _AgentConsoleState extends State<_AgentConsole> {
                 )
               else
                 GestureDetector(
-                  onDoubleTap:
-                      selected == null
-                          ? null
-                          : () => _startRename(selected.name),
+                  onDoubleTap: selected == null
+                      ? null
+                      : () => _startRename(selected.name),
                   child: Text(
-                    selected?.name ?? 'Host session',
+                    selected?.name ?? 'No session selected',
                     style: const TextStyle(fontWeight: FontWeight.w300),
                   ),
                 ),
@@ -364,11 +370,23 @@ class _AgentConsoleState extends State<_AgentConsole> {
                       return DropdownButton<String>(
                         isDense: true,
                         iconSize: 14,
-                        style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xff8b96aa),
+                        ),
                         value: resolved,
-                        hint: const Text('Default', style: TextStyle(fontSize: 11, color: Color(0xff69758a))),
+                        hint: const Text(
+                          'Default',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Color(0xff69758a),
+                          ),
+                        ),
                         items: [
-                          const DropdownMenuItem(value: '', child: Text('Default')),
+                          const DropdownMenuItem(
+                            value: '',
+                            child: Text('Default'),
+                          ),
                           ...widget.host.models.map(
                             (m) => DropdownMenuItem(
                               value: m,
@@ -382,8 +400,12 @@ class _AgentConsoleState extends State<_AgentConsole> {
                               child: Text(resolved.split('/').last),
                             ),
                         ],
-                        onChanged: (v) => widget.host.sessions
-                            .setModel(widget.host.activeSessionId, v ?? ''),
+                        onChanged: selected == null
+                            ? null
+                            : (v) => widget.host.sessions.setModel(
+                                widget.host.activeSessionId,
+                                v ?? '',
+                              ),
                       );
                     },
                   ),
@@ -397,7 +419,10 @@ class _AgentConsoleState extends State<_AgentConsole> {
                   child: DropdownButton<String>(
                     isDense: true,
                     iconSize: 14,
-                    style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: Color(0xff8b96aa),
+                    ),
                     value: selected?.thinking ?? 'medium',
                     items: const [
                       DropdownMenuItem(value: 'none', child: Text('None')),
@@ -406,8 +431,12 @@ class _AgentConsoleState extends State<_AgentConsole> {
                       DropdownMenuItem(value: 'high', child: Text('High')),
                       DropdownMenuItem(value: 'max', child: Text('Max')),
                     ],
-                    onChanged: (v) => widget.host.sessions
-                        .setThinking(widget.host.activeSessionId, v ?? 'medium'),
+                    onChanged: selected == null
+                        ? null
+                        : (v) => widget.host.sessions.setThinking(
+                            widget.host.activeSessionId,
+                            v ?? 'medium',
+                          ),
                   ),
                 ),
               ),
@@ -432,17 +461,14 @@ class _AgentConsoleState extends State<_AgentConsole> {
                   controller: scroll,
                   padding: const EdgeInsets.all(18),
                   itemCount: entries.length,
-                  itemBuilder: (_, index) =>
-                      _EntryCard(entry: entries[index]),
+                  itemBuilder: (_, index) => _EntryCard(entry: entries[index]),
                 ),
         ),
         Container(
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
             color: widget.host.theme.panelRaised,
-            border: Border(
-              top: BorderSide(color: widget.host.theme.border),
-            ),
+            border: Border(top: BorderSide(color: widget.host.theme.border)),
           ),
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.end,
@@ -453,8 +479,11 @@ class _AgentConsoleState extends State<_AgentConsole> {
                   minLines: 1,
                   maxLines: 6,
                   onSubmitted: (_) => submit(),
+                  enabled: selected != null,
                   decoration: InputDecoration(
-                    hintText: running
+                    hintText: selected == null
+                        ? 'Create a session to begin…'
+                        : running
                         ? 'Steer the running agent…'
                         : 'Ask Pi anything…',
                     filled: true,
@@ -468,10 +497,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
               ),
               const SizedBox(width: 8),
               IconButton.filled(
-                onPressed: submit,
-                icon: Icon(
-                  running ? Icons.turn_right : Icons.arrow_upward,
-                ),
+                onPressed: selected == null ? null : submit,
+                icon: Icon(running ? Icons.turn_right : Icons.arrow_upward),
               ),
             ],
           ),
@@ -539,9 +566,7 @@ class _EntryCard extends StatelessWidget {
         padding: const EdgeInsets.only(bottom: 10),
         child: MarkdownBody(
           data: text,
-          styleSheet: MarkdownStyleSheet.fromTheme(
-            Theme.of(context),
-          ).copyWith(
+          styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
             p: _conversationStyle,
             listBullet: _conversationStyle,
             blockquote: _conversationStyle.copyWith(
@@ -569,16 +594,11 @@ class _EntryCard extends StatelessWidget {
           leading: Icon(
             Icons.build_outlined,
             size: 18,
-            color: status == 'done'
-                ? const Color(0xff78dba9)
-                : Colors.amber,
+            color: status == 'done' ? const Color(0xff78dba9) : Colors.amber,
           ),
           title: Text(
             name,
-            style: const TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w300,
-            ),
+            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w300),
           ),
           trailing: status == 'done'
               ? const Icon(
@@ -594,10 +614,7 @@ class _EntryCard extends StatelessWidget {
           children: [
             SelectableText(
               detail,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 11,
-              ),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
             ),
           ],
         ),
@@ -613,10 +630,7 @@ class _EntryCard extends StatelessWidget {
             const SizedBox(width: 6),
             Text(
               text,
-              style: const TextStyle(
-                fontSize: 11,
-                color: Color(0xff8b96aa),
-              ),
+              style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
             ),
           ],
         ),

@@ -1,13 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
+import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync } from './pif-shared.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 
 test('pif envelope codec accepts all protocol channels and rejects malformed data', () => {
-  for (const channel of ['session/state', 'widget/registry', 'store/catalog', 'shell/state']) {
+  for (const channel of ['session/state', 'widget/registry', 'store/catalog', 'models/save', 'tracker/state', 'shell/state']) {
     const env = createEnvelope(channel, 'fixture', {ok: true}, 'fixed');
     assert.deepEqual(decodeEnvelope(JSON.stringify(env)), env);
   }
@@ -43,6 +46,14 @@ test('child environment scrubs hub lifecycle variables and credentials', () => {
   assert.equal(child.PIF_ALLOWED_ORIGINS, undefined);
   assert.equal(child.PIF_PI_BIN, '/fake/pi');
   assert.equal(child.PATH, '/usr/bin');
+});
+
+test('packaged hubs resolve the bundled pi runtime for child sessions', () => {
+  const source = fs.readFileSync(path.join(repo, 'extensions', 'pif.ts'), 'utf8');
+  assert.match(source, /function resolvePiInvocation\(extensionPath: string\)/);
+  assert.match(source, /const resources = path\.resolve\(path\.dirname\(extensionPath\), "\.\."\)/);
+  assert.match(source, /spawn\(pi\.command, args/);
+  assert.doesNotMatch(source, /spawn\(process\.env\.PIF_PI_BIN \|\| "pi"/);
 });
 
 test('malformed percent-encoding in the upgrade URL does not throw', () => {
@@ -82,4 +93,260 @@ test('hub source preserves phase-one process and analyze gates', async () => {
   assert.match(source, /flutter[^\n]+run/);
   assert.match(source, /child\.kill\("SIGTERM"\)/);
   assert.match(source, /Core widget .* cannot be uninstalled/);
+});
+
+test('board config parsing validates column blocks', () => {
+  const config = parseBoardConfig('# board\n\ncolumn todo:\n  name: To Do\n  label: status:todo\n\ncolumn doing:\n  name: Doing\n  label: status:doing\n\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  assert.deepEqual(config.columns.map(({id, name}) => ({id, name})), [
+    {id: 'todo', name: 'To Do'},
+    {id: 'doing', name: 'Doing'},
+    {id: 'shipped', name: 'Shipped'},
+  ]);
+  assert.equal(config.columns[2].state, 'closed');
+  assert.equal(config.columns[0].label, 'status:todo');
+  assert.throws(() => parseBoardConfig('column todo:\n  name: To Do\ncolumn todo:\n  name: Twice\n'), /Duplicate column id/);
+  assert.throws(() => parseBoardConfig('column todo:\n  label: status:todo\n'), /missing a name/);
+  assert.throws(() => parseBoardConfig('column todo:\n  name: To Do\n  state: maybe\n'), /Invalid column state/);
+  assert.throws(() => parseBoardConfig('column todo:\n  name: To Do\n  status: sometimes\n'), /Invalid column status rule/);
+  assert.throws(() => parseBoardConfig('name: orphan\n'), /must follow a column header/);
+  assert.throws(() => parseBoardConfig('# only comments\n'), /at least one column/);
+});
+
+test('default board derives columns from state and status labels', () => {
+  const config = defaultBoardConfig();
+  assert.equal(columnForCard([], 'open', config), 'backlog');
+  assert.equal(columnForCard(['status:in-progress'], 'open', config), 'in_progress');
+  assert.equal(columnForCard(['status:blocked'], 'open', config), 'in_progress');
+  assert.equal(columnForCard(['task', 'status:review'], 'open', config), 'in_progress');
+  assert.equal(columnForCard([], 'closed', config), 'done');
+  assert.equal(columnForCard(['status:in-progress'], 'closed', config), 'done');
+});
+
+test('gh issue normalization detects types and caps bodies', () => {
+  const config = defaultBoardConfig();
+  const epic = normalizeGhIssue({number: 10, title: 'Epic: widgets', state: 'OPEN', labels: [{name: 'epic'}, {name: 'planning'}], body: '# Body', updatedAt: '2026-08-23T01:00:00Z', url: 'u10'}, config);
+  assert.equal(epic.type, 'epic');
+  assert.equal(epic.state, 'open');
+  assert.equal(epic.column, 'backlog');
+  const task = normalizeGhIssue({number: 11, title: 'Task: build', state: 'open', labels: [{name: 'task'}, {name: 'status:in-progress'}], body: 'x'.repeat(25_000), updatedAt: '2026-08-23T02:00:00Z', url: 'u11'}, config);
+  assert.equal(task.type, 'task');
+  assert.equal(task.column, 'in_progress');
+  assert.equal(task.body.length, 20_000);
+  const closed = normalizeGhIssue({number: 12, title: 'Done thing', state: 'CLOSED', labels: [], body: '', updatedAt: '2026-08-22T00:00:00Z', url: 'u12'}, config);
+  assert.equal(closed.state, 'closed');
+  assert.equal(closed.column, 'done');
+  const plain = normalizeGhIssue({number: 13, title: 'Plain issue'}, config);
+  assert.equal(plain.type, 'issue');
+  assert.deepEqual(plain.labels, []);
+});
+
+test('planned tracker moves map columns to label and state mutations', () => {
+  const config = parseBoardConfig('column todo:\n  name: To Do\n  label: status:todo\n\ncolumn doing:\n  name: Doing\n  label: status:doing\n\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  const card = {number: 11, title: 'Task', type: 'task', state: 'open', labels: ['task', 'status:todo'], body: '', updatedAt: '', url: '', column: 'todo'};
+  assert.deepEqual(plannedTrackerMove(card, config.columns[1]), {add: ['status:doing'], remove: ['status:todo'], state: 'open'});
+  assert.deepEqual(plannedTrackerMove(card, config.columns[0]), {add: [], remove: [], state: 'open'});
+  assert.deepEqual(plannedTrackerMove(card, config.columns[2]), {add: [], remove: ['status:todo'], state: 'closed'});
+});
+
+function stubRunner(responses) {
+  const calls = [];
+  const runner = (command, args) => {
+    calls.push({command, args});
+    for (const response of responses) if (response.match(command, args)) return {status: response.status ?? 0, stdout: response.stdout ?? '', stderr: response.stderr ?? ''};
+    return {status: 0, stdout: '', stderr: ''};
+  };
+  runner.calls = calls;
+  return runner;
+}
+
+const ghIssuesFixture = [
+  {number: 10, title: 'Epic: widgets', state: 'OPEN', labels: [{name: 'epic'}, {name: 'planning'}], body: '# Epic body', updatedAt: '2026-08-23T01:00:00Z', url: 'https://github.com/acme/widgets/issues/10'},
+  {number: 11, title: 'Task: build', state: 'open', labels: [{name: 'task'}, {name: 'status:todo'}], body: 'Task body', updatedAt: '2026-08-23T02:00:00Z', url: 'https://github.com/acme/widgets/issues/11'},
+  {number: 12, title: 'Done thing', state: 'closed', labels: [], body: '', updatedAt: '2026-08-22T00:00:00Z', url: 'https://github.com/acme/widgets/issues/12'},
+];
+
+function onlineRunner() {
+  return stubRunner([
+    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+  ]);
+}
+
+test('tracker sync refreshes via gh, caches offline, and reloads the cache', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const boards = [];
+  const tracker = new TrackerSync(workspace, (state) => boards.push(state), onlineRunner(), true);
+  await tracker.init();
+  assert.equal(tracker.state.cards.length, 0);
+  const refreshed = tracker.refresh();
+  assert.equal(refreshed.ok, true);
+  assert.equal(tracker.state.repo, 'acme/widgets');
+  assert.deepEqual(tracker.state.columns.map((column) => column.id), ['backlog', 'in_progress', 'done']);
+  assert.equal(tracker.state.cards.length, 3);
+  assert.equal(tracker.state.stale, false);
+  assert.ok(fs.existsSync(path.join(workspace, '.pi', 'pif', 'cache', 'tracker-cache.json')));
+  const listed = tracker.list();
+  assert.ok(listed.cards.every((card) => !('body' in card)));
+  assert.equal(boards.length, 1);
+
+  const offline = new TrackerSync(workspace, () => {}, stubRunner([
+    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[1] === 'list', status: 1, stderr: 'gh: authentication required'},
+  ]), true);
+  await offline.init();
+  assert.equal(offline.state.cards.length, 3);
+  assert.equal(offline.state.stale, true);
+  const failed = offline.refresh();
+  assert.equal(failed.ok, false);
+  assert.match(offline.state.error, /authentication required/);
+  assert.equal(offline.state.cards.length, 3);
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker move writes back through gh and reverts nothing on failure', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
+  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\n\ncolumn doing:\n  name: Doing\n  label: status:doing\n\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  const runner = onlineRunner();
+  const tracker = new TrackerSync(workspace, () => {}, runner, true);
+  await tracker.init();
+  tracker.refresh();
+
+  const moved = tracker.move({number: 11, column: 'doing'});
+  assert.equal(moved.ok, true);
+  const edit = runner.calls.find((call) => call.args[1] === 'edit');
+  assert.deepEqual(edit.args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--add-label', 'status:doing', '--remove-label', 'status:todo']);
+  const card = tracker.state.cards.find((candidate) => candidate.number === 11);
+  assert.deepEqual(card.labels, ['task', 'status:doing']);
+  assert.equal(card.column, 'doing');
+
+  const shipped = tracker.move({number: 11, column: 'shipped'});
+  assert.equal(shipped.ok, true);
+  const flip = runner.calls.filter((call) => call.args[1] !== 'list').pop();
+  assert.deepEqual(flip.args, ['issue', 'close', '11', '-R', 'acme/widgets']);
+  assert.equal(card.state, 'closed');
+  assert.equal(card.column, 'shipped');
+
+  const rejected = tracker.move({number: 404, column: 'doing'});
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /Unknown card/);
+
+  const failing = new TrackerSync(workspace, () => {}, stubRunner([
+    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+    {match: (command, args) => command === 'gh' && args[1] === 'edit', status: 1, stderr: 'gh: label does not exist'},
+  ]), true);
+  await failing.init();
+  failing.refresh();
+  const failed = failing.move({number: 11, column: 'doing'});
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /label does not exist/);
+  const unchanged = failing.state.cards.find((candidate) => candidate.number === 11);
+  assert.equal(unchanged.column, 'todo');
+  assert.deepEqual(unchanged.labels, ['task', 'status:todo']);
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker create writes through gh, falls back without labels, and prepends the card', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
+  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\ncolumn doing:\n  name: Doing\n  label: status:doing\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  const runner = stubRunner([
+    {match: (command) => command === 'git', stdout: 'git@github.com:acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[0] === 'issue' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+    {match: (command, args) => command === 'gh' && args[1] === 'create' && args.includes('status:todo'), status: 1, stderr: "could not add label: 'status:todo' not found"},
+    {match: (command, args) => command === 'gh' && args[1] === 'create', stdout: 'https://github.com/acme/widgets/issues/20\n'},
+  ]);
+  const tracker = new TrackerSync(workspace, () => {}, runner, true);
+  await tracker.init();
+  tracker.refresh();
+  const missingTitle = tracker.create({body: 'no title'});
+  assert.equal(missingTitle.ok, false);
+  assert.match(missingTitle.error, /Title is required/);
+  const badColumn = tracker.create({title: 'X', column: 'nowhere'});
+  assert.equal(badColumn.ok, false);
+  assert.match(badColumn.error, /Unknown column/);
+  const created = tracker.create({title: 'New ticket', body: 'Body text', type: 'task', column: 'todo'});
+  assert.equal(created.ok, true);
+  assert.equal(created.number, 20);
+  const createArgs = runner.calls.filter((call) => call.args[1] === 'create');
+  assert.equal(createArgs.length, 2);
+  assert.ok(createArgs[0].args.includes('status:todo'));
+  assert.ok(!createArgs[1].args.includes('--label'));
+  const card = tracker.state.cards.find((candidate) => candidate.number === 20);
+  assert.equal(card.title, 'New ticket');
+  assert.equal(card.type, 'task');
+  assert.equal(card.column, 'todo');
+  assert.equal(tracker.state.cards[0].number, 20);
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker update edits title and body through gh and patches locally', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const runner = onlineRunner();
+  const tracker = new TrackerSync(workspace, () => {}, runner, true);
+  await tracker.init();
+  tracker.refresh();
+  const empty = tracker.update({number: 11, title: '  '});
+  assert.equal(empty.ok, false);
+  assert.match(empty.error, /Title cannot be empty/);
+  const nothing = tracker.update({number: 11});
+  assert.equal(nothing.ok, false);
+  const unknown = tracker.update({number: 999, title: 'x'});
+  assert.equal(unknown.ok, false);
+  const updated = tracker.update({number: 11, title: 'Task: renamed', body: 'New body'});
+  assert.equal(updated.ok, true);
+  const edit = runner.calls.filter((call) => call.args[1] === 'edit').pop();
+  assert.deepEqual(edit.args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--title', 'Task: renamed', '--body', 'New body']);
+  const card = tracker.state.cards.find((candidate) => candidate.number === 11);
+  assert.equal(card.title, 'Task: renamed');
+  assert.equal(card.body, 'New body');
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker delete removes the card through gh and keeps state on failure', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const failing = stubRunner([
+    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
+    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
+    {match: (command, args) => command === 'gh' && args[1] === 'delete', status: 1, stderr: 'gh: no delete permission'},
+  ]);
+  const tracker = new TrackerSync(workspace, () => {}, failing, true);
+  await tracker.init();
+  tracker.refresh();
+  const failed = tracker.delete({number: 11});
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /no delete permission/);
+  assert.ok(tracker.state.cards.some((candidate) => candidate.number === 11));
+
+  const runner = onlineRunner();
+  const working = new TrackerSync(workspace, () => {}, runner, true);
+  await working.init();
+  working.refresh();
+  const removed = working.delete({number: 11});
+  assert.equal(removed.ok, true);
+  const deleteCall = runner.calls.filter((call) => call.args[1] === 'delete').pop();
+  assert.deepEqual(deleteCall.args, ['issue', 'delete', '11', '-R', 'acme/widgets', '--yes']);
+  assert.ok(!working.state.cards.some((candidate) => candidate.number === 11));
+  fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+test('tracker surfaces invalid board config and missing github remote as errors', async () => {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
+  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column broken:\n  state: sideways\n');
+  const invalid = new TrackerSync(workspace, () => {}, onlineRunner(), true);
+  await invalid.init();
+  const result = invalid.refresh();
+  assert.equal(result.ok, false);
+  assert.match(invalid.state.error, /Invalid board\.yaml/);
+
+  const remoteless = new TrackerSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-')), () => {}, stubRunner([
+    {match: (command) => command === 'git', status: 1, stderr: 'fatal: no such remote'},
+  ]), true);
+  await remoteless.init();
+  const noRepo = remoteless.refresh();
+  assert.equal(noRepo.ok, false);
+  assert.match(remoteless.state.error, /no GitHub origin remote/);
+  fs.rmSync(workspace, {recursive: true, force: true});
 });

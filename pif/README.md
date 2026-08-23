@@ -29,6 +29,26 @@ flutter build macos --debug
 
 Widget source belongs in `lib/widgets/<id>/` with `widget.yaml`. Available but uninstalled source belongs in `catalog/`. The generated `lib/widget_registry.g.dart` is owned by the hub install pipeline.
 
+## Tracker board
+
+The **Tracker** widget is a center-stage Kanban board for the workspace repo's GitHub issues. The hub reads issues via the ambient `gh` session (epic/sprint/task labels become card types) and writes card moves back through it — the repo stays the single source of truth. A local cache in `.pi/pif/cache/` keeps the board readable offline with a `cached` staleness badge.
+
+Columns come from a versioned `.pif/board.yaml` in the repo; repos without one get the default Backlog / In Progress / Done board derived from issue state and `status:*` labels:
+
+```yaml
+column todo:
+  name: To Do
+  label: status:todo
+column in_progress:
+  name: In Progress
+  label: status:in-progress
+column done:
+  name: Done
+  state: closed
+```
+
+Moving a card in pif and the hub writes the matching label / state back via gh. Cards can also be created, edited (title/body), moved between lanes (drag or the sheet's lane dropdown), and deleted from the resizable ticket sheet — its preferred size is remembered. Agents get the same operations through the `pif_tracker_list` / `pif_tracker_create` / `pif_tracker_update` / `pif_tracker_delete` pi tools.
+
 ## Install globally
 
 To use pif as the host environment in any project:

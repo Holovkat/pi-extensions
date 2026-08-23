@@ -202,15 +202,20 @@ class PiLauncher {
     final piCli = _findPiCli();
     final extension = _findExtension();
     final appDir = _findAppDir();
+    final hostSessionFile = '$workspace/.pi/pif/sessions/host.jsonl';
+    final hostSession = File(hostSessionFile);
+    hostSession.parent.createSync(recursive: true);
+    hostSession.writeAsStringSync('', mode: FileMode.append);
+    final sessionArgs = ['--session', hostSessionFile];
 
     // Build the command: either "node cli.js --mode rpc -e ext" or "pi --mode rpc -e ext"
     // --mode rpc is required so pi doesn't exit when stdin isn't a TTY.
     // The Flutter app keeps stdin open (Process.start pipes) so pi stays alive.
     final List<String> cmd;
     if (piCli.isNotEmpty) {
-      cmd = [nodeBin, piCli, '--mode', 'rpc', '-e', extension];
+      cmd = [nodeBin, piCli, '--mode', 'rpc', '-e', extension, ...sessionArgs];
     } else {
-      cmd = ['pi', '--mode', 'rpc', '-e', extension];
+      cmd = ['pi', '--mode', 'rpc', '-e', extension, ...sessionArgs];
     }
 
     final env = {
@@ -221,6 +226,7 @@ class PiLauncher {
       'PIF_WORKSPACE': workspace,
       'PIF_APP_DIR': appDir,
       'PIF_TOKEN': _token!,
+      'PIF_HOST_SESSION_FILE': hostSessionFile,
     };
 
     _process = await Process.start(

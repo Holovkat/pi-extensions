@@ -55,14 +55,19 @@ class _DockingShellState extends State<DockingShell>
   Map<String, PifWidgetPlugin Function()> _factories = pifWidgetFactories();
   void _refreshFactories() => _factories = pifWidgetFactories();
   @override
-  void reassemble() { super.reassemble(); _refreshFactories(); }
+  void reassemble() {
+    super.reassemble();
+    _refreshFactories();
+  }
 
   @override
   void initState() {
     super.initState();
     host = PifHost(bus: widget.bus)
       ..workspace =
-          widget.workspace ?? Platform.environment['PIF_WORKSPACE'] ?? Directory.current.path;
+          widget.workspace ??
+          Platform.environment['PIF_WORKSPACE'] ??
+          Directory.current.path;
     host.storage.workspace = host.workspace;
     events = widget.bus.events.listen(_event, onError: (_) {});
     errors = widget.bus.errors.listen(_showError);
@@ -110,8 +115,7 @@ class _DockingShellState extends State<DockingShell>
         // Only side-slot widgets have overlays and grabbers; a persisted
         // unpinned flag on any other widget would strand it invisibly.
         final slot = value['slot'] as String?;
-        final pinnableSlot =
-            slot == 'left' || slot == 'right' || slot == null;
+        final pinnableSlot = slot == 'left' || slot == 'right' || slot == null;
         if (pinnableSlot && _pinnableIds.contains(entry.key)) {
           unpinnedIds.add(entry.key);
         }
@@ -148,6 +152,7 @@ class _DockingShellState extends State<DockingShell>
       host.sessions.applySnapshot(
         Map<String, dynamic>.from(snapshot['sessions'] as Map? ?? {}),
       );
+      host.requestTranscript(host.activeSessionId);
       final widgets = Map<String, dynamic>.from(
         snapshot['widgets'] as Map? ?? {},
       );
@@ -185,7 +190,15 @@ class _DockingShellState extends State<DockingShell>
       _applyLayout(layout);
       if (mounted) setState(() {});
     }
-    if (envelope.channel == 'session/selection' &&
+    if (envelope.channel == 'session/state' &&
+        envelope.type == 'created' &&
+        envelope.payload is Map) {
+      final payload = Map<String, dynamic>.from(envelope.payload as Map);
+      host.sessions.applyEvent(payload, envelopeId: envelope.id);
+      final created = payload['id'] as String?;
+      if (created != null) host.activateSession(created);
+      if (mounted) setState(() {});
+    } else if (envelope.channel == 'session/selection' &&
         envelope.type == 'selected') {
       final payload = Map<String, dynamic>.from(envelope.payload as Map);
       host.activeSessionId = payload['sessionId'] as String? ?? 'host';
@@ -204,7 +217,7 @@ class _DockingShellState extends State<DockingShell>
       final payload = Map<String, dynamic>.from(envelope.payload as Map);
       final removed = payload['sessionId'] as String? ?? '';
       host.sessions.remove(removed);
-      if (host.activeSessionId == removed) host.activeSessionId = 'host';
+      host.activateFallbackSession(removed);
       if (mounted) setState(() {});
     } else if (envelope.channel.startsWith('session/') &&
         envelope.payload is Map) {
@@ -273,10 +286,7 @@ class _DockingShellState extends State<DockingShell>
         slidIn.remove(id);
       }
     });
-    widget.bus.send('shell/layout', 'pin', {
-      'widgetId': id,
-      'pinned': pinned,
-    });
+    widget.bus.send('shell/layout', 'pin', {'widgetId': id, 'pinned': pinned});
   }
 
   void _saveSizes() {
@@ -338,135 +348,152 @@ class _DockingShellState extends State<DockingShell>
       autofocus: true,
       onKeyEvent: _handleEscapeKey,
       child: Scaffold(
-      body: Column(
-        children: [
-          _titleBar(),
-          Expanded(
-            child: Stack(
-              children: [
-                LayoutBuilder(
-                  builder: (context, constraints) {
-                // Keep the center stage livable no matter how far the
-                // dividers are dragged. Upper bounds are floored at the
-                // minimums so a tiny window can never produce reversed
-                // (min > max) clamps, which throw inside build().
-                final maxSide = math.max(
-                  _minSide,
-                  (constraints.maxWidth - _centerMinWidth) / 2,
-                );
-                final maxBottom = math.max(
-                  _minBottom,
-                  constraints.maxHeight - _bottomTopGap,
-                );
-                final left = _left.clamp(_minSide, maxSide);
-                final right = _right.clamp(_minSide, maxSide);
-                final bottom = _bottom.clamp(_minBottom, maxBottom);
-                return Row(
-                  children: [
-                    // Docks with no visible widgets collapse so adjacent
-                    // panels reclaim the space; a slim edge remains as the
-                    // drop target that re-expands the slot.
-                    if (leftWidgets.isEmpty)
-                      _collapsedEdge(PifSlot.left)
-                    else ...[
-                      SizedBox(
-                        width: left,
-                        child: _dock(PifSlot.left, leftWidgets),
-                      ),
-                      _divider(
-                        key: const Key('pif_divider_left'),
-                        horizontal: false,
-                        onDelta: (dx) => setState(
-                          () => _left = (_left + dx).clamp(_minSide, maxSide),
-                        ),
-                        onReset: () => setState(() => _left = _defaultLeft),
-                      ),
-                    ],
-                    Expanded(
-                      child: Column(
+        body: Column(
+          children: [
+            _titleBar(),
+            Expanded(
+              child: Stack(
+                children: [
+                  LayoutBuilder(
+                    builder: (context, constraints) {
+                      // Keep the center stage livable no matter how far the
+                      // dividers are dragged. Upper bounds are floored at the
+                      // minimums so a tiny window can never produce reversed
+                      // (min > max) clamps, which throw inside build().
+                      final maxSide = math.max(
+                        _minSide,
+                        (constraints.maxWidth - _centerMinWidth) / 2,
+                      );
+                      final maxBottom = math.max(
+                        _minBottom,
+                        constraints.maxHeight - _bottomTopGap,
+                      );
+                      final left = _left.clamp(_minSide, maxSide);
+                      final right = _right.clamp(_minSide, maxSide);
+                      final bottom = _bottom.clamp(_minBottom, maxBottom);
+                      return Row(
                         children: [
-                          if (centerWidgets.isEmpty &&
-                              bottomWidgets.isNotEmpty) ...[
-                            // No center widgets: the bottom dock expands
-                            // into the freed stage; a slim edge keeps the
-                            // center slot droppable.
-                            _collapsedEdge(PifSlot.center),
-                            Expanded(child: _dock(PifSlot.bottom, bottomWidgets)),
-                          ] else ...[
-                            Expanded(child: _center(centerWidgets)),
-                            if (bottomWidgets.isEmpty)
-                              _collapsedEdge(PifSlot.bottom)
-                            else if (centerWidgets.isEmpty)
-                              SizedBox(
-                                height: bottom,
-                                child: _dock(PifSlot.bottom, bottomWidgets),
-                              )
-                            else ...[
-                              _divider(
-                                key: const Key('pif_divider_bottom'),
-                                horizontal: true,
-                                onDelta: (dy) => setState(
-                                  () => _bottom = (_bottom - dy).clamp(
-                                    _minBottom,
-                                    maxBottom,
-                                  ),
+                          // Docks with no visible widgets collapse so adjacent
+                          // panels reclaim the space; a slim edge remains as the
+                          // drop target that re-expands the slot.
+                          if (leftWidgets.isEmpty)
+                            _collapsedEdge(PifSlot.left)
+                          else ...[
+                            SizedBox(
+                              width: left,
+                              child: _dock(PifSlot.left, leftWidgets),
+                            ),
+                            _divider(
+                              key: const Key('pif_divider_left'),
+                              horizontal: false,
+                              onDelta: (dx) => setState(
+                                () => _left = (_left + dx).clamp(
+                                  _minSide,
+                                  maxSide,
                                 ),
-                                onReset: () =>
-                                    setState(() => _bottom = _defaultBottom),
                               ),
-                              SizedBox(
-                                height: bottom,
-                                child: _dock(PifSlot.bottom, bottomWidgets),
+                              onReset: () =>
+                                  setState(() => _left = _defaultLeft),
+                            ),
+                          ],
+                          Expanded(
+                            child: Column(
+                              children: [
+                                if (centerWidgets.isEmpty &&
+                                    bottomWidgets.isNotEmpty) ...[
+                                  // No center widgets: the bottom dock expands
+                                  // into the freed stage; a slim edge keeps the
+                                  // center slot droppable.
+                                  _collapsedEdge(PifSlot.center),
+                                  Expanded(
+                                    child: _dock(PifSlot.bottom, bottomWidgets),
+                                  ),
+                                ] else ...[
+                                  Expanded(child: _center(centerWidgets)),
+                                  if (bottomWidgets.isEmpty)
+                                    _collapsedEdge(PifSlot.bottom)
+                                  else if (centerWidgets.isEmpty)
+                                    SizedBox(
+                                      height: bottom,
+                                      child: _dock(
+                                        PifSlot.bottom,
+                                        bottomWidgets,
+                                      ),
+                                    )
+                                  else ...[
+                                    _divider(
+                                      key: const Key('pif_divider_bottom'),
+                                      horizontal: true,
+                                      onDelta: (dy) => setState(
+                                        () => _bottom = (_bottom - dy).clamp(
+                                          _minBottom,
+                                          maxBottom,
+                                        ),
+                                      ),
+                                      onReset: () => setState(
+                                        () => _bottom = _defaultBottom,
+                                      ),
+                                    ),
+                                    SizedBox(
+                                      height: bottom,
+                                      child: _dock(
+                                        PifSlot.bottom,
+                                        bottomWidgets,
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ],
+                            ),
+                          ),
+                          if (rightWidgets.isEmpty)
+                            _collapsedEdge(PifSlot.right)
+                          else ...[
+                            _divider(
+                              key: const Key('pif_divider_right'),
+                              horizontal: false,
+                              onDelta: (dx) => setState(
+                                () => _right = (_right - dx).clamp(
+                                  _minSide,
+                                  maxSide,
+                                ),
                               ),
-                            ],
+                              onReset: () =>
+                                  setState(() => _right = _defaultRight),
+                            ),
+                            SizedBox(
+                              width: right,
+                              child: _dock(PifSlot.right, rightWidgets),
+                            ),
                           ],
                         ],
-                      ),
-                    ),
-                    if (rightWidgets.isEmpty)
-                      _collapsedEdge(PifSlot.right)
-                    else ...[
-                      _divider(
-                        key: const Key('pif_divider_right'),
-                        horizontal: false,
-                        onDelta: (dx) => setState(
-                          () => _right = (_right - dx).clamp(_minSide, maxSide),
-                        ),
-                        onReset: () => setState(() => _right = _defaultRight),
-                      ),
-                      SizedBox(
-                        width: right,
-                        child: _dock(PifSlot.right, rightWidgets),
-                      ),
-                    ],
-                  ],
-                );
-              },
-                ),
-                // Tapping outside an open overlay slides it back out.
-                if (slidIn.isNotEmpty)
-                  Positioned.fill(
-                    key: const Key('pif_overlay_barrier'),
-                    child: GestureDetector(
-                      behavior: HitTestBehavior.opaque,
-                      onTap: () => setState(slidIn.clear),
-                    ),
+                      );
+                    },
                   ),
-                ..._overlayPanels(),
-                ..._edgeGrabbers(),
-              ],
+                  // Tapping outside an open overlay slides it back out.
+                  if (slidIn.isNotEmpty)
+                    Positioned.fill(
+                      key: const Key('pif_overlay_barrier'),
+                      child: GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: () => setState(slidIn.clear),
+                      ),
+                    ),
+                  ..._overlayPanels(),
+                  ..._edgeGrabbers(),
+                ],
+              ),
             ),
-          ),
-          if (statusWidgets.isEmpty)
-            _collapsedEdge(PifSlot.status)
-          else
-            SizedBox(
-              height: 25,
-              child: _dock(PifSlot.status, statusWidgets, chrome: false),
-            ),
-        ],
+            if (statusWidgets.isEmpty)
+              _collapsedEdge(PifSlot.status)
+            else
+              SizedBox(
+                height: 25,
+                child: _dock(PifSlot.status, statusWidgets, chrome: false),
+              ),
+          ],
+        ),
       ),
-    ),
     );
   }
 
@@ -672,11 +699,10 @@ class _DockingShellState extends State<DockingShell>
         IconButton(
           onPressed: () {
             final visible = enabled.contains('widget_store');
-            widget.bus.send(
-              'widget/control',
-              'toggle',
-              {'id': 'widget_store', 'enabled': !visible},
-            );
+            widget.bus.send('widget/control', 'toggle', {
+              'id': 'widget_store',
+              'enabled': !visible,
+            });
           },
           tooltip: enabled.contains('widget_store')
               ? 'Hide widget store'
@@ -709,7 +735,8 @@ class _DockingShellState extends State<DockingShell>
   Widget _collapsedEdge(PifSlot slot) {
     final vertical = slot == PifSlot.left || slot == PifSlot.right;
     final horizontal =
-        slot == PifSlot.bottom || slot == PifSlot.center ||
+        slot == PifSlot.bottom ||
+        slot == PifSlot.center ||
         slot == PifSlot.status;
     return SizedBox(
       key: Key('pif_dock_edge_${slot.name}'),
@@ -797,7 +824,9 @@ class _DockingShellState extends State<DockingShell>
             ),
           ],
         ),
-      );  /// Tabbed panels have no panel-header chrome, so the tab itself is the
+      );
+
+  /// Tabbed panels have no panel-header chrome, so the tab itself is the
   /// drag affordance for moving the widget to another slot.
   Widget _draggableTab(PifWidgetPlugin plugin) => Draggable<String>(
     data: plugin.meta.id,

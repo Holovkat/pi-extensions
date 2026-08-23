@@ -5,6 +5,7 @@ import 'widgets/diff_viewer/diff_viewer.dart';
 import 'widgets/session_rail/session_rail.dart';
 import 'widgets/status_bar/status_bar.dart';
 import 'widgets/terminal/terminal.dart';
+import 'widgets/tracker_board/tracker_board.dart';
 import 'widgets/widget_store/widget_store.dart';
 import 'widgets/workspace_clock/workspace_clock.dart';
 
@@ -15,6 +16,7 @@ Map<String, PifWidgetPlugin Function()> pifWidgetFactories() {
     'session_rail': () => SessionRailPlugin(),
     'status_bar': () => StatusBarPlugin(),
     'terminal': () => TerminalPlugin(),
+    'tracker_board': () => TrackerBoardPlugin(),
     'widget_store': () => WidgetStorePlugin(),
     'workspace_clock': () => WorkspaceClockPlugin(),
   };

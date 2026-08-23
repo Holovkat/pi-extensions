@@ -73,12 +73,12 @@ function fakePi(workspace) {
   // Mirrors real pi: events stream over stdout AND append to the
   // `--session <file>.jsonl` log, which the hub treats as the source of
   // truth for display history.
-  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nconst at = process.argv.indexOf('--session');\nconst sessionFile = at >= 0 ? process.argv[at + 1] : null;\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);const ev={type:'message_update',delta:q.message||'',command:q.type};if(sessionFile)fs.appendFileSync(sessionFile, JSON.stringify(ev)+'\\n');process.stdout.write(JSON.stringify(ev)+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
+  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nconst at = process.argv.indexOf('--session');\nconst sessionFile = at >= 0 ? process.argv[at + 1] : null;\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);if(q.type==='prompt'||q.type==='steer'){const user={role:'user',content:[{type:'text',text:q.message||''}]};process.stdout.write(JSON.stringify({type:'message_start',message:user})+'\\n');process.stdout.write(JSON.stringify({type:'message_end',message:user})+'\\n');}const ev={type:'message_update',delta:q.message||'',command:q.type};if(sessionFile)fs.appendFileSync(sessionFile, JSON.stringify(ev)+'\\n');process.stdout.write(JSON.stringify(ev)+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, token = 'integration-token'}) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, token = 'integration-token'}) {
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -97,8 +97,14 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const checkpoint = (name) => console.error(`[pif-smoke] ${name}`);
   checkpoint('setup');
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-smoke-')); copyFixture(workspace); const piBin = fakePi(workspace); const port = 32000 + Math.floor(Math.random() * 1000);
+  const hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl'); fs.mkdirSync(path.dirname(hostSessionFile), {recursive: true});
+  fs.writeFileSync(hostSessionFile, [
+    {type: 'session', version: 3, id: 'host-fixture', timestamp: new Date().toISOString(), cwd: workspace},
+    {type: 'custom_message', customType: 'pif-input', content: 'restored host input'},
+    {type: 'message', message: {role: 'assistant', content: [{type: 'text', text: 'restored host reply'}]}},
+  ].map((value) => JSON.stringify(value)).join('\n') + '\n');
   const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
-  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath, hostSessionFile}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
   const tokenFile = path.join(workspace, '.pi', 'pif', 'token');
   assert.equal(fs.readFileSync(tokenFile, 'utf8'), 'integration-token');
   const openFail = (url) => new Promise((resolve, reject) => { const socket = new WebSocket(url); socket.addEventListener('open', () => { socket.close(); resolve(); }, {once: true}); socket.addEventListener('error', () => reject(new Error('connection rejected')), {once: true}); });
@@ -123,11 +129,16 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   checkpoint('snapshot received');
   assert.equal(snapshot.payload.health.hub, 'running'); assert.equal(snapshot.payload.widgets.agent_console.core, true); assert.equal(snapshot.payload.widgets.diff_viewer, undefined);
   assert.equal(snapshot.payload.health.origin, 'standalone');
+  send(socket, 'session/control', 'transcript', {sessionId: 'host'});
+  const hostHistory = await nextMessage(socket, (value) => value.type === 'history' && value.payload?.sessionId === 'host');
+  assert.ok(hostHistory.payload.transcript.some((entry) => entry.type === 'input' && entry.content === 'restored host input'), 'host history hydrates from its persisted session file');
+  assert.ok(hostHistory.payload.transcript.some((entry) => entry.type === 'message' && entry.text === 'restored host reply'), 'host assistant history hydrates from its persisted session file');
 
   const createdPromise = nextMessage(socket, (value) => value.type === 'created');
   send(socket, 'session/control', 'spawn', {cwd: workspace, model: 'fake'});
   const created = await createdPromise;
   const sessionId = created.payload.id; assert.match(sessionId, /^session_/);
+  assert.ok(fs.existsSync(path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`)), 'new sessions reserve a transcript file before first input');
   const childEnv = JSON.parse(await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.env.json')) ? fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8') : false, 'child env dump'));
   assert.equal(childEnv.autostart, null); assert.equal(childEnv.noFlutter, null); assert.equal(childEnv.port, null);
   checkpoint('child env scrubbed of lifecycle vars');
@@ -148,9 +159,12 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket, 'session/control', 'transcript', {sessionId});
   const history = await nextMessage(socket, (value) => value.type === 'history' && value.payload?.sessionId === sessionId);
   assert.ok(Array.isArray(history.payload.transcript), 'history envelope carries a transcript array');
+  const inputEvents = [];
+  const inputListener = (event) => { const value = JSON.parse(event.data); if (value.channel === 'session/event' && value.payload?.sessionId === sessionId && value.type === 'input') inputEvents.push(value); };
+  socket.addEventListener('message', inputListener);
   const streamPromise = nextMessage(socket, (value) => value.channel === 'session/event' && value.payload.sessionId === sessionId && value.type === 'message_update');
   send(socket, 'session/control', 'input', {sessionId, content: 'hello'});
-  const streamed = await streamPromise; checkpoint('child streamed'); assert.equal(streamed.payload.event.delta, 'hello');
+  const streamed = await streamPromise; checkpoint('child streamed'); assert.equal(streamed.payload.event.delta, 'hello'); await delay(20); socket.removeEventListener('message', inputListener); assert.equal(inputEvents.length, 1, 'user boundary events must not duplicate the authoritative input');
   const steerPromise = nextMessage(socket, (value) => value.channel === 'session/event' && value.payload.event?.delta === 'turn');
   send(socket, 'session/control', 'steer', {sessionId, content: 'turn'});
   const steered = await steerPromise; assert.equal(steered.payload.event.command, 'steer');
@@ -240,6 +254,23 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.match(actionFailed.payload.error, /Unknown session/);
   checkpoint('failed actions produce correlated errors');
 
+  // models/* envelopes over the WS bus previously failed channel validation.
+  const modelsRefreshed = nextMessage(socket, (value) => value.type === 'snapshot' && Array.isArray(value.payload.models));
+  send(socket, 'models/control', 'refresh', {});
+  await modelsRefreshed; checkpoint('models channel envelope accepted');
+
+  // Tracker surface: the temp workspace has no GitHub remote — errors surface over the bus and the empty cache stays stale.
+  assert.equal(snapshot.payload.tracker.repo, null);
+  const trackerState = nextMessage(socket, (value) => value.channel === 'tracker/state');
+  const refreshed = await control(controlPath, 'tracker.refresh');
+  assert.equal(refreshed.ok, false); assert.match(refreshed.error, /no GitHub origin remote/);
+  await trackerState; checkpoint('tracker error surfaced');
+  const board = await control(controlPath, 'tracker.list');
+  assert.deepEqual(board.columns, []); assert.equal(board.cards.length, 0); assert.equal(board.stale, true);
+  const moveReject = await control(controlPath, 'tracker.move', {number: 1, column: 'todo'});
+  assert.equal(moveReject.ok, false); assert.match(moveReject.error, /Unknown card/);
+  checkpoint('tracker controls verified');
+
   send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
   send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');
@@ -247,6 +278,8 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.name === 'My Workspace');
   const prefs = JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'prefs.json'), 'utf8'));
   assert.equal(prefs.model, 'fixture/fast'); assert.equal(prefs.thinking, 'low'); assert.equal(prefs.name, 'My Workspace');
+  const sessionFile = path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`);
+  fs.appendFileSync(sessionFile, JSON.stringify({type: 'message', message: {role: 'user', content: [{type: 'text', text: 'restored input'}]}}) + '\n');
   const port2 = 34000 + Math.floor(Math.random() * 500);
   const pi2 = await startPi({workspace, port: port2, piBin});
   const socket2 = new WebSocket(`ws://127.0.0.1:${port2}/pif?token=integration-token`);
@@ -263,14 +296,13 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket2, 'session/control', 'transcript', {sessionId});
   const restoredHistory = await nextMessage(socket2, (value) => value.type === 'history' && value.payload?.sessionId === sessionId);
   assert.ok(restoredHistory.payload.transcript.length > 0, 'hydrated transcript carries history after restart');
-  // Resume: pi respawns against the same session file and streams again.
-  const sessionFile = path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`);
-  if (!fs.existsSync(sessionFile)) fs.writeFileSync(sessionFile, '');
+  assert.ok(restoredHistory.payload.transcript.some((entry) => entry.type === 'input' && entry.content === 'restored input'), 'persisted user messages hydrate as input');
+  // Console input automatically resumes an ended session against its
+  // existing session file before sending the prompt.
   const resumedMsg = nextMessage(socket2, (value) => value.type === 'updated' && value.payload?.id === sessionId && value.payload?.state === 'idle');
-  send(socket2, 'session/control', 'resume', {sessionId});
-  await resumedMsg;
   const resumedStream = nextMessage(socket2, (value) => value.channel === 'session/event' && value.payload.sessionId === sessionId && value.type === 'message_update');
   send(socket2, 'session/control', 'input', {sessionId, content: 'back again'});
+  await resumedMsg;
   const streamedAgain = await resumedStream;
   assert.equal(streamedAgain.payload.event.delta, 'back again');
   checkpoint('session resumed from history');
@@ -280,6 +312,20 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket2, 'shell/state', 'snapshot_request', {});
   const afterDelete = await nextMessage(socket2, (value) => value.type === 'snapshot');
   assert.equal(afterDelete.payload.sessions[sessionId], undefined);
+  // The host card is removable too. Its live parent session stays intact;
+  // only the rail card is removed, and the host transcript file remains owned
+  // by the parent pi process.
+  const hostRemoved = nextMessage(socket2, (value) => value.type === 'removed' && value.payload?.sessionId === 'host');
+  send(socket2, 'session/control', 'delete', {sessionId: 'host'});
+  await hostRemoved;
+  assert.ok(fs.existsSync(hostSessionFile), 'deleting the host card must not unlink the live host transcript');
+  send(socket2, 'shell/state', 'snapshot_request', {});
+  const afterHostDelete = await nextMessage(socket2, (value) => value.type === 'snapshot');
+  assert.equal(afterHostDelete.payload.sessions.host, undefined, 'host card is removable');
+  const hostInputFailed = nextMessage(socket2, (value) => value.channel === 'shell/error' && value.type === 'action_failed');
+  send(socket2, 'session/control', 'input', {sessionId: 'host', content: 'after delete'});
+  const hostError = await hostInputFailed;
+  assert.match(hostError.payload.error, /Host session has been deleted/);
   checkpoint('sessions persist, restore, and delete');
   send(socket2, 'shell/state', 'shutdown_request', {});
   await waitFor(() => pi2.exitCode != null ? true : false, 'pi2 shutdown via shutdown_request', 15_000);
