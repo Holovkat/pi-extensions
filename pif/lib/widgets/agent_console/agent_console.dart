@@ -28,11 +28,20 @@ class _AgentConsoleState extends State<_AgentConsole> {
   final controller = TextEditingController();
   final scroll = ScrollController();
   late StreamSubscription subscription;
+  late StreamSubscription escapes;
   bool editingName = false;
+  // The session being renamed is captured when the edit starts, so a
+  // hub-driven active-session change mid-edit cannot retarget the commit.
+  String? renamingSessionId;
   final nameController = TextEditingController();
   final nameFocus = FocusNode();
+  // Incremental entry state: built entries are kept per session and
+  // extended by streaming deltas; a full rebuild happens only when a
+  // snapshot replaces history or the selection changes.
   final entriesBySession = <String, List<Map<String, dynamic>>>{};
   final runningBySession = <String, bool>{};
+  final processedEvents = <String, int>{};
+  Timer? _coalesce;
   List<Map<String, dynamic>> get entries => entriesBySession.putIfAbsent(
     widget.host.activeSessionId,
     () => <Map<String, dynamic>>[],
@@ -42,29 +51,55 @@ class _AgentConsoleState extends State<_AgentConsole> {
   @override
   void initState() {
     super.initState();
-    _hydrate(widget.host.sessions.current);
+    _rebuildAll(widget.host.sessions.current);
     nameFocus.addListener(() {
       if (!nameFocus.hasFocus && editingName) _commitName();
     });
+    // Esc cancels the rename instead of the focus-loss commit path.
+    escapes = widget.host.escapes.listen((_) {
+      if (editingName) _cancelName();
+    });
     subscription = widget.host.sessions.changes.listen((sessions) {
-      _hydrate(sessions);
+      _consume(sessions);
       if (mounted) setState(() {});
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (scroll.hasClients) {
-          scroll.animateTo(
-            scroll.position.maxScrollExtent,
-            duration: const Duration(milliseconds: 150),
-            curve: Curves.easeOut,
-          );
-        }
-      });
+      _scheduleAutoScroll();
     });
   }
 
-  void _hydrate(List<PifSession> sessions) {
+  /// Coalesced auto-scroll: many deltas in one frame scroll once.
+  void _scheduleAutoScroll() {
+    _coalesce ??= Timer(const Duration(milliseconds: 32), () {
+      _coalesce = null;
+      if (!mounted || !scroll.hasClients) return;
+      scroll.animateTo(
+        scroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 150),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  /// Apply new events incrementally: only unseen transcript events for a
+  /// session are appended to its already-built entries — no full rescan
+  /// of every session's history per token.
+  void _consume(List<PifSession> sessions) {
     for (final session in sessions) {
       runningBySession[session.id] = session.state == 'running';
-      entriesBySession[session.id] = _buildEntries(session.transcript);
+      final seen = processedEvents[session.id] ?? 0;
+      final transcript = session.transcript;
+      if (seen > transcript.length) {
+        // History was replaced (snapshot) — rebuild this session.
+        processedEvents[session.id] = transcript.length;
+        entriesBySession[session.id] = _buildEntries(transcript);
+        continue;
+      }
+      if (transcript.length == seen) continue;
+      final target = entriesBySession.putIfAbsent(
+        session.id,
+        () => <Map<String, dynamic>>[],
+      );
+      _appendEntries(transcript.sublist(seen), target);
+      processedEvents[session.id] = transcript.length;
     }
     entriesBySession.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
@@ -72,6 +107,35 @@ class _AgentConsoleState extends State<_AgentConsole> {
     runningBySession.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
     );
+    processedEvents.removeWhere(
+      (id, _) => sessions.every((session) => session.id != id),
+    );
+  }
+
+  void _rebuildAll(List<PifSession> sessions) {
+    for (final session in sessions) {
+      runningBySession[session.id] = session.state == 'running';
+      processedEvents[session.id] = session.transcript.length;
+      entriesBySession[session.id] = _buildEntries(session.transcript);
+    }
+  }
+
+  /// Extend already-built entries with new raw transcript items.
+  void _appendEntries(List<dynamic> rawItems, List<Map<String, dynamic>> into) {
+    final fresh = _buildEntries(rawItems);
+    // A delta continues the previous assistant message rather than
+    // starting a new card.
+    for (final entry in fresh) {
+      if ((entry['kind'] == 'assistant' ||
+              entry['kind'] == 'turn_end') &&
+          into.isNotEmpty &&
+          into.last['kind'] == entry['kind'] &&
+          entry['kind'] == 'assistant') {
+        into.last['text'] = '${into.last['text']}${entry['text']}';
+      } else {
+        into.add(entry);
+      }
+    }
   }
 
   List<Map<String, dynamic>> _buildEntries(List<dynamic> transcript) {
@@ -178,6 +242,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
   @override
   void dispose() {
     subscription.cancel();
+    escapes.cancel();
+    _coalesce?.cancel();
     controller.dispose();
     nameController.dispose();
     nameFocus.dispose();
@@ -187,15 +253,24 @@ class _AgentConsoleState extends State<_AgentConsole> {
 
   void _startRename(String current) {
     nameController.text = current;
+    renamingSessionId = widget.host.activeSessionId;
     setState(() => editingName = true);
   }
 
   void _commitName() {
     final name = nameController.text.trim();
+    final id = renamingSessionId;
     setState(() => editingName = false);
-    if (name.isNotEmpty) {
-      widget.host.sessions.rename(widget.host.activeSessionId, name);
+    renamingSessionId = null;
+    if (name.isNotEmpty && id != null) {
+      widget.host.sessions.rename(id, name);
     }
+  }
+
+  void _cancelName() {
+    setState(() => editingName = false);
+    renamingSessionId = null;
+    nameController.clear();
   }
 
   void submit() {

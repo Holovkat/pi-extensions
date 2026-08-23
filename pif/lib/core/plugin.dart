@@ -81,6 +81,35 @@ class PifSessions {
                 ? 1
                 : a.name.compareTo(b.name),
           );
+    _sorted = true;
+    _state.add(current);
+  }
+
+  /// Request the authoritative transcript for a session (the hub reads
+  /// its `.jsonl`). Response arrives as a `session/transcript` history
+  /// envelope handled by the shell/host wiring.
+  void fetchTranscript(String sessionId) => bus.send(
+    'session/control',
+    'transcript',
+    {'sessionId': sessionId},
+  );
+
+  /// Install a fetched history (lazy hydration) into the matching session.
+  void replaceTranscript(String sessionId, List<dynamic> transcript) {
+    final at = current.indexWhere((session) => session.id == sessionId);
+    if (at < 0) return;
+    final existing = current[at];
+    if (existing.transcript.length >= transcript.length) return;
+    current[at] = PifSession(
+      id: existing.id,
+      name: existing.name,
+      host: existing.host,
+      state: existing.state,
+      model: existing.model,
+      thinking: existing.thinking,
+      cwd: existing.cwd,
+      transcript: transcript,
+    );
     _state.add(current);
   }
 
@@ -94,6 +123,9 @@ class PifSessions {
     final id = payload['sessionId'] as String? ?? payload['id'] as String?;
     if (id == null) return;
     final existing = current.where((session) => session.id == id).firstOrNull;
+    // Streaming events append one entry; metadata patches (rename,
+    // setModel…) carry no event. Neither rebuilds the transcript array.
+    final hasFullRecord = payload.containsKey('transcript');
     final source = payload.containsKey('id')
         ? payload
         : <String, dynamic>{
@@ -103,24 +135,39 @@ class PifSessions {
               'host': existing.host,
               'model': existing.model,
               'cwd': existing.cwd,
-              'transcript': [
-                ...existing.transcript,
-                if (payload['event'] != null) payload['event'],
-              ],
+              if (hasFullRecord)
+                'transcript': [
+                  ...existing.transcript,
+                  if (payload['event'] != null) payload['event'],
+                ],
             },
             'id': id,
             'state': payload['state'] ?? existing?.state ?? 'idle',
           };
     final replacement = PifSession.fromJson(source);
-    current = [...current.where((session) => session.id != id), replacement]
-      ..sort(
-        (a, b) => a.host
-            ? -1
-            : b.host
-            ? 1
-            : a.name.compareTo(b.name),
-      );
+    // Pure transcript events keep the rail order untouched — no re-sort
+    // per delta. Metadata changes (rename affects ordering) re-sort.
+    final orderChanged =
+        replacement.name != existing?.name ||
+        replacement.host != existing?.host ||
+        existing == null;
+    current = [...current.where((session) => session.id != id), replacement];
+    if (orderChanged || !_sorted) {
+      _sortCurrent();
+    }
     _state.add(current);
+  }
+
+  bool _sorted = true;
+  void _sortCurrent() {
+    current.sort(
+      (a, b) => a.host
+          ? -1
+          : b.host
+          ? 1
+          : a.name.compareTo(b.name),
+    );
+    _sorted = true;
   }
 
   void spawn({required String cwd, String? model, String? thinking, String? prompt}) => bus.send(
@@ -260,4 +307,22 @@ class PifHost {
   List<String> models = const [];
   Map<String, dynamic> modelProviders = {};
   Map<String, dynamic> snapshot = {};
+
+  /// Fetch the selected session's transcript if it has none yet — the
+  /// slim snapshot ships metadata only.
+  void requestTranscript(String sessionId) {
+    final session = sessions.current
+        .where((candidate) => candidate.id == sessionId)
+        .firstOrNull;
+    if (session == null) return;
+    if (session.transcript.isNotEmpty || sessionId == 'host') return;
+    sessions.fetchTranscript(sessionId);
+  }
+
+  /// Shell-wide escape signal (Esc pressed): inline rename fields listen
+  /// and cancel without committing.
+  final _escapes = StreamController<void>.broadcast();
+  Stream<void> get escapes => _escapes.stream;
+  void escape() => _escapes.add(null);
+  Future<void> disposeEscapes() => _escapes.close();
 }

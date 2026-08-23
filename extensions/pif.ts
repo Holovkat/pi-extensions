@@ -16,6 +16,7 @@ import {
 	decodeEnvelope,
 	generateWidgetRegistry,
 	parseWidgetManifest,
+	pifProbeProof,
 	pifUpgradeAuthorized,
 	type PifEnvelope,
 	type PifWidgetManifest,
@@ -42,7 +43,9 @@ const text = (value: unknown, details: unknown = value) => ({ content: [{ type: 
 
 /** Per-project session persistence. SQLite via node:sqlite when the
  * runtime provides it, JSON file fallback otherwise. Stores child
- * sessions (name, model, transcript) so reopened projects recall them. */
+ * sessions as metadata only — transcripts live in the session `.jsonl`
+ * files, which resume already reads, so the DB never duplicates or
+ * lags behind them. */
 class SessionStore {
 	private db: any = null;
 	private jsonPath: string = "";
@@ -50,23 +53,56 @@ class SessionStore {
 	constructor(private pifDir: string) {}
 	async init() {
 		try {
-			const { DatabaseSync } = await import("node:sqlite");
+			// Feature-detect node:sqlite separately from opening the file so a
+			// corrupt DB file falls back to JSON instead of crashing init.
+			const sqlite = await import("node:sqlite").catch(() => null);
+			if (!sqlite || typeof sqlite.DatabaseSync !== "function") throw new Error("node:sqlite unavailable");
+			const { DatabaseSync } = sqlite;
 			this.db = new DatabaseSync(path.join(this.pifDir, "sessions.db"));
-			this.db.exec("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT, thinking TEXT, cwd TEXT, session_file TEXT, transcript TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+			// WAL keeps a hard kill mid-write from corrupting the DB (the
+			// default journal_mode=memory does not); busy_timeout lets a
+			// second writer wait instead of throwing SQLITE_BUSY immediately.
+			this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA user_version = 1;");
+			this.db.exec("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT, thinking TEXT, cwd TEXT, session_file TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+			this.migrateTranscriptColumn();
 		} catch {
 			this.jsonPath = path.join(this.pifDir, "sessions.json");
 			try { const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8")); if (parsed && Array.isArray(parsed.sessions)) this.json = parsed; } catch { /* absent */ }
 		}
 	}
+	/** v1 stored full transcript blobs inline; v2 drops the column. */
+	private migrateTranscriptColumn() {
+		const columns: any[] = this.db.prepare("PRAGMA table_info(sessions)").all();
+		if (!columns.some((column) => column.name === "transcript")) return;
+		this.db.exec("ALTER TABLE sessions DROP COLUMN transcript");
+	}
+	/** Keep the newest `keep` sessions per workspace; older rows (and
+	 * their session files) are deleted so history stops growing forever. */
+	prune(keep: number, removeSessionFile: (file: string) => void) {
+		const rows: any[] = this.db
+			? this.db.prepare("SELECT id, session_file FROM sessions ORDER BY updated_at DESC").all()
+			: [...this.json.sessions].sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
+		for (const row of rows.slice(keep)) {
+			this.safe("remove", () => this.remove(String(row.id)));
+			if (row.session_file) removeSessionFile(String(row.session_file));
+		}
+		return rows.length - Math.min(rows.length, keep);
+	}
+	/** Persistence is best-effort: the in-memory session always survives,
+	 * so store failures are logged and swallowed rather than crashing an
+	 * exit callback or aborting shutdown teardown mid-sequence. */
+	safe(label: string, action: () => void) {
+		try { action(); } catch (error) { console.error(`[pif] session store ${label} failed:`, (error as Error)?.message ?? error); }
+	}
 	upsert(session: PifSession) {
 		const now = new Date().toISOString();
 		if (this.db) {
-			this.db.prepare("INSERT INTO sessions (id, name, model, thinking, cwd, session_file, transcript, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, model = excluded.model, thinking = excluded.thinking, transcript = excluded.transcript, updated_at = excluded.updated_at")
-				.run(session.id, session.name, session.model, session.thinking, session.cwd, session.sessionFile ?? null, JSON.stringify(session.transcript), now, now);
+			this.db.prepare("INSERT INTO sessions (id, name, model, thinking, cwd, session_file, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, model = excluded.model, thinking = excluded.thinking, updated_at = excluded.updated_at")
+				.run(session.id, session.name, session.model, session.thinking, session.cwd, session.sessionFile ?? null, now, now);
 		} else {
-			const record = { id: session.id, name: session.name, model: session.model, thinking: session.thinking, cwd: session.cwd, session_file: session.sessionFile ?? null, transcript: session.transcript, created_at: now, updated_at: now };
+			const record = { id: session.id, name: session.name, model: session.model, thinking: session.thinking, cwd: session.cwd, session_file: session.sessionFile ?? null, created_at: now, updated_at: now };
 			const at = this.json.sessions.findIndex((row) => row.id === session.id);
-			if (at >= 0) this.json.sessions[at] = { ...this.json.sessions[at], ...record }; else this.json.sessions.push(record);
+			if (at >= 0) this.json.sessions[at] = { ...this.json.sessions[at], ...record, created_at: this.json.sessions[at].created_at ?? now }; else this.json.sessions.push(record);
 			this.saveJson();
 		}
 	}
@@ -82,7 +118,12 @@ class SessionStore {
 		if (this.db) return this.db.prepare("SELECT * FROM sessions ORDER BY updated_at DESC").all();
 		return [...this.json.sessions].sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
 	}
-	private saveJson() { fs.mkdirSync(this.pifDir, { recursive: true }); fs.writeFileSync(this.jsonPath, JSON.stringify(this.json, null, 2) + "\n"); }
+	private saveJson() {
+		fs.mkdirSync(this.pifDir, { recursive: true });
+		const temp = `${this.jsonPath}.tmp`;
+		fs.writeFileSync(temp, JSON.stringify(this.json, null, 2) + "\n");
+		fs.renameSync(temp, this.jsonPath);
+	}
 }
 
 class WsPeer {
@@ -91,7 +132,10 @@ class WsPeer {
 		socket.on("data", (chunk) => this.read(chunk)); socket.on("close", onClose); socket.on("error", onClose);
 	}
 	send(value: unknown) {
-		const payload = Buffer.from(JSON.stringify(value));
+		this.sendRaw(Buffer.from(JSON.stringify(value)));
+	}
+	/** Pre-serialized frame body (used to stringify once per broadcast). */
+	sendRaw(payload: Buffer) {
 		let header: Buffer;
 		if (payload.length < 126) header = Buffer.from([0x81, payload.length]);
 		else if (payload.length <= 0xffff) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 126; header.writeUInt16BE(payload.length, 2); }
@@ -163,6 +207,7 @@ class PifHub {
 	readonly state: HubState;
 	readonly modelsPath: string;
 	readonly token: string;
+	private controlSecret = "";
 	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
@@ -186,17 +231,23 @@ class PifHub {
 		if (this.httpServer) return;
 		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
 		await this.store.init();
-		fs.writeFileSync(path.join(this.pifDir, "token"), this.token, { mode: 0o600 }); try { fs.chmodSync(path.join(this.pifDir, "token"), 0o600); } catch { /* perms best-effort */ }
+		// Ephemeral control-socket credential: same-user processes can read
+		// any 0600 file, but requiring a per-launch secret in the handshake
+		// stops accidental/unwitting tool calls from other local processes.
+		this.controlSecret = crypto.randomBytes(32).toString("hex");
+		const tokenPath = path.join(this.pifDir, "token");
+		fs.writeFileSync(`${tokenPath}.tmp`, this.token, { mode: 0o600 }); fs.renameSync(`${tokenPath}.tmp`, tokenPath);
+		try { fs.chmodSync(tokenPath, 0o600); fs.writeFileSync(path.join(this.pifDir, "control.secret"), this.controlSecret, { mode: 0o600 }); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
-		this.createHostSession(); this.loadPersistedSessions(); await this.startWebSocket(); await this.startControl();
+		this.createHostSession(); this.prunePersistedSessions(); this.loadPersistedSessions(); await this.startWebSocket(); await this.startControl();
 		this.state.health.hub = "running"; this.setStatus(); this.broadcastSnapshot();
 		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token });
 	}
 	async stop() {
 		for (const child of this.children.values()) this.terminateChild(child);
-		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.upsert(session);
+		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.safe("upsert", () => this.store.upsert(session));
 		this.children.clear(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
 		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
@@ -219,16 +270,37 @@ class PifHub {
 		const matches = this.state.models.filter((candidate) => candidate.endsWith(`/${model}`));
 		return matches.length === 1 ? matches[0] : model;
 	}
+	/** Retention: keep the newest sessions per workspace so the store and
+	 * its session files stop growing forever. */
+	private prunePersistedSessions() {
+		const keep = Number(process.env.PIF_SESSION_RETENTION) || 50;
+		this.store.safe("prune", () => this.store.prune(keep, (file) => { try { fs.rmSync(file, { force: true }); } catch { /* absent */ } }));
+	}
 	/** Restored child sessions from the store: read-only history — their
-	 * processes are gone, so they load as ended. */
+	 * processes are gone, so they load as ended. Only metadata rows are
+	 * read; transcripts hydrate lazily from the session `.jsonl` (the
+	 * source of truth) on first selection/resume. */
 	private loadPersistedSessions() {
 		for (const row of this.store.list()) {
 			const id = String(row.id);
 			if (id === "host" || this.state.sessions[id]) continue;
-			let transcript: unknown[] = [];
-			try { const parsed = JSON.parse(String(row.transcript ?? "[]")); if (Array.isArray(parsed)) transcript = parsed; } catch { /* corrupt */ }
-			this.state.sessions[id] = { id, name: String(row.name ?? "Agent"), host: false, state: "ended", model: String(row.model ?? "default"), thinking: String(row.thinking ?? "medium"), cwd: String(row.cwd ?? this.workspace), transcript, sessionFile: row.session_file ? String(row.session_file) : undefined, exit: { code: null, signal: null } };
+			this.state.sessions[id] = { id, name: String(row.name ?? "Agent"), host: false, state: "ended", model: String(row.model ?? "default"), thinking: String(row.thinking ?? "medium"), cwd: String(row.cwd ?? this.workspace), transcript: [], sessionFile: row.session_file ? String(row.session_file) : undefined, exit: { code: null, signal: null }, hydrated: false };
 		}
+	}
+	/** Fill a session's transcript from its `.jsonl` file once. The file is
+	 * authoritative: the DB never stored transcripts after v2, and resume
+	 * already replays it. Falls back to an empty history when absent. */
+	private hydrateTranscript(session: PifSession) {
+		if ((session as any).hydrated) return;
+		(session as any).hydrated = true;
+		if (!session.sessionFile || session.transcript.length) return;
+		try {
+			const lines = fs.readFileSync(session.sessionFile, "utf8").split("\n").filter(Boolean);
+			for (const line of lines) {
+				let value: any; try { value = JSON.parse(line); } catch { continue; }
+				session.transcript.push({ ...this.normalizeEntry(String(value.type ?? "event"), value), ts: value.ts ?? new Date().toISOString() });
+			}
+		} catch { /* absent or unreadable — keep empty */ }
 	}
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
@@ -237,7 +309,19 @@ class PifHub {
 	}
 	private startWebSocket() {
 		return new Promise<void>((resolve, reject) => {
-			const server = http.createServer((_req, res) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ name: "pif", status: this.state.health })); });
+			// Health discloses only identity + coarse state — never the
+			// absolute workspace path. /probe proves hub identity: it echoes
+			// an HMAC of the caller's nonce under the hub token, so a port
+			// squatter cannot pass itself off as our hub.
+			const server = http.createServer((req, res) => {
+				const url = new URL(req.url ?? "/", "http://127.0.0.1");
+				res.writeHead(200, { "content-type": "application/json" });
+				if (url.pathname === "/probe") {
+					const nonce = String(url.searchParams.get("nonce") ?? "");
+					return res.end(JSON.stringify({ name: "pif", nonce, proof: nonce ? pifProbeProof(nonce, this.token) : null }));
+				}
+				res.end(JSON.stringify({ name: "pif", status: { hub: this.state.health.hub } }));
+			});
 			server.on("upgrade", (req, socket) => {
 				const pathname = (req.url ?? "/").split("?")[0];
 				if (pathname !== "/pif" || !req.headers["sec-websocket-key"]) return socket.destroy();
@@ -256,21 +340,54 @@ class PifHub {
 		return new Promise<void>((resolve, reject) => {
 			try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
 			const server = net.createServer((socket) => {
-				let input = ""; socket.on("data", (chunk) => { input += chunk; const at = input.indexOf("\n"); if (at < 0) return; const raw = input.slice(0, at); input = input.slice(at + 1); Promise.resolve().then(async () => { const req = JSON.parse(raw); return this.control(req.method, req.params ?? {}); }).then((result) => socket.end(JSON.stringify({ ok: true, result }) + "\n"), (error) => socket.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }) + "\n")); });
+				let input = ""; let authorized = false; socket.on("data", (chunk) => {
+					input += chunk;
+					if (!authorized) {
+						// Handshake line must carry the per-launch control
+						// secret; everything else is rejected and dropped.
+						const at = input.indexOf("\n"); if (at < 0) return;
+						const first = input.slice(0, at); input = input.slice(at + 1);
+						let secret: unknown = null; try { secret = JSON.parse(first).secret; } catch { /* malformed */ }
+						const expected = Buffer.from(this.controlSecret), provided = Buffer.from(String(secret ?? ""));
+						if (expected.length !== provided.length || !crypto.timingSafeEqual(expected, provided)) {
+							socket.end(JSON.stringify({ ok: false, error: "control socket authorization failed" }) + "\n", () => socket.destroy());
+							return;
+						}
+						authorized = true; if (!input.trim()) return;
+					}
+					const at = input.indexOf("\n"); if (at < 0) return; const raw = input.slice(0, at); input = input.slice(at + 1); Promise.resolve().then(async () => { const req = JSON.parse(raw); return this.control(req.method, req.params ?? {}); }).then((result) => socket.end(JSON.stringify({ ok: true, result }) + "\n"), (error) => socket.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }) + "\n"));
+				});
 			});
 			server.once("error", reject); server.listen(this.controlPath, () => { server.off("error", reject); this.controlServer = server; try { fs.chmodSync(this.controlPath, 0o600); } catch { /* perms best-effort */ } resolve(); });
 		});
 	}
 	private snapshotEnvelope() { return createEnvelope("shell/state", "snapshot", this.snapshot()); }
-	snapshot() { return JSON.parse(JSON.stringify(this.state)); }
+	/** Wire snapshot: rail metadata only. Transcripts ship separately via
+	 * `session/transcript` so payload size stays independent of total
+	 * history (deep-cloning every session's full transcript on every
+	 * connect/broadcast froze the hub for seconds on long histories). */
+	snapshot() {
+		const state = JSON.parse(JSON.stringify({ ...this.state, sessions: {} })) as HubState;
+		for (const [id, session] of Object.entries(this.state.sessions)) {
+			const { transcript, ...meta } = session;
+			state.sessions[id] = { ...meta, transcript: [] } as PifSession;
+		}
+		return state as unknown as Record<string, unknown>;
+	}
+	sessionTranscript(id: string) { const s = this.state.sessions[id]; if (!s) throw new Error(`Unknown session ${id}`); this.hydrateTranscript(s); return { sessionId: id, transcript: s.transcript }; }
 	private broadcastSnapshot() { this.send(this.snapshotEnvelope()); }
 	broadcast(channel: PifEnvelope["channel"], type: string, payload: unknown) { this.send(createEnvelope(channel, type, payload)); }
-	private send(env: PifEnvelope) { for (const peer of this.peers) peer.send(env); }
+	private send(env: PifEnvelope) {
+		if (!this.peers.size) return;
+		const payload = Buffer.from(JSON.stringify(env));
+		for (const peer of this.peers) peer.sendRaw(payload);
+	}
 	private async receive(raw: string, peer: WsPeer) {
-		let env: PifEnvelope; try { env = decodeEnvelope(raw); } catch (error) { peer.send(createEnvelope("shell/error", "invalid_envelope", { error: String(error) })); return; }
+		let env: PifEnvelope; try { env = decodeEnvelope(raw); } catch (error) { peer.send(createEnvelope("shell/error", "invalid_envelope", { requestId: null, error: String(error) })); return; }
 		try {
 			if (env.channel === "shell/state" && env.type === "snapshot_request") return peer.send(this.snapshotEnvelope());
 			if (env.channel === "shell/state" && env.type === "shutdown_request") return void this.shutdown();
+			if (env.channel === "session/control" && env.type === "transcript") return peer.send(createEnvelope("session/transcript", "history", this.sessionTranscript((env.payload as any)?.sessionId)));
 			if (env.channel.startsWith("session/")) await this.sessionAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
@@ -296,9 +413,30 @@ class PifHub {
 			return { type: "message_update", delta: "" };
 		}
 		if (type.includes("tool")) return { type, toolName: String(p.toolName ?? p.name ?? "tool"), toolCallId: String(p.toolCallId ?? p.id ?? ""), args: p.args ? JSON.stringify(p.args).slice(0, 300) : undefined, result: p.result ? String(p.result).slice(0, 300) : undefined };
-		if (type === "agent_start" || type === "agent_end") return { type, state: type === "agent_start" ? "running" : "idle", ...(p.aborted !== undefined ? { aborted: Boolean(p.aborted) } : {}) };
+		if (type === "agent_start" || type === "agent_end") {
+			// Surface the model id and cumulative token usage pi already
+			// reports so the shell status bar shows real data.
+			const usage = p.usage?.totalTokens ?? p.message?.usage?.totalTokens;
+			return {
+				type,
+				state: type === "agent_start" ? "running" : "idle",
+				...(p.aborted !== undefined ? { aborted: Boolean(p.aborted) } : {}),
+				...(this.ctxModelId() ? { model: this.ctxModelId() } : {}),
+				...(usage != null ? { usage: { totalTokens: Number(usage) } } : {}),
+			};
+		}
 		if (type === "stderr" || type === "output") return { type, data: String(p.data ?? p).slice(0, 500) };
 		return { type, data: JSON.stringify(p).slice(0, 500) };
+	}
+	private ctxModelId(): string | undefined {
+		const model = (this.ctx as any)?.model;
+		return typeof model?.id === "string" && model.id ? model.id : undefined;
+	}
+	/** Rail-level metadata for a session: everything except the transcript
+	 * (which ships on demand via session/transcript). */
+	private sessionPatch(session: PifSession) {
+		const { transcript, ...meta } = session;
+		return meta;
 	}
 	private async sessionAction(type: string, payload: any) {
 		if (type === "spawn") return this.spawnSession(payload);
@@ -312,13 +450,13 @@ class PifHub {
 		if (type === "rename") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
 			const name = String(payload.name ?? "").trim().slice(0, 80); if (!name) throw new Error("Session name is required");
-			session.name = name; if (id === "host") this.savePrefs({ name }); else this.store.upsert(session); this.broadcast("session/state", "updated", session); return session;
+			session.name = name; if (id === "host") this.savePrefs({ name }); else this.store.safe("upsert", () => this.store.upsert(session)); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (type === "delete") {
 			if (id === "host") throw new Error("The host session cannot be deleted");
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
 			const child = this.children.get(id); if (child) { this.children.delete(id); this.terminateChild(child); }
-			this.store.remove(id);
+			this.store.safe("remove", () => this.store.remove(id));
 			if (session.sessionFile) { try { fs.rmSync(session.sessionFile, { force: true }); } catch { /* absent */ } }
 			delete this.state.sessions[id];
 			this.broadcast("session/state", "removed", { sessionId: id });
@@ -326,11 +464,11 @@ class PifHub {
 		}
 		if (type === "setModel") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
-			session.model = String(payload.model ?? ""); if (id === "host") this.savePrefs({ model: session.model }); this.broadcast("session/state", "updated", session); return session;
+			session.model = String(payload.model ?? ""); if (id === "host") this.savePrefs({ model: session.model }); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (type === "setThinking") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
-			session.thinking = String(payload.thinking ?? "medium"); if (id === "host") this.savePrefs({ thinking: session.thinking }); this.broadcast("session/state", "updated", session); return session;
+			session.thinking = String(payload.thinking ?? "medium"); if (id === "host") this.savePrefs({ thinking: session.thinking }); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (id === "host") {
 			if (type === "abort") return (this.ctx as any).abort?.();
@@ -353,16 +491,30 @@ class PifHub {
 		const thinking = String(payload.thinking || prefs.thinking || "medium");
 		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile]; if (model) args.push("--model", model); if (thinking && thinking !== "none") args.push("--thinking", thinking);
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
-		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.upsert(session);
+		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.safe("upsert", () => this.store.upsert(session));
 		this.wireChild(session, child);
-		this.broadcast("session/state", "created", session); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
+		this.broadcast("session/state", "created", this.sessionPatch(session)); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
 		return session;
 	}
 	/** (Re)attach event wiring for a live child process. */
 	private wireChild(session: PifSession, child: ChildProcessWithoutNullStreams) {
 		let output = ""; child.stdout.on("data", (chunk) => { output += chunk; let at; while ((at = output.indexOf("\n")) >= 0) { const line = output.slice(0, at).trim(); output = output.slice(at + 1); if (line) this.childEvent(session, line); } });
 		child.stderr.on("data", (chunk) => this.childEvent(session, JSON.stringify({ type: "stderr", data: chunk.toString() })));
-		child.on("exit", (code, signal) => { this.children.delete(session.id); session.state = "ended"; session.exit = { code, signal }; this.store.upsert(session); this.broadcast("session/state", "ended", session); });
+		child.on("error", (error) => {
+			// Spawn failure (missing binary, bad args): 'exit' may never fire,
+			// so without this the card shows idle forever and blocks re-resume.
+			this.children.delete(session.id); session.state = "ended"; session.exit = { code: null, signal: null };
+			this.store.safe("upsert", () => this.store.upsert(session));
+			this.broadcast("session/state", "ended", { ...this.sessionPatch(session), error: String(error) });
+		});
+		child.on("exit", (code, signal) => {
+			this.children.delete(session.id); session.state = "ended"; session.exit = { code, signal };
+			// The session was deleted while the child was still dying
+			// (SIGTERM is async) — upserting here would resurrect its row.
+			if (this.state.sessions[session.id] !== session) return;
+			this.store.safe("upsert", () => this.store.upsert(session));
+			this.broadcast("session/state", "ended", this.sessionPatch(session));
+		});
 	}
 	resumeSession(payload: any) {
 		const id = String(payload.sessionId ?? ""); const session = this.state.sessions[id];
@@ -376,11 +528,12 @@ class PifHub {
 		const args = ["--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", session.sessionFile, "--name", session.name];
 		if (model) args.push("--model", model); if (session.thinking && session.thinking !== "none") args.push("--thinking", session.thinking);
 		const child = spawn(process.env.PIF_PI_BIN || "pi", args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
+		this.hydrateTranscript(session);
 		session.state = "idle"; session.exit = undefined;
 		this.children.set(id, child);
 		this.wireChild(session, child);
-		this.store.upsert(session);
-		this.broadcast("session/state", "updated", session);
+		this.store.safe("upsert", () => this.store.upsert(session));
+		this.broadcast("session/state", "updated", this.sessionPatch(session));
 		return session;
 	}
 	private childEvent(session: PifSession, line: string) {
@@ -389,7 +542,13 @@ class PifHub {
 		const entry = { ...this.normalizeEntry(kind, event), ts: event.ts ?? new Date().toISOString() }; session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
 	}
 	private loadLayout() { try { this.state.layout = JSON.parse(fs.readFileSync(this.layoutPath, "utf8")); } catch { this.state.layout = { panels: {} }; } }
-	private saveLayout() { fs.mkdirSync(path.dirname(this.layoutPath), { recursive: true }); fs.writeFileSync(this.layoutPath, JSON.stringify(this.state.layout, null, 2) + "\n"); }
+	private saveLayout() {
+		// `action` (focus/open) is ephemeral — persisting it re-focuses the
+		// same tab on every future launch. Strip it from the copy on disk.
+		const panels = (this.state.layout as any).panels;
+	 const persisted = panels && typeof panels === "object" ? { ...this.state.layout, panels: Object.fromEntries(Object.entries(panels).map(([id, record]) => [id, { ...(record as any), action: undefined }])) } : this.state.layout;
+	 fs.mkdirSync(path.dirname(this.layoutPath), { recursive: true }); fs.writeFileSync(this.layoutPath, JSON.stringify(persisted, null, 2) + "\n");
+	}
 	private loadRegistryState() { try { const saved = JSON.parse(fs.readFileSync(this.registryStatePath, "utf8")); this.enabled = new Set(Array.isArray(saved.enabled) ? saved.enabled : []); } catch { this.enabled = new Set(); } }
 	private saveRegistryState() { fs.mkdirSync(path.dirname(this.registryStatePath), { recursive: true }); fs.writeFileSync(this.registryStatePath, JSON.stringify({ enabled: [...this.enabled].sort() }, null, 2) + "\n"); }
 	private async layoutAction(type: string, payload: any) {
@@ -512,7 +671,9 @@ let hub: PifHub | null = null;
 async function callControl(workspace: string, method: string, params: unknown) {
 	if (hub) return hub.control(method, params);
 	const socketPath = path.join(workspace, ".pi", "pif", "control.sock");
-	return new Promise<any>((resolve, reject) => { const socket = net.createConnection(socketPath); let raw = ""; socket.on("connect", () => socket.write(JSON.stringify({ method, params }) + "\n")); socket.on("data", (chunk) => raw += chunk); socket.on("end", () => { try { const result = JSON.parse(raw); result.ok ? resolve(result.result) : reject(new Error(result.error)); } catch (error) { reject(error); } }); socket.on("error", reject); });
+	let secret = "";
+	try { secret = fs.readFileSync(path.join(workspace, ".pi", "pif", "control.secret"), "utf8").trim(); } catch { /* absent — handshake will fail */ }
+	return new Promise<any>((resolve, reject) => { const socket = net.createConnection(socketPath); let raw = ""; socket.on("connect", () => socket.write(JSON.stringify({ secret }) + "\n" + JSON.stringify({ method, params }) + "\n")); socket.on("data", (chunk) => raw += chunk); socket.on("end", () => { try { const result = JSON.parse(raw); result.ok ? resolve(result.result) : reject(new Error(result.error)); } catch (error) { reject(error); } }); socket.on("error", reject); });
 }
 
 export default function pifExtension(pi: ExtensionAPI) {

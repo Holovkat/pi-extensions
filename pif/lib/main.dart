@@ -29,6 +29,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   String? _workspace;
   String? _adoptedWorkspace;
   StreamSubscription<PifEnvelope>? _busEvents;
+  StreamSubscription<bool>? _connectionEvents;
   Timer? _watchdog;
   bool _snapshotSeen = false;
   int _recoverAttempts = 0;
@@ -56,18 +57,17 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   }
 
   /// If a hub is already running (e.g. from a terminal pi session),
-  /// connect to it directly without showing the project picker. A
-  /// standalone-origin hub (left over from a previous app launch that
-  /// died without cleanup) is adopted so we shut it down on quit.
+  /// connect to it directly without showing the project picker. Only a
+  /// hub that proves possession of this workspace's token is adopted —
+  /// a foreign listener on the port is left alone entirely.
   Future<void> _checkExistingHub() async {
-    if (await PiLauncher.isHubRunning()) {
-      final bus = PifBus();
-      _bus = bus;
-      _watchBus(bus);
-      await bus.connect();
-      if (mounted) setState(() {});
-      _armWatchdog();
-    }
+    if ((await PiLauncher.probeHub()) != HubProbe.ours) return;
+    final bus = PifBus();
+    _bus = bus;
+    _watchBus(bus);
+    await bus.connect();
+    if (mounted) setState(() {});
+    _armWatchdog();
   }
 
   /// Called when the user selects a project in the picker.
@@ -82,14 +82,18 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     if (workspace == null) return;
     _launcher = PiLauncher();
     await _launcher!.start(workspace: workspace);
-    final ready = await PiLauncher.waitForHub(
-      timeout: const Duration(seconds: 20),
-    );
+    final ready = await PiLauncher.waitForHub(port: _launcher!.port);
     if (!ready) {
       await _cleanup();
       return _recover('hub did not start within 20 seconds');
     }
-    final bus = PifBus(token: _launcher!.token);
+    // The token file is the designed recovery path when an orphaned hub
+    // from a previous launch still holds the requested port and answers
+    // with its own token — resolve fresh instead of caching the minted
+    // one so upgrades never 401 against a hub we cannot restart.
+    final bus = PifBus(
+      tokenResolver: () => PiLauncher.resolveWorkspaceToken(workspace),
+    );
     _bus = bus;
     _watchBus(bus);
     await bus.connect();
@@ -112,6 +116,14 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
         if (mounted) setState(() {});
       }
     }, onError: (_) {});
+    // The hub can die long after startup: re-arm on every disconnect so
+    // recovery stays armed for the whole session, not just launch.
+    _connectionEvents?.cancel();
+    _connectionEvents = bus.connection.listen((connected) {
+      if (connected) return;
+      _snapshotSeen = false;
+      if (_launcher != null || _adoptedWorkspace != null) _armWatchdog();
+    });
   }
 
   /// The pi session is unhealthy if we are connected but no snapshot has
@@ -152,6 +164,8 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     _watchdog = null;
     await _busEvents?.cancel();
     _busEvents = null;
+    await _connectionEvents?.cancel();
+    _connectionEvents = null;
     // An adopted standalone hub (we connected, never spawned) is asked to
     // stop itself over the authenticated bus so it does not leak as an
     // orphan holding the port. Terminal-origin hubs are never touched.

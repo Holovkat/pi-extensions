@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pif/core/bus.dart';
 import 'package:pif/core/docking_shell.dart';
+import 'package:pif/core/plugin.dart';
 
 class MockHubBus extends PifBus {
   MockHubBus() : super(uri: Uri.parse('ws://mock.invalid/pif'));
@@ -152,6 +154,35 @@ Future<HubLikeServer> startHubLikeServer(int port, List<String> received) async 
 }
 
 void main() {
+  testWidgets('shell renders at tiny surface sizes without clamping exceptions', (
+    tester,
+  ) async {
+    // Below ~520px width / ~200px height the dock clamps used to invert
+    // (min > max) and throw ArgumentError inside build(); resizing alone
+    // crashed. Production keeps macOS above 720×480 via contentMinSize,
+    // but the shell itself must stay crash-free at any size — RenderFlex
+    // overflow stripes at absurd sizes are cosmetic and ignored here.
+    await tester.binding.setSurfaceSize(const Size(480, 180));
+    final previousOnError = FlutterError.onError;
+    FlutterError.onError = (details) {
+      if (!details.toString().contains('RenderFlex overflowed')) {
+        previousOnError?.call(details);
+      }
+    };
+    try {
+      final bus = MockHubBus();
+      await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+      bus.emitSnapshot();
+      await tester.pump();
+      await tester.pump();
+      expect(tester.takeException(), isNull);
+    } finally {
+      FlutterError.onError = previousOnError;
+      await tester.pumpWidget(const SizedBox());
+      await tester.binding.setSurfaceSize(null);
+    }
+  });
+
   test('PifBus queues sends while disconnected and flushes in order on reconnect', () async {
     const port = 31877;
     var server = await startHubLikeServer(port, []);
@@ -393,6 +424,70 @@ void main() {
     await tester.tap(find.byIcon(Icons.widgets));
     await tester.pumpAndSettle();
     expect(bus.sent, contains('widget/control:toggle'));
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('second widget dropped on the status slot is rejected', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    bus.emitSnapshot(
+      widgets: {
+        'agent_console': {'enabled': true},
+        'status_bar': {'enabled': true},
+      },
+    );
+    await tester.pumpAndSettle();
+    // Simulate dropping the console onto the status dock: the shell must
+    // refuse to route a second widget into the chromeless slot instead of
+    // orphaning it. move() is the handler both DragTargets call.
+    final shell = tester.state(find.byType(DockingShell)) as dynamic;
+    shell.move('agent_console', PifSlot.status);
+    await tester.pumpAndSettle();
+    expect(
+      find.text('Mock Host'),
+      findsOneWidget,
+      reason: 'the console stays in the center; status keeps only its widget',
+    );
+    expect(bus.sent, isNot(contains('shell/layout:move')));
+    await tester.pumpWidget(const SizedBox());
+    await tester.binding.setSurfaceSize(null);
+  });
+
+  testWidgets('Esc closes open overlays and does not commit renames', (
+    tester,
+  ) async {
+    await tester.binding.setSurfaceSize(const Size(1400, 900));
+    final bus = MockHubBus();
+    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    bus.emitSnapshot(
+      widgets: {
+        'agent_console': {'enabled': true},
+        'session_rail': {'enabled': true},
+        'widget_store': {'enabled': true},
+        'status_bar': {'enabled': true},
+      },
+      layout: {
+        'panels': {
+          'widget_store': {'pinned': false},
+        },
+      },
+    );
+    await tester.pumpAndSettle();
+
+    // The unpinned store renders as an overlay with a grabber on its side…
+    final grabber = find.byKey(const Key('pif_grabber_right_widget_store'));
+    expect(grabber, findsOneWidget);
+    await tester.tap(grabber);
+    await tester.pumpAndSettle();
+
+    // …then press Esc: the overlay barrier is gone.
+    await tester.sendKeyEvent(LogicalKeyboardKey.escape);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pif_overlay_barrier')), findsNothing);
     await tester.pumpWidget(const SizedBox());
     await tester.binding.setSurfaceSize(null);
   });

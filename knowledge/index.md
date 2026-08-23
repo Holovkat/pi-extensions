@@ -19,5 +19,5 @@
 ## Quick Links
 
 - [Update Log](./log.md)
-- [Knowledge Graph Viewer](./viewer.html) (open in Chrome)
+- [Knowledge Graph Viewer](./viz.html) (open in Chrome)
 - [OKF Standard](https://github.com/holovkat/designs/blob/main/templates/okf/OKF-STANDARD.md)

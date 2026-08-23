@@ -1,7 +1,21 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
+
+/// A hub-side rejection (shell/error envelope), correlated with the
+/// request that caused it when the hub echoed a known request id.
+class PifRequestError {
+  const PifRequestError({
+    required this.kind,
+    required this.message,
+    this.requestId,
+  });
+  final String kind;
+  final String message;
+  final String? requestId;
+}
 
 class PifEnvelope {
   const PifEnvelope({
@@ -94,6 +108,10 @@ class PifBus {
           });
   final _events = StreamController<PifEnvelope>.broadcast();
   final _connection = StreamController<bool>.broadcast();
+  /// Hub rejections (shell/error envelopes) correlated by the id of the
+  /// request envelope that caused them; uncorrelated errors surface with
+  /// a null request id.
+  final _errors = StreamController<PifRequestError>.broadcast();
   WebSocket? _socket;
   Timer? _retry;
   int _attempt = 0;
@@ -104,6 +122,7 @@ class PifBus {
 
   Stream<PifEnvelope> get events => _events.stream;
   Stream<bool> get connection => _connection.stream;
+  Stream<PifRequestError> get errors => _errors.stream;
   bool get connected => _socket != null;
   Stream<PifEnvelope> channel(String prefix) =>
       events.where((event) => event.channel.startsWith(prefix));
@@ -150,10 +169,28 @@ class PifBus {
   void _receive(dynamic raw) {
     try {
       final decoded = jsonDecode(raw as String) as Map<String, dynamic>;
-      _events.add(PifEnvelope.fromJson(decoded));
+      final envelope = PifEnvelope.fromJson(decoded);
+      if (envelope.channel == 'shell/error') {
+        _errors.add(
+          PifRequestError(
+            kind: envelope.type,
+            message: _errorMessage(envelope.payload),
+            requestId:
+                (envelope.payload as Map?)?['requestId'] as String?,
+          ),
+        );
+      }
+      _events.add(envelope);
     } catch (error, stack) {
       _events.addError(error, stack);
     }
+  }
+
+  static String _errorMessage(Object? payload) {
+    if (payload is Map && payload['error'] is String) {
+      return payload['error'] as String;
+    }
+    return 'hub request failed';
   }
 
   void _disconnected() {
@@ -179,6 +216,8 @@ class PifBus {
       payload: payload,
     );
     final raw = jsonEncode(envelope.toJson());
+    _sentRequestIds.add(envelope.id);
+    if (_sentRequestIds.length > 200) _sentRequestIds.removeFirst();
     final socket = _socket;
     if (socket != null) {
       socket.add(raw);
@@ -186,6 +225,10 @@ class PifBus {
       _enqueue(raw);
     }
   }
+
+  /// Ids of recently sent request envelopes, bounded, so shell/error
+  /// payloads can be correlated back to what the user asked for.
+  final ListQueue<String> _sentRequestIds = ListQueue();
 
   /// Envelopes sent while disconnected are queued and flushed in order on
   /// reconnect, so user input typed during a hub restart is never lost
@@ -209,5 +252,6 @@ class PifBus {
     await socket?.close();
     await _events.close();
     await _connection.close();
+    await _errors.close();
   }
 }

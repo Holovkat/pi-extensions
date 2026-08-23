@@ -24,6 +24,7 @@ class _SessionRail extends StatefulWidget {
 
 class _SessionRailState extends State<_SessionRail> {
   late StreamSubscription subscription;
+  late StreamSubscription escapes;
   String? renamingId;
   final renameController = TextEditingController();
   final renameFocus = FocusNode();
@@ -33,6 +34,10 @@ class _SessionRailState extends State<_SessionRail> {
     renameFocus.addListener(() {
       if (!renameFocus.hasFocus && renamingId != null) _commitRename();
     });
+    // Esc cancels the rename instead of committing on focus loss.
+    escapes = widget.host.escapes.listen((_) {
+      if (renamingId != null) _cancelRename();
+    });
     subscription = widget.host.sessions.changes.listen((_) {
       if (mounted) setState(() {});
     });
@@ -41,6 +46,7 @@ class _SessionRailState extends State<_SessionRail> {
   @override
   void dispose() {
     subscription.cancel();
+    escapes.cancel();
     renameController.dispose();
     renameFocus.dispose();
     super.dispose();
@@ -53,6 +59,11 @@ class _SessionRailState extends State<_SessionRail> {
     if (id != null && name.isNotEmpty) {
       widget.host.sessions.rename(id, name);
     }
+  }
+
+  void _cancelRename() {
+    setState(() => renamingId = null);
+    renameController.clear();
   }
 
   Future<void> _cardMenu(Offset position, PifSession session) async {
@@ -205,13 +216,17 @@ class _SessionRailState extends State<_SessionRail> {
             padding: const EdgeInsets.fromLTRB(14, 14, 8, 8),
             child: Row(
               children: [
-                const Text(
-                  'SESSIONS',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w300,
-                    letterSpacing: 1.2,
-                    color: Color(0xff8b96aa),
+                const Flexible(
+                  child: Text(
+                    'SESSIONS',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w300,
+                      letterSpacing: 1.2,
+                      color: Color(0xff8b96aa),
+                    ),
                   ),
                 ),
                 const Spacer(),

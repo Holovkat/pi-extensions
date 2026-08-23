@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../widget_registry.g.dart';
 import 'bus.dart';
 import 'panel_error_boundary.dart';
@@ -19,6 +20,7 @@ class _DockingShellState extends State<DockingShell>
     with TickerProviderStateMixin {
   late final PifHost host;
   late StreamSubscription events;
+  late StreamSubscription errors;
   final slotOverrides = <String, PifSlot>{};
   final hiddenPanels = <String>{};
   // Unpinned panels leave the layout (neighbours reclaim the space) and
@@ -42,6 +44,11 @@ class _DockingShellState extends State<DockingShell>
   static const double _defaultLeft = 230;
   static const double _defaultRight = 300;
   static const double _defaultBottom = 245;
+  // Center stage reserved between the side docks and above the bottom
+  // dock; below these surface sizes the clamps would invert.
+  static const double _centerMinWidth = 240;
+  static const double _bottomTopGap = 120;
+  static const double _maxOverlayWidth = 520;
   double _left = _defaultLeft;
   double _right = _defaultRight;
   double _bottom = _defaultBottom;
@@ -58,11 +65,27 @@ class _DockingShellState extends State<DockingShell>
           widget.workspace ?? Platform.environment['PIF_WORKSPACE'] ?? Directory.current.path;
     host.storage.workspace = host.workspace;
     events = widget.bus.events.listen(_event, onError: (_) {});
+    errors = widget.bus.errors.listen(_showError);
     widget.bus.connect();
     // The snapshot triggered by connect() can arrive before this shell
     // subscribed (broadcast streams do not replay); ask again now that the
     // listener is attached so state always lands.
     widget.bus.send('shell/state', 'snapshot_request', const {});
+  }
+
+  /// Hub rejections (failed resume, unknown session, rejected save…) were
+  /// previously invisible; surface each one as actionable feedback.
+  void _showError(PifRequestError error) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..clearSnackBars()
+      ..showSnackBar(
+        SnackBar(
+          content: Text(error.message, style: const TextStyle(fontSize: 12)),
+          behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 4),
+        ),
+      );
   }
 
   void _applyLayout(Map<String, dynamic> layout) {
@@ -84,7 +107,14 @@ class _DockingShellState extends State<DockingShell>
       final slot = value['slot'] as String?;
       if (value['open'] == false) hiddenPanels.add(entry.key);
       if (value['pinned'] == false) {
-        unpinnedIds.add(entry.key);
+        // Only side-slot widgets have overlays and grabbers; a persisted
+        // unpinned flag on any other widget would strand it invisibly.
+        final slot = value['slot'] as String?;
+        final pinnableSlot =
+            slot == 'left' || slot == 'right' || slot == null;
+        if (pinnableSlot && _pinnableIds.contains(entry.key)) {
+          unpinnedIds.add(entry.key);
+        }
       } else {
         unpinnedIds.remove(entry.key);
         slidIn.remove(entry.key);
@@ -159,6 +189,15 @@ class _DockingShellState extends State<DockingShell>
         envelope.type == 'selected') {
       final payload = Map<String, dynamic>.from(envelope.payload as Map);
       host.activeSessionId = payload['sessionId'] as String? ?? 'host';
+      host.requestTranscript(host.activeSessionId);
+      if (mounted) setState(() {});
+    } else if (envelope.channel == 'session/transcript' &&
+        envelope.type == 'history') {
+      // Lazy hydration: the hub read the authoritative `.jsonl` for us.
+      final payload = Map<String, dynamic>.from(envelope.payload as Map);
+      final sessionId = payload['sessionId'] as String? ?? '';
+      final transcript = (payload['transcript'] as List?) ?? const [];
+      host.sessions.replaceTranscript(sessionId, transcript);
       if (mounted) setState(() {});
     } else if (envelope.channel == 'session/state' &&
         envelope.type == 'removed') {
@@ -180,6 +219,8 @@ class _DockingShellState extends State<DockingShell>
   @override
   void dispose() {
     events.cancel();
+    errors.cancel();
+    _escapeFocus.dispose();
     widget.bus.dispose();
     super.dispose();
   }
@@ -204,6 +245,9 @@ class _DockingShellState extends State<DockingShell>
   }
 
   void move(String id, PifSlot slot) {
+    // The status dock renders chromeless: a second widget dropped there
+    // would be unreachable (no tab strip, no header). Reject instead.
+    if (slot == PifSlot.status && inSlot(PifSlot.status).isNotEmpty) return;
     setState(() => slotOverrides[id] = slot);
     host.layout.move(id, slot);
   }
@@ -289,7 +333,11 @@ class _DockingShellState extends State<DockingShell>
         rightWidgets = inSlot(PifSlot.right),
         bottomWidgets = inSlot(PifSlot.bottom),
         statusWidgets = inSlot(PifSlot.status);
-    return Scaffold(
+    return KeyboardListener(
+      focusNode: _escapeFocus,
+      autofocus: true,
+      onKeyEvent: _handleEscapeKey,
+      child: Scaffold(
       body: Column(
         children: [
           _titleBar(),
@@ -299,14 +347,20 @@ class _DockingShellState extends State<DockingShell>
                 LayoutBuilder(
                   builder: (context, constraints) {
                 // Keep the center stage livable no matter how far the
-                // dividers are dragged.
-                final maxSide = (constraints.maxWidth - 240) / 2;
+                // dividers are dragged. Upper bounds are floored at the
+                // minimums so a tiny window can never produce reversed
+                // (min > max) clamps, which throw inside build().
+                final maxSide = math.max(
+                  _minSide,
+                  (constraints.maxWidth - _centerMinWidth) / 2,
+                );
+                final maxBottom = math.max(
+                  _minBottom,
+                  constraints.maxHeight - _bottomTopGap,
+                );
                 final left = _left.clamp(_minSide, maxSide);
                 final right = _right.clamp(_minSide, maxSide);
-                final bottom = _bottom.clamp(
-                  _minBottom,
-                  constraints.maxHeight - 120,
-                );
+                final bottom = _bottom.clamp(_minBottom, maxBottom);
                 return Row(
                   children: [
                     // Docks with no visible widgets collapse so adjacent
@@ -354,7 +408,7 @@ class _DockingShellState extends State<DockingShell>
                                 onDelta: (dy) => setState(
                                   () => _bottom = (_bottom - dy).clamp(
                                     _minBottom,
-                                    constraints.maxHeight - 120,
+                                    maxBottom,
                                   ),
                                 ),
                                 onReset: () =>
@@ -412,7 +466,22 @@ class _DockingShellState extends State<DockingShell>
             ),
         ],
       ),
+    ),
     );
+  }
+
+  final FocusNode _escapeFocus = FocusNode();
+
+  /// Esc cancels the transient UI states: open overlays slide back out,
+  /// and widgets with active inline renames are told to cancel via the
+  /// bus-scoped escape stream.
+  void _handleEscapeKey(KeyEvent event) {
+    if (event is! KeyDownEvent ||
+        event.logicalKey != LogicalKeyboardKey.escape) {
+      return;
+    }
+    if (slidIn.isNotEmpty) setState(slidIn.clear);
+    host.escape();
   }
 
   /// Slide-in overlay panels for unpinned widgets, anchored to the edge
@@ -427,7 +496,7 @@ class _DockingShellState extends State<DockingShell>
       if (side != PifSlot.left && side != PifSlot.right) continue;
       final open = slidIn.contains(id);
       final width = (side == PifSlot.left ? _left : _right)
-          .clamp(_minSide, 520)
+          .clamp(_minSide, math.max(_minSide, _maxOverlayWidth))
           .toDouble();
       overlays.add(
         Positioned(
@@ -587,12 +656,16 @@ class _DockingShellState extends State<DockingShell>
           style: TextStyle(fontWeight: FontWeight.w300, letterSpacing: 1),
         ),
         const SizedBox(width: 10),
-        const Text(
-          'PI-NATIVE AGENTIC IDE',
-          style: TextStyle(
-            fontSize: 10,
-            letterSpacing: 1.4,
-            color: Color(0xff69758a),
+        Flexible(
+          child: Text(
+            'PI-NATIVE AGENTIC IDE',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 10,
+              letterSpacing: 1.4,
+              color: Color(0xff69758a),
+            ),
           ),
         ),
         const Spacer(),
@@ -724,9 +797,7 @@ class _DockingShellState extends State<DockingShell>
             ),
           ],
         ),
-      );
-
-  /// Tabbed panels have no panel-header chrome, so the tab itself is the
+      );  /// Tabbed panels have no panel-header chrome, so the tab itself is the
   /// drag affordance for moving the widget to another slot.
   Widget _draggableTab(PifWidgetPlugin plugin) => Draggable<String>(
     data: plugin.meta.id,
@@ -801,9 +872,13 @@ class _DockingShellState extends State<DockingShell>
         children: [
           const Icon(Icons.drag_indicator, size: 14, color: Color(0xff69758a)),
           const SizedBox(width: 5),
-          Text(
-            plugin.meta.name,
-            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
+          Flexible(
+            child: Text(
+              plugin.meta.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
+            ),
           ),
           const Spacer(),
           if (_pinnable(plugin))

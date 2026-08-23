@@ -345,7 +345,7 @@ void main() {
     expect(find.byIcon(Icons.code), findsOneWidget);
     await bus.dispose();
   });
-  test('session deltas are idempotent by envelope id', () {
+  test('session deltas are idempotent by envelope id', () async {
     final bus = FakeBus();
     final sessions = PifSessions(bus);
     sessions.applySnapshot({
@@ -359,6 +359,10 @@ void main() {
         'transcript': <dynamic>[],
       },
     });
+    var emissions = 0;
+    sessions.changes.listen((_) => emissions++);
+    // Snapshots ship rail metadata; transcripts stream separately, so a
+    // pure delta event updates state without touching the transcript.
     final payload = {
       'sessionId': 'host',
       'state': 'running',
@@ -366,7 +370,17 @@ void main() {
     };
     sessions.applyEvent(payload, envelopeId: 'same');
     sessions.applyEvent(payload, envelopeId: 'same');
-    expect(sessions.current.single.transcript, hasLength(1));
+    await Future<void>.delayed(Duration.zero);
+    expect(emissions, 1, reason: 'duplicate envelope must be dropped');
+    // Metadata patches rename without duplicating the session card.
+    sessions.applyEvent({
+      'id': 'host',
+      'name': 'Renamed',
+      'state': 'idle',
+    });
+    await Future<void>.delayed(Duration.zero);
+    expect(sessions.current.single.name, 'Renamed');
+    expect(sessions.current, hasLength(1));
   });
   testWidgets('Session Rail pins host and exposes New Session', (tester) async {
     final bus = FakeBus();

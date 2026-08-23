@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
-import { createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifUpgradeAuthorized } from './pif-shared.ts';
+import { __test as __shared, createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 
@@ -34,13 +34,21 @@ test('widget path guard line-stops traversal outside managed roots', () => {
   assert.throws(() => assertSafeWidgetPath(root, path.join(root, '..', '..', 'main.dart')), /escapes/);
 });
 
-test('child environment scrubs hub lifecycle variables', () => {
-  const child = childEnvironment({PIF_AUTOSTART: '1', PIF_NO_FLUTTER: '1', PIF_PORT: '31415', PIF_PI_BIN: '/fake/pi', PATH: '/usr/bin'});
+test('child environment scrubs hub lifecycle variables and credentials', () => {
+  const child = childEnvironment({PIF_AUTOSTART: '1', PIF_NO_FLUTTER: '1', PIF_PORT: '31415', PIF_TOKEN: 'secret-token', PIF_ALLOWED_ORIGINS: 'https://app.local', PIF_PI_BIN: '/fake/pi', PATH: '/usr/bin'});
   assert.equal(child.PIF_AUTOSTART, undefined);
   assert.equal(child.PIF_NO_FLUTTER, undefined);
   assert.equal(child.PIF_PORT, undefined);
+  assert.equal(child.PIF_TOKEN, undefined, 'children must not inherit the hub token');
+  assert.equal(child.PIF_ALLOWED_ORIGINS, undefined);
   assert.equal(child.PIF_PI_BIN, '/fake/pi');
   assert.equal(child.PATH, '/usr/bin');
+});
+
+test('malformed percent-encoding in the upgrade URL does not throw', () => {
+  const token = 'a'.repeat(64);
+  assert.equal(extractPifToken('/pif?token=%zz'), null);
+  assert.equal(extractPifToken(`/pif?other=1&token=${token}`), token, 'valid pairs still parse');
 });
 
 test('hub upgrade authorization requires token and allowlisted browser origins', () => {
@@ -53,6 +61,18 @@ test('hub upgrade authorization requires token and allowlisted browser origins',
   assert.equal(pifUpgradeAuthorized('/pif', undefined, token), false);
   assert.equal(pifUpgradeAuthorized('/pif?token=' + token, 'https://evil.example', token), false);
   assert.equal(pifUpgradeAuthorized('/pif?token=' + token, 'https://app.local', token, ['https://app.local']), true);
+});
+
+test('probe proof is an HMAC of the nonce under the hub token', async () => {
+  const { createHmac } = await import('node:crypto');
+  const token = 't'.repeat(64);
+  const nonce = 'nonce-value';
+  assert.equal(pifProbeProof(nonce, token), createHmac('sha256', token).update(nonce).digest('hex'));
+  assert.equal(pifProbeValid(nonce, token, pifProbeProof(nonce, token)), true);
+  assert.equal(pifProbeValid(nonce, token, '0'.repeat(64)), false);
+  assert.equal(pifProbeValid(nonce, 'other-token', pifProbeProof(nonce, token)), false);
+  assert.equal(pifProbeValid(nonce, token, null), false);
+  assert.equal(pifProbeValid(nonce, token, undefined), false);
 });
 
 test('hub source preserves phase-one process and analyze gates', async () => {

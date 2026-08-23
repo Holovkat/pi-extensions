@@ -3,7 +3,7 @@ import * as path from "node:path";
 
 export const PIF_PROTOCOL_VERSION = 1 as const;
 export const PIF_DEFAULT_PORT = 31415;
-export const PIF_CHANNELS = ["session", "widget", "store", "shell"] as const;
+export const PIF_CHANNELS = ["session", "widget", "store", "shell", "models"] as const;
 export type PifChannel = (typeof PIF_CHANNELS)[number];
 
 export interface PifEnvelope<T = unknown> {
@@ -100,10 +100,12 @@ export function assertSafeWidgetPath(root: string, candidate: string): string {
 	return resolved;
 }
 
-const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT"] as const;
+const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT", "PIF_TOKEN", "PIF_ALLOWED_ORIGINS"] as const;
 
 /** Environment for spawned child sessions: hub lifecycle vars must not
- * propagate, or every child tries to autostart a second hub on our port. */
+ * propagate, or every child tries to autostart a second hub on our port.
+ * Credentials (PIF_TOKEN, PIF_ALLOWED_ORIGINS) are scrubbed so a
+ * prompt-injected child cannot open an authenticated hub connection. */
 export function childEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const child = { ...env };
 	for (const key of CHILD_SCRUBBED_ENV_KEYS) delete child[key];
@@ -114,7 +116,10 @@ export function extractPifToken(requestUrl: string): string | null {
 	const query = requestUrl.split("?")[1] ?? "";
 	for (const pair of query.split("&")) {
 		const at = pair.indexOf("=");
-		if (at > 0 && decodeURIComponent(pair.slice(0, at)) === "token") return decodeURIComponent(pair.slice(at + 1));
+		if (at <= 0) continue;
+		let key: string, value: string;
+		try { key = decodeURIComponent(pair.slice(0, at)); value = decodeURIComponent(pair.slice(at + 1)); } catch { return null; }
+		if (key === "token") return value;
 	}
 	return null;
 }
@@ -127,6 +132,22 @@ export function pifUpgradeAuthorized(requestUrl: string, origin: string | undefi
 	const provided = extractPifToken(requestUrl);
 	if (!provided || provided.length !== token.length) return false;
 	return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(token));
+}
+
+/** Identity proof for the HTTP health probe: the hub answers a caller
+ * nonce with an HMAC-SHA256 under the hub token, so the app only treats a
+ * listener as *its* hub when it proves token possession — a port squatter
+ * that merely echoes `"name":"pif"` cannot harvest the real token or the
+ * user's first typed prompt. */
+export function pifProbeProof(nonce: string, token: string): string {
+	return crypto.createHmac("sha256", token).update(nonce).digest("hex");
+}
+
+export function pifProbeValid(nonce: string, token: string, proof: unknown): boolean {
+	if (typeof proof !== "string" || proof.length !== 64) return false;
+	const expected = Buffer.from(pifProbeProof(nonce, token));
+	const provided = Buffer.from(proof);
+	return expected.length === provided.length && crypto.timingSafeEqual(expected, provided);
 }
 
 export const __test = { scalar };

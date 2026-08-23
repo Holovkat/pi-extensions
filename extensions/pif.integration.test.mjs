@@ -18,11 +18,15 @@ async function waitFor(check, message, timeout = 15_000) {
 
 function control(socketPath, method, params = {}) {
   return new Promise((resolve, reject) => {
+    const secretPath = path.join(path.dirname(socketPath), 'control.secret');
+    const secret = fs.existsSync(secretPath) ? fs.readFileSync(secretPath, 'utf8').trim() : '';
     const socket = net.createConnection(socketPath); let raw = '';
-    socket.on('connect', () => socket.write(JSON.stringify({method, params}) + '\n'));
+    const finish = (action, value) => { socket.destroy(); action(value); };
+    socket.on('connect', () => socket.write(JSON.stringify({secret}) + '\n' + JSON.stringify({method, params}) + '\n'));
     socket.on('data', (chunk) => raw += chunk);
-    socket.on('end', () => { try { const value = JSON.parse(raw); value.ok ? resolve(value.result) : reject(new Error(value.error)); } catch (error) { reject(error); } });
-    socket.on('error', reject);
+    socket.on('end', () => { try { const value = JSON.parse(raw); value.ok ? finish(resolve, value.result) : finish(reject, new Error(value.error)); } catch (error) { finish(reject, error); } });
+    socket.on('close', () => { if (raw === '') finish(reject, new Error('control socket closed without a response')); });
+    socket.on('error', (error) => finish(reject, error));
   });
 }
 
@@ -66,7 +70,10 @@ function copyFixture(workspace, removeDogfood = true) {
 
 function fakePi(workspace) {
   const file = path.join(workspace, 'fake-pi.mjs');
-  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);process.stdout.write(JSON.stringify({type:'message_update',delta:q.message||'',command:q.type})+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
+  // Mirrors real pi: events stream over stdout AND append to the
+  // `--session <file>.jsonl` log, which the hub treats as the source of
+  // truth for display history.
+  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nconst at = process.argv.indexOf('--session');\nconst sessionFile = at >= 0 ? process.argv[at + 1] : null;\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);const ev={type:'message_update',delta:q.message||'',command:q.type};if(sessionFile)fs.appendFileSync(sessionFile, JSON.stringify(ev)+'\\n');process.stdout.write(JSON.stringify(ev)+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
   fs.chmodSync(file, 0o755); return file;
 }
 
@@ -98,6 +105,19 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await assert.rejects(() => openFail(`ws://127.0.0.1:${port}/pif`), /rejected/);
   await assert.rejects(() => openFail(`ws://127.0.0.1:${port}/pif?token=wrong-token-value`), /rejected/);
   checkpoint('unauthenticated connections rejected');
+
+  // Health endpoint discloses no absolute workspace path; /probe proves
+  // hub identity via HMAC of our nonce under the token.
+  const health = await (await fetch(`http://127.0.0.1:${port}/`)).json();
+  assert.equal(health.name, 'pif');
+  assert.ok(!JSON.stringify(health).includes(workspace), 'health must not leak the workspace path');
+  const nonce = `nonce-${Date.now()}`;
+  const { createHmac } = await import('node:crypto');
+  const proof = createHmac('sha256', 'integration-token').update(nonce).digest('hex');
+  const probe = await (await fetch(`http://127.0.0.1:${port}/probe?nonce=${nonce}`)).json();
+  assert.equal(proof, probe.proof, 'hub proves token possession');
+  const squatter = await (await fetch(`http://127.0.0.1:${port}/probe?nonce=x`)).json();
+  assert.notEqual(proof, squatter.proof, 'proof is bound to the caller nonce');
   const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {}); const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   checkpoint('snapshot received');
@@ -110,6 +130,24 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const sessionId = created.payload.id; assert.match(sessionId, /^session_/);
   const childEnv = JSON.parse(await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.env.json')) ? fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8') : false, 'child env dump'));
   assert.equal(childEnv.autostart, null); assert.equal(childEnv.noFlutter, null); assert.equal(childEnv.port, null);
+  checkpoint('child env scrubbed of lifecycle vars');
+  // Full env dump: no credentials may reach the child either (#176).
+  fs.writeFileSync(path.join(workspace, 'fake-pi.mjs'), `#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify(process.env));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);process.stdout.write(JSON.stringify({type:'message_update',delta:q.message||'',command:q.type})+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`, {flag: 'w'});
+  const fullEnv = JSON.parse(await waitFor(() => { try { return fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8'); } catch { return false; } }, 'full child env dump'));
+  assert.equal(fullEnv.PIF_TOKEN, undefined, 'PIF_TOKEN must not reach children');
+  assert.equal(fullEnv.PIF_ALLOWED_ORIGINS, undefined, 'PIF_ALLOWED_ORIGINS must not reach children');
+  checkpoint('child env contains no pif credentials');
+
+  // Slim snapshots (#174): payload carries rail metadata, no transcripts.
+  send(socket, 'shell/state', 'snapshot_request', {});
+  const postSpawnSnapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
+  const slimmed = postSpawnSnapshot.payload.sessions[sessionId];
+  assert.ok(slimmed, 'snapshot carries the spawned session');
+  assert.deepEqual(slimmed.transcript, [], 'snapshot excludes transcripts');
+  // Lazy hydration: session/transcript returns the authoritative history.
+  send(socket, 'session/control', 'transcript', {sessionId});
+  const history = await nextMessage(socket, (value) => value.type === 'history' && value.payload?.sessionId === sessionId);
+  assert.ok(Array.isArray(history.payload.transcript), 'history envelope carries a transcript array');
   const streamPromise = nextMessage(socket, (value) => value.channel === 'session/event' && value.payload.sessionId === sessionId && value.type === 'message_update');
   send(socket, 'session/control', 'input', {sessionId, content: 'hello'});
   const streamed = await streamPromise; checkpoint('child streamed'); assert.equal(streamed.payload.event.delta, 'hello');
@@ -123,6 +161,15 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.id === sessionId && value.payload?.name === 'Researcher');
 
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
+  // Control socket rejects callers without the per-launch secret (#176).
+  await assert.rejects(() => new Promise((resolve, reject) => {
+    const socket = net.createConnection(controlPath); let raw = '';
+    socket.on('connect', () => socket.write(JSON.stringify({secret: 'wrong'}) + '\n' + JSON.stringify({method: 'shell.status', params: {}}) + '\n'));
+    socket.on('data', (chunk) => raw += chunk);
+    socket.on('end', () => { try { const value = JSON.parse(raw); value.ok ? resolve(value.result) : reject(new Error(value.error)); } catch (error) { reject(error); } });
+    socket.on('error', reject);
+  }), /authorization failed/);
+  checkpoint('unauthorized control connection rejected');
   const scaffold = await control(controlPath, 'widget.create', {id: 'diff_viewer', name: 'Diff Viewer', slot: 'center', spec: 'Compare before and after text'});
   assert.ok(fs.existsSync(scaffold.manifest));
   fs.writeFileSync(scaffold.source, `import 'package:flutter/material.dart';\nimport '../../core/plugin.dart';\nclass DiffViewerPlugin implements PifWidgetPlugin {\n @override PifWidgetMeta get meta => const PifWidgetMeta(id: 'diff_viewer', name: 'Diff Viewer', slot: PifSlot.center);\n @override Widget build(BuildContext context, PifHost host) => const Row(children:[Expanded(child:SelectableText('before')),VerticalDivider(),Expanded(child:SelectableText('after'))]);\n}\n`);
@@ -178,6 +225,21 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.ok(fs.readdirSync(workspace).some((name) => name.startsWith('models-fixture.json.bak-')), 'backup written');
   checkpoint('input hardening verified');
 
+  // models/save round-trips through the WebSocket (#175): the Model
+  // Manager's channel is allowlisted and persists providers to disk.
+  const wsSavePromise = nextMessage(socket, (value) => value.type === 'snapshot');
+  send(socket, 'models/save', 'save', {providers: {fixture: {models: [{id: 'ws-saved'}]}}});
+  await wsSavePromise;
+  await waitFor(() => { try { return JSON.parse(fs.readFileSync(modelsPath, 'utf8')).providers.fixture.models[0].id === 'ws-saved'; } catch { return false; } }, 'models/save over WS writes the file');
+  checkpoint('models/save works over WS');
+
+  // A failing action surfaces shell/error with request correlation (#175).
+  send(socket, 'session/control', 'resume', {sessionId: 'no-such-session'});
+  const actionFailed = await nextMessage(socket, (value) => value.channel === 'shell/error' && value.type === 'action_failed');
+  assert.ok(actionFailed.payload.requestId, 'failure carries the request id');
+  assert.match(actionFailed.payload.error, /Unknown session/);
+  checkpoint('failed actions produce correlated errors');
+
   send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
   send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');
@@ -197,7 +259,10 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const restored = restarted.payload.sessions[sessionId];
   assert.equal(restored.name, 'Researcher');
   assert.equal(restored.state, 'ended');
-  assert.ok(restored.transcript.length > 0, 'restored session carries its transcript');
+  // Metadata-only restore: the transcript hydrates from `.jsonl` on demand.
+  send(socket2, 'session/control', 'transcript', {sessionId});
+  const restoredHistory = await nextMessage(socket2, (value) => value.type === 'history' && value.payload?.sessionId === sessionId);
+  assert.ok(restoredHistory.payload.transcript.length > 0, 'hydrated transcript carries history after restart');
   // Resume: pi respawns against the same session file and streams again.
   const sessionFile = path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`);
   if (!fs.existsSync(sessionFile)) fs.writeFileSync(sessionFile, '');

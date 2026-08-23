@@ -58,7 +58,6 @@ Each agent subprocess:
 
 | Path                                                                                                         | Purpose                                                                                                |
 | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md)                                             | Current rollout checklist and repo alignment tracker                                                   |
 | [docs/walkthrough-fasttrack.md](docs/walkthrough-fasttrack.md)                                               | Fast Track workflow walkthrough                                                                        |
 | [docs/comms.md](docs/comms.md)                                                                             | Local `coms` and networked `council` setup, tools, deployment profiles, UAT notes                       |
 | [docs/research-diffusion-llm-code-generation.md](docs/research-diffusion-llm-code-generation.md)             | Research context behind the pipeline design                                                            |
@@ -68,6 +67,8 @@ Each agent subprocess:
 | [.mcp.json](.mcp.json)                                                                                       | Project-local MCP server wiring                                                                        |
 | [agents/pi-blueprint/](agents/pi-blueprint/)                                                                 | Repo-managed blueprint agents                                                                          |
 | [skills/pi-blueprint/](skills/pi-blueprint/)                                                                 | Repo-managed blueprint skills                                                                          |
+
+> **Legacy:** [00-IMPLEMENTATION-CHECKLIST.md](00-IMPLEMENTATION-CHECKLIST.md) predates GitHub-native task tracking. As [commands/INSTALL.md](commands/INSTALL.md) states, GitHub issues linked to the epic are the source of truth for task queue and completion state; the checklist remains only as a backward-compatibility fallback for `/next-phase`.
 
 ## Current Repo State
 
@@ -849,54 +850,11 @@ brew install glow
 
 ## File Structure
 
-```
-pi-extensions/
-├── 00-IMPLEMENTATION-CHECKLIST.md
-├── .mcp.json
-├── PRD-PI-TOOLSHED.md
-├── README.md
-├── TOOLSHED-IMPLEMENTATION-INSTRUCTIONS.md
-├── extensions/
-│   ├── req-qa.ts              # Requirements discovery extension
-│   ├── dev-pipeline.ts        # Sprint development extension
-│   ├── pi-blueprint.ts        # GitHub-backed planning cockpit
-│   ├── pi-toolshed.ts         # Card/workspace shell
-│   ├── bailian-provider.ts    # Alibaba Cloud Bailian provider
-│   ├── qwen-provider.ts       # Qwen CLI provider (OAuth PKCE)
-│   ├── glm-provider.ts        # Zhipu GLM provider
-│   ├── ollama-provider.ts     # Ollama local models provider
-│   ├── apfel-provider.ts      # Apple FoundationModels via apfel
-│   ├── factory-droid-provider.ts # Factory Droid CLI provider bridge
-│   ├── themeMap.ts            # Per-extension theme assignments
-│   └── theme-cycler.ts        # Runtime theme switching
-├── agents/
-│   ├── req-qa/                # Requirements discovery agents
-│   │   ├── req-analyst.md
-│   │   ├── tech-analyst.md
-│   │   ├── ux-analyst.md
-│   │   ├── scenario-analyst.md
-│   │   └── prd-writer.md
-│   ├── pi-blueprint/          # Repo-managed blueprint agents
-│   ├── pi-subagents/          # Repo-managed global Pi subagent model routing
-│   └── dev-pipeline/          # Development pipeline agents
-│       ├── dev.md
-│       ├── compliance.md
-│       ├── reviewer.md
-│       ├── lint-build.md
-│       ├── tester.md
-│       ├── uat-signoff.md
-│       └── sharder.md
-├── skills/
-│   └── pi-blueprint/          # Repo-managed blueprint skills
-├── bin/
-│   ├── pipeline-dashboard     # Standalone terminal dashboard (bash)
-│   ├── pipeline-dashboard-web # Pipeline Control Center (Node.js HTTP + SSE + TCP)
-│   ├── blueprint-dashboard-web # Blueprint web mirror
-│   └── toolshed-dashboard-web # Toolshed workspace UI
-└── docs/
-    ├── walkthrough-fasttrack.md
-    └── research-diffusion-llm-code-generation.md
-```
+The repository has grown well beyond the tree previously listed here (pif, knowledge/, commands/, hooks/, scripts/, and most provider bridges were all missing). Rather than maintain a second tree that drifts, the authoritative repository layout now lives in:
+
+**[docs/PI_EXTENSIONS_ARCHITECTURE_RUNBOOK.html — Section 04: Repository Layout](docs/PI_EXTENSIONS_ARCHITECTURE_RUNBOOK.html)**
+
+That section is verified against the working tree and covers `extensions/` (32 files), `agents/`, `skills/`, `bin/`, `commands/`, `hooks/`, `scripts/`, `pif/` (Flutter macOS app), `knowledge/` (OKF bundle), `docs/`, and `features/`, along with the runtime artifacts that stay untracked.
 
 ## Performance Characteristics
 
