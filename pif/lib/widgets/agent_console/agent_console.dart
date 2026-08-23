@@ -25,6 +25,7 @@ class _AgentConsole extends StatefulWidget {
 }
 
 class _AgentConsoleState extends State<_AgentConsole> {
+  static const _conversationMaxWidth = 760.0;
   final controller = TextEditingController();
   final scroll = ScrollController();
   late StreamSubscription subscription;
@@ -122,7 +123,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
 
   /// Extend already-built entries with new raw transcript items.
   void _appendEntries(List<dynamic> rawItems, List<Map<String, dynamic>> into) {
-    final fresh = _buildEntries(rawItems);
+    final fresh = _buildEntries(rawItems, finalizeOpenTurn: false);
     // Streaming deltas continue the current assistant card. A final
     // message/message_end is authoritative and replaces the streamed text
     // instead of duplicating it.
@@ -135,13 +136,38 @@ class _AgentConsoleState extends State<_AgentConsole> {
         } else {
           into.last['text'] = '${into.last['text']}${entry['text']}';
         }
+        if (entry['ts'] != null) into.last['ts'] = entry['ts'];
       } else {
         into.add(entry);
       }
     }
+    if (fresh.any(
+          (entry) => entry['kind'] == 'assistant' && entry['replace'] == true,
+        ) &&
+        !fresh.any((entry) => entry['kind'] == 'turn_end')) {
+      _finalizeOpenTurn(into);
+    }
   }
 
-  List<Map<String, dynamic>> _buildEntries(List<dynamic> transcript) {
+  void _finalizeOpenTurn(List<Map<String, dynamic>> entries) {
+    final assistantIndex = _lastAssistantIndex(entries);
+    if (assistantIndex < 0 || assistantIndex != entries.length - 1) return;
+    final userIndex = entries
+        .sublist(0, assistantIndex)
+        .lastIndexWhere((entry) => entry['kind'] == 'user');
+    if (userIndex < 0) return;
+    _appendTurnEnd(
+      entries,
+      startIndex: userIndex,
+      startTs: entries[userIndex]['ts'] as String?,
+      endTs: entries[assistantIndex]['ts'] as String?,
+    );
+  }
+
+  List<Map<String, dynamic>> _buildEntries(
+    List<dynamic> transcript, {
+    bool finalizeOpenTurn = true,
+  }) {
     final entries = <Map<String, dynamic>>[];
     var turnStartIndex = -1;
     String? turnStartTs;
@@ -154,27 +180,53 @@ class _AgentConsoleState extends State<_AgentConsole> {
           : event;
 
       if (type == 'input') {
+        if (turnStartTs != null && _lastAssistantIndex(entries) >= 0) {
+          _appendTurnEnd(
+            entries,
+            startIndex: turnStartIndex,
+            startTs: turnStartTs,
+            endTs: _lastAssistantTimestamp(entries),
+          );
+        }
+        final timestamp = _eventTimestamp(event, data);
+        turnStartTs = timestamp;
+        turnStartIndex = entries.length;
         entries.add({
           'kind': 'user',
           'text': data['content'] ?? event['content'] ?? '',
+          ..._timestampEntry(timestamp),
         });
       } else if (type == 'message_update' || type == 'message_start') {
         final delta = _extractDelta(data);
+        final timestamp = _eventTimestamp(event, data);
         if (delta != null && delta.isNotEmpty) {
           if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
             entries.last['text'] = '${entries.last['text']}$delta';
+            if (timestamp != null) entries.last['ts'] = timestamp;
           } else {
-            entries.add({'kind': 'assistant', 'text': delta, 'replace': false});
+            entries.add({
+              'kind': 'assistant',
+              'text': delta,
+              'replace': false,
+              ..._timestampEntry(timestamp),
+            });
           }
         }
       } else if (type == 'message_end' || type == 'message') {
         final text = _extractFullText(data);
+        final timestamp = _eventTimestamp(event, data);
         if (text != null && text.isNotEmpty) {
           if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
             entries.last['text'] = text;
             entries.last['replace'] = true;
+            if (timestamp != null) entries.last['ts'] = timestamp;
           } else {
-            entries.add({'kind': 'assistant', 'text': text, 'replace': true});
+            entries.add({
+              'kind': 'assistant',
+              'text': text,
+              'replace': true,
+              ..._timestampEntry(timestamp),
+            });
           }
         }
       } else if (type.contains('tool')) {
@@ -185,24 +237,17 @@ class _AgentConsoleState extends State<_AgentConsole> {
           'detail': data['args'] ?? data['result'] ?? '',
         });
       } else if (type == 'agent_start') {
-        turnStartTs = event['ts'] as String? ?? data['ts'] as String?;
+        turnStartTs = _eventTimestamp(event, data) ?? turnStartTs;
         turnStartIndex = entries.length;
         entries.add({'kind': 'status', 'text': 'Agent started'});
       } else if (type == 'agent_end') {
-        final response = entries
-            .skip(turnStartIndex + 1)
-            .where((entry) => entry['kind'] == 'assistant')
-            .map((entry) => entry['text'] as String? ?? '')
-            .where((text) => text.isNotEmpty)
-            .join('\n\n');
-        final endTs = event['ts'] as String? ?? data['ts'] as String?;
-        entries.add({
-          'kind': 'turn_end',
-          if (turnStartTs != null && endTs != null)
-            'duration': _durationBetween(turnStartTs, endTs),
-          'response': response,
-          'aborted': event['aborted'] == true || data['aborted'] == true,
-        });
+        _appendTurnEnd(
+          entries,
+          startIndex: turnStartIndex,
+          startTs: turnStartTs,
+          endTs: _eventTimestamp(event, data),
+          aborted: event['aborted'] == true || data['aborted'] == true,
+        );
         turnStartIndex = -1;
         turnStartTs = null;
       } else if (type == 'stderr' || type == 'output') {
@@ -212,8 +257,71 @@ class _AgentConsoleState extends State<_AgentConsole> {
         }
       }
     }
+    if (finalizeOpenTurn && turnStartTs != null) {
+      _appendTurnEnd(
+        entries,
+        startIndex: turnStartIndex,
+        startTs: turnStartTs,
+        endTs: _lastAssistantTimestamp(entries),
+      );
+    }
     return entries;
   }
+
+  String? _eventTimestamp(
+    Map<String, dynamic> event,
+    Map<String, dynamic> data,
+  ) {
+    final value =
+        event['ts'] ?? event['timestamp'] ?? data['ts'] ?? data['timestamp'];
+    if (value is String && value.isNotEmpty) return value;
+    if (value is num) {
+      return DateTime.fromMillisecondsSinceEpoch(
+        value.toInt(),
+      ).toIso8601String();
+    }
+    return null;
+  }
+
+  Map<String, dynamic> _timestampEntry(String? timestamp) =>
+      timestamp == null ? const {} : {'ts': timestamp};
+
+  int _lastAssistantIndex(List<Map<String, dynamic>> entries) =>
+      entries.lastIndexWhere((entry) => entry['kind'] == 'assistant');
+
+  String? _lastAssistantTimestamp(List<Map<String, dynamic>> entries) {
+    final index = _lastAssistantIndex(entries);
+    return index < 0 ? null : entries[index]['ts'] as String?;
+  }
+
+  void _appendTurnEnd(
+    List<Map<String, dynamic>> entries, {
+    required int startIndex,
+    required String? startTs,
+    required String? endTs,
+    bool aborted = false,
+  }) {
+    if (entries.isEmpty || entries.last['kind'] == 'turn_end') return;
+    final response = entries
+        .skip(startIndex + 1)
+        .where((entry) => entry['kind'] == 'assistant')
+        .map((entry) => entry['text'] as String? ?? '')
+        .where((text) => text.isNotEmpty)
+        .join('\n\n');
+    if (response.isEmpty) return;
+    final duration = startTs == null || endTs == null
+        ? null
+        : _durationBetween(startTs, endTs);
+    entries.add({
+      'kind': 'turn_end',
+      ..._durationEntry(duration),
+      'response': response,
+      'aborted': aborted,
+    });
+  }
+
+  Map<String, dynamic> _durationEntry(Duration? duration) =>
+      duration == null ? const {} : {'duration': duration};
 
   Duration? _durationBetween(String start, String end) {
     final duration = DateTime.tryParse(
@@ -314,198 +422,279 @@ class _AgentConsoleState extends State<_AgentConsole> {
     final selected = widget.host.sessions.current
         .where((s) => s.id == widget.host.activeSessionId)
         .firstOrNull;
-    return Column(
+    return Container(
+      color: const Color(0xff171717),
+      child: Column(
+        children: [
+          _header(selected),
+          // No per-session strip: the Session Rail switches sessions; the
+          // header title carries the active name.
+          Expanded(
+            child: entries.isEmpty
+                ? const _ConsoleEmpty()
+                : ListView.builder(
+                    controller: scroll,
+                    padding: const EdgeInsets.fromLTRB(20, 24, 20, 28),
+                    itemCount: entries.length,
+                    itemBuilder: (_, index) => Align(
+                      alignment: Alignment.center,
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxWidth: _conversationMaxWidth,
+                        ),
+                        child: SizedBox(
+                          width: double.infinity,
+                          child: _EntryCard(entry: entries[index]),
+                        ),
+                      ),
+                    ),
+                  ),
+          ),
+          _composer(selected),
+        ],
+      ),
+    );
+  }
+
+  Widget _header(PifSession? selected) => Container(
+    height: 48,
+    padding: const EdgeInsets.symmetric(horizontal: 18),
+    decoration: BoxDecoration(
+      color: widget.host.theme.panel,
+      border: Border(bottom: BorderSide(color: widget.host.theme.border)),
+    ),
+    child: Row(
       children: [
-        Container(
-          height: 42,
-          padding: const EdgeInsets.symmetric(horizontal: 14),
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          width: 8,
+          height: 8,
           decoration: BoxDecoration(
-            color: widget.host.theme.panelRaised,
-            border: Border(bottom: BorderSide(color: widget.host.theme.border)),
-          ),
-          child: Row(
-            children: [
-              Icon(
-                running ? Icons.sync : Icons.auto_awesome,
-                size: 16,
-                color: running ? Colors.amber : widget.host.theme.accent,
-              ),
-              const SizedBox(width: 8),
-              // The session title; double-click renames it inline — the
-              // editing field keeps the same typography, just a caret.
-              if (editingName)
-                SizedBox(
-                  width: 220,
-                  child: TextField(
-                    controller: nameController,
-                    focusNode: nameFocus,
-                    autofocus: true,
-                    style: const TextStyle(fontWeight: FontWeight.w300),
-                    decoration: const InputDecoration(
-                      isDense: true,
-                      isCollapsed: true,
-                      border: InputBorder.none,
-                    ),
-                    onSubmitted: (_) => _commitName(),
-                  ),
-                )
-              else
-                GestureDetector(
-                  onDoubleTap: selected == null
-                      ? null
-                      : () => _startRename(selected.name),
-                  child: Text(
-                    selected?.name ?? 'No session selected',
-                    style: const TextStyle(fontWeight: FontWeight.w300),
-                  ),
-                ),
-              const Spacer(),
-              // On-the-fly model selector
-              SizedBox(
-                width: 140,
-                child: DropdownButtonHideUnderline(
-                  child: Builder(
-                    builder: (context) {
-                      final resolved = _resolvedModelValue(selected);
-                      return DropdownButton<String>(
-                        isDense: true,
-                        iconSize: 14,
-                        style: const TextStyle(
-                          fontSize: 11,
-                          color: Color(0xff8b96aa),
-                        ),
-                        value: resolved,
-                        hint: const Text(
-                          'Default',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: Color(0xff69758a),
-                          ),
-                        ),
-                        items: [
-                          const DropdownMenuItem(
-                            value: '',
-                            child: Text('Default'),
-                          ),
-                          ...widget.host.models.map(
-                            (m) => DropdownMenuItem(
-                              value: m,
-                              child: Text(m.split('/').last),
-                            ),
-                          ),
-                          if (resolved != null &&
-                              !widget.host.models.contains(resolved))
-                            DropdownMenuItem(
-                              value: resolved,
-                              child: Text(resolved.split('/').last),
-                            ),
-                        ],
-                        onChanged: selected == null
-                            ? null
-                            : (v) => widget.host.sessions.setModel(
-                                widget.host.activeSessionId,
-                                v ?? '',
-                              ),
-                      );
-                    },
-                  ),
-                ),
-              ),
-              const SizedBox(width: 8),
-              // On-the-fly thinking selector
-              SizedBox(
-                width: 90,
-                child: DropdownButtonHideUnderline(
-                  child: DropdownButton<String>(
-                    isDense: true,
-                    iconSize: 14,
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Color(0xff8b96aa),
-                    ),
-                    value: selected?.thinking ?? 'medium',
-                    items: const [
-                      DropdownMenuItem(value: 'none', child: Text('None')),
-                      DropdownMenuItem(value: 'low', child: Text('Low')),
-                      DropdownMenuItem(value: 'medium', child: Text('Medium')),
-                      DropdownMenuItem(value: 'high', child: Text('High')),
-                      DropdownMenuItem(value: 'max', child: Text('Max')),
-                    ],
-                    onChanged: selected == null
-                        ? null
-                        : (v) => widget.host.sessions.setThinking(
-                            widget.host.activeSessionId,
-                            v ?? 'medium',
-                          ),
-                  ),
-                ),
-              ),
-              if (running) ...[
-                const SizedBox(width: 8),
-                TextButton.icon(
-                  onPressed: () =>
-                      widget.host.sessions.abort(widget.host.activeSessionId),
-                  icon: const Icon(Icons.stop_circle_outlined, size: 16),
-                  label: const Text('Abort'),
-                ),
-              ],
-            ],
+            color: running ? Colors.amber : widget.host.theme.accent,
+            shape: BoxShape.circle,
+            boxShadow: running
+                ? const [BoxShadow(color: Colors.amber, blurRadius: 6)]
+                : null,
           ),
         ),
-        // No per-session strip: the Session Rail switches sessions; the
-        // header title carries the active name.
-        Expanded(
-          child: entries.isEmpty
-              ? const _ConsoleEmpty()
-              : ListView.builder(
-                  controller: scroll,
-                  padding: const EdgeInsets.all(18),
-                  itemCount: entries.length,
-                  itemBuilder: (_, index) => _EntryCard(entry: entries[index]),
-                ),
-        ),
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: widget.host.theme.panelRaised,
-            border: Border(top: BorderSide(color: widget.host.theme.border)),
+        const SizedBox(width: 10),
+        if (editingName)
+          SizedBox(
+            width: 240,
+            child: TextField(
+              controller: nameController,
+              focusNode: nameFocus,
+              autofocus: true,
+              style: const TextStyle(fontWeight: FontWeight.w400),
+              decoration: const InputDecoration(
+                isDense: true,
+                isCollapsed: true,
+                border: InputBorder.none,
+              ),
+              onSubmitted: (_) => _commitName(),
+            ),
+          )
+        else
+          GestureDetector(
+            onDoubleTap: selected == null
+                ? null
+                : () => _startRename(selected.name),
+            child: Text(
+              selected?.name ?? 'No session selected',
+              style: const TextStyle(fontWeight: FontWeight.w400),
+            ),
           ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              Expanded(
-                child: TextField(
+        const Spacer(),
+        if (running)
+          const Text(
+            'Working',
+            style: TextStyle(fontSize: 11, color: Color(0xffb9a26a)),
+          ),
+      ],
+    ),
+  );
+
+  Widget _composer(PifSession? selected) => Container(
+    padding: const EdgeInsets.fromLTRB(18, 10, 18, 16),
+    decoration: BoxDecoration(
+      color: widget.host.theme.panel,
+      border: Border(top: BorderSide(color: widget.host.theme.border)),
+    ),
+    child: Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: _conversationMaxWidth),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: const Color(0xff242424),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: const Color(0xff343434)),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(14, 8, 8, 7),
+            child: Column(
+              children: [
+                TextField(
+                  key: const Key('agent_console_composer'),
                   controller: controller,
                   minLines: 1,
                   maxLines: 6,
                   onSubmitted: (_) => submit(),
                   enabled: selected != null,
+                  style: const TextStyle(fontSize: 14, color: Colors.white),
                   decoration: InputDecoration(
                     hintText: selected == null
                         ? 'Create a session to begin…'
                         : running
                         ? 'Steer the running agent…'
                         : 'Ask Pi anything…',
-                    filled: true,
-                    fillColor: widget.host.theme.panel,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(10),
-                      borderSide: BorderSide.none,
+                    hintStyle: const TextStyle(
+                      fontSize: 14,
+                      color: Color(0xff8d8d8d),
                     ),
+                    isDense: true,
+                    border: InputBorder.none,
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                onPressed: selected == null ? null : submit,
-                icon: Icon(running ? Icons.turn_right : Icons.arrow_upward),
-              ),
-            ],
+                const SizedBox(height: 5),
+                Row(
+                  children: [
+                    Tooltip(
+                      message: 'Attachments are not available yet',
+                      child: IconButton(
+                        key: const Key('agent_console_add'),
+                        onPressed: null,
+                        icon: const Icon(Icons.add, size: 18),
+                        color: const Color(0xffb0b0b0),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    const Icon(
+                      Icons.lock_open_outlined,
+                      size: 14,
+                      color: Color(0xffcf8d55),
+                    ),
+                    const SizedBox(width: 4),
+                    const Text(
+                      'Workspace access',
+                      style: TextStyle(fontSize: 11, color: Color(0xffcf8d55)),
+                    ),
+                    const Spacer(),
+                    if (selected != null) ...[
+                      _modelSelector(selected),
+                      const SizedBox(width: 5),
+                      _thinkingSelector(selected),
+                      const SizedBox(width: 5),
+                    ],
+                    if (running)
+                      TextButton.icon(
+                        key: const Key('agent_console_steer'),
+                        onPressed: submit,
+                        icon: const Icon(Icons.arrow_upward, size: 14),
+                        label: const Text('Steer'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: const Color(0xffb0b0b0),
+                          padding: const EdgeInsets.symmetric(horizontal: 7),
+                          minimumSize: const Size(0, 30),
+                        ),
+                      ),
+                    const Tooltip(
+                      message: 'Voice input is not available yet',
+                      child: IconButton(
+                        onPressed: null,
+                        icon: Icon(Icons.mic_none, size: 17),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                    IconButton.filled(
+                      key: const Key('agent_console_send'),
+                      onPressed: selected == null
+                          ? null
+                          : running
+                          ? () => widget.host.sessions.abort(
+                              widget.host.activeSessionId,
+                            )
+                          : submit,
+                      tooltip: running ? 'Abort agent' : 'Send message',
+                      style: IconButton.styleFrom(
+                        backgroundColor: running
+                            ? const Color(0xff9c5b5b)
+                            : widget.host.theme.accent,
+                        foregroundColor: const Color(0xff10141c),
+                        disabledBackgroundColor: const Color(0xff3b3b3b),
+                        disabledForegroundColor: const Color(0xff777777),
+                      ),
+                      icon: Icon(
+                        running ? Icons.stop_rounded : Icons.arrow_upward,
+                        size: 18,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
-      ],
+      ),
+    ),
+  );
+
+  Widget _modelSelector(PifSession selected) {
+    final resolved = _resolvedModelValue(selected);
+    return SizedBox(
+      width: 136,
+      child: DropdownButtonHideUnderline(
+        child: DropdownButton<String>(
+          isDense: true,
+          iconSize: 14,
+          style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
+          value: resolved,
+          hint: const Text('Model', style: TextStyle(fontSize: 11)),
+          items: [
+            const DropdownMenuItem(value: '', child: Text('Default')),
+            ...widget.host.models.map(
+              (model) => DropdownMenuItem(
+                value: model,
+                child: Text(model.split('/').last),
+              ),
+            ),
+            if (resolved != null && !widget.host.models.contains(resolved))
+              DropdownMenuItem(
+                value: resolved,
+                child: Text(resolved.split('/').last),
+              ),
+          ],
+          onChanged: (value) => widget.host.sessions.setModel(
+            widget.host.activeSessionId,
+            value ?? '',
+          ),
+        ),
+      ),
     );
   }
+
+  Widget _thinkingSelector(PifSession selected) => SizedBox(
+    width: 90,
+    child: DropdownButtonHideUnderline(
+      child: DropdownButton<String>(
+        isDense: true,
+        iconSize: 14,
+        style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
+        value: selected.thinking,
+        items: const [
+          DropdownMenuItem(value: 'none', child: Text('None')),
+          DropdownMenuItem(value: 'low', child: Text('Low')),
+          DropdownMenuItem(value: 'medium', child: Text('Medium')),
+          DropdownMenuItem(value: 'high', child: Text('High')),
+          DropdownMenuItem(value: 'max', child: Text('Max')),
+        ],
+        onChanged: (value) => widget.host.sessions.setThinking(
+          widget.host.activeSessionId,
+          value ?? 'medium',
+        ),
+      ),
+    ),
+  );
 }
 
 class _ConsoleEmpty extends StatelessWidget {
@@ -538,8 +727,8 @@ class _EntryCard extends StatelessWidget {
   const _EntryCard({required this.entry});
   final Map<String, dynamic> entry;
 
-  /// Conversation text: small, light, and unboxed — no paneling around
-  /// host-session messages.
+  /// Conversation text: small and light, with the user turn separated by a
+  /// restrained bubble and assistant output left open for scanning.
   static const TextStyle _conversationStyle = TextStyle(
     fontSize: 13,
     fontWeight: FontWeight.w300,
@@ -554,16 +743,31 @@ class _EntryCard extends StatelessWidget {
     if (kind == 'user') {
       return Align(
         alignment: Alignment.centerRight,
-        child: Padding(
-          padding: const EdgeInsets.only(bottom: 10, left: 40),
-          child: SelectableText(text, style: _conversationStyle),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 620),
+          child: Container(
+            key: const Key('agent_console_user_bubble'),
+            margin: const EdgeInsets.only(bottom: 16, left: 40),
+            padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 11),
+            decoration: const BoxDecoration(
+              color: Color(0xff2b2b2b),
+              borderRadius: BorderRadius.only(
+                topLeft: Radius.circular(16),
+                topRight: Radius.circular(16),
+                bottomLeft: Radius.circular(16),
+                bottomRight: Radius.circular(5),
+              ),
+            ),
+            child: SelectableText(text, style: _conversationStyle),
+          ),
         ),
       );
     }
 
     if (kind == 'assistant') {
       return Padding(
-        padding: const EdgeInsets.only(bottom: 10),
+        key: const Key('agent_console_assistant_lane'),
+        padding: const EdgeInsets.only(bottom: 16, right: 22),
         child: MarkdownBody(
           data: text,
           styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
@@ -582,12 +786,12 @@ class _EntryCard extends StatelessWidget {
       final status = entry['status'] as String? ?? 'running';
       final detail = entry['detail'] as String? ?? '';
       return Container(
-        margin: const EdgeInsets.only(bottom: 10),
-        padding: const EdgeInsets.all(12),
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
         decoration: BoxDecoration(
-          color: const Color(0xff17241f),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: const Color(0xff315844)),
+          color: const Color(0xff20241f),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xff303b34)),
         ),
         child: ExpansionTile(
           tilePadding: EdgeInsets.zero,
@@ -672,6 +876,7 @@ class _TurnEndCard extends StatefulWidget {
 
 class _TurnEndCardState extends State<_TurnEndCard> {
   String? copied;
+  bool expanded = false;
 
   @override
   Widget build(BuildContext context) {
@@ -681,42 +886,78 @@ class _TurnEndCardState extends State<_TurnEndCard> {
     final aborted = entry['aborted'] == true;
     final codeBlocks = _codeBlocks(response);
     return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Row(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(
-            aborted ? Icons.stop_outlined : Icons.check_circle,
-            size: 13,
-            color: aborted ? Colors.amber : const Color(0xff78dba9),
+          InkWell(
+            key: const Key('agent_console_turn_summary'),
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => setState(() => expanded = !expanded),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 3),
+              child: Row(
+                children: [
+                  Icon(
+                    aborted ? Icons.stop_outlined : Icons.check_circle,
+                    size: 13,
+                    color: aborted ? Colors.amber : const Color(0xff78dba9),
+                  ),
+                  const SizedBox(width: 7),
+                  const Text(
+                    'Worked for',
+                    style: TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                  ),
+                  if (duration != null) ...[
+                    const SizedBox(width: 4),
+                    Text(
+                      _formatDuration(duration),
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xff8b96aa),
+                      ),
+                    ),
+                  ],
+                  if (aborted) ...[
+                    const SizedBox(width: 6),
+                    const Text(
+                      'aborted',
+                      style: TextStyle(fontSize: 11, color: Colors.amber),
+                    ),
+                  ],
+                  Icon(
+                    expanded ? Icons.keyboard_arrow_down : Icons.chevron_right,
+                    size: 15,
+                    color: const Color(0xff737373),
+                  ),
+                  const SizedBox(width: 8),
+                  if (response.isNotEmpty)
+                    _copyAction(
+                      key: 'response',
+                      tooltip: 'Copy response',
+                      icon: Icons.content_copy,
+                      onCopy: () => response,
+                    ),
+                  if (codeBlocks != null && codeBlocks.isNotEmpty)
+                    _copyAction(
+                      key: 'code',
+                      tooltip: 'Copy code blocks',
+                      icon: Icons.code,
+                      onCopy: () => codeBlocks,
+                    ),
+                ],
+              ),
+            ),
           ),
-          if (duration != null) ...[
-            const SizedBox(width: 6),
-            Text(
-              _formatDuration(duration),
-              style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
-            ),
-          ],
-          if (aborted) ...[
-            const SizedBox(width: 6),
-            const Text(
-              'aborted',
-              style: TextStyle(fontSize: 11, color: Colors.amber),
-            ),
-          ],
-          const Spacer(),
-          if (response.isNotEmpty)
-            _copyAction(
-              key: 'response',
-              tooltip: 'Copy response',
-              icon: Icons.content_copy,
-              onCopy: () => response,
-            ),
-          if (codeBlocks != null && codeBlocks.isNotEmpty)
-            _copyAction(
-              key: 'code',
-              tooltip: 'Copy code blocks',
-              icon: Icons.code,
-              onCopy: () => codeBlocks,
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.only(left: 27, top: 4),
+              child: Text(
+                aborted
+                    ? 'The agent was stopped before the turn completed.'
+                    : 'Turn complete. Tap the response actions to copy output.',
+                style: const TextStyle(fontSize: 11, color: Color(0xff737373)),
+              ),
             ),
         ],
       ),

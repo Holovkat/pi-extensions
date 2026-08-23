@@ -104,6 +104,34 @@ The `pif-builder` droid (`.factory/droids/pif-builder.md`, model: GLM-5.3) autom
 
 Invoke it by asking: "build pif", "rebuild pif", or "update pif to the latest version".
 
+### UAT handback: build, deploy, and verify pif
+
+When handing pif back for UAT, complete the full local delivery loop before
+reporting it as ready:
+
+```bash
+(cd pif && flutter analyze)
+(cd pif && flutter test)
+node --test extensions/pif.integration.test.mjs
+./scripts/build-pif-app.sh
+pkill -TERM -f '/Applications/pif.app/Contents/MacOS/pif' || true
+ditto build/pif.app /Applications/pif.app
+open /Applications/pif.app
+sleep 2
+pgrep -fl '/Applications/pif.app/Contents/MacOS/pif'
+codesign --verify --deep --strict /Applications/pif.app
+```
+
+Build, install, and launch are separate evidence. The UAT handback must name
+the installed path and the returned process ID, and must not call the app
+deployed based on a build artifact alone. The installed bundle should also be
+checked against the source for the changed widget when practical:
+
+```bash
+cmp -s pif/lib/widgets/agent_console/agent_console.dart \
+  /Applications/pif.app/Contents/Resources/app/lib/widgets/agent_console/agent_console.dart
+```
+
 ### What gets bundled
 
 ```

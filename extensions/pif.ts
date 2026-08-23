@@ -315,9 +315,20 @@ class PifHub {
 			const lines = fs.readFileSync(session.sessionFile, "utf8").split("\n").filter(Boolean);
 			for (const line of lines) {
 				let value: any; try { value = JSON.parse(line); } catch { continue; }
-				session.transcript.push({ ...this.normalizeEntry(String(value.type ?? "event"), value), ts: value.ts ?? new Date().toISOString() });
+				session.transcript.push({ ...this.normalizeEntry(String(value.type ?? "event"), value), ts: this.eventTimestamp(value) });
 			}
 		} catch { /* absent or unreadable — keep empty */ }
+	}
+	private eventTimestamp(value: any): string {
+		const raw = value?.ts ?? value?.timestamp ?? value?.message?.timestamp;
+		if (typeof raw === "number" && Number.isFinite(raw)) return new Date(raw).toISOString();
+		if (typeof raw === "string") {
+			const numeric = Number(raw);
+			if (Number.isFinite(numeric) && raw.trim() !== "") return new Date(numeric).toISOString();
+			const parsed = Date.parse(raw);
+			if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+		}
+		return new Date().toISOString();
 	}
 	private isUserBoundaryEcho(type: string, payload: any) { return (type === "message_start" || type === "message_end") && payload?.message?.role === "user"; }
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
@@ -418,7 +429,7 @@ class PifHub {
 		const host = this.state.sessions.host; if (!host) return;
 		if (this.isUserBoundaryEcho(type, payload)) return;
 		if (type === "agent_start") host.state = "running"; if (type === "agent_end") host.state = "idle";
-		const entry = { ...this.normalizeEntry(type, payload), ts: new Date().toISOString() }; host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
+		const entry = { ...this.normalizeEntry(type, payload), ts: this.eventTimestamp(payload) }; host.transcript.push(entry); if (host.transcript.length > 2_000) host.transcript.shift();
 		this.broadcast("session/host", type, { sessionId: "host", state: host.state, event: entry });
 	}
 	private normalizeEntry(type: string, payload: any): Record<string, unknown> {
@@ -571,7 +582,7 @@ class PifHub {
 		let event: any; try { event = JSON.parse(line); } catch { event = { type: "output", data: line }; }
 		const kind = String(event.type ?? event.event ?? "event"); if (/start|delta|tool/.test(kind)) session.state = "running"; if (/agent_end|turn_end|result/.test(kind)) session.state = "idle"; if (/input_required/.test(kind)) session.state = "awaiting-input";
 		if (this.isUserBoundaryEcho(kind, event)) return;
-		const entry = { ...this.normalizeEntry(kind, event), ts: event.ts ?? new Date().toISOString() }; session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
+		const entry = { ...this.normalizeEntry(kind, event), ts: this.eventTimestamp(event) }; session.transcript.push(entry); if (session.transcript.length > 2_000) session.transcript.shift(); this.broadcast("session/event", kind, { sessionId: session.id, state: session.state, event: entry });
 	}
 	private loadLayout() { try { this.state.layout = JSON.parse(fs.readFileSync(this.layoutPath, "utf8")); } catch { this.state.layout = { panels: {} }; } }
 	private saveLayout() {

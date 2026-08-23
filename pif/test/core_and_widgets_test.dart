@@ -217,6 +217,32 @@ void main() {
     );
     await bus.dispose();
   });
+  testWidgets('Agent Console exposes steer and abort controls while running', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'running',
+        'model': 'test',
+        'thinking': 'medium',
+        'cwd': '/tmp',
+        'transcript': <dynamic>[],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+
+    expect(find.byKey(const Key('agent_console_steer')), findsOneWidget);
+    expect(find.byIcon(Icons.stop_rounded), findsOneWidget);
+    await tester.tap(find.byKey(const Key('agent_console_send')));
+
+    expect(bus.sent.single['type'], 'abort');
+    await bus.dispose();
+  });
   testWidgets('model dropdown lists available models and reflects selection', (
     tester,
   ) async {
@@ -386,7 +412,7 @@ void main() {
     await bus.dispose();
   });
 
-  testWidgets('Agent Console conversation is unboxed and light', (
+  testWidgets('Agent Console uses a Codex-style user bubble and light text', (
     tester,
   ) async {
     final bus = FakeBus();
@@ -420,14 +446,12 @@ void main() {
           .style,
       isNotNull,
     );
-    // No decorated container wraps the conversation entries anymore.
-    expect(
-      find.descendant(
-        of: find.widgetWithText(Align, 'plain question'),
-        matching: find.byType(Container),
-      ),
-      findsNothing,
+    expect(find.byKey(const Key('agent_console_user_bubble')), findsOneWidget);
+    final assistantLane = find.byKey(
+      const Key('agent_console_assistant_lane'),
     );
+    expect(tester.getSize(assistantLane).width, 760);
+    expect(tester.getTopLeft(assistantLane).dx, lessThan(150));
     await bus.dispose();
   });
 
@@ -465,6 +489,40 @@ void main() {
       await bus.dispose();
     },
   );
+  testWidgets('Agent Console derives duration and copy action from history', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final host = PifHost(bus: bus);
+    host.sessions.applySnapshot({
+      'host': {
+        'id': 'host',
+        'name': 'Host',
+        'host': true,
+        'state': 'idle',
+        'model': 'test',
+        'cwd': '/tmp',
+        'transcript': [
+          {
+            'type': 'input',
+            'content': 'history request',
+            'ts': '2026-08-22T10:00:00.000Z',
+          },
+          {
+            'type': 'message',
+            'text': 'history response',
+            'ts': '2026-08-22T10:01:57.000Z',
+          },
+        ],
+      },
+    });
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+
+    expect(find.text('Worked for'), findsOneWidget);
+    expect(find.text('1m 57s'), findsOneWidget);
+    expect(find.byIcon(Icons.content_copy), findsOneWidget);
+    await bus.dispose();
+  });
   test('session deltas are idempotent by envelope id', () async {
     final bus = FakeBus();
     final sessions = PifSessions(bus);
