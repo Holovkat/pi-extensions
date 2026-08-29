@@ -1,0 +1,28 @@
+# pif app template manifest — FMS Mercury
+# Settled schema (Task #154): id, name, description, layer list.
+# Storage: repo path pif/templates/mercury/; the hub syncs repo templates
+# into the global catalog (~/.pi/pif/catalog/templates/mercury/) at hub start.
+id: mercury
+name: FMS Mercury
+description: >-
+  Calm, resilient wayfinding for field operations and administration. Cool
+  layered surfaces (Cool Mist / Graphite Night, paired light+dark) with
+  Mercury Teal as a restrained signal for interaction, focus, selection and
+  state. Poppins type capped at weight 500, a six-step spacing rhythm
+  (4/8/12/16/24/32), tonal-first elevation, one flat rounded group per
+  content section, and one job per screen. Navigation rail at >=1024px,
+  bottom navigation below. Suitable for dashboards, record workspaces and
+  operational consoles.
+source: ~/workspace/fmsmercury (DESIGN.md, docs/MERCURY_VISUAL_STANDARD.md,
+  docs/MERCURY_UI_CONTRACT.md, frontend/triplogger/lib/shared/)
+font: Poppins (SIL Open Font License). The template references Poppins by
+  name but does not bundle the font files; the consuming app must vendor
+  Poppins (keeping the OFL license notice) or accept the sans-serif fallback.
+layers:
+  - design.json     # machine-readable tokens (extract-design output, validated)
+  - rules.md        # named design rules + authority chain (agent-obeyable)
+  - components.md   # starter component kit inventory + usage guidance
+  - shell.md        # responsive shell pattern (rail >=1024 / bottom nav / one job per screen)
+consumed_by:
+  - pif_app_init --template mercury (Task #157)
+  - skills/pif-app-designer/SKILL.md design pass (Tasks #158, #178)
