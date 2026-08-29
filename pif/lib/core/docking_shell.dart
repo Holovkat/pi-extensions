@@ -9,9 +9,18 @@ import 'panel_error_boundary.dart';
 import 'plugin.dart';
 
 class DockingShell extends StatefulWidget {
-  const DockingShell({super.key, required this.bus, this.workspace});
+  const DockingShell({
+    super.key,
+    required this.bus,
+    this.workspace,
+    this.factories,
+  });
   final PifBus bus;
   final String? workspace;
+
+  /// Widget factory override (test seam). Defaults to the generated
+  /// registry; app mode resolves page widgets from the same table.
+  final Map<String, PifWidgetPlugin Function()>? factories;
   @override
   State<DockingShell> createState() => _DockingShellState();
 }
@@ -37,6 +46,18 @@ class _DockingShellState extends State<DockingShell>
     'diff_viewer',
   };
   bool centerSplit = false;
+  // App runtime mode (issue #156): active only when the hub snapshot
+  // carries a usable app manifest (pif_app/app.yaml parsed by the hub —
+  // `app` = {id, name, home, pages}). A project without a manifest keeps
+  // the IDE shell below byte-for-byte in behaviour.
+  Map<String, dynamic>? _appManifest;
+  List<String> _pageIds = const [];
+  String? _activePageId;
+  // Dev toggle: false renders the page stage (app mode), true exposes the
+  // full IDE docking. Persisted as a shell setting; the hub-side control
+  // method is the hub lane's surface.
+  bool _devMode = false;
+  bool _consoleOpen = false;
   // Dock sizes — user-resizable via the dividers, persisted per project
   // through the shell/layout resize action.
   static const double _minSide = 140;
@@ -53,7 +74,8 @@ class _DockingShellState extends State<DockingShell>
   double _right = _defaultRight;
   double _bottom = _defaultBottom;
   Map<String, PifWidgetPlugin Function()> _factories = pifWidgetFactories();
-  void _refreshFactories() => _factories = pifWidgetFactories();
+  void _refreshFactories() =>
+      _factories = widget.factories ?? pifWidgetFactories();
   @override
   void reassemble() {
     super.reassemble();
@@ -63,12 +85,18 @@ class _DockingShellState extends State<DockingShell>
   @override
   void initState() {
     super.initState();
+    // Apply the injected factory seam before the FIRST build — the field
+    // initialiser otherwise leaves the real generated registry active for
+    // frame one, and the pre-snapshot default `enabled` set would build
+    // real widgets (console overflow) in tests.
+    _refreshFactories();
     host = PifHost(bus: widget.bus)
       ..workspace =
           widget.workspace ??
           Platform.environment['PIF_WORKSPACE'] ??
           Directory.current.path;
     host.storage.workspace = host.workspace;
+    _devMode = host.storage.read('shell', 'devMode') == true;
     events = widget.bus.events.listen(_event, onError: (_) {});
     errors = widget.bus.errors.listen(_showError);
     widget.bus.connect();
@@ -127,11 +155,46 @@ class _DockingShellState extends State<DockingShell>
         focusedWidgetId = entry.key;
       }
       if (slot != null) {
-        slotOverrides[entry.key] = PifSlot.values.firstWhere(
-          (item) => item.name == slot,
-          orElse: () => PifSlot.center,
-        );
+        // Unknown slot names keep the widget's manifest slot instead of
+        // silently forcing center — a persisted `slot: page` must never
+        // strand a page widget inside a dock.
+        final parsed = PifSlot.values
+            .where((item) => item.name == slot)
+            .firstOrNull;
+        if (parsed != null) slotOverrides[entry.key] = parsed;
       }
+    }
+  }
+
+  /// App runtime mode contract (issue #156): the hub parses
+  /// `pif_app/app.yaml` into the snapshot as `app` = {id, name, home,
+  /// pages}. The declared home page is the boot page; a snapshot without
+  /// a usable manifest (or with no declared pages) keeps IDE mode.
+  void _applyAppManifest(Object? raw) {
+    final pages = <String>[];
+    String? home;
+    if (raw is Map) {
+      home = raw['home'] as String?;
+      for (final page in raw['pages'] as List? ?? const []) {
+        if (page is String && page.isNotEmpty) pages.add(page);
+      }
+    }
+    if (pages.isEmpty) {
+      _appManifest = null;
+      _pageIds = const [];
+      _activePageId = null;
+      _consoleOpen = false;
+      return;
+    }
+    _appManifest = Map<String, dynamic>.from(raw as Map);
+    _pageIds = pages;
+    // Navigation state survives resyncs; it only resets when the active
+    // page disappeared from the manifest. Each boot starts on the home
+    // page (_activePageId is null until the first snapshot arrives).
+    if (_activePageId == null || !_pageIds.contains(_activePageId)) {
+      _activePageId = (home != null && _pageIds.contains(home))
+          ? home
+          : _pageIds.first;
     }
   }
 
@@ -162,6 +225,7 @@ class _DockingShellState extends State<DockingShell>
           .where(_factories.containsKey)
           .toSet();
       _applyLayout(Map<String, dynamic>.from(snapshot['layout'] as Map? ?? {}));
+      _applyAppManifest(snapshot['app']);
       if (mounted) setState(() {});
       return;
     }
@@ -244,6 +308,10 @@ class _DockingShellState extends State<DockingShell>
         .where((id) => !unpinnedIds.contains(id))
         .map((id) => _factories[id]?.call())
         .whereType<PifWidgetPlugin>()
+        // Line-stop guard (issue #156): page widgets render only in the
+        // app-mode page stage — never in a dock slot, whatever a stale
+        // persisted layout says.
+        .where((plugin) => plugin.meta.slot != PifSlot.page)
         .where(
           (plugin) =>
               (slotOverrides[plugin.meta.id] ?? plugin.meta.slot) == slot,
@@ -257,10 +325,15 @@ class _DockingShellState extends State<DockingShell>
     return plugins;
   }
 
+  bool _isPageWidget(String id) =>
+      _factories[id]?.call().meta.slot == PifSlot.page;
+
   void move(String id, PifSlot slot) {
     // The status dock renders chromeless: a second widget dropped there
     // would be unreachable (no tab strip, no header). Reject instead.
     if (slot == PifSlot.status && inSlot(PifSlot.status).isNotEmpty) return;
+    // Page widgets live only in the page stage; they cannot be docked.
+    if (slot != PifSlot.page && _isPageWidget(id)) return;
     setState(() => slotOverrides[id] = slot);
     host.layout.move(id, slot);
   }
@@ -338,163 +411,347 @@ class _DockingShellState extends State<DockingShell>
 
   @override
   Widget build(BuildContext context) {
+    return KeyboardListener(
+      focusNode: _escapeFocus,
+      autofocus: true,
+      onKeyEvent: _handleEscapeKey,
+      child: _pageIds.isEmpty
+          ? _ideScaffold()
+          // App runtime mode: both shells stay in the tree (Offstage keeps
+          // them laid out but invisible), so flipping the dev toggle never
+          // loses docking state or page state.
+          : Stack(
+              children: [
+                Offstage(offstage: _devMode, child: _appScaffold()),
+                Offstage(offstage: !_devMode, child: _ideScaffold()),
+              ],
+            ),
+    );
+  }
+
+  /// The IDE docking shell — the pre-app-mode tree, unchanged for
+  /// projects without a manifest (drag/dock, collapse, resize, pin).
+  Widget _ideScaffold() {
     final leftWidgets = inSlot(PifSlot.left),
         centerWidgets = inSlot(PifSlot.center),
         rightWidgets = inSlot(PifSlot.right),
         bottomWidgets = inSlot(PifSlot.bottom),
         statusWidgets = inSlot(PifSlot.status);
-    return KeyboardListener(
-      focusNode: _escapeFocus,
-      autofocus: true,
-      onKeyEvent: _handleEscapeKey,
-      child: Scaffold(
-        body: Column(
-          children: [
-            _titleBar(),
-            Expanded(
-              child: Stack(
-                children: [
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      // Keep the center stage livable no matter how far the
-                      // dividers are dragged. Upper bounds are floored at the
-                      // minimums so a tiny window can never produce reversed
-                      // (min > max) clamps, which throw inside build().
-                      final maxSide = math.max(
-                        _minSide,
-                        (constraints.maxWidth - _centerMinWidth) / 2,
-                      );
-                      final maxBottom = math.max(
-                        _minBottom,
-                        constraints.maxHeight - _bottomTopGap,
-                      );
-                      final left = _left.clamp(_minSide, maxSide);
-                      final right = _right.clamp(_minSide, maxSide);
-                      final bottom = _bottom.clamp(_minBottom, maxBottom);
-                      return Row(
-                        children: [
-                          // Docks with no visible widgets collapse so adjacent
-                          // panels reclaim the space; a slim edge remains as the
-                          // drop target that re-expands the slot.
-                          if (leftWidgets.isEmpty)
-                            _collapsedEdge(PifSlot.left)
-                          else ...[
-                            SizedBox(
-                              width: left,
-                              child: _dock(PifSlot.left, leftWidgets),
+    return Scaffold(
+      body: Column(
+        children: [
+          _titleBar(),
+          Expanded(
+            child: Stack(
+              children: [
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    // Keep the center stage livable no matter how far the
+                    // dividers are dragged. Upper bounds are floored at the
+                    // minimums so a tiny window can never produce reversed
+                    // (min > max) clamps, which throw inside build().
+                    final maxSide = math.max(
+                      _minSide,
+                      (constraints.maxWidth - _centerMinWidth) / 2,
+                    );
+                    final maxBottom = math.max(
+                      _minBottom,
+                      constraints.maxHeight - _bottomTopGap,
+                    );
+                    final left = _left.clamp(_minSide, maxSide);
+                    final right = _right.clamp(_minSide, maxSide);
+                    final bottom = _bottom.clamp(_minBottom, maxBottom);
+                    return Row(
+                      children: [
+                        // Docks with no visible widgets collapse so adjacent
+                        // panels reclaim the space; a slim edge remains as the
+                        // drop target that re-expands the slot.
+                        if (leftWidgets.isEmpty)
+                          _collapsedEdge(PifSlot.left)
+                        else ...[
+                          SizedBox(
+                            width: left,
+                            child: _dock(PifSlot.left, leftWidgets),
+                          ),
+                          _divider(
+                            key: const Key('pif_divider_left'),
+                            horizontal: false,
+                            onDelta: (dx) => setState(
+                              () =>
+                                  _left = (_left + dx).clamp(_minSide, maxSide),
                             ),
-                            _divider(
-                              key: const Key('pif_divider_left'),
-                              horizontal: false,
-                              onDelta: (dx) => setState(
-                                () => _left = (_left + dx).clamp(
-                                  _minSide,
-                                  maxSide,
+                            onReset: () => setState(() => _left = _defaultLeft),
+                          ),
+                        ],
+                        Expanded(
+                          child: Column(
+                            children: [
+                              if (centerWidgets.isEmpty &&
+                                  bottomWidgets.isNotEmpty) ...[
+                                // No center widgets: the bottom dock expands
+                                // into the freed stage; a slim edge keeps the
+                                // center slot droppable.
+                                _collapsedEdge(PifSlot.center),
+                                Expanded(
+                                  child: _dock(PifSlot.bottom, bottomWidgets),
                                 ),
-                              ),
-                              onReset: () =>
-                                  setState(() => _left = _defaultLeft),
-                            ),
-                          ],
-                          Expanded(
-                            child: Column(
-                              children: [
-                                if (centerWidgets.isEmpty &&
-                                    bottomWidgets.isNotEmpty) ...[
-                                  // No center widgets: the bottom dock expands
-                                  // into the freed stage; a slim edge keeps the
-                                  // center slot droppable.
-                                  _collapsedEdge(PifSlot.center),
-                                  Expanded(
+                              ] else ...[
+                                Expanded(child: _center(centerWidgets)),
+                                if (bottomWidgets.isEmpty)
+                                  _collapsedEdge(PifSlot.bottom)
+                                else if (centerWidgets.isEmpty)
+                                  SizedBox(
+                                    height: bottom,
+                                    child: _dock(PifSlot.bottom, bottomWidgets),
+                                  )
+                                else ...[
+                                  _divider(
+                                    key: const Key('pif_divider_bottom'),
+                                    horizontal: true,
+                                    onDelta: (dy) => setState(
+                                      () => _bottom = (_bottom - dy).clamp(
+                                        _minBottom,
+                                        maxBottom,
+                                      ),
+                                    ),
+                                    onReset: () => setState(
+                                      () => _bottom = _defaultBottom,
+                                    ),
+                                  ),
+                                  SizedBox(
+                                    height: bottom,
                                     child: _dock(PifSlot.bottom, bottomWidgets),
                                   ),
-                                ] else ...[
-                                  Expanded(child: _center(centerWidgets)),
-                                  if (bottomWidgets.isEmpty)
-                                    _collapsedEdge(PifSlot.bottom)
-                                  else if (centerWidgets.isEmpty)
-                                    SizedBox(
-                                      height: bottom,
-                                      child: _dock(
-                                        PifSlot.bottom,
-                                        bottomWidgets,
-                                      ),
-                                    )
-                                  else ...[
-                                    _divider(
-                                      key: const Key('pif_divider_bottom'),
-                                      horizontal: true,
-                                      onDelta: (dy) => setState(
-                                        () => _bottom = (_bottom - dy).clamp(
-                                          _minBottom,
-                                          maxBottom,
-                                        ),
-                                      ),
-                                      onReset: () => setState(
-                                        () => _bottom = _defaultBottom,
-                                      ),
-                                    ),
-                                    SizedBox(
-                                      height: bottom,
-                                      child: _dock(
-                                        PifSlot.bottom,
-                                        bottomWidgets,
-                                      ),
-                                    ),
-                                  ],
                                 ],
                               ],
-                            ),
+                            ],
                           ),
-                          if (rightWidgets.isEmpty)
-                            _collapsedEdge(PifSlot.right)
-                          else ...[
-                            _divider(
-                              key: const Key('pif_divider_right'),
-                              horizontal: false,
-                              onDelta: (dx) => setState(
-                                () => _right = (_right - dx).clamp(
-                                  _minSide,
-                                  maxSide,
-                                ),
+                        ),
+                        if (rightWidgets.isEmpty)
+                          _collapsedEdge(PifSlot.right)
+                        else ...[
+                          _divider(
+                            key: const Key('pif_divider_right'),
+                            horizontal: false,
+                            onDelta: (dx) => setState(
+                              () => _right = (_right - dx).clamp(
+                                _minSide,
+                                maxSide,
                               ),
-                              onReset: () =>
-                                  setState(() => _right = _defaultRight),
                             ),
-                            SizedBox(
-                              width: right,
-                              child: _dock(PifSlot.right, rightWidgets),
-                            ),
-                          ],
+                            onReset: () =>
+                                setState(() => _right = _defaultRight),
+                          ),
+                          SizedBox(
+                            width: right,
+                            child: _dock(PifSlot.right, rightWidgets),
+                          ),
                         ],
-                      );
-                    },
-                  ),
-                  // Tapping outside an open overlay slides it back out.
-                  if (slidIn.isNotEmpty)
-                    Positioned.fill(
-                      key: const Key('pif_overlay_barrier'),
-                      child: GestureDetector(
-                        behavior: HitTestBehavior.opaque,
-                        onTap: () => setState(slidIn.clear),
-                      ),
+                      ],
+                    );
+                  },
+                ),
+                // Tapping outside an open overlay slides it back out.
+                if (slidIn.isNotEmpty)
+                  Positioned.fill(
+                    key: const Key('pif_overlay_barrier'),
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () => setState(slidIn.clear),
                     ),
-                  ..._overlayPanels(),
-                  ..._edgeGrabbers(),
+                  ),
+                ..._overlayPanels(),
+                ..._edgeGrabbers(),
+              ],
+            ),
+          ),
+          if (statusWidgets.isEmpty)
+            _collapsedEdge(PifSlot.status)
+          else
+            SizedBox(
+              height: 25,
+              child: _dock(PifSlot.status, statusWidgets, chrome: false),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// The app-mode shell: the active page renders full-viewport in the
+  /// page stage with responsive navigation (rail at >=1024px width, a
+  /// bottom bar below). The Agent Console slides in as an overlay so an
+  /// app stays operable without leaving app mode.
+  Widget _appScaffold() {
+    final statusWidgets = inSlot(PifSlot.status);
+    return Scaffold(
+      body: Column(
+        children: [
+          _titleBar(),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                final wide = constraints.maxWidth >= 1024;
+                final stage = _pageStage();
+                return Stack(
+                  children: [
+                    Positioned.fill(
+                      child: wide
+                          ? Row(
+                              children: [
+                                _navRail(),
+                                const VerticalDivider(width: 1),
+                                Expanded(child: stage),
+                              ],
+                            )
+                          : Column(
+                              children: [
+                                Expanded(child: stage),
+                                _navBottomBar(),
+                              ],
+                            ),
+                    ),
+                    if (_consoleOpen && !_devMode) _consoleOverlay(),
+                  ],
+                );
+              },
+            ),
+          ),
+          if (statusWidgets.isEmpty)
+            _collapsedEdge(PifSlot.status)
+          else
+            SizedBox(
+              height: 25,
+              child: _dock(PifSlot.status, statusWidgets, chrome: false),
+            ),
+        ],
+      ),
+    );
+  }
+
+  int _selectedPageIndex() {
+    final index = _pageIds.indexWhere((id) => id == _activePageId);
+    return index < 0 ? 0 : index;
+  }
+
+  String _pageName(String id) => _factories[id]?.call().meta.name ?? id;
+
+  void _navigateTo(int index) =>
+      setState(() => _activePageId = _pageIds[index]);
+
+  Widget _navRail() => NavigationRail(
+    selectedIndex: _selectedPageIndex(),
+    onDestinationSelected: _navigateTo,
+    labelType: NavigationRailLabelType.all,
+    destinations: [
+      for (final id in _pageIds)
+        NavigationRailDestination(
+          icon: const Icon(Icons.circle, size: 10),
+          label: Text(
+            _pageName(id),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+    ],
+  );
+
+  Widget _navBottomBar() => NavigationBar(
+    selectedIndex: _selectedPageIndex(),
+    onDestinationSelected: _navigateTo,
+    destinations: [
+      for (final id in _pageIds)
+        NavigationDestination(
+          icon: const Icon(Icons.circle, size: 10),
+          label: _pageName(id),
+        ),
+    ],
+  );
+
+  /// The active page, full-viewport, inside the error boundary like any
+  /// other widget surface. Only page widgets ever render here.
+  Widget _pageStage() {
+    final id = _activePageId;
+    final plugin = id == null ? null : _factories[id]?.call();
+    if (plugin == null) {
+      return Center(
+        child: Text(
+          'Page "$id" is not installed',
+          style: const TextStyle(fontSize: 12, color: Color(0xff8b96aa)),
+        ),
+      );
+    }
+    return PanelErrorBoundary(
+      key: ValueKey('pif_page_stage_$id'),
+      plugin: plugin,
+      host: host,
+    );
+  }
+
+  Widget _consoleOverlay() {
+    final plugin = _factories['agent_console']?.call();
+    return Positioned(
+      key: const Key('pif_app_console'),
+      top: 0,
+      bottom: 0,
+      right: 0,
+      width: 440,
+      child: Material(
+        color: host.theme.panel,
+        elevation: 14,
+        child: Column(
+          children: [
+            Container(
+              height: 32,
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              decoration: BoxDecoration(
+                color: host.theme.panelRaised,
+                border: Border(bottom: BorderSide(color: host.theme.border)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.smart_toy_outlined, size: 14),
+                  const SizedBox(width: 5),
+                  const Text(
+                    'AGENT CONSOLE',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: () => setState(() => _consoleOpen = false),
+                    tooltip: 'Close Agent Console',
+                    icon: const Icon(Icons.close, size: 13),
+                  ),
                 ],
               ),
             ),
-            if (statusWidgets.isEmpty)
-              _collapsedEdge(PifSlot.status)
-            else
-              SizedBox(
-                height: 25,
-                child: _dock(PifSlot.status, statusWidgets, chrome: false),
-              ),
+            Expanded(
+              child: plugin == null
+                  ? const Center(
+                      child: Text(
+                        'Agent Console is not installed',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Color(0xff8b96aa),
+                        ),
+                      ),
+                    )
+                  : PanelErrorBoundary(
+                      key: const ValueKey('pif_app_console_host'),
+                      plugin: plugin,
+                      host: host,
+                    ),
+            ),
           ],
         ),
       ),
     );
+  }
+
+  void _toggleDevMode() {
+    setState(() => _devMode = !_devMode);
+    // Persisted shell setting; the hub control method for the toggle is
+    // the hub lane's surface (issue #156).
+    unawaited(host.storage.write('shell', 'devMode', _devMode));
   }
 
   final FocusNode _escapeFocus = FocusNode();
@@ -672,63 +929,100 @@ class _DockingShellState extends State<DockingShell>
     return grabbers;
   }
 
-  Widget _titleBar() => Container(
-    height: 42,
-    color: const Color(0xff11151d),
-    padding: const EdgeInsets.only(left: 78, right: 10),
-    child: Row(
-      children: [
-        const Text(
-          'pif',
-          style: TextStyle(fontWeight: FontWeight.w300, letterSpacing: 1),
-        ),
-        const SizedBox(width: 10),
-        Flexible(
-          child: Text(
-            'PI-NATIVE AGENTIC IDE',
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 10,
-              letterSpacing: 1.4,
-              color: Color(0xff69758a),
+  Widget _titleBar() {
+    // App runtime mode surfaces the dev toggle (and the console overlay
+    // button); a project without a manifest keeps the IDE title bar.
+    final appMode = _pageIds.isNotEmpty;
+    final ideVisible = !appMode || _devMode;
+    final appName = (_appManifest?['name'] as String?) ?? 'app';
+    return Container(
+      height: 42,
+      color: const Color(0xff11151d),
+      padding: const EdgeInsets.only(left: 78, right: 10),
+      child: Row(
+        children: [
+          const Text(
+            'pif',
+            style: TextStyle(fontWeight: FontWeight.w300, letterSpacing: 1),
+          ),
+          const SizedBox(width: 10),
+          Flexible(
+            child: Text(
+              appMode ? appName.toUpperCase() : 'PI-NATIVE AGENTIC IDE',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 10,
+                letterSpacing: 1.4,
+                color: Color(0xff69758a),
+              ),
             ),
           ),
-        ),
-        const Spacer(),
-        IconButton(
-          onPressed: () {
-            final visible = enabled.contains('widget_store');
-            widget.bus.send('widget/control', 'toggle', {
-              'id': 'widget_store',
-              'enabled': !visible,
-            });
-          },
-          tooltip: enabled.contains('widget_store')
-              ? 'Hide widget store'
-              : 'Show widget store',
-          icon: Icon(
-            Icons.widgets,
-            size: 18,
-            color: enabled.contains('widget_store')
-                ? const Color(0xff78dba9)
-                : null,
+          const Spacer(),
+          if (appMode && !ideVisible)
+            IconButton(
+              onPressed: () => setState(() => _consoleOpen = !_consoleOpen),
+              tooltip: _consoleOpen
+                  ? 'Hide Agent Console'
+                  : 'Show Agent Console',
+              icon: Icon(
+                Icons.smart_toy_outlined,
+                size: 18,
+                color: _consoleOpen ? const Color(0xff78dba9) : null,
+              ),
+            ),
+          if (ideVisible) ...[
+            IconButton(
+              onPressed: () {
+                final visible = enabled.contains('widget_store');
+                widget.bus.send('widget/control', 'toggle', {
+                  'id': 'widget_store',
+                  'enabled': !visible,
+                });
+              },
+              tooltip: enabled.contains('widget_store')
+                  ? 'Hide widget store'
+                  : 'Show widget store',
+              icon: Icon(
+                Icons.widgets,
+                size: 18,
+                color: enabled.contains('widget_store')
+                    ? const Color(0xff78dba9)
+                    : null,
+              ),
+            ),
+            IconButton(
+              onPressed: () => setState(() => centerSplit = !centerSplit),
+              tooltip: centerSplit ? 'Tabbed center' : 'Split center',
+              icon: Icon(
+                centerSplit ? Icons.tab : Icons.vertical_split,
+                size: 18,
+              ),
+            ),
+          ],
+          if (appMode)
+            IconButton(
+              key: const Key('pif_dev_toggle'),
+              onPressed: _toggleDevMode,
+              tooltip: _devMode
+                  ? 'Return to app mode'
+                  : 'Show IDE docking (dev)',
+              icon: Icon(
+                Icons.developer_mode,
+                size: 18,
+                color: _devMode ? const Color(0xff78dba9) : null,
+              ),
+            ),
+          IconButton(
+            onPressed: () =>
+                widget.bus.send('shell/state', 'snapshot_request', const {}),
+            tooltip: 'Resync',
+            icon: const Icon(Icons.sync, size: 18),
           ),
-        ),
-        IconButton(
-          onPressed: () => setState(() => centerSplit = !centerSplit),
-          tooltip: centerSplit ? 'Tabbed center' : 'Split center',
-          icon: Icon(centerSplit ? Icons.tab : Icons.vertical_split, size: 18),
-        ),
-        IconButton(
-          onPressed: () =>
-              widget.bus.send('shell/state', 'snapshot_request', const {}),
-          tooltip: 'Resync',
-          icon: const Icon(Icons.sync, size: 18),
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 
   /// A collapsed dock's slim drop edge: invisible until a drag hovers it,
   /// accepts drops into the (now empty) slot, which re-expands the dock.

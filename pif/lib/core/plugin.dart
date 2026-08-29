@@ -9,7 +9,13 @@ abstract class PifWidgetPlugin {
   Widget build(BuildContext context, PifHost host);
 }
 
-enum PifSlot { left, center, right, bottom, status }
+/// Where a widget renders inside the shell.
+///
+/// `page` is the app-runtime-mode slot (issue #156): page widgets are
+/// full-screen and render only in the app-mode page stage. They are
+/// excluded from the five docking slots — the docking frame keeps its
+/// left/center/right/bottom/status layout untouched for IDE chrome.
+enum PifSlot { left, center, right, bottom, status, page }
 
 class PifWidgetMeta {
   const PifWidgetMeta({
