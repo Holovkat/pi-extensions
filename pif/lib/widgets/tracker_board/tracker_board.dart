@@ -256,7 +256,12 @@ class _BoardState extends State<_Board> {
   /// The Epics overview (#188): one content card per epic with per-column
   /// counts of its family; tap drills into the epic's own board.
   Widget _epicsOverview(PifTheme theme) {
-    final epics = cards.where((card) => '${card['type']}' == 'epic').toList()
+    // Only epics that still need work (#188, owner): closed epics are done —
+    // they don't belong on the "what's next" board.
+    final epics = cards
+        .where((card) =>
+            '${card['type']}' == 'epic' && card['state'] != 'closed')
+        .toList()
       ..sort(
         (a, b) => '${b['updatedAt'] ?? ''}'.compareTo('${a['updatedAt'] ?? ''}'),
       );

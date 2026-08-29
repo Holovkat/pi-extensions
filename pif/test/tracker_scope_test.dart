@@ -89,6 +89,14 @@ Map<String, dynamic> _fixture() => {
     ),
     _card(14, 'Task: cards page', 'task', 'review', parent: 13),
     _card(12, 'Unrelated thing', 'issue', 'done', closed: true),
+    _card(
+      15,
+      'Epic: finished long ago',
+      'epic',
+      'done',
+      closed: true,
+      excerpt: 'This epic is closed and must not appear in the Epics overview.',
+    ),
   ],
 };
 
@@ -139,8 +147,10 @@ void main() {
     // Family: sprint #13 + tasks #11 (To Do) and #14 (Review).
     expect(find.textContaining('To Do 2'), findsOneWidget);
     expect(find.textContaining('Review 1'), findsOneWidget);
-    // The overview is per-epic: unrelated work stays out.
+    // The overview is per-epic: unrelated work stays out, and closed epics
+    // are done — hidden from the "what's next" list (owner, 2026-08-30).
     expect(find.text('Unrelated thing'), findsNothing);
+    expect(find.text('#15 — Epic: finished long ago'), findsNothing);
     await bus.dispose();
   });
 
