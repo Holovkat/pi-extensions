@@ -1153,7 +1153,7 @@ class _TicketSheetState extends State<_TicketSheet> {
                     maxLines: null,
                     expands: true,
                     textAlignVertical: TextAlignVertical.top,
-                    style: const TextStyle(fontSize: 12.5),
+                    style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
                     decoration: const InputDecoration(
                       isDense: true,
                       border: InputBorder.none,
@@ -1193,6 +1193,14 @@ class _TicketSheetState extends State<_TicketSheet> {
                     child: SelectionArea(
                       child: MarkdownBody(
                         data: _body.text,
+                        // Normal text sits at w300 (#189 owner note): only
+                        // titles and headings keep heavier weights.
+                        styleSheet: MarkdownStyleSheet.fromTheme(
+                          Theme.of(context),
+                        ).copyWith(
+                          p: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
+                          listBullet: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
+                        ),
                         builders: {
                           'img': _SheetImageBuilder(onWidthChange: _setImageWidth),
                         },
@@ -1310,7 +1318,7 @@ class _TicketSheetState extends State<_TicketSheet> {
                     asset,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11),
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
                   ),
                 ),
                 Text(
@@ -1470,7 +1478,7 @@ class _TicketSheetState extends State<_TicketSheet> {
               Expanded(
                 child: Text(
                   parentCard ?? 'No parent epic',
-                  style: const TextStyle(fontSize: 12.5),
+                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
                 ),
               ),
             ],
@@ -1567,7 +1575,7 @@ class _TicketSheetState extends State<_TicketSheet> {
                       .map(
                         (level) => DropdownMenuItem(
                           value: level,
-                          child: Text(level, style: TextStyle(fontSize: 12)),
+                          child: Text(level, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w300)),
                         ),
                       )
                       .toList(),
