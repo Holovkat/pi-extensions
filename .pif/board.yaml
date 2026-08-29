@@ -7,6 +7,9 @@ column todo:
 column in_progress:
   name: In Progress
   label: status:in-progress
+column review:
+  name: Review
+  label: status:review
 column blocked:
   name: Blocked
   label: status:blocked
