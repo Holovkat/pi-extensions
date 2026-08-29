@@ -115,8 +115,8 @@ function fakePi(workspace) {
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, globalCatalog = null, token = 'integration-token'}) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {}), ...(globalCatalog ? {PIF_GLOBAL_CATALOG: globalCatalog} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, globalCatalog = null, token = 'integration-token', appDir = null}) {
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {}), ...(globalCatalog ? {PIF_GLOBAL_CATALOG: globalCatalog} : {}), ...(appDir ? {PIF_APP_DIR: appDir} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -434,4 +434,55 @@ test('real Flutter supervisor boots the macOS shell and performs a machine-proto
   socket.close();
   pi.kill('SIGTERM');
   await new Promise((resolve) => pi.once('exit', resolve));
+});
+
+test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (#157)', {timeout: 180_000}, async (t) => {
+  const checkpoint = (name) => console.error(`[pif-app-init] ${name}`);
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-app-init-')); copyFixture(workspace); const port = 34000 + Math.floor(Math.random() * 1000);
+  const globalCatalog = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-app-catalog-'));
+  // PIF_APP_DIR points at the repo's app source so template resolution and
+  // the analyzer have a real package — which means the hub's registry
+  // writes land in the repo. Snapshot and restore them (the test cleans
+  // up after itself; the gate depends on a pristine registry).
+  const registryPath = path.join(repo, 'pif', 'lib', 'widget_registry.g.dart');
+  const registryStatePath = path.join(repo, 'pif', '.pi', 'pif', 'registry.json');
+  const registryBefore = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
+  const stateBefore = fs.existsSync(registryStatePath) ? fs.readFileSync(registryStatePath) : null;
+  const pi = await startPi({workspace, port, piBin: fakePi(workspace), globalCatalog, appDir: path.join(repo, 'pif')});
+  checkpoint('hub started'); t.after(() => {
+    if (pi.exitCode == null) pi.kill('SIGKILL');
+    fs.rmSync(workspace, {recursive: true, force: true});
+    fs.rmSync(globalCatalog, {recursive: true, force: true});
+    if (registryBefore) fs.writeFileSync(registryPath, registryBefore); else fs.rmSync(registryPath, {force: true});
+    if (stateBefore) fs.writeFileSync(registryStatePath, stateBefore); else fs.rmSync(registryStatePath, {force: true});
+  });
+  const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
+  await waitFor(() => fs.existsSync(controlPath), 'control socket appears');
+  const init = await control(controlPath, 'pif_app.init', {name: 'Notes Trial', template: 'mercury'});
+  assert.equal(init.ok, true);
+  assert.equal(init.id, 'notes-trial');
+  assert.equal(init.template, 'mercury');
+  assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'app.yaml')), 'manifest written');
+  assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'template', 'template.yaml')), 'mercury layers pinned into the project');
+  assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'widgets', 'home', 'home.dart')), 'home page scaffolded');
+  checkpoint('init done (template pinned, home installed through the analyzer gate)');
+  const page = await control(controlPath, 'pif_app.page_add', {name: 'Editor', id: 'editor_page'});
+  assert.deepEqual(page.pages, ['home', 'editor_page']);
+  assert.equal((await control(controlPath, 'pif_app.home_set', {id: 'home'})).home, 'home');
+  const build = await control(controlPath, 'pif_app.build', {});
+  assert.equal(build.ok, false);
+  assert.match(build.error, /#159/, 'build is a registered stub until the export pipeline (#159)');
+  const list = await control(controlPath, 'pif_app.list', {});
+  assert.equal(list.manifest.pages.join(','), 'home,editor_page');
+  assert.equal(list.widgets[0].installed, true, 'home page installed');
+  // The shell contract: the snapshot carries the manifest, so app mode boots.
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
+  await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
+  send(socket, 'shell/state', 'snapshot_request', {});
+  const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
+  assert.equal(snapshot.payload.app.id, 'notes-trial');
+  assert.equal(snapshot.payload.app.home, 'home');
+  assert.deepEqual(snapshot.payload.app.pages, ['home', 'editor_page']);
+  assert.equal(snapshot.payload.widgets.home.source, 'project', 'scaffolded page registers from the project overlay');
+  checkpoint('manifest live in the snapshot — app mode is armed');
 });

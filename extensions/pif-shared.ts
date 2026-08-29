@@ -73,7 +73,7 @@ export function parseWidgetManifest(raw: string): PifWidgetManifest {
 	const id = scalar(values.id);
 	if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("Widget id must be lowercase snake_case");
 	const slot = scalar(values.slot) as PifWidgetManifest["slot"];
-	if (!["left", "center", "right", "bottom", "status"].includes(slot)) throw new Error(`Invalid widget slot: ${slot}`);
+	if (!["left", "center", "right", "bottom", "status", "page"].includes(slot)) throw new Error(`Invalid widget slot: ${slot}`);
 	const list = (source = "") => {
 		const text = source.trim();
 		if (!text || text === "[]") return [];
@@ -150,6 +150,97 @@ export function trackerParentRef(body: string, type: string): number | null {
 	if (sprints.length === 1) return sprints[0];
 	if (sprints.length === 0 && epics.length === 1) return epics[0];
 	return null;
+}
+
+// --- App manifest (#157): pif_app/app.yaml — the project's app model ---
+
+export interface PifAppManifest {
+  id: string;
+  name: string;
+  version: string;
+  home: string;
+  pages: string[];
+  template?: string;
+  dependencies: string[];
+}
+
+export function slugifyAppId(name: string): string {
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "my-app";
+}
+
+function parseYamlStringList(value: string): string[] {
+  const inline = value.match(/^\[(.*)\]$/);
+  if (inline) {
+    return inline[1].split(",").map((item) => item.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+  }
+  return [];
+}
+
+/** Parse + validate `pif_app/app.yaml` (settled schema, task #157): id,
+ * name, version, home, pages (ordered), optional template + dependencies.
+ * Every rejection is an actionable diagnostic; nothing is guessed. */
+export function parseAppManifest(text: string): { manifest?: PifAppManifest; error?: string } {
+  const values = new Map<string, string>();
+  const lists = new Map<string, string[]>();
+  let currentList: string | null = null;
+  for (const [index, raw] of text.split(/\r?\n/).entries()) {
+    const line = raw.replace(/#.*$/, "").trim();
+    if (!line) { currentList = null; continue; }
+    if (currentList && /^-\s+/.test(line)) {
+      lists.get(currentList)!.push(line.replace(/^-.s*/, "").trim().replace(/^["']|["']$/g, ""));
+      continue;
+    }
+    const pair = /^(\w+)\s*:\s*(.*)$/.exec(line);
+    if (!pair) return { error: `app.yaml line ${index + 1}: expected 'key: value' or a list item, got: ${raw.trim()}` };
+    const [, key, value] = pair;
+    currentList = null;
+    if (value === "") { lists.set(key, []); currentList = key; } else { values.set(key, value.trim().replace(/^["']|["']$/g, "")); }
+  }
+  const id = values.get("id") ?? "";
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(id)) return { error: `app.yaml: 'id' must be a kebab identifier (lowercase letters, digits, dashes) — got '${id || "(missing)"}'` };
+  const name = values.get("name") ?? "";
+  if (!name) return { error: "app.yaml: 'name' is required (display name for the app)" };
+  const pages = lists.get("pages") ?? parseYamlStringList(values.get("pages") ?? "");
+  if (!pages.length) return { error: "app.yaml: 'pages' must list at least one page widget id (ordered, first entry is not necessarily home)" };
+  if (new Set(pages).size !== pages.length) return { error: "app.yaml: 'pages' contains duplicate widget ids" };
+  const home = values.get("home") ?? "";
+  if (!pages.includes(home)) return { error: `app.yaml: 'home' must be one of the declared pages — got '${home || "(missing)"}'; pages: ${pages.join(", ")}` };
+  const dependencies = lists.get("dependencies") ?? parseYamlStringList(values.get("dependencies") ?? "");
+  const manifest: PifAppManifest = { id, name, version: values.get("version") || "0.1.0", home, pages, template: values.get("template") || undefined, dependencies };
+  if (manifest.template !== undefined && !/^[a-z0-9][a-z0-9-]*$/.test(manifest.template)) return { error: `app.yaml: 'template' must be a kebab identifier — got '${manifest.template}'` };
+  return { manifest };
+}
+
+/** Render the manifest back to canonical app.yaml text (single key order,
+ * block lists) so hub writes never churn the file. */
+export function renderAppManifest(manifest: PifAppManifest): string {
+  const lines = [
+    `id: ${manifest.id}`,
+    `name: ${manifest.name}`,
+    `version: ${manifest.version}`,
+    `home: ${manifest.home}`,
+    "pages:",
+    ...manifest.pages.map((page) => `  - ${page}`),
+  ];
+  if (manifest.template) lines.push(`template: ${manifest.template}`);
+  if (manifest.dependencies.length) {
+    lines.push("dependencies:", ...manifest.dependencies.map((dep) => `  - ${dep}`));
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/** Pure manifest updates used by the pif_app_* tools: adding a page keeps
+ * order and rejects duplicates; setting home requires a declared page. */
+export function addAppPage(manifest: PifAppManifest, page: string): { manifest?: PifAppManifest; error?: string } {
+  if (!/^[a-z][a-z0-9_]*$/.test(page)) return { error: `Page id must be a lowercase widget identifier (snake_case) — got '${page}'` };
+  if (manifest.pages.includes(page)) return { error: `Page '${page}' is already declared` };
+  return { manifest: { ...manifest, pages: [...manifest.pages, page] } };
+}
+
+export function setAppHome(manifest: PifAppManifest, home: string): { manifest?: PifAppManifest; error?: string } {
+  if (!manifest.pages.includes(home)) return { error: `Home must be one of the declared pages: ${manifest.pages.join(", ")} — got '${home}'` };
+  return { manifest: { ...manifest, home } };
 }
 
 /** Tag→label diff for a ticket update (#189): `desired` is the full tag list

@@ -20,6 +20,12 @@ import {
 	pifProbeProof,
 	pifUpgradeAuthorized,
 	TrackerSync,
+	addAppPage,
+	parseAppManifest,
+	renderAppManifest,
+	setAppHome,
+	slugifyAppId,
+	type PifAppManifest,
 	type PifEnvelope,
 	type PifWidgetManifest,
 	type PifWidgetSource,
@@ -41,6 +47,8 @@ interface HubState {
 	models: string[];
 	modelProviders: Record<string, any>;
 	tracker: TrackerState;
+	app: PifAppManifest | null;
+	appError: string | null;
 	health: { hub: "running" | "stopped"; flutter: string; reload: string; workspace: string; port: number; origin: "standalone" | "terminal" };
 }
 
@@ -244,7 +252,7 @@ class PifHub {
 		this.globalCatalogPath = process.env.PIF_GLOBAL_CATALOG || path.join(os.homedir(), ".pi", "pif", "catalog");
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -266,7 +274,7 @@ class PifHub {
 		fs.writeFileSync(`${tokenPath}.tmp`, this.token, { mode: 0o600 }); fs.renameSync(`${tokenPath}.tmp`, tokenPath);
 		try { fs.chmodSync(tokenPath, 0o600); fs.writeFileSync(path.join(this.pifDir, "control.secret"), this.controlSecret, { mode: 0o600 }); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
-		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.scanWidgets();
+		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.syncRepoTemplates(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
 		this.createHostSession(); this.prunePersistedSessions(); this.loadPersistedSessions(); await this.startWebSocket(); await this.startControl();
 		this.state.health.hub = "running"; this.setStatus(); this.broadcastSnapshot();
@@ -652,6 +660,7 @@ class PifHub {
 		this.installed = new Set(Object.keys(this.state.widgets));
 		for (const id of Object.keys(this.state.widgets)) delete this.state.catalog[id];
 		for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
+		this.loadAppManifest();
 	}
 	private generateRegistry() {
 		const roots = this.widgetRoots();
@@ -773,6 +782,183 @@ class PifHub {
 		const source = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); const target = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target);
 		this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot(); if (this.supervisor.process) await this.supervisor.reload(); return { ok: true, id, source: "base", archived: target };
 	}
+	// --- App model (#157): pif_app/app.yaml + pif_app_* tools ---
+
+	private appManifestPath() { return path.join(this.state.health.workspace, "pif_app", "app.yaml"); }
+
+	/// Template resolution (#157/#178): project pinned copy → global catalog →
+	/// the templates shipped with the app source (repo fallback).
+	private appTemplateSource(template: string) {
+		const candidates = [
+			path.join(this.state.health.workspace, "pif_app", "template"),
+			path.join(this.globalCatalogPath, "templates", template),
+			path.join(this.appDir, "templates", template),
+		];
+		return candidates.find((candidate) => fs.existsSync(path.join(candidate, "template.yaml")));
+	}
+
+	/// Mirror repo-shipped templates into the global catalog at hub start —
+	/// same origin→store philosophy as widgets (#155).
+	syncRepoTemplates() {
+		const source = path.join(this.appDir, "templates");
+		if (!fs.existsSync(source)) return;
+		for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+			if (!entry.isDirectory()) continue;
+			const from = path.join(source, entry.name);
+			const to = path.join(this.globalCatalogPath, "templates", entry.name);
+			fs.mkdirSync(path.dirname(to), { recursive: true });
+			fs.rmSync(to, { recursive: true, force: true });
+			fs.cpSync(from, to, { recursive: true });
+		}
+	}
+
+	loadAppManifest() {
+		const file = this.appManifestPath();
+		if (!fs.existsSync(file)) { this.state.app = null; this.state.appError = null; return; }
+		const parsed = parseAppManifest(fs.readFileSync(file, "utf8"));
+		if (parsed.error) { this.state.appError = parsed.error; this.changed(this.state); return; }
+		this.state.app = parsed.manifest ?? null;
+		this.state.appError = null;
+	}
+
+	private writeAppManifest(manifest: PifAppManifest) {
+		const file = this.appManifestPath();
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, renderAppManifest(manifest));
+		this.state.app = manifest;
+		this.state.appError = null;
+	}
+
+	/// pif_app is a package per the layered-sources convention (#155): its
+	/// pubspec (flutter + a path dep on the app) gives the analyzer a package
+	/// config for project widgets. Scaffolded once; pub get runs here so the
+	/// install gate sees resolved packages.
+	private scaffoldAppPackage() {
+		const root = path.join(this.state.health.workspace, "pif_app");
+		const pubspec = path.join(root, "pubspec.yaml");
+		if (!fs.existsSync(pubspec)) {
+			const appRef = path.relative(root, this.appDir).split(path.sep).join("/");
+			fs.writeFileSync(pubspec, `name: pif_app\npublish_to: none\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  flutter:\n    sdk: flutter\n  pif:\n    path: ${appRef}\n`);
+		}
+		const pubGet = spawnSync("flutter", ["pub", "get"], { cwd: root, encoding: "utf8", timeout: 180_000 });
+		if (pubGet.status !== 0) throw new Error(`flutter pub get failed in pif_app: ${pubGet.stdout}${pubGet.stderr}`);
+	}
+
+	private assertNoApp() {
+		if (fs.existsSync(this.appManifestPath())) throw new Error("This project already has pif_app/app.yaml — use the pif_app_* tools to change it");
+	}
+
+	/// Scaffold a widget inside the project overlay (pif_app/widgets): the
+	/// only allowed write root for app scaffolding per the #157 contract.
+	private async scaffoldWidget(id: string, name: string, slot: string) {
+		const widgetsRoot = path.join(this.state.health.workspace, "pif_app", "widgets");
+		const dir = assertSafeWidgetPath(widgetsRoot, path.join(widgetsRoot, id));
+		fs.mkdirSync(dir, { recursive: true });
+		const safeName = name.replace(/'/g, "\\'");
+		fs.writeFileSync(path.join(dir, "widget.yaml"), `id: ${id}\nname: ${safeName}\nslot: ${slot}\nversion: 0.1.0\ncore: false\ndescription: ${slot === "page" ? "Page" : "Widget"} ${safeName} for the project app\n`);
+		fs.writeFileSync(
+			path.join(dir, `${id}.dart`),
+			"import 'package:flutter/material.dart';\nimport 'package:pif/core/plugin.dart';\n\n" +
+			`class ${widgetClassName(id)} implements PifWidgetPlugin {\n` +
+			`  const ${widgetClassName(id)}();\n` +
+			"  @override\n" +
+			`  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: '${safeName}', slot: PifSlot.${slot});\n` +
+			"  @override\n" +
+			"  Widget build(BuildContext context, PifHost host) => Scaffold(\n" +
+			"    body: Center(\n" +
+			"      child: Column(\n" +
+			"        mainAxisAlignment: MainAxisAlignment.center,\n" +
+			"        children: [\n" +
+			`          Text('${safeName}', style: Theme.of(context).textTheme.headlineSmall),\n` +
+			"          const SizedBox(height: 8),\n" +
+			"          Text('Scaffolded by pif_app_init — ready for its content.', style: Theme.of(context).textTheme.bodySmall),\n" +
+			"        ],\n" +
+			"      ),\n" +
+			"    ),\n" +
+			"  );\n" +
+			"}\n",
+		);
+	}
+
+	private async installOrFail(id: string, what: string) {
+		const install = await this.installWidget({ id });
+		if (!install?.ok) {
+			const detail = install?.reload?.error ?? JSON.stringify(install?.diagnostics ?? install ?? {});
+			throw new Error(`${what} '${id}' failed the analyzer gate: ${detail}`);
+		}
+		return install;
+	}
+
+	async appInit(params: any) {
+		this.assertNoApp();
+		const name = String(params.name ?? "My App").trim() || "My App";
+		const template = params.template ? String(params.template) : undefined;
+		if (template && !/^[a-z0-9][a-z0-9-]*$/.test(template)) throw new Error(`Template id must be a kebab identifier — got '${template}'`);
+		const manifest: PifAppManifest = { id: slugifyAppId(name), name, version: "0.1.0", home: "home", pages: ["home"], template, dependencies: [] };
+		if (template) {
+			const source = this.appTemplateSource(template);
+			if (!source) throw new Error(`Template '${template}' not found (searched project pinned copy, ${this.globalCatalogPath}/templates, and the app's bundled templates)`);
+			const to = path.join(this.state.health.workspace, "pif_app", "template");
+			fs.mkdirSync(path.dirname(to), { recursive: true });
+			fs.rmSync(to, { recursive: true, force: true });
+			fs.cpSync(source, to, { recursive: true });
+		}
+		this.writeAppManifest(manifest);
+		this.scaffoldAppPackage();
+		await this.scaffoldWidget("home", "Home", "page");
+		await this.installOrFail("home", "Home page");
+		this.loadAppManifest();
+		return { ok: true, id: manifest.id, name: manifest.name, template: template ?? null, pages: manifest.pages, note: template ? "template layers pinned to pif_app/template/" : "minimal unstyled app" };
+	}
+
+	async appPageAdd(params: any) {
+		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
+		const name = String(params.name ?? "").trim();
+		if (!name) throw new Error("Page name is required");
+		const id = params.id ? String(params.id) : slugifyAppId(name).replace(/-/g, "_");
+		const parsed = addAppPage(this.state.app, id);
+		if (parsed.error) throw new Error(parsed.error);
+		await this.scaffoldWidget(id, name, "page");
+		await this.installOrFail(id, "Page");
+		this.writeAppManifest(parsed.manifest!);
+		return { ok: true, page: id, pages: this.state.app!.pages };
+	}
+
+	async appWidgetAdd(params: any) {
+		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
+		const name = String(params.name ?? "").trim();
+		if (!name) throw new Error("Widget name is required");
+		const id = params.id ? String(params.id) : slugifyAppId(name).replace(/-/g, "_");
+		const slot = String(params.slot ?? "center");
+		if (!["left", "center", "right", "bottom", "status"].includes(slot)) throw new Error(`Slot must be one of left|center|right|bottom|status — got '${slot}'`);
+		if (this.state.widgets[id]) throw new Error(`Widget id '${id}' is already installed`);
+		await this.scaffoldWidget(id, name, slot);
+		await this.installOrFail(id, "Widget");
+		return { ok: true, widget: id, slot };
+	}
+
+	appHomeSet(params: any) {
+		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
+		const parsed = setAppHome(this.state.app, String(params.id ?? ""));
+		if (parsed.error) throw new Error(parsed.error);
+		this.writeAppManifest(parsed.manifest!);
+		return { ok: true, home: this.state.app!.home, pages: this.state.app!.pages };
+	}
+
+	appList() {
+		if (!this.state.app) return { ok: false, error: this.state.appError ?? "No app manifest — run pif_app_init first" };
+		const manifest = this.state.app;
+		return {
+			ok: true,
+			manifest,
+			widgets: manifest.pages.map((page) => ({ page, installed: !!this.state.widgets[page], enabled: !!this.state.widgets[page]?.enabled })),
+		};
+	}
+
+	appBuild() {
+		return { ok: false, error: "not-built-yet: the export pipeline lands in task #159 — pif_app_build is registered ahead of it per plan" };
+	}
+
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
 	private async storeAction(type: string, payload: any) { if (type === "install") return this.installWidget(payload); if (type === "refresh") { this.scanWidgets(); this.broadcastSnapshot(); } }
 	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
@@ -782,7 +968,7 @@ class PifHub {
 	shutdown() { this.stop().catch(() => { /* partial startup */ }); setTimeout(() => process.exit(0), 250).unref(); return Promise.resolve({ ok: true, stopping: true }); }
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
-			case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
+			case "pif_app.init": return this.appInit(params); case "pif_app.page_add": return this.appPageAdd(params); case "pif_app.widget_add": return this.appWidgetAdd(params); case "pif_app.home_set": return this.appHomeSet(params); case "pif_app.list": return this.appList(); case "pif_app.build": return this.appBuild(); case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
 			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list(); case "tracker.create": return this.trackerAction("create", params); case "tracker.update": return this.trackerAction("update", params); case "tracker.delete": return this.trackerAction("delete", params);
 			case "shell.shutdown": return this.shutdown();
@@ -814,6 +1000,12 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_widget_uninstall", "pif widget uninstall", "Deregister a non-core widget: base widgets archive back into the app-local catalog, project overlay widgets deregister in place.", Type.Object({ id: Type.String() }), "widget.uninstall");
 	register("pif_widget_list", "pif widget list", "List installed and catalog widgets with per-layer provenance (base, catalog, project).", Type.Object({}), "widget.list");
 	register("pif_tracker_list", "pif tracker list", "List the workspace repo's board cards (epics, sprints, tasks, issues) with their columns, without bodies.", Type.Object({}), "tracker.list");
+	register("pif_app_init", "pif app init", "Scaffold this project's app: pif_app/app.yaml + a Home page, installed through the analyzer gate. Optional template (e.g. mercury) pins the template's layers into pif_app/template/.", Type.Object({ name: Type.Optional(Type.String()), template: Type.Optional(Type.String()) }), "pif_app.init");
+	register("pif_app_page_add", "pif app page add", "Add a page to the project app: scaffolds a page widget in pif_app/widgets, installs it through the analyzer gate, and appends it to the manifest's page order.", Type.Object({ name: Type.String(), id: Type.Optional(Type.String()) }), "pif_app.page_add");
+	register("pif_app_widget_add", "pif app widget add", "Add a widget-extension to the project app (dock or status slot).", Type.Object({ name: Type.String(), id: Type.Optional(Type.String()), slot: Type.Optional(Type.String()) }), "pif_app.widget_add");
+	register("pif_app_home_set", "pif app home set", "Set the app's home page (must be a declared page).", Type.Object({ id: Type.String() }), "pif_app.home_set");
+	register("pif_app_list", "pif app list", "List the project app manifest and its pages with install state.", Type.Object({}), "pif_app.list");
+	register("pif_app_build", "pif app build", "Export the project app as a standalone application. Registered ahead of the export pipeline (task #159).", Type.Object({}), "pif_app.build");
 	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
 	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
 	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");

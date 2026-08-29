@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
-import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange } from './pif-shared.ts';
+import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange, parseAppManifest, renderAppManifest, addAppPage, setAppHome, slugifyAppId } from './pif-shared.ts';
 import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
@@ -563,4 +563,34 @@ test('plannedLabelChange diffs tags while preserving status and type labels', ()
   const protect = plannedLabelChange(['task', 'status:in-progress'], ['design'], 'task');
   assert.deepEqual(protect.add, ['design']);
   assert.deepEqual(protect.remove, []);
+});
+
+test('parseAppManifest accepts the settled schema and rejects with actionable diagnostics', () => {
+  const good = parseAppManifest('id: notes\nname: Notes\nversion: 0.1.0\nhome: home\npages:\n  - home\n  - editor\ntemplate: mercury\ndependencies:\n  - diff_viewer\n');
+  assert.equal(good.error, undefined);
+  assert.deepEqual(good.manifest, { id: 'notes', name: 'Notes', version: '0.1.0', home: 'home', pages: ['home', 'editor'], template: 'mercury', dependencies: ['diff_viewer'] });
+  const inline = parseAppManifest('id: notes\nname: Notes\nhome: home\npages: [home, editor]\n');
+  assert.deepEqual(inline.manifest.pages, ['home', 'editor']);
+  assert.equal(inline.manifest.version, '0.1.0');
+  assert.match(parseAppManifest('id: Bad Id\nname: X\nhome: a\npages: [a]').error, /kebab identifier/);
+  assert.match(parseAppManifest('id: notes\nhome: home\npages: [home]').error, /'name' is required/);
+  assert.match(parseAppManifest('id: notes\nname: N\nhome: editor\npages: [home]').error, /'home' must be one of the declared pages/);
+  assert.match(parseAppManifest('id: notes\nname: N\nhome: home\npages: [home, home]').error, /duplicate/);
+  assert.match(parseAppManifest('what is this line\n', ).error, /line 1/);
+});
+
+test('app manifest updates validate and render round-trips', () => {
+  const base = parseAppManifest('id: notes\nname: Notes\nhome: home\npages: [home]\n').manifest;
+  const withPage = addAppPage(base, 'editor');
+  assert.deepEqual(withPage.manifest.pages, ['home', 'editor']);
+  assert.match(addAppPage(base, 'home').error, /already declared/);
+  assert.match(addAppPage(base, 'Not Kebab').error, /widget identifier/);
+  const newHome = setAppHome(withPage.manifest, 'editor');
+  assert.equal(newHome.manifest.home, 'editor');
+  assert.match(setAppHome(withPage.manifest, 'missing').error, /must be one of the declared pages/);
+  assert.equal(slugifyAppId('My Fancy App!'), 'my-fancy-app');
+  const rendered = renderAppManifest(newHome.manifest);
+  const reparsed = parseAppManifest(rendered);
+  assert.equal(reparsed.error, undefined);
+  assert.deepEqual(reparsed.manifest, newHome.manifest);
 });
