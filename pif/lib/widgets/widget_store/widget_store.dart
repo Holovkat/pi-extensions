@@ -26,6 +26,16 @@ class _StoreState extends State<_Store> {
   Map<String, dynamic> installed = {};
   Map<String, dynamic> catalog = {};
   String diagnostics = '';
+
+  /// Provenance badge per source layer (issue #156; values match the
+  /// settled layered-sources model: base | catalog | project). Widgets
+  /// from a hub without provenance render no badge.
+  static const Map<String, (String, Color)> _sourceBadges = {
+    'base': ('BASE', Color(0xff8b96aa)),
+    'catalog': ('CATALOG', Color(0xff5b8dd9)),
+    'project': ('PROJECT', Color(0xff78dba9)),
+  };
+
   @override
   void initState() {
     super.initState();
@@ -108,6 +118,29 @@ class _StoreState extends State<_Store> {
       ),
     ),
   );
+  Widget _sourceBadge(String source) {
+    final (label, color) =
+        _sourceBadges[source] ??
+        (source.toUpperCase(), const Color(0xff8b96aa));
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withValues(alpha: 0.55)),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 9,
+          letterSpacing: 0.8,
+          fontWeight: FontWeight.w400,
+          color: color,
+        ),
+      ),
+    );
+  }
+
   Widget _installed(String id, Map<String, dynamic> item) => Card(
     child: Padding(
       padding: const EdgeInsets.all(8),
@@ -117,9 +150,22 @@ class _StoreState extends State<_Store> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  '${item['name'] ?? id}',
-                  style: const TextStyle(fontWeight: FontWeight.w300),
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        '${item['name'] ?? id}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontWeight: FontWeight.w300),
+                      ),
+                    ),
+                    if (item['source'] is String &&
+                        (item['source'] as String).isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      _sourceBadge(item['source'] as String),
+                    ],
+                  ],
                 ),
                 Text(
                   '${item['description'] ?? ''}',
@@ -161,7 +207,19 @@ class _StoreState extends State<_Store> {
   );
   Widget _catalog(String id, Map<String, dynamic> item) => Card(
     child: ListTile(
-      title: Text('${item['name'] ?? id}'),
+      title: Row(
+        children: [
+          Flexible(
+            child: Text(
+              '${item['name'] ?? id}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          const SizedBox(width: 6),
+          _sourceBadge('catalog'),
+        ],
+      ),
       subtitle: Text('${item['description'] ?? ''}', maxLines: 2),
       trailing: FilledButton.tonal(
         onPressed: () =>
