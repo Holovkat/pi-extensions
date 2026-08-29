@@ -32,6 +32,12 @@ class _BoardState extends State<_Board> {
   bool stale = false;
   String? error;
   List<Map<String, dynamic>>? _revertOnFailure;
+  // Scope (issue #188): "All work" is the original board; the Epics overview
+  // lists one card per epic; _scopedEpic drills into a single epic's family
+  // (the epic pinned as a header card above lanes containing only its own
+  // sprints and tasks — the notes-app project board view).
+  bool _epicsView = false;
+  int? _scopedEpic;
   @override
   void initState() {
     super.initState();
@@ -132,7 +138,15 @@ class _BoardState extends State<_Board> {
                 style: const TextStyle(color: Color(0xffe2a4a4), fontSize: 11),
               ),
             ),
-          Expanded(child: columns.isEmpty ? _empty(theme) : _board(theme)),
+          Expanded(
+            child: columns.isEmpty
+                ? _empty(theme)
+                : _scopedEpic != null
+                ? _scopedBoard(context, theme)
+                : _epicsView
+                ? _epicsOverview(theme)
+                : _board(theme),
+          ),
         ],
       ),
     );
@@ -142,6 +156,12 @@ class _BoardState extends State<_Board> {
     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
     child: Row(
       children: [
+        if (_scopedEpic != null)
+          IconButton(
+            tooltip: 'Back to epics',
+            icon: const Icon(Icons.arrow_back, size: 18),
+            onPressed: () => setState(() => _scopedEpic = null),
+          ),
         Text(
           repo.isEmpty ? 'TRACKER' : repo.toUpperCase(),
           style: TextStyle(
@@ -166,6 +186,7 @@ class _BoardState extends State<_Board> {
           ),
         ],
         const Spacer(),
+        if (_scopedEpic == null) _scopeSwitch(theme),
         IconButton(
           tooltip: 'New ticket',
           icon: const Icon(Icons.add, size: 20),
@@ -177,6 +198,25 @@ class _BoardState extends State<_Board> {
           onPressed: () =>
               widget.host.bus.send('tracker/control', 'refresh', const {}),
         ),
+      ],
+    ),
+  );
+
+  /// Scope switch (#188): "All work" is today's board, untouched; "Epics"
+  /// opens the overview that drills into per-epic project boards.
+  Widget _scopeSwitch(PifTheme theme) => Padding(
+    padding: const EdgeInsets.only(right: 6),
+    child: ToggleButtons(
+      isSelected: [!_epicsView, _epicsView],
+      onPressed: (index) => setState(() => _epicsView = index == 1),
+      borderRadius: BorderRadius.circular(6),
+      constraints: const BoxConstraints(minHeight: 28, minWidth: 60),
+      textStyle: const TextStyle(fontSize: 11),
+      color: theme.textMuted,
+      selectedColor: theme.accent,
+      children: const [
+        Padding(padding: EdgeInsets.symmetric(horizontal: 10), child: Text('All work')),
+        Padding(padding: EdgeInsets.symmetric(horizontal: 10), child: Text('Epics')),
       ],
     ),
   );
@@ -195,21 +235,227 @@ class _BoardState extends State<_Board> {
     itemBuilder: (context, index) => _column(context, columns[index], theme),
   );
 
+  /// Cards belonging to an epic's family: the epic itself, its direct
+  /// children, and children of its sprints. Parent links come from the hub
+  /// sync (#188); anything without a resolvable parent stays out of scoped
+  /// views — ambiguity must never place a card under the wrong epic.
+  bool _inEpicFamily(Map<String, dynamic> card, int epicNumber) {
+    if (card['number'] == epicNumber) return true;
+    if (card['parent'] == epicNumber) return true;
+    final sprintNumbers = cards
+        .where((candidate) =>
+            '${candidate['type']}' == 'sprint' &&
+            candidate['parent'] == epicNumber)
+        .map((candidate) => candidate['number'])
+        .toSet();
+    return sprintNumbers.contains(card['parent']);
+  }
+
+  /// The Epics overview (#188): one content card per epic with per-column
+  /// counts of its family; tap drills into the epic's own board.
+  Widget _epicsOverview(PifTheme theme) {
+    final epics = cards.where((card) => '${card['type']}' == 'epic').toList()
+      ..sort(
+        (a, b) => '${b['updatedAt'] ?? ''}'.compareTo('${a['updatedAt'] ?? ''}'),
+      );
+    if (epics.isEmpty) {
+      return Center(
+        child: Text(
+          'No epics on this board',
+          style: TextStyle(color: theme.textMuted, fontSize: 12),
+        ),
+      );
+    }
+    return ListView.builder(
+      padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+      itemCount: epics.length,
+      itemBuilder: (context, index) {
+        final epic = epics[index];
+        final epicNumber = epic['number'] as int;
+        final perColumn = <String, int>{};
+        for (final card in cards) {
+          if (card['number'] == epicNumber) continue;
+          if (!_inEpicFamily(card, epicNumber)) continue;
+          final columnId = '${card['column']}';
+          perColumn[columnId] = (perColumn[columnId] ?? 0) + 1;
+        }
+        final summary = columns
+            .map((column) {
+              final count = perColumn['${column['id']}'] ?? 0;
+              return count > 0 ? '${column['name']} $count' : null;
+            })
+            .whereType<String>()
+            .join('  ·  ');
+        return _contentCard(
+          context,
+          card: epic,
+          theme: theme,
+          countsSummary: summary,
+          onTap: () => setState(() => _scopedEpic = epicNumber),
+        );
+      },
+    );
+  }
+
+  /// The epic-scoped board (#188): the epic pinned as a header card at the
+  /// top, lanes containing only that epic's family. Drags write back to the
+  /// tracker exactly like the All-work view.
+  Widget _scopedBoard(BuildContext context, PifTheme theme) {
+    final epicNumber = _scopedEpic!;
+    final epicCards = cards
+        .where((card) => card['number'] == epicNumber)
+        .toList();
+    if (epicCards.isEmpty) {
+      return Center(
+        child: Text(
+          'Epic #$epicNumber is no longer on the board',
+          style: TextStyle(color: theme.textMuted, fontSize: 12),
+        ),
+      );
+    }
+    // The epic renders as the pinned header card — not duplicated as a
+    // lane card — so the lanes hold only its sprints and tasks.
+    final family = cards
+        .where(
+          (card) => card['number'] != epicNumber && _inEpicFamily(card, epicNumber),
+        )
+        .toList();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+          child: _contentCard(
+            context,
+            card: epicCards.first,
+            theme: theme,
+            countsSummary: 'tap for details',
+            onTap: () => _openSheet(card: epicCards.first),
+          ),
+        ),
+        Expanded(
+          child: ListView.builder(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+            itemCount: columns.length,
+            itemBuilder: (context, index) => _column(
+              context,
+              columns[index],
+              theme,
+              pool: family,
+              contentCards: true,
+              width: 300,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Content card anatomy (#188, macOS Reminders reference): `#NNN — Title`
+  /// header, quiet body excerpt cropped at five lines, theme tokens only —
+  /// no status line (the lane carries status) and no hardcoded colours.
+  Widget _contentCard(
+    BuildContext context, {
+    required Map<String, dynamic> card,
+    required PifTheme theme,
+    String? countsSummary,
+    double? width,
+    required VoidCallback onTap,
+  }) {
+    final number = card['number'] as int;
+    final type = '${card['type'] ?? 'issue'}';
+    final excerpt = '${card['excerpt'] ?? ''}';
+    final surface = Container(
+      width: width,
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: theme.panelRaised,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.border),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(
+                  color: _typeColor(type),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+                child: Text(
+                  type.toUpperCase(),
+                  style: const TextStyle(fontSize: 9, letterSpacing: 0.5),
+                ),
+              ),
+              if (card['state'] == 'closed')
+                Padding(
+                  padding: const EdgeInsets.only(left: 6),
+                  child: Icon(
+                    Icons.check_circle_outline,
+                    size: 11,
+                    color: theme.accent,
+                  ),
+                ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  '#$number — ${card['title'] ?? ''}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (excerpt.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              excerpt,
+              maxLines: 5,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10, color: theme.textMuted),
+            ),
+          ],
+          if (countsSummary != null && countsSummary.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(
+              countsSummary,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 10, color: theme.textMuted),
+            ),
+          ],
+        ],
+      ),
+    );
+    return InkWell(onTap: onTap, child: surface);
+  }
+
   Widget _column(
     BuildContext context,
     Map<String, dynamic> column,
-    PifTheme theme,
-  ) {
+    PifTheme theme, {
+    List<Map<String, dynamic>>? pool,
+    bool contentCards = false,
+    double width = 260,
+  }) {
     final columnId = '${column['id']}';
-    final columnCards = cards
-        .where((card) => '${card['column']}' == columnId)
-        .toList();
+    final source = pool ?? cards;
+    final columnCards =
+        source.where((card) => '${card['column']}' == columnId).toList();
     return DragTarget<Map>(
       onWillAcceptWithDetails: (details) => true,
       onAcceptWithDetails: (details) =>
           _moveCard(details.data['number'] as int, columnId),
       builder: (context, candidates, rejected) => Container(
-        width: 260,
+        width: width,
         margin: const EdgeInsets.only(right: 10),
         decoration: BoxDecoration(
           color: theme.panelRaised,
@@ -237,8 +483,14 @@ class _BoardState extends State<_Board> {
               child: ListView.builder(
                 padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
                 itemCount: columnCards.length,
-                itemBuilder: (context, index) =>
-                    _card(context, columnCards[index], theme),
+                itemBuilder: (context, index) => contentCards
+                    ? _contentCard(
+                        context,
+                        card: columnCards[index],
+                        theme: theme,
+                        onTap: () => _openSheet(card: columnCards[index]),
+                      )
+                    : _card(context, columnCards[index], theme),
               ),
             ),
           ],

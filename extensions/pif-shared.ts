@@ -134,7 +134,53 @@ export function assertSafeWidgetPath(root: string, candidate: string): string {
 
 export interface PifBoardColumn { id: string; name: string; state?: "open" | "closed"; label?: string; status?: "any" | "none"; }
 export interface PifBoardConfig { columns: PifBoardColumn[]; }
-export interface PifTrackerCard { number: number; title: string; type: "epic" | "sprint" | "task" | "issue"; state: "open" | "closed"; labels: string[]; body: string; updatedAt: string; url: string; column: string; }
+export interface PifTrackerCard { number: number; title: string; type: "epic" | "sprint" | "task" | "issue"; state: "open" | "closed"; labels: string[]; body: string; updatedAt: string; url: string; column: string; parent: number | null; excerpt: string; }
+
+/** Parent link for a card, parsed from its body Reference Index (`Epic: #12`,
+ * `Sprint**: #34` — markdown bold tolerated). A task binds to its sprint when
+ * exactly one is referenced, else its epic; a sprint binds to its epic.
+ * Ambiguity (two different references at the same level) resolves to null —
+ * never a guess (#188). */
+export function trackerParentRef(body: string, type: string): number | null {
+	if (type === "epic" || type === "issue") return null;
+	const distinct = (pattern: RegExp): number[] => [...new Set([...body.matchAll(pattern)].map((m) => Number(m[1])))];
+	const epics = distinct(/epic\*{0,2}\s*:\s*#?(\d+)/gi);
+	const sprints = distinct(/sprint\*{0,2}\s*:\s*#?(\d+)/gi);
+	if (type === "sprint") return sprints.length === 1 ? sprints[0] : epics.length === 1 ? epics[0] : null;
+	if (sprints.length === 1) return sprints[0];
+	if (sprints.length === 0 && epics.length === 1) return epics[0];
+	return null;
+}
+
+/** Plain-text card excerpt for the board preview (#188): fenced code removed,
+ * markdown stripped, the Reference Index section skipped, first meaningful
+ * paragraph(s) kept up to `cap` characters with an ellipsis. */
+export function trackerExcerpt(body: string, cap = 240): string {
+	const lines = body.replace(/```[\s\S]*?```/g, " ").split(/\r?\n/);
+	const paragraphs: string[] = [];
+	let current = "";
+	let inReference = false;
+	for (const raw of lines) {
+		const line = raw.trim();
+		if (/^#{1,6}\s/.test(line)) {
+			if (current) { paragraphs.push(current); current = ""; }
+			inReference = /reference index/i.test(line);
+			continue;
+		}
+		if (inReference) continue;
+		if (!line) {
+			if (current) { paragraphs.push(current); current = ""; }
+			continue;
+		}
+		const text = line.replace(/!\[[^\]]*\]\([^)]*\)/g, "").replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[*_`#>]+/g, "").trim();
+		if (text) current = current ? `${current} ${text}` : text;
+	}
+	if (current) paragraphs.push(current);
+	const text = paragraphs.join(" ").replace(/\s+/g, " ").trim();
+	if (text.length <= cap) return text;
+	const cut = text.slice(0, cap);
+	return `${cut.slice(0, Math.min(cut.length, cut.lastIndexOf(" ") > 0 ? cut.lastIndexOf(" ") : cut.length))}…`;
+}
 
 /** Repo-versioned board definition (`.pif/board.yaml`): a `column <id>:` block
  * per column with `name`, an optional `state` (open|closed), an optional exact
@@ -193,7 +239,7 @@ export function normalizeGhIssue(issue: any, config: PifBoardConfig): PifTracker
 	const labels = Array.isArray(issue.labels) ? issue.labels.map((label: any) => String(label?.name ?? label)).filter(Boolean) : [];
 	const type = TRACKER_TYPES.find((candidate) => labels.includes(candidate)) ?? "issue";
 	const state = String(issue.state ?? "").toLowerCase() === "closed" ? "closed" : "open";
-	return { number: Number(issue.number), title: String(issue.title ?? ""), type, state, labels, body: String(issue.body ?? "").slice(0, 20_000), updatedAt: String(issue.updatedAt ?? ""), url: String(issue.url ?? ""), column: columnForCard(labels, state, config) };
+	return { number: Number(issue.number), title: String(issue.title ?? ""), type, state, labels, body: String(issue.body ?? "").slice(0, 20_000), updatedAt: String(issue.updatedAt ?? ""), url: String(issue.url ?? ""), column: columnForCard(labels, state, config), parent: trackerParentRef(String(issue.body ?? ""), type), excerpt: trackerExcerpt(String(issue.body ?? "")) };
 }
 
 /** Write-back plan for dropping a card on a column: ensure the column's exact

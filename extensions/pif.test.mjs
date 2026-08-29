@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
-import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync } from './pif-shared.ts';
+import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt } from './pif-shared.ts';
 import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
@@ -522,4 +522,33 @@ test('project uninstall deregisters only; base uninstall archives; core refuses 
 
   await assert.rejects(() => hub.uninstallWidget({id: 'core_widget'}), /Core widget .* cannot be uninstalled/);
   await assert.rejects(() => hub.uninstallWidget({id: 'never_was'}), /Unknown installed widget/);
+});
+
+// --- #188: tracker parent index + card excerpt ---
+
+test('trackerParentRef binds tasks to their sprint, else epic; ambiguity resolves to null', () => {
+  const body = '### Reference Index\n- **Epic**: #152 · **Sprint**: #153 (slotted before #157)\n\n## Task\nDo the thing.';
+  assert.equal(trackerParentRef(body, 'task'), 153);
+  const epicOnly = '### Reference Index\n- **Epic**: #152\n\n## Task\nGo.';
+  assert.equal(trackerParentRef(epicOnly, 'task'), 152);
+  assert.equal(trackerParentRef(epicOnly, 'sprint'), 152);
+  const ambiguous = 'Epic: #152\nEpic: #155\nSprint: #1\nSprint: #2';
+  assert.equal(trackerParentRef(ambiguous, 'task'), null);
+  assert.equal(trackerParentRef(ambiguous, 'sprint'), null);
+  assert.equal(trackerParentRef('No references at all', 'task'), null);
+  assert.equal(trackerParentRef('Epic: #10', 'epic'), null);
+  assert.equal(trackerParentRef('anything', 'issue'), null);
+});
+
+test('trackerExcerpt strips markdown, skips Reference Index, caps with ellipsis', () => {
+  const body = '### Reference Index\n- **Epic**: #152 · **Sprint**: #153\n\n## Task\nGive the tracker board an **epic drill-down** so work is viewed per-epic.\n\n## Atomicity\n- Complexity score: 4.0';
+  const excerpt = trackerExcerpt(body);
+  assert.ok(excerpt.startsWith('Give the tracker board'), excerpt);
+  assert.ok(!excerpt.includes('Reference Index'), excerpt);
+  assert.ok(!excerpt.includes('**'), excerpt);
+  assert.equal(trackerExcerpt('Plain task body'), 'Plain task body');
+  assert.equal(trackerExcerpt(''), '');
+  const long = trackerExcerpt('word '.repeat(200).trim(), 240);
+  assert.ok(long.length <= 241, `${long.length}`);
+  assert.ok(long.endsWith('…'));
 });
