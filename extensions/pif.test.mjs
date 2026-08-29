@@ -4,8 +4,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
-import { __test as __shared, createEnvelope, decodeEnvelope, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
+import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
 import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync } from './pif-shared.ts';
+import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 
@@ -349,4 +350,176 @@ test('tracker surfaces invalid board config and missing github remote as errors'
   assert.equal(noRepo.ok, false);
   assert.match(remoteless.state.error, /no GitHub origin remote/);
   fs.rmSync(workspace, {recursive: true, force: true});
+});
+
+// ---------------------------------------------------------------------------
+// Layered widget sources (#155): base app -> global catalog -> project overlay
+// ---------------------------------------------------------------------------
+
+function writeWidgetFixture(root, id, overrides = {}) {
+  const dir = path.join(root, id);
+  fs.mkdirSync(dir, {recursive: true});
+  const fields = {slot: 'center', core: 'false', name: `${id} name`, ...overrides};
+  fs.writeFileSync(path.join(dir, 'widget.yaml'), `id: ${id}\nname: "${fields.name}"\nversion: 0.1.0\ndescription: "Layered fixture"\nslot: ${fields.slot}\ncore: ${fields.core}\ntags: [test]\ndart_dependencies: []\n`);
+  fs.writeFileSync(path.join(dir, `${id}.dart`), `// ${id} fixture source\n`);
+  return dir;
+}
+
+/** Clean non-repo workspace + app dir + global catalog, all temp dirs, wired
+ * through env overrides (this is the #130 "install once, use in any project"
+ * shape: the app never has to live inside the workspace). */
+function layeredFixture(t) {
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-ws-'));
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-app-'));
+  const globalCatalog = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-global-'));
+  fs.mkdirSync(path.join(appDir, 'lib', 'widgets'), {recursive: true});
+  fs.mkdirSync(path.join(appDir, 'catalog'), {recursive: true});
+  process.env.PIF_APP_DIR = appDir;
+  process.env.PIF_GLOBAL_CATALOG = globalCatalog;
+  t.after(() => {
+    delete process.env.PIF_APP_DIR;
+    delete process.env.PIF_GLOBAL_CATALOG;
+    for (const dir of [workspace, appDir, globalCatalog]) fs.rmSync(dir, {recursive: true, force: true});
+  });
+  return {workspace, appDir, globalCatalog};
+}
+
+function layeredHub(workspace) {
+  return new __pif.PifHub({}, {}, workspace, 0);
+}
+
+test('layered widget sources resolve deterministically with provenance (#155)', async (t) => {
+  const f = layeredFixture(t);
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'alpha_widget', {core: 'true'});
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'shared_widget', {name: 'Base Shared'});
+  writeWidgetFixture(path.join(f.appDir, 'catalog'), 'archived_widget');
+  writeWidgetFixture(path.join(f.appDir, 'catalog'), 'catalog_shadow', {name: 'Archive Shadow'});
+  writeWidgetFixture(f.globalCatalog, 'global_only');
+  writeWidgetFixture(f.globalCatalog, 'catalog_shadow', {name: 'Global Shadow'});
+  writeWidgetFixture(path.join(f.workspace, 'pif_app', 'widgets'), 'shared_widget', {name: 'Project Shared'});
+  writeWidgetFixture(path.join(f.workspace, 'pif_app', 'widgets'), 'project_only');
+  const hub = layeredHub(f.workspace);
+  assert.equal(hub.appDir, f.appDir, 'PIF_APP_DIR pins the base app outside the workspace');
+  assert.equal(hub.globalCatalogPath, f.globalCatalog);
+
+  hub.loadRegistryState();
+  hub.scanWidgets();
+  // Wholesale shadowing: project wins over base for shared_widget.
+  assert.deepEqual(Object.keys(hub.state.widgets).sort(), ['alpha_widget', 'project_only', 'shared_widget']);
+  assert.equal(hub.state.widgets.shared_widget.source, 'project');
+  assert.equal(hub.state.widgets.shared_widget.name, 'Project Shared', 'the later layer shadows the earlier id wholesale');
+  assert.equal(hub.state.widgets.alpha_widget.source, 'base');
+  assert.equal(hub.state.widgets.alpha_widget.enabled, true, 'core base widgets stay enabled');
+  assert.equal(hub.state.widgets.project_only.source, 'project');
+  // Catalog layer: global catalog entries shadow app-archive entries on the same id.
+  assert.deepEqual(Object.keys(hub.state.catalog).sort(), ['archived_widget', 'catalog_shadow', 'global_only']);
+  assert.equal(hub.state.catalog.archived_widget.source, 'base');
+  assert.equal(hub.state.catalog.catalog_shadow.source, 'catalog');
+  assert.equal(hub.state.catalog.catalog_shadow.name, 'Global Shadow');
+  assert.equal(hub.state.catalog.global_only.source, 'catalog');
+  assert.equal(hub.state.catalog.global_only.installed, false);
+
+  // Determinism: widget.list rescans and must surface the identical resolved set.
+  const first = JSON.stringify({widgets: hub.state.widgets, catalog: hub.state.catalog});
+  const listed = await hub.control('widget.list');
+  assert.equal(JSON.stringify({widgets: listed.installed, catalog: listed.catalog}), first);
+  // Provenance flows through the snapshot the shell renders.
+  const snap = hub.snapshot();
+  assert.equal(snap.widgets.shared_widget.source, 'project');
+  assert.equal(snap.catalog.global_only.source, 'catalog');
+});
+
+test('registry codegen carries provenance and project import paths (#155)', () => {
+  const base = {...parseWidgetManifest(manifest), source: 'base'};
+  const project = {...parseWidgetManifest(manifest.replace('alpha_widget', 'beta_page')), source: 'project', importPath: 'file:///ws/pif_app/widgets/beta_page/beta_page.dart'};
+  const actual = generateWidgetRegistry([project, base]);
+  assert.equal(actual, `// GENERATED BY pif. DO NOT EDIT.\nimport 'core/plugin.dart';\nimport 'widgets/alpha_widget/alpha_widget.dart';\nimport 'file:///ws/pif_app/widgets/beta_page/beta_page.dart';\n\nMap<String, PifWidgetPlugin Function()> pifWidgetFactories() {\n  return {\n    // source: base\n    'alpha_widget': () => AlphaWidgetPlugin(),\n    // source: project\n    'beta_page': () => BetaPagePlugin(),\n  };\n}\n`);
+  assert.equal(dartFileUri('/tmp/some ws/pif_app/widgets/x/x.dart').startsWith('file://'), true);
+  assert.throws(() => dartFileUri("/tmp/qu'ote/x.dart"), /Unsafe Dart import URI/);
+  assert.throws(() => generateWidgetRegistry([{...base, importPath: 'has space.dart'}]), /Unsafe registry import path/);
+  assert.throws(() => generateWidgetRegistry([{...base, importPath: '/abs/x.dart'}]), /Unsafe registry import path/);
+});
+
+class StubbedAnalyzeHub extends __pif.PifHub {
+  analyzeWidget() { return {ok: true, diagnostics: 'stub-clean'}; }
+}
+
+test('project widgets install in place and global catalog installs copy into the overlay (#155)', async (t) => {
+  const f = layeredFixture(t);
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'alpha_widget');
+  writeWidgetFixture(path.join(f.appDir, 'catalog'), 'archived_widget');
+  writeWidgetFixture(f.globalCatalog, 'global_only');
+  const projectDir = writeWidgetFixture(path.join(f.workspace, 'pif_app', 'widgets'), 'project_only');
+  const projectShared = writeWidgetFixture(path.join(f.workspace, 'pif_app', 'widgets'), 'shared_widget', {name: 'Project Shared'});
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'shared_widget', {name: 'Base Shared'});
+  const hub = new StubbedAnalyzeHub({}, {}, f.workspace, 0);
+  hub.loadRegistryState();
+  hub.scanWidgets();
+
+  const result = await hub.installWidget({id: 'project_only'});
+  assert.equal(result.ok, true);
+  assert.equal(result.source, 'project');
+  assert.ok(fs.existsSync(path.join(projectDir, 'widget.yaml')), 'project source never moves');
+  assert.ok(!fs.existsSync(path.join(f.appDir, 'lib', 'widgets', 'project_only')), 'no copy escapes into the base app');
+  assert.equal(hub.state.widgets.project_only.enabled, true);
+  const registry = fs.readFileSync(path.join(f.appDir, 'lib', 'widget_registry.g.dart'), 'utf8');
+  assert.match(registry, /\/\/ source: project\n    'project_only'/);
+  assert.match(registry, new RegExp(`import 'file://${projectDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/project_only\\.dart';`));
+
+  // Shadowed base ids install the project definition, in place.
+  const shadowInstall = await hub.installWidget({id: 'shared_widget'});
+  assert.equal(shadowInstall.source, 'project');
+  assert.equal(hub.state.widgets.shared_widget.name, 'Project Shared');
+  assert.ok(fs.existsSync(projectShared));
+
+  // Global catalog install copies into the project overlay; the catalog source stays put.
+  const globalInstall = await hub.installWidget({id: 'global_only'});
+  assert.equal(globalInstall.ok, true);
+  assert.equal(globalInstall.source, 'project');
+  assert.ok(fs.existsSync(path.join(f.workspace, 'pif_app', 'widgets', 'global_only', 'widget.yaml')), 'global catalog installs copy into the project overlay');
+  assert.ok(fs.existsSync(path.join(f.globalCatalog, 'global_only', 'widget.yaml')), 'global catalog source never moves');
+  assert.equal(hub.state.widgets.global_only.source, 'project');
+  assert.equal(hub.state.catalog.global_only, undefined);
+
+  // App-archive installs keep the existing copy-into-base behaviour.
+  const archiveInstall = await hub.installWidget({id: 'archived_widget'});
+  assert.equal(archiveInstall.source, 'base');
+  assert.ok(fs.existsSync(path.join(f.appDir, 'lib', 'widgets', 'archived_widget', 'widget.yaml')));
+  assert.equal(hub.state.widgets.archived_widget.source, 'base');
+
+  await assert.rejects(() => hub.installWidget({id: 'missing_widget'}), /not found in widgets or catalog/);
+  await assert.rejects(() => hub.installWidget({id: '../escape'}), /snake_case/);
+  // Writes stayed inside the declared roots: the workspace only gained the overlay and hub state.
+  assert.deepEqual(fs.readdirSync(f.workspace).sort(), ['.pi', 'pif_app']);
+});
+
+test('project uninstall deregisters only; base uninstall archives; core refuses (#155)', async (t) => {
+  const f = layeredFixture(t);
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'core_widget', {core: 'true'});
+  writeWidgetFixture(path.join(f.appDir, 'lib', 'widgets'), 'base_widget');
+  const projectDir = writeWidgetFixture(path.join(f.workspace, 'pif_app', 'widgets'), 'project_only');
+  const hub = new StubbedAnalyzeHub({}, {}, f.workspace, 0);
+  hub.loadRegistryState();
+  hub.scanWidgets();
+  await hub.installWidget({id: 'project_only'});
+  await hub.installWidget({id: 'base_widget'});
+  assert.match(fs.readFileSync(path.join(f.appDir, 'lib', 'widget_registry.g.dart'), 'utf8'), /'project_only'/);
+
+  const removed = await hub.uninstallWidget({id: 'project_only'});
+  assert.equal(removed.ok, true);
+  assert.equal(removed.source, 'project');
+  assert.equal(removed.deregistered, true);
+  assert.ok(fs.existsSync(path.join(projectDir, 'project_only.dart')), 'uninstalling a project widget keeps its source in place');
+  assert.equal(hub.state.widgets.project_only.enabled, false, 'deregistered project widget stays present but disabled');
+  assert.ok(!fs.readFileSync(path.join(f.appDir, 'lib', 'widget_registry.g.dart'), 'utf8').includes("'project_only'"), 'registry drops the deregistered widget');
+  assert.equal(hub.state.catalog.project_only, undefined);
+
+  const archived = await hub.uninstallWidget({id: 'base_widget'});
+  assert.equal(archived.source, 'base');
+  assert.ok(fs.existsSync(path.join(f.appDir, 'catalog', 'base_widget', 'widget.yaml')), 'base widgets archive to the app-local catalog');
+  assert.ok(!fs.existsSync(path.join(f.appDir, 'lib', 'widgets', 'base_widget')));
+  assert.equal(hub.state.catalog.base_widget.source, 'base');
+
+  await assert.rejects(() => hub.uninstallWidget({id: 'core_widget'}), /Core widget .* cannot be uninstalled/);
+  await assert.rejects(() => hub.uninstallWidget({id: 'never_was'}), /Unknown installed widget/);
 });

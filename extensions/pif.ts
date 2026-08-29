@@ -13,6 +13,7 @@ import {
 	assertSafeWidgetPath,
 	childEnvironment,
 	createEnvelope,
+	dartFileUri,
 	decodeEnvelope,
 	generateWidgetRegistry,
 	parseWidgetManifest,
@@ -21,6 +22,7 @@ import {
 	TrackerSync,
 	type PifEnvelope,
 	type PifWidgetManifest,
+	type PifWidgetSource,
 	type TrackerState,
 	widgetClassName,
 } from "./pif-shared.ts";
@@ -30,7 +32,7 @@ interface PifSession {
 	id: string; name: string; host: boolean; state: SessionState; model: string; thinking: string;
 	cwd: string; transcript: unknown[]; sessionFile?: string; exit?: { code: number | null; signal: string | null };
 }
-interface WidgetRecord extends PifWidgetManifest { enabled: boolean; installed: boolean; }
+interface WidgetRecord extends PifWidgetManifest { enabled: boolean; installed: boolean; source: PifWidgetSource; }
 interface HubState {
 	sessions: Record<string, PifSession>;
 	widgets: Record<string, WidgetRecord>;
@@ -60,7 +62,8 @@ class SessionStore {
 	private db: any = null;
 	private jsonPath: string = "";
 	private json: { sessions: any[] } = { sessions: [] };
-	constructor(private pifDir: string) {}
+	private pifDir: string;
+	constructor(pifDir: string) { this.pifDir = pifDir; }
 	async init() {
 		try {
 			// Feature-detect node:sqlite separately from opening the file so a
@@ -138,7 +141,9 @@ class SessionStore {
 
 class WsPeer {
 	private buffer = Buffer.alloc(0);
-	constructor(private socket: net.Socket, private onMessage: (raw: string) => void, private onClose: () => void) {
+	private socket: net.Socket; private onMessage: (raw: string) => void; private onClose: () => void;
+	constructor(socket: net.Socket, onMessage: (raw: string) => void, onClose: () => void) {
+		this.socket = socket; this.onMessage = onMessage; this.onClose = onClose;
 		socket.on("data", (chunk) => this.read(chunk)); socket.on("close", onClose); socket.on("error", onClose);
 	}
 	send(value: unknown) {
@@ -177,7 +182,8 @@ class FlutterSupervisor {
 	state = "stopped";
 	private requestId = 0;
 	private pending = new Map<number, (value: any) => void>();
-	constructor(private appDir: string, private changed: (state: string, detail?: unknown) => void) {}
+	private appDir: string; private changed: (state: string, detail?: unknown) => void;
+	constructor(appDir: string, changed: (state: string, detail?: unknown) => void) { this.appDir = appDir; this.changed = changed; }
 	start(env: NodeJS.ProcessEnv) {
 		if (this.process) return;
 		this.state = "starting"; this.changed(this.state);
@@ -214,9 +220,11 @@ class FlutterSupervisor {
 
 class PifHub {
 	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string; readonly prefsPath: string;
+	readonly globalCatalogPath: string;
 	readonly state: HubState;
 	readonly modelsPath: string;
 	readonly token: string;
+	readonly pi: ExtensionAPI; readonly ctx: ExtensionContext; readonly workspace: string; readonly port: number;
 	private controlSecret = "";
 	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
@@ -225,10 +233,15 @@ class PifHub {
 	private supervisor: FlutterSupervisor;
 	private tracker: TrackerSync;
 	readonly store: SessionStore;
-	constructor(readonly pi: ExtensionAPI, readonly ctx: ExtensionContext, readonly workspace: string, readonly port: number) {
+	constructor(pi: ExtensionAPI, ctx: ExtensionContext, workspace: string, port: number) {
+		this.pi = pi; this.ctx = ctx; this.workspace = workspace; this.port = port;
 		const globalApp = path.join(os.homedir(), ".pi", "pif", "app");
 		const localApp = path.join(workspace, "pif");
 		this.appDir = process.env.PIF_APP_DIR || (fs.existsSync(path.join(localApp, "pubspec.yaml")) ? localApp : globalApp);
+		// Layered widget sources (#155): the global catalog is shared across
+		// projects; the project overlay lives in the workspace regardless of
+		// where the app itself runs from.
+		this.globalCatalogPath = process.env.PIF_GLOBAL_CATALOG || path.join(os.homedir(), ".pi", "pif", "catalog");
 		this.pifDir = path.join(workspace, ".pi", "pif");
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
@@ -605,19 +618,49 @@ class PifHub {
 		else { const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), ...payload, open: type !== "close", action: type }; }
 		this.saveLayout(); this.broadcast("shell/layout", "layout_state", this.state.layout); return this.state.layout;
 	}
-	private widgetRoots() { return { widgets: path.join(this.appDir, "lib", "widgets"), catalog: path.join(this.appDir, "catalog"), registry: path.join(this.appDir, "lib", "widget_registry.g.dart") }; }
-	private scanDirectory(root: string, installed: boolean) {
+	/** Layered widget roots (settled app-builder spec, Task #154). Resolution
+	 * order: base (`appDir/lib/widgets`, with the app's local archive catalog)
+	 * → global catalog (`~/.pi/pif/catalog/`) → project overlay
+	 * (`<workspace>/pif_app/widgets`). Every write stays inside one of these
+	 * declared roots and is guarded by assertSafeWidgetPath. */
+	private widgetRoots() {
+		return {
+			widgets: path.join(this.appDir, "lib", "widgets"),
+			catalog: path.join(this.appDir, "catalog"),
+			globalCatalog: this.globalCatalogPath,
+			project: path.join(this.workspace, "pif_app", "widgets"),
+			registry: path.join(this.appDir, "lib", "widget_registry.g.dart"),
+		};
+	}
+	private scanDirectory(root: string, installed: boolean, source: PifWidgetSource) {
 		const records: Record<string, WidgetRecord> = {}; if (!fs.existsSync(root)) return records;
-		for (const entry of fs.readdirSync(root, { withFileTypes: true })) { if (!entry.isDirectory()) continue; const manifestPath = path.join(root, entry.name, "widget.yaml"); if (!fs.existsSync(manifestPath)) continue; try { const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8")); records[manifest.id] = { ...manifest, installed, enabled: installed && (this.enabled.has(manifest.id) || manifest.core) }; } catch { /* invalid catalog entries surface during install */ } }
+		for (const entry of fs.readdirSync(root, { withFileTypes: true })) { if (!entry.isDirectory()) continue; const manifestPath = path.join(root, entry.name, "widget.yaml"); if (!fs.existsSync(manifestPath)) continue; try { const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8")); records[manifest.id] = { ...manifest, source, installed, enabled: installed && (this.enabled.has(manifest.id) || manifest.core) }; } catch { /* invalid catalog entries surface during install */ } }
 		return records;
 	}
 	scanWidgets() {
 		const roots = this.widgetRoots(); const oldEnabled = new Set(Object.values(this.state.widgets).filter((w) => w.enabled).map((w) => w.id)); this.enabled = new Set([...this.enabled, ...oldEnabled]);
-		this.state.widgets = this.scanDirectory(roots.widgets, true); this.state.catalog = this.scanDirectory(roots.catalog, false); this.installed = new Set(Object.keys(this.state.widgets));
+		// Layered resolution: a later layer shadows an earlier id wholesale —
+		// the project definition wins over a global-catalog entry, which wins
+		// over the base app. Scan, widget.list, and the registry codegen all
+		// consume this one resolved set.
+		const base = this.scanDirectory(roots.widgets, true, "base");
+		const project = this.scanDirectory(roots.project, true, "project");
+		this.state.widgets = { ...base, ...project };
+		const appCatalog = this.scanDirectory(roots.catalog, false, "base");
+		const globalCatalog = this.scanDirectory(roots.globalCatalog, false, "catalog");
+		this.state.catalog = { ...appCatalog, ...globalCatalog };
+		this.installed = new Set(Object.keys(this.state.widgets));
 		for (const id of Object.keys(this.state.widgets)) delete this.state.catalog[id];
 		for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
 	}
-	private generateRegistry() { const manifests = Object.values(this.state.widgets).filter((record) => record.enabled); fs.writeFileSync(this.widgetRoots().registry, generateWidgetRegistry(manifests)); }
+	private generateRegistry() {
+		const roots = this.widgetRoots();
+		const manifests = Object.values(this.state.widgets).filter((record) => record.enabled).map((record) => ({
+			...record,
+			...(record.source === "project" ? { importPath: dartFileUri(path.join(roots.project, record.id, `${record.id}.dart`)) } : {}),
+		}));
+		fs.writeFileSync(roots.registry, generateWidgetRegistry(manifests));
+	}
 	private readModelsConfig(): Record<string, any> { try { return JSON.parse(fs.readFileSync(this.modelsPath, "utf8")).providers ?? {}; } catch { return {}; } }
 	private readModelsList(): string[] {
 		const models = new Set<string>();
@@ -672,15 +715,31 @@ class PifHub {
 	async installWidget(params: any) {
 		const id = String(params.id ?? "");
 		if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("Widget id must be lowercase snake_case");
-		const roots = this.widgetRoots(); const dir = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); let copied = false;
-		if (!fs.existsSync(dir)) { const source = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (!fs.existsSync(source)) throw new Error(`Widget not found in widgets or catalog: ${id}`); fs.cpSync(source, dir, { recursive: true, errorOnExist: true }); copied = true; }
+		const roots = this.widgetRoots();
+		// Layered install resolution mirrors scanWidgets so install can never
+		// register a definition other than the one a scan would surface:
+		// project overlay first (registered in place), then base app widgets,
+		// then the app-local archive (copied into the base app), then the
+		// global catalog (copied into the project overlay).
+		let dir = "", source: PifWidgetSource, copied = false;
+		const projectDir = assertSafeWidgetPath(roots.project, path.join(roots.project, id));
+		const baseDir = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id));
+		if (fs.existsSync(projectDir)) { dir = projectDir; source = "project"; }
+		else if (fs.existsSync(baseDir)) { dir = baseDir; source = "base"; }
+		else {
+			const appArchive = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id));
+			const globalEntry = assertSafeWidgetPath(roots.globalCatalog, path.join(roots.globalCatalog, id));
+			if (fs.existsSync(appArchive)) { fs.cpSync(appArchive, baseDir, { recursive: true, errorOnExist: true }); dir = baseDir; source = "base"; copied = true; }
+			else if (fs.existsSync(globalEntry)) { fs.mkdirSync(roots.project, { recursive: true }); fs.cpSync(globalEntry, projectDir, { recursive: true, errorOnExist: true }); dir = projectDir; source = "project"; copied = true; }
+			else throw new Error(`Widget not found in widgets or catalog: ${id}`);
+		}
 		const manifest = parseWidgetManifest(fs.readFileSync(path.join(dir, "widget.yaml"), "utf8")); if (manifest.id !== id) throw new Error("Manifest id does not match folder");
 		const pubspecPath = path.join(this.appDir, "pubspec.yaml"), lockPath = path.join(this.appDir, "pubspec.lock");
 		const pubspecBefore = fs.existsSync(pubspecPath) ? fs.readFileSync(pubspecPath) : null, lockBefore = fs.existsSync(lockPath) ? fs.readFileSync(lockPath) : null;
 		const rejectInstall = (phase: string, diagnostics: string) => {
 			if (manifest.dart_dependencies.length) { this.restoreFile(pubspecPath, pubspecBefore); this.restoreFile(lockPath, lockBefore); spawnSync("flutter", ["pub", "get"], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); }
 			if (copied) fs.rmSync(dir, { recursive: true, force: true });
-			const result = { ok: false, id, phase, diagnostics }; this.broadcast("widget/reload", "reload_result", result); return result;
+			const result = { ok: false, id, phase, diagnostics, source }; this.broadcast("widget/reload", "reload_result", result); return result;
 		};
 		if (manifest.dart_dependencies.length) {
 			for (const dependency of manifest.dart_dependencies) if (!/^[a-zA-Z0-9_]+(?::[^\s]+)?$/.test(dependency)) throw new Error(`Invalid Dart dependency: ${dependency}`);
@@ -694,10 +753,26 @@ class PifHub {
 		if (!projectAnalysis.ok) { this.enabled = enabledBefore; this.restoreFile(roots.registry, registryBefore); this.scanWidgets(); return rejectInstall("registry_analyze", projectAnalysis.diagnostics); }
 		this.saveRegistryState();
 		let reload: any = "shell-not-running"; if (this.supervisor.process) { this.state.health.reload = "running"; try { reload = await this.supervisor.reload(Boolean(manifest.dart_dependencies.length)); } catch (first) { try { reload = await this.supervisor.reload(true); } catch (second) { reload = { error: String(second), first: String(first) }; } } this.state.health.reload = reload?.error ? "failed" : "idle"; }
-		this.scanWidgets(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); this.broadcast("store/catalog", "catalog_state", { catalog: this.state.catalog }); const result = { ok: !reload?.error, id, phase: "reload", diagnostics: analysis.diagnostics, reload }; this.broadcast("widget/reload", "reload_result", result); return result;
+		this.scanWidgets(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); this.broadcast("store/catalog", "catalog_state", { catalog: this.state.catalog }); const result = { ok: !reload?.error, id, phase: "reload", diagnostics: analysis.diagnostics, reload, source }; this.broadcast("widget/reload", "reload_result", result); return result;
 	}
 	async toggleWidget(params: any) { const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); widget.enabled = params.enabled ?? !widget.enabled; widget.enabled ? this.enabled.add(id) : this.enabled.delete(id); this.saveRegistryState(); this.generateRegistry(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); if (this.supervisor.process) await this.supervisor.reload(); return widget; }
-	async uninstallWidget(params: any) { const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); if (widget.core) throw new Error(`Core widget ${id} cannot be uninstalled`); const roots = this.widgetRoots(); const source = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); const target = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target); this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot(); if (this.supervisor.process) await this.supervisor.reload(); return { ok: true, id, archived: target }; }
+	async uninstallWidget(params: any) {
+		const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); if (widget.core) throw new Error(`Core widget ${id} cannot be uninstalled`);
+		const roots = this.widgetRoots();
+		if (widget.source === "project") {
+			// Project widgets are versioned inside the project overlay: uninstall
+			// deregisters only — the source never moves or disappears, and it
+			// keeps shadowing the base id until the project deletes it. The
+			// enabled flag is cleared on the record too, or the next scan would
+			// re-harvest it back into the registry.
+			widget.enabled = false; this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot();
+			if (this.supervisor.process) await this.supervisor.reload();
+			return { ok: true, id, source: "project", deregistered: true };
+		}
+		// Base widgets archive back into the app-local catalog (source is never destroyed).
+		const source = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); const target = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target);
+		this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot(); if (this.supervisor.process) await this.supervisor.reload(); return { ok: true, id, source: "base", archived: target };
+	}
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
 	private async storeAction(type: string, payload: any) { if (type === "install") return this.installWidget(payload); if (type === "refresh") { this.scanWidgets(); this.broadcastSnapshot(); } }
 	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
@@ -734,10 +809,10 @@ export default function pifExtension(pi: ExtensionAPI) {
 	pi.registerCommand("pif-status", { description: "Show pif hub status", handler: async (_args, ctx) => { ctx.ui.notify(hub ? JSON.stringify(hub.snapshot().health) : "pif is stopped", "info"); } });
 	const register = (name: string, label: string, description: string, parameters: any, method: string) => pi.registerTool({ name, label, description, parameters, async execute(_id, params) { const result = await callControl(workspace, method, params); return text(result); } });
 	register("pif_widget_create", "pif widget create", "Scaffold a real Dart pif widget in lib/widgets.", Type.Object({ id: Type.String(), name: Type.String(), slot: Type.Union([Type.Literal("left"), Type.Literal("center"), Type.Literal("right"), Type.Literal("bottom"), Type.Literal("status")]), spec: Type.Optional(Type.String()) }), "widget.create");
-	register("pif_widget_install", "pif widget install", "Analyze, register, and reload an in-place or catalog widget. Returns compiler diagnostics.", Type.Object({ id: Type.String() }), "widget.install");
+	register("pif_widget_install", "pif widget install", "Analyze, register, and reload a widget resolved across the layered sources (project overlay in place, base app, app archive, or global catalog copied into the project overlay). Returns compiler diagnostics.", Type.Object({ id: Type.String() }), "widget.install");
 	register("pif_widget_toggle", "pif widget toggle", "Enable or disable an installed widget.", Type.Object({ id: Type.String(), enabled: Type.Optional(Type.Boolean()) }), "widget.toggle");
-	register("pif_widget_uninstall", "pif widget uninstall", "Archive a non-core widget back into the local catalog.", Type.Object({ id: Type.String() }), "widget.uninstall");
-	register("pif_widget_list", "pif widget list", "List installed and local catalog widgets.", Type.Object({}), "widget.list");
+	register("pif_widget_uninstall", "pif widget uninstall", "Deregister a non-core widget: base widgets archive back into the app-local catalog, project overlay widgets deregister in place.", Type.Object({ id: Type.String() }), "widget.uninstall");
+	register("pif_widget_list", "pif widget list", "List installed and catalog widgets with per-layer provenance (base, catalog, project).", Type.Object({}), "widget.list");
 	register("pif_tracker_list", "pif tracker list", "List the workspace repo's board cards (epics, sprints, tasks, issues) with their columns, without bodies.", Type.Object({}), "tracker.list");
 	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
 	register("pif_tracker_update", "pif tracker update", "Update a ticket's title and/or body by issue number.", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()) }), "tracker.update");
