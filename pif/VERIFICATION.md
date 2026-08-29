@@ -33,9 +33,9 @@ The Flutter suite covers the public host/plugin contract, authoritative transcri
 
 A fresh requirements review initially identified transcript recovery and rendered panel-state gaps. Both were repaired and regression-tested. The independent re-review scored the implementation **97/100**, reported no remaining blocking or material findings, and judged T2 ready for Dev UAT.
 
-## Dogfood
+## Real-use trial
 
-The repeatable create → implement → analyze → register → open record is in `pif/DOGFOOD.md` and `extensions/pif.integration.test.mjs`. The resulting non-core `pif/lib/widgets/diff_viewer/` provides editable Before/After inputs and a live red/green line comparison. Its rendered interaction is covered by Flutter tests.
+The repeatable create → implement → analyze → register → open record is in `pif/REAL_USE_TRIAL.md` and `extensions/pif.integration.test.mjs`. The resulting non-core `pif/lib/widgets/diff_viewer/` provides editable Before/After inputs and a live red/green line comparison. Its rendered interaction is covered by Flutter tests.
 
 ## Remaining gate and risk
 

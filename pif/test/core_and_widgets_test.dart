@@ -631,13 +631,13 @@ void main() {
     expect(find.text('Clock'), findsOneWidget);
     await bus.dispose();
   });
-  testWidgets('Diff Viewer dogfood renders and updates a usable comparison', (
+  testWidgets('Diff Viewer real-use trial renders and updates a usable comparison', (
     tester,
   ) async {
     final bus = FakeBus();
     final host = PifHost(bus: bus);
     await tester.pumpWidget(panel(DiffViewerPlugin(), host));
-    expect(find.text('Phase 1 dogfood'), findsOneWidget);
+    expect(find.text('Phase 1 real-use trial'), findsOneWidget);
     expect(find.byType(TextField), findsNWidgets(2));
     await tester.enterText(
       find.byType(TextField).last,

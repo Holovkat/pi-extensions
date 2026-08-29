@@ -1,8 +1,8 @@
 id: diff_viewer
 name: "Diff Viewer"
 version: 0.1.0
-description: "Dogfooded side-by-side text diff viewer"
+description: "Real-use proven side-by-side text diff viewer"
 slot: center
 core: false
-tags: [dogfood, diff]
+tags: [real-use trial, diff]
 dart_dependencies: []

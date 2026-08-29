@@ -17,7 +17,7 @@ A next-generation agentic IDE that replaces the terminal surface with a Pi-nativ
 |---|---|---|
 | Host topology | **Pi hosts.** A pi extension (`extensions/pif.ts`) is the hub; it launches the Flutter shell, which connects back over a local WebSocket | Flutter app spawning pi internally; standalone daemon in the middle |
 | Dynamic widget mechanism | **Real Dart source, run from source.** Shell runs via `flutter run --machine` (JIT); widgets hot-reload when installed/changed | RFW interpreted widgets (deferred — Sprint 3 RFW lane, see Roadmap realignment); dart_eval |
-| v1 base widgets | Agent Console, Session Rail, Terminal (pty), Widget Store panel, Status Bar | Diff Viewer and File Explorer deferred, deliberately: they are the first dogfooded widgets Pi builds through pif itself |
+| v1 base widgets | Agent Console, Session Rail, Terminal (pty), Widget Store panel, Status Bar | Diff Viewer and File Explorer deferred, deliberately: they are the first real-use proven widgets Pi builds through pif itself |
 | Repo layout | Everything in pi-extensions: `extensions/pif.ts` + Flutter app in `pif/` | Separate repo for the shell |
 | Name | **pif** (extension `pif`, app dir `pif/`, widget namespace `pif.*`) | pi-deck, pi-studio, pi-shell |
 | Scope of this spec | Full platform, phased: Phase 1 = hub + contract + primitives; later phases = ecosystem and platform features | Minimal mirror-only bridge; unphased big-bang build |
@@ -140,21 +140,21 @@ The signature loop: "build me a diff viewer widget" → `pif_widget_create` → 
 
 - **Extension (hub)**: unit tests in the repo's existing `*.test.mjs` style — envelope codec, registry codegen (golden file), session manager against a scripted fake `pi --mode rpc` subprocess, store install pipeline in tmp dirs.
 - **Flutter (shell)**: `flutter test` for the contract host and each base widget against a fake bus; `dart analyze` clean as a gate; one integration smoke test against a mock hub.
-- **Phase 1 acceptance (dogfood)**: use pif itself to have Pi build the Diff Viewer widget end to end (create → implement → install → visible → usable).
+- **Phase 1 acceptance (real-use trial)**: use pif itself to have Pi build the Diff Viewer widget end to end (create → implement → install → visible → usable).
 
 ## Roadmap realignment (2026-08-29 — supersedes the original Phase 2 → 3 order)
 
-Recorded on epic [#152](https://github.com/Holovkat/pi-extensions/issues/152) ("Roadmap Realignment"); the app-builder direction reorders the original Ecosystem → Platform phasing around packaging a project's application. Phase 1 is complete (exit: diff-viewer dogfood passed). The original **Phase 2 — Ecosystem** and **Phase 3 — Platform** sections are retired; their items are dispositioned below so spec and tracker tell one story.
+Recorded on epic [#152](https://github.com/Holovkat/pi-extensions/issues/152) ("Roadmap Realignment"); the app-builder direction reorders the original Ecosystem → Platform phasing around packaging a project's application. Phase 1 is complete (exit: diff-viewer real-use trial passed). The original **Phase 2 — Ecosystem** and **Phase 3 — Platform** sections are retired; their items are dispositioned below so spec and tracker tell one story.
 
-- **Already complete despite being listed as Phase 2**: layout presets (`pif_layout` save/load, presets under `.pi/pif/presets/` — shipped with the Phase 1 iteration waves) and the diff viewer (the Phase 1 exit dogfood, installed under `pif/lib/widgets/diff_viewer/`).
+- **Already complete despite being listed as Phase 2**: layout presets (`pif_layout` save/load, presets under `.pi/pif/presets/` — shipped with the Phase 1 iteration waves) and the diff viewer (the Phase 1 exit real-use trial, installed under `pif/lib/widgets/diff_viewer/`).
 - **Pulled forward from Phase 3 into the app-builder sprint**: packaged release mode with a frozen widget set (AOT) — repurposed from "package the IDE" to "package a project's application" (Task 6 / #159).
-- **Pulled forward from Sprint 2 as precursor lane 1 (2026-08-23; shipped)**: the tracker panel — a repo-synced Kanban board for epics/sprints/tasks with Markdown detail, drag-between-columns write-back to the tracker, and an offline cache (Sprint #163, tasks #164–#166, plus the CRUD iteration #168). It was the first large non-console widget dogfood and tracked the epic itself from inside pif.
+- **Pulled forward from Sprint 2 as precursor lane 1 (2026-08-23; shipped)**: the tracker panel — a repo-synced Kanban board for epics/sprints/tasks with Markdown detail, drag-between-columns write-back to the tracker, and an offline cache (Sprint #163, tasks #164–#166, plus the CRUD iteration #168). It was the first large non-console widget real-use trial and tracked the epic itself from inside pif.
 - **Precursor lane 2 (added 2026-08-29)**: **app templates + design-first build** — the agentic build flow gains a design pass (brief → template-backed UI plan → owner approval → build; recipe is law), with **FMS Mercury as the first template**. Task #178 authors the Mercury template (`pif/templates/mercury/`) and the `pif-app-designer` skill (`skills/pif-app-designer/SKILL.md`); #157 gains `pif_app_init --template`; #158 consumes both. Sprint 2's theming item is absorbed by templates.
 - **Subsumed from Phase 2**: on-demand builds — the same agentic loop, generalized from single widgets to whole applications (Task 5 / #158).
 
 Remaining work, in order, as future sprints under epic #152 (no issues created yet — planned when reached, per repo convention):
 
-- **Sprint 2 — Ecosystem**: remote git catalogs as an installable widget-pack source layer (builds directly on #155's layered sources); per-widget settings schema; theming (themeMap integration — absorbed by app templates, see precursor lane 2); file-explorer widget, built through the #158 agentic flow as the ecosystem dogfood.
+- **Sprint 2 — Ecosystem**: remote git catalogs as an installable widget-pack source layer (builds directly on #155's layered sources); per-widget settings schema; theming (themeMap integration — absorbed by app templates, see precursor lane 2); file-explorer widget, built through the #158 agentic flow as the ecosystem real-use trial.
 - **Sprint 3 — Platform & sharing**: publish/share widgets across machines via coms/council (depends on epic #112); trust/signing for third-party widgets (mandatory once remote catalogs land); RFW lane for runtime widget installation in shipped AOT apps (the answer to "pi, add a page to this app" on a shipped app); multi-window; non-macOS targets.
 
 Current sprint (#153) task order: #154 (this update) → #155 (hub/TS) ∥ #156 (shell/Dart) → #157 → #158 / #159 → #160 (epic verification). The settled app-builder model follows.
@@ -166,7 +166,7 @@ Current sprint (#153) task order: #154 (this update) → #155 (hub/TS) ∥ #156 
 Two weeks of shipped pif work (commits `64eca93` → `7237e0b`: hub, bus, docking shell, standalone launcher, packaging) reviewed against the app-builder vision:
 
 **Reusable as-is**
-- **Widget engine**: install pipeline + `dart analyze` gate + registry codegen + hot reload (`pif_widget_create/install/toggle/uninstall/list`). The create → write Dart → install → live loop is the app-builder loop at widget scale, already proven by the diff-viewer and tracker-board dogfoods.
+- **Widget engine**: install pipeline + `dart analyze` gate + registry codegen + hot reload (`pif_widget_create/install/toggle/uninstall/list`). The create → write Dart → install → live loop is the app-builder loop at widget scale, already proven by the diff-viewer and tracker-board real-use trials.
 - **Hub hardening** (remediation wave): per-launch WS token (b93c897), scrubbed child env + atomic hub start (553762c), input validation (dcf4304), bus resilience — queued sends, single connect, real hub probe (3d48fdc). Ships unchanged inside exported apps.
 - **Docking shell core** (`pif/lib/core/`): `PifHost` API, bus client, panel error boundary, snapshot/reconnect resync. App mode reuses the same widget-host surface inside a page stage.
 - **Session manager**: `pi --mode rpc` children, SQLite persistence, resume from session files (d002d9a, 3abad36). Drives the agentic build flow (#158) unchanged.
@@ -231,7 +231,7 @@ All registered beside the `pif_widget_*` tools, callable from host and child ses
 
 - ~~No packaged/release build; run-from-source is the product for now~~ — superseded: release packaging pulled forward into the app-builder sprint as "package a project's application" (#159, see Roadmap realignment).
 - ~~No remote or networked store; local catalog only~~ — superseded: remote git catalogs are Sprint 2 — Ecosystem (see Roadmap realignment).
-- No full code editor or diff viewer in the base set (diff viewer arrived via dogfooding, as planned).
+- No full code editor or diff viewer in the base set (diff viewer arrived via real-use trialing, as planned).
 - macOS desktop only (toolchain verified: Flutter 3.44.8 stable, Dart 3.12.2, macOS arm64); non-macOS targets are Sprint 3 — Platform & sharing.
 - No RFW/interpreted widgets — deferred to the Sprint 3 RFW lane for runtime widget installation in shipped AOT apps.
 

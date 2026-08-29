@@ -61,10 +61,10 @@ function nextMessage(socket, predicate, timeout = 10_000) {
 
 function send(socket, channel, type, payload) { socket.send(JSON.stringify({v: 1, id: `${Date.now()}`, ts: new Date().toISOString(), channel, type, payload})); }
 
-function copyFixture(workspace, removeDogfood = true) {
+function copyFixture(workspace, removeDiffViewer = true) {
   const target = path.join(workspace, 'pif'); fs.mkdirSync(target, {recursive: true});
   for (const name of ['lib', 'catalog', '.dart_tool', 'macos']) fs.cpSync(path.join(repo, 'pif', name), path.join(target, name), {recursive: true});
-  if (removeDogfood) fs.rmSync(path.join(target, 'lib', 'widgets', 'diff_viewer'), {recursive: true, force: true});
+  if (removeDiffViewer) fs.rmSync(path.join(target, 'lib', 'widgets', 'diff_viewer'), {recursive: true, force: true});
   for (const name of ['pubspec.yaml', 'pubspec.lock', 'analysis_options.yaml', '.metadata']) fs.copyFileSync(path.join(repo, 'pif', name), path.join(target, name));
 }
 
@@ -231,12 +231,12 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const scaffold = await control(controlPath, 'widget.create', {id: 'diff_viewer', name: 'Diff Viewer', slot: 'center', spec: 'Compare before and after text'});
   assert.ok(fs.existsSync(scaffold.manifest));
   fs.writeFileSync(scaffold.source, `import 'package:flutter/material.dart';\nimport '../../core/plugin.dart';\nclass DiffViewerPlugin implements PifWidgetPlugin {\n @override PifWidgetMeta get meta => const PifWidgetMeta(id: 'diff_viewer', name: 'Diff Viewer', slot: PifSlot.center);\n @override Widget build(BuildContext context, PifHost host) => const Row(children:[Expanded(child:SelectableText('before')),VerticalDivider(),Expanded(child:SelectableText('after'))]);\n}\n`);
-  checkpoint('dogfood scaffolded');
-  const dogfood = await control(controlPath, 'widget.install', {id: 'diff_viewer'}); checkpoint('dogfood installed'); assert.equal(dogfood.ok, true); assert.match(dogfood.diagnostics, /No issues found/);
+  checkpoint('diff viewer scaffolded');
+  const diffInstall = await control(controlPath, 'widget.install', {id: 'diff_viewer'}); checkpoint('diff viewer installed'); assert.equal(diffInstall.ok, true); assert.match(diffInstall.diagnostics, /No issues found/);
   await control(controlPath, 'layout', {action: 'open', widgetId: 'diff_viewer', slot: 'center'});
-  const dogfoodSnapshotPromise = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.widgets.diff_viewer);
-  send(socket, 'shell/state', 'snapshot_request', {}); const dogfoodSnapshot = await dogfoodSnapshotPromise;
-  assert.equal(dogfoodSnapshot.payload.widgets.diff_viewer.enabled, true);
+  const diffSnapshotPromise = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.widgets.diff_viewer);
+  send(socket, 'shell/state', 'snapshot_request', {}); const diffSnapshot = await diffSnapshotPromise;
+  assert.equal(diffSnapshot.payload.widgets.diff_viewer.enabled, true);
   const badDir = path.join(workspace, 'pif', 'lib', 'widgets', 'broken_widget'); fs.mkdirSync(badDir); fs.writeFileSync(path.join(badDir, 'widget.yaml'), 'id: broken_widget\nname: "Broken"\nversion: 0.1.0\ndescription: "Broken fixture"\nslot: center\ncore: false\ntags: [test]\ndart_dependencies: []\n'); fs.writeFileSync(path.join(badDir, 'broken_widget.dart'), "void broken( {\n");
   const rejected = await control(controlPath, 'widget.install', {id: 'broken_widget'}); checkpoint('broken rejected'); assert.equal(rejected.ok, false); assert.equal(rejected.phase, 'analyze'); assert.match(rejected.diagnostics, /error/i);
   const pubspecPath = path.join(workspace, 'pif', 'pubspec.yaml');

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import '../../core/plugin.dart';
 
-/// Phase 1 dogfood widget: scaffolded with pif_widget_create, implemented as
+/// Phase 1 real-use trial widget: scaffolded with pif_widget_create, implemented as
 /// ordinary Dart, analyze-gated, registered, and opened through pif_layout.
 class DiffViewerPlugin implements PifWidgetPlugin {
   @override
@@ -90,7 +90,7 @@ class _DiffViewerState extends State<_DiffViewer> {
               SizedBox(width: 8),
               Flexible(
                 child: Text(
-                  'Phase 1 dogfood',
+                  'Phase 1 real-use trial',
                   style: TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.right,

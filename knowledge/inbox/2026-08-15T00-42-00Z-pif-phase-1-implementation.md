@@ -2,7 +2,7 @@
 type: Inbox
 title: pif Phase 1 Implementation Reached T2
 
-description: Implemented and verified the Pi-hosted Flutter agentic IDE primitives for epic 120, including the hub, shell, base widgets, tools, and Diff Viewer dogfood
+description: Implemented and verified the Pi-hosted Flutter agentic IDE primitives for epic 120, including the hub, shell, base widgets, tools, and Diff Viewer real-use trial
 tags: [pi-extensions, pif, flutter, implementation, verification, github]
 timestamp: 2026-08-15T00:42:00Z
 generated_at: 2026-08-15T00:42:00Z
@@ -17,7 +17,7 @@ capture_tier: session
 
 # What Was Done
 
-Implemented the Phase 1 pif system: a Pi extension hub with authoritative WebSocket and control-socket state, host and child session routing, Flutter machine-protocol supervision, analyze-gated widget lifecycle, generated registry, and eight Pi tools. Added the macOS Flutter shell, docking layout, common widget contract, five core widgets, local catalog example, and non-core Diff Viewer dogfood widget.
+Implemented the Phase 1 pif system: a Pi extension hub with authoritative WebSocket and control-socket state, host and child session routing, Flutter machine-protocol supervision, analyze-gated widget lifecycle, generated registry, and eight Pi tools. Added the macOS Flutter shell, docking layout, common widget contract, five core widgets, local catalog example, and non-core Diff Viewer real-use trial widget.
 
 Added Node unit/integration coverage and Flutter widget/integration coverage. The integration path runs a real Pi-hosted hub and real macOS Flutter shell, checks child lifecycle, snapshot recovery, dependency rollback, catalog and registry behavior, layout persistence, and reload. Existing council tests and packaging remain green. A combined fresh review found no remaining material findings and judged the epic ready for Dev UAT at T2.
 
@@ -44,4 +44,4 @@ Nothing. The implementation adds the approved pif surface without replacing `pi-
 
 # Current State
 
-Tasks #122-#129 are implementation-complete and their T2 evidence is recorded in `pif/VERIFICATION.md` and `pif/DOGFOOD.md`. The complete pif and existing council validation gates pass, the macOS debug app builds, and independent re-review scores the delivery 97/100 with no blocking findings. The remaining stage is owner-led Dev UAT (T3) in the canonical local macOS shell; no push, merge, deployment, or release action has been performed.
+Tasks #122-#129 are implementation-complete and their T2 evidence is recorded in `pif/VERIFICATION.md` and `pif/REAL_USE_TRIAL.md`. The complete pif and existing council validation gates pass, the macOS debug app builds, and independent re-review scores the delivery 97/100 with no blocking findings. The remaining stage is owner-led Dev UAT (T3) in the canonical local macOS shell; no push, merge, deployment, or release action has been performed.
