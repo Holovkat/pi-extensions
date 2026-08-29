@@ -152,6 +152,17 @@ export function trackerParentRef(body: string, type: string): number | null {
 	return null;
 }
 
+/** Tag→label diff for a ticket update (#189): `desired` is the full tag list
+ * from the Attributes pane; `status:*` labels and the card's type label are
+ * mechanical and always preserved. Returns the gh label add/remove plan. */
+export function plannedLabelChange(current: string[], desired: string[], type?: string): { add: string[]; remove: string[] } {
+	const keep = new Set([...current.filter((l) => l.startsWith("status:")), ...(type ? [type] : [])]);
+	const want = new Set(desired.map((l) => l.trim()).filter(Boolean));
+	const add = [...want].filter((l) => !current.includes(l) && !keep.has(l));
+	const remove = current.filter((l) => !want.has(l) && !keep.has(l));
+	return { add, remove };
+}
+
 /** Plain-text card excerpt for the board preview (#188): fenced code removed,
  * markdown stripped, the Reference Index section skipped, first meaningful
  * paragraph(s) kept up to `cap` characters with an ellipsis. */
@@ -371,16 +382,24 @@ export class TrackerSync {
 		const title = params.title !== undefined ? String(params.title).trim() : undefined;
 		if (title !== undefined && !title) return { ok: false, error: "Title cannot be empty" };
 		const body = params.body !== undefined ? String(params.body) : undefined;
-		if (title === undefined && body === undefined) return { ok: false, error: "Nothing to update" };
+		const wantsLabelChange = Array.isArray(params.labels) && plannedLabelChange(card.labels, params.labels.map(String), card.type).add.length + plannedLabelChange(card.labels, params.labels.map(String), card.type).remove.length > 0;
+		if (title === undefined && body === undefined && !wantsLabelChange) return { ok: false, error: "Nothing to update" };
 		const repo = this.state.repo ?? this.resolveRepo();
 		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
 		const args = ["issue", "edit", String(number), "-R", repo];
 		if (title !== undefined) args.push("--title", title);
 		if (body !== undefined) args.push("--body", body);
+		const labelPlan = Array.isArray(params.labels) ? plannedLabelChange(card.labels, params.labels.map(String), card.type) : null;
+		if (labelPlan) {
+			for (const label of labelPlan.add) args.push("--add-label", label);
+			for (const label of labelPlan.remove) args.push("--remove-label", label);
+		}
+		if (title === undefined && body === undefined && (!labelPlan || (!labelPlan.add.length && !labelPlan.remove.length))) return { ok: false, error: "Nothing to update" };
 		const edit = this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
 		if (edit.status !== 0) return { ok: false, error: `${edit.stderr || edit.stdout}`.trim() || "gh issue edit failed" };
 		if (title !== undefined) card.title = title;
 		if (body !== undefined) card.body = body.slice(0, 20_000);
+		if (labelPlan) card.labels = [...card.labels.filter((l) => !labelPlan.remove.includes(l) || l.startsWith("status:") || l === card.type), ...labelPlan.add];
 		card.updatedAt = new Date().toISOString();
 		this.writeCache(); this.changed(this.state);
 		return { ok: true, number };

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
-import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt } from './pif-shared.ts';
+import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange } from './pif-shared.ts';
 import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
@@ -551,4 +551,16 @@ test('trackerExcerpt strips markdown, skips Reference Index, caps with ellipsis'
   const long = trackerExcerpt('word '.repeat(200).trim(), 240);
   assert.ok(long.length <= 241, `${long.length}`);
   assert.ok(long.endsWith('…'));
+});
+
+test('plannedLabelChange diffs tags while preserving status and type labels', () => {
+  const plan = plannedLabelChange(['task', 'status:todo', 'old-tag'], ['task', 'status:todo', 'new-tag'], 'task');
+  assert.deepEqual(plan.add, ['new-tag']);
+  assert.deepEqual(plan.remove, ['old-tag']);
+  const none = plannedLabelChange(['task', 'status:todo'], ['task', 'status:todo'], 'task');
+  assert.deepEqual(none.add, []);
+  assert.deepEqual(none.remove, []);
+  const protect = plannedLabelChange(['task', 'status:in-progress'], ['design'], 'task');
+  assert.deepEqual(protect.add, ['design']);
+  assert.deepEqual(protect.remove, []);
 });

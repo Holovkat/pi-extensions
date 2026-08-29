@@ -213,4 +213,173 @@ void main() {
     );
     await bus.dispose();
   });
+
+  // (board scope tests above)
+
+  testWidgets('clean sheet closes on X without prompting', (tester) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pump();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    expect(find.text('Save changes?'), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('dirty X prompts: No discards, Yes saves and closes', (
+    tester,
+  ) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('tracker_sheet_title')),
+      'Task: renamed again',
+    );
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pump();
+    expect(find.text('Save changes?'), findsOneWidget);
+    // No discards: sheet closes, nothing sent.
+    await tester.tap(find.byKey(const Key('tracker_sheet_discard')));
+    await tester.pump();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    expect(
+      bus.sent.where((event) => event['type'] == 'update'),
+      isEmpty,
+    );
+    // Reopen, edit, and confirm the save path.
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('tracker_sheet_title')),
+      'Task: renamed again',
+    );
+    await tester.tap(find.byTooltip('Close'));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('tracker_sheet_save_close')));
+    await tester.pump();
+    expect(
+      bus.sent.where(
+        (event) =>
+            event['type'] == 'update' &&
+            (event['payload'] as Map)['title'] == 'Task: renamed again',
+      ),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {
+      'op': 'update',
+      'ok': true,
+      'number': 11,
+    });
+    await tester.pump();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('editor preserves newlines and fills the remaining panel', (
+    tester,
+  ) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pump();
+    final sheetHeight = tester
+        .getSize(find.byKey(const Key('tracker_sheet_box')))
+        .height;
+    final editorHeight = tester
+        .getSize(find.byKey(const Key('tracker_sheet_body')))
+        .height;
+    expect(editorHeight, greaterThan(sheetHeight * 0.4));
+    await tester.enterText(
+      find.byKey(const Key('tracker_sheet_body')),
+      'line one\n\nline two',
+    );
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where(
+        (event) =>
+            event['type'] == 'update' &&
+            '((event.payload) as Map)'.contains('never') == false &&
+            (event['payload'] as Map)['body'] == 'line one\n\nline two',
+      ),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
+
+  testWidgets('pill tabs switch between body, attachments, and attributes', (
+    tester,
+  ) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('tracker_pill_attachments')));
+    await tester.pump();
+    expect(find.text('No attachments.'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('tracker_pill_attributes')));
+    await tester.pump();
+    expect(find.text('DATE & TIME'), findsOneWidget);
+    expect(find.text('Urgent'), findsOneWidget);
+    expect(find.text('Flag'), findsOneWidget);
+    expect(find.text('Priority'), findsOneWidget);
+    await tester.tap(find.byKey(const Key('tracker_pill_body')));
+    await tester.pump();
+    expect(find.text('DATE & TIME'), findsNothing);
+    await bus.dispose();
+  });
+
+  testWidgets('images insert as width-tagged markdown and render inline', (
+    tester,
+  ) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('tracker_sheet_insert_image')));
+    await tester.pump();
+    await tester.enterText(
+      find.byKey(const Key('tracker_image_source')),
+      '/tmp/notes-sketch.png',
+    );
+    await tester.tap(find.text('Insert'));
+    await tester.pump();
+    expect(
+      find.textContaining('![image|800](/tmp/notes-sketch.png)'),
+      findsOneWidget,
+    );
+    await bus.dispose();
+  });
+
+  testWidgets('tags added in attributes sync as labels on save', (tester) async {
+    final (bus, _) = await _pump(tester);
+    await tester.tap(find.text('Task: design pass'));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('tracker_pill_attributes')));
+    await tester.pump();
+    await tester.enterText(find.byKey(const Key('tracker_tag_input')), 'design');
+    await tester.testTextInput.receiveAction(TextInputAction.done);
+    await tester.pump();
+    expect(find.text('design'), findsOneWidget);
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where(
+        (event) =>
+            event['type'] == 'update' &&
+            ((event['payload'] as Map)['labels'] as List).contains('design'),
+      ),
+      isNotEmpty,
+    );
+    await bus.dispose();
+  });
 }
