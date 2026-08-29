@@ -68,6 +68,44 @@ function copyFixture(workspace, removeDogfood = true) {
   for (const name of ['pubspec.yaml', 'pubspec.lock', 'analysis_options.yaml', '.metadata']) fs.copyFileSync(path.join(repo, 'pif', name), path.join(target, name));
 }
 
+/** Layered widget sources (#155): a project overlay package (`pif_app/` with a
+ * path dependency on the app so `package:pif/core/plugin.dart` resolves), one
+ * project widget, and one global-catalog-only widget. Both are real enough to
+ * pass the hub's dart analyze gates. */
+function seedProjectOverlay(workspace) {
+  const overlay = path.join(workspace, 'pif_app');
+  fs.mkdirSync(path.join(overlay, 'widgets'), {recursive: true});
+  fs.writeFileSync(path.join(overlay, 'pubspec.yaml'), 'name: pif_app\nenvironment:\n  sdk: ^3.0.0\ndependencies:\n  flutter:\n    sdk: flutter\n  pif:\n    path: ../pif\n');
+  fs.writeFileSync(path.join(overlay, 'widgets', 'hello_page.dart'), [
+    "import 'package:flutter/material.dart';",
+    "import 'package:pif/core/plugin.dart';",
+    '',
+    'class HelloPagePlugin implements PifWidgetPlugin {',
+    '  @override PifWidgetMeta get meta => const PifWidgetMeta(id: \'hello_page\', name: \'Hello Page\', slot: PifSlot.center);',
+    '  @override Widget build(BuildContext context, PifHost host) => const SizedBox();',
+    '}',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(overlay, 'widgets', 'widget.yaml'), 'id: hello_page\nname: "Hello Page"\nversion: 0.1.0\ndescription: "Project overlay fixture"\nslot: center\ncore: false\ntags: [project]\ndart_dependencies: []\n');
+  fs.mkdirSync(path.join(overlay, 'widgets', 'hello_page'), {recursive: true});
+  fs.renameSync(path.join(overlay, 'widgets', 'hello_page.dart'), path.join(overlay, 'widgets', 'hello_page', 'hello_page.dart'));
+  fs.renameSync(path.join(overlay, 'widgets', 'widget.yaml'), path.join(overlay, 'widgets', 'hello_page', 'widget.yaml'));
+  const globalCatalog = path.join(workspace, 'global-pif-catalog');
+  fs.mkdirSync(path.join(globalCatalog, 'global_only'), {recursive: true});
+  fs.writeFileSync(path.join(globalCatalog, 'global_only', 'widget.yaml'), 'id: global_only\nname: "Global Only"\nversion: 0.1.0\ndescription: "Global catalog fixture"\nslot: right\ncore: false\ntags: [global]\ndart_dependencies: []\n');
+  fs.writeFileSync(path.join(globalCatalog, 'global_only', 'global_only.dart'), [
+    "import 'package:flutter/material.dart';",
+    "import 'package:pif/core/plugin.dart';",
+    '',
+    'class GlobalOnlyPlugin implements PifWidgetPlugin {',
+    '  @override PifWidgetMeta get meta => const PifWidgetMeta(id: \'global_only\', name: \'Global Only\', slot: PifSlot.right);',
+    '  @override Widget build(BuildContext context, PifHost host) => const SizedBox();',
+    '}',
+    '',
+  ].join('\n'));
+  return {overlay, globalCatalog};
+}
+
 function fakePi(workspace) {
   const file = path.join(workspace, 'fake-pi.mjs');
   // Mirrors real pi: events stream over stdout AND append to the
@@ -77,8 +115,8 @@ function fakePi(workspace) {
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, token = 'integration-token'}) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, globalCatalog = null, token = 'integration-token'}) {
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {}), ...(globalCatalog ? {PIF_GLOBAL_CATALOG: globalCatalog} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -97,6 +135,9 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const checkpoint = (name) => console.error(`[pif-smoke] ${name}`);
   checkpoint('setup');
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-smoke-')); copyFixture(workspace); const piBin = fakePi(workspace); const port = 32000 + Math.floor(Math.random() * 1000);
+  checkpoint('seeding project overlay + global catalog');
+  const {overlay, globalCatalog} = seedProjectOverlay(workspace);
+  const overlayPubGet = spawn('flutter', ['pub', 'get'], {cwd: overlay, stdio: 'ignore'}); await new Promise((resolve) => overlayPubGet.on('exit', resolve)); checkpoint('pif_app pub get done');
   const hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl'); fs.mkdirSync(path.dirname(hostSessionFile), {recursive: true});
   fs.writeFileSync(hostSessionFile, [
     {type: 'session', version: 3, id: 'host-fixture', timestamp: new Date().toISOString(), cwd: workspace},
@@ -104,7 +145,7 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
     {type: 'message', message: {role: 'assistant', content: [{type: 'text', text: 'restored host reply'}]}},
   ].map((value) => JSON.stringify(value)).join('\n') + '\n');
   const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
-  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath, hostSessionFile}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath, hostSessionFile, globalCatalog}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
   const tokenFile = path.join(workspace, '.pi', 'pif', 'token');
   assert.equal(fs.readFileSync(tokenFile, 'utf8'), 'integration-token');
   const openFail = (url) => new Promise((resolve, reject) => { const socket = new WebSocket(url); socket.addEventListener('open', () => { socket.close(); resolve(); }, {once: true}); socket.addEventListener('error', () => reject(new Error('connection rejected')), {once: true}); });
@@ -129,6 +170,9 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   checkpoint('snapshot received');
   assert.equal(snapshot.payload.health.hub, 'running'); assert.equal(snapshot.payload.widgets.agent_console.core, true); assert.equal(snapshot.payload.widgets.diff_viewer, undefined);
   assert.equal(snapshot.payload.health.origin, 'standalone');
+  // Layered widget sources (#155): provenance reaches the shell snapshot.
+  assert.equal(snapshot.payload.widgets.hello_page.source, 'project', 'project overlay provenance in the snapshot');
+  assert.equal(snapshot.payload.catalog.global_only.source, 'catalog', 'global catalog provenance in the snapshot');
   send(socket, 'session/control', 'transcript', {sessionId: 'host'});
   const hostHistory = await nextMessage(socket, (value) => value.type === 'history' && value.payload?.sessionId === 'host');
   assert.ok(hostHistory.payload.transcript.some((entry) => entry.type === 'input' && entry.content === 'restored host input'), 'host history hydrates from its persisted session file');
@@ -209,6 +253,35 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(fs.readFileSync(pubspecPath, 'utf8'), pubspecBefore);
   assert.equal(fs.readFileSync(lockPath, 'utf8'), lockBefore);
   const installed = await control(controlPath, 'widget.install', {id: 'workspace_clock'}); checkpoint('catalog installed'); assert.equal(installed.ok, true); assert.ok(fs.existsSync(path.join(workspace, 'pif', 'lib', 'widgets', 'workspace_clock')));
+  // Layered widget sources (#155): provenance in widget.list plus per-source install/uninstall.
+  const listed = await control(controlPath, 'widget.list'); checkpoint('widget.list verified');
+  assert.equal(listed.installed.agent_console.source, 'base');
+  assert.equal(listed.installed.hello_page.source, 'project');
+  assert.equal(listed.installed.workspace_clock.source, 'base');
+  assert.equal(listed.catalog.global_only.source, 'catalog');
+  assert.equal(listed.catalog.workspace_clock, undefined, 'installed widgets shadow catalog entries');
+  const helloSource = path.join(workspace, 'pif_app', 'widgets', 'hello_page', 'hello_page.dart');
+  const helloBefore = fs.readFileSync(helloSource, 'utf8');
+  const projectInstall = await control(controlPath, 'widget.install', {id: 'hello_page'}); checkpoint('project widget installed');
+  assert.equal(projectInstall.ok, true, projectInstall.diagnostics || '');
+  assert.equal(projectInstall.source, 'project');
+  assert.equal(fs.readFileSync(helloSource, 'utf8'), helloBefore, 'installing a project widget registers it in place — source never moves');
+  const registry = fs.readFileSync(path.join(workspace, 'pif', 'lib', 'widget_registry.g.dart'), 'utf8');
+  assert.match(registry, /\/\/ source: project\n    'hello_page'/);
+  assert.match(registry, /import 'file:\/\/.+\/pif_app\/widgets\/hello_page\/hello_page\.dart';/);
+  const globalInstall = await control(controlPath, 'widget.install', {id: 'global_only'}); checkpoint('global catalog widget installed');
+  assert.equal(globalInstall.ok, true, globalInstall.diagnostics || '');
+  assert.equal(globalInstall.source, 'project');
+  assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'widgets', 'global_only', 'widget.yaml')), 'global catalog installs copy into the project overlay');
+  assert.ok(fs.existsSync(path.join(globalCatalog, 'global_only', 'widget.yaml')), 'global catalog source never moves');
+  const deregistered = await control(controlPath, 'widget.uninstall', {id: 'hello_page'}); checkpoint('project widget deregistered');
+  assert.equal(deregistered.ok, true);
+  assert.equal(deregistered.source, 'project');
+  assert.equal(deregistered.deregistered, true);
+  assert.ok(fs.existsSync(helloSource), 'uninstalling a project widget keeps its source');
+  const afterUninstall = await control(controlPath, 'widget.list');
+  assert.equal(afterUninstall.installed.hello_page.enabled, false, 'deregistered project widget stays present but disabled');
+  assert.ok(!fs.readFileSync(path.join(workspace, 'pif', 'lib', 'widget_registry.g.dart'), 'utf8').includes("'hello_page'"), 'registry drops the deregistered project widget');
   await assert.rejects(() => control(controlPath, 'widget.uninstall', {id: 'agent_console'}), /Core widget/);
   await control(controlPath, 'layout', {action: 'move', widgetId: 'diff_viewer', slot: 'right'}); assert.equal(JSON.parse(fs.readFileSync(path.join(workspace, '.pi', 'pif', 'layout.json'))).panels.diff_viewer.slot, 'right');
   const resetState = nextMessage(socket, (value) => value.type === 'layout_state' && Object.keys(value.payload.panels ?? {}).length === 0);
