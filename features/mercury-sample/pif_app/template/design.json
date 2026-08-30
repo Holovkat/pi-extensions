@@ -1,0 +1,315 @@
+{
+  "source": {
+    "type": "existing-interface",
+    "identifier": "FMS Mercury design system — DESIGN.md, docs/MERCURY_VISUAL_STANDARD.md, docs/MERCURY_UI_CONTRACT.md, frontend/triplogger/lib/shared/mercury_tokens.dart, app_theme.dart, app_spacing.dart, lib/shared/widgets/mercury_components.dart, lib/view/mercury_shell.dart (read-only extract, no runtime assets embedded)",
+    "extracted_with": "extract-design skill (validated design-system JSON)"
+  },
+  "tokens": {
+    "colors": {
+      "roles": {
+        "page": {
+          "light": "#EEF1F8",
+          "dark": "#24252A",
+          "description": "Page field behind content; dark form is also the map-adjacent operating canvas."
+        },
+        "surface": {
+          "light": "#F8FAFE",
+          "dark": "#35383F",
+          "description": "Default card and grouped-content surface."
+        },
+        "surface_raised": {
+          "light": "#FFFFFF",
+          "dark": "#3D4049",
+          "description": "Raised controls, input fields, navigation surfaces."
+        },
+        "navigation": {
+          "light": "#FFFFFF",
+          "dark": "#303136",
+          "description": "Navigation bar and rail background."
+        },
+        "accent": {
+          "light": "#397C76",
+          "dark": "#78B8B0",
+          "description": "Mercury Teal — the single interaction, selection, focus, icon and progress signal. Dark form is the higher-luminance variant of the same signal."
+        },
+        "accent_soft": {
+          "light": "#CFE5E2",
+          "dark": "#365A57",
+          "description": "Tonal container for selection, secondary action, status and icon-container surfaces."
+        },
+        "divider": {
+          "light": "#D9DEE8",
+          "dark": "#4B4E57",
+          "description": "Hairline separation for grouped rows and pane boundaries."
+        },
+        "text_high": {
+          "light": "#202329",
+          "dark": "#F2F3F7",
+          "description": "Ink / Night Text — high-emphasis foreground."
+        },
+        "text_secondary": {
+          "light": "#555C66",
+          "dark": "#C5C7CE",
+          "description": "Secondary foreground (onSurfaceVariant in app_theme.dart)."
+        },
+        "text_on_accent": {
+          "light": "#FFFFFF",
+          "dark": "#102A28",
+          "description": "Foreground on accent fills (onPrimary in app_theme.dart)."
+        },
+        "success": {
+          "light": "#287A55",
+          "dark": "#75C99C",
+          "description": "Confirmed, available, safely completed."
+        },
+        "warning": {
+          "light": "#9A5B00",
+          "dark": "#F2BE72",
+          "description": "Attention and recoverable operational risk."
+        },
+        "error": {
+          "light": "#B3261E",
+          "dark": "#FFB4AB",
+          "description": "Failed or destructive state."
+        },
+        "disabled": {
+          "light": "#9AA2AE",
+          "dark": "#777B84",
+          "description": "Unavailable state — always paired with reduced opacity plus an icon, label, or semantic announcement; never color or opacity alone."
+        }
+      },
+      "authority_note": "Light/dark values above are the documented semantic palette (DESIGN.md frontmatter + docs/MERCURY_VISUAL_STANDARD.md, two consistent doc sources). The shipped mercury_tokens.dart records different light values for page (#E6EBF2), surface (#EFEFF5), accent (#143633), accent_soft (#143633), divider (#B8BEC4) and dark accent (#64CBBF) — see evidence item EVID-DRIFT-1. Per the Mercury authority chain, doc values bind for new builds until the owner reconciles the drift.",
+      "rule": "Every semantic role must resolve deliberately in BOTH light and dark appearance (Paired Appearance Rule). Feature code consumes semantic role names, never raw hex values."
+    },
+    "typography": {
+      "font_family": "Poppins",
+      "fallback": "sans-serif",
+      "weights_allowed": [400, 500],
+      "weight_cap": 500,
+      "weight_note": "No-Bold Rule: no user-facing text above Medium (500). Hierarchy comes from role, size, spacing and tone. DESIGN.md documents Regular 400 body + Medium 500 heads/labels; the shipped app_theme.dart pins all semantic roles to w300 as an owner-approved legibility exception for field devices (EVID-DRIFT-2). New builds default to the documented 400/500; deviate only by owner decision.",
+      "roles": {
+        "display": { "size": "57px", "weight": 500, "line_height": 1.12, "letter_spacing": "-0.25px", "use": "Rare high-level display moments, never routine operations." },
+        "headline": { "size": "32px", "weight": 500, "line_height": 1.25, "letter_spacing": "0", "use": "Major page or state headings." },
+        "title": { "size": "22px", "weight": 500, "line_height": 1.27, "letter_spacing": "0", "use": "App bars, centered page headers, section hierarchy." },
+        "body": { "size": "16px", "weight": 400, "line_height": 1.5, "letter_spacing": "0.5px", "use": "Instructions, records, values, explanatory copy." },
+        "label": { "size": "14px", "weight": 500, "line_height": 1.43, "letter_spacing": "0.1px", "use": "Buttons, navigation, field labels, chips, compact operational metadata." }
+      },
+      "scale_note": "Implemented as Material 3 large/medium/small variants within each role. System text scaling passes through with no application-level maximum; essential actions must remain reachable at 1x and 2x text scale."
+    },
+    "spacing": {
+      "unit": "logical pixel",
+      "scale": [4, 8, 12, 16, 24, 32],
+      "named": {
+        "compact": 4,
+        "related": 8,
+        "control": 12,
+        "group": 16,
+        "section": 24,
+        "page": 32
+      },
+      "use": {
+        "compact": "Tight spacing between related elements, icon padding, badge internals",
+        "related": "Gaps between a label and its icon/value, chip vertical padding",
+        "control": "Control-adjacent gaps, chip horizontal padding, form field spacing",
+        "group": "Card internal padding, row content insets, divider indent",
+        "section": "Between content sections, grid gutters at 2-3 columns",
+        "page": "Screen padding, major layout separation"
+      }
+    },
+    "radii": {
+      "chip": 8,
+      "control": 12,
+      "group": 20,
+      "hero": 28,
+      "circular": 999,
+      "use": {
+        "chip": "Chips and compact feedback",
+        "control": "Buttons, fields, inputs, metric chips",
+        "group": "Cards, settings groups, content clusters",
+        "hero": "Large hero regions only",
+        "circular": "Circular controls, icon pills, status badge silhouettes"
+      },
+      "rule": "Nested-Radius Rule: child controls use a tighter radius than the group containing them. Pill Has a Job Rule: full pills (999) are reserved for compact actions, status, and circular navigation — not ordinary content containers."
+    },
+    "borders": {
+      "hairline": { "width": 1, "color_role": "divider", "use": "Quiet dividers between grouped rows and pane boundaries; default card border is none" },
+      "focus": { "width": 2, "color_role": "accent", "use": "Field focus outline" },
+      "focused_error": { "width": 2, "color_role": "error", "use": "Field focused-error outline" },
+      "status_badge_border": { "width": 1, "color_role": "tone color", "use": "Status badge outline in the tone color over a 12% tint" }
+    },
+    "shadows": {
+      "vocabulary": {
+        "flat": { "elevation": 0, "use": "Page fields, app bars, resting structural regions" },
+        "ambient_card": { "elevation": 2, "ambient": "10% black", "use": "Tappable cards and grouped operational containers" },
+        "decision_surface": { "elevation": 3, "use": "Dialogs and decision surfaces rising temporarily above the workflow" },
+        "floating_map_control": { "elevation": 4, "ambient": "24% black", "use": "Controls requiring separation over detailed map imagery" }
+      },
+      "rule": "Tonal-First Rule: hierarchy is established with semantic surface levels; shadow confirms a raised role instead of inventing one. Lift With Purpose Rule: visible lift is reserved for actionable cards, decisions, and controls floating over complex content. Primary buttons render at elevation 1 (app_theme.dart); surfaceTint is transparent everywhere."
+    }
+  },
+  "layout": {
+    "containers": {
+      "page_max_width": { "default": 1280, "info_heavy": 1440, "confidence": 0.9, "evidence": "DESIGN.md: general page content stops stretching at 1280px; information-heavy workspaces may expand to 1440px." },
+      "list_or_section_pane": { "min": 260, "max": 430 },
+      "extended_rail": 260,
+      "page_header": { "height": 64, "back_control": 48, "horizontal_text_inset": 64 },
+      "footer_action_target": { "pill": "64x32", "hit_target": "112 wide x min 72 high" }
+    },
+    "grids": {
+      "responsive_card_grid": {
+        "columns": { "below_600": 1, "at_600": 2, "at_1024": 3 },
+        "gutter": "group (16) at 1 column, section (24) at 2-3 columns",
+        "evidence": "MercuryResponsiveGrid in mercury_components.dart (observed)"
+      }
+    },
+    "alignment": {
+      "page_header": "Centered title, back control leading, at most one trailing action; long titles ellipsize rather than displace controls",
+      "cards": "Left-aligned content; centered variant only when the card is a single focused task",
+      "dividers": "Hairline, indented by group (16) inside groups"
+    },
+    "responsive": {
+      "breakpoints": {
+        "compact": 600,
+        "intermediate": [600, 720, 840, 900],
+        "expanded_navigation": 1024
+      },
+      "rules": [
+        "Below 1024: bottom navigation; one clear task; scrollable card stacks; safe-area-aware content; controls usable without hover.",
+        "At 1024 and above: bottom navigation is replaced by an always-labeled navigation rail (NavigationRailLabelType.all observed in mercury_shell.dart) plus a 1px vertical divider before content.",
+        "Intermediate thresholds (600/720/840/900) admit horizontal filters, two-column forms, navigation rails, or master-detail panes per workflow.",
+        "Desktop is an administration/master-data workspace (persistent navigation, panes, multi-column forms); mobile is a role-filtered operational surface (current work, status, quick actions, full-bleed maps). Share tokens and product truth; do not force compositional parity.",
+        "Desktop-only administrative modules do not leave dead navigation placeholders on mobile.",
+        "One job per screen (Screen Composition Law) — see rules.md."
+      ],
+      "breakpoint_note": "600 and 1024 are observed in code (MercuryBreakpoints.compact / .expandedNavigation). The 720/840/900 intermediate thresholds are documented in DESIGN.md but were not observed as code constants — treat as guidance, not law."
+    }
+  },
+  "components": {
+    "card": {
+      "geometry": { "radius_role": "group (20)", "padding": "group (16)", "elevation": "ambient_card (2, 10% black shadow)", "border": "none by default" },
+      "surface": "surface role",
+      "structure": "Optional accent-colored leading icon + title (title role) + optional subtitle/body-small + content + trailing chevron when tappable; optional top-right corner badge; optional bottom trailing indicator; optional loading strobe along the bottom edge",
+      "rules": [
+        "Never nest a card inside a card.",
+        "One tappable surface; header may carry its own tap target when it differs from the body action.",
+        "Semantic container with a combined label; announces 'Updating.' while loading."
+      ]
+    },
+    "grouped_panel": {
+      "geometry": { "radius_role": "group (20)", "row_inset": "group (16)", "elevation": "ambient_card", "divider": "hairline, indent group (16)" },
+      "use": "One shared surface for a related stack of actionable rows; children keep their own interaction and semantics while the group owns background, radius, elevation, insets and separators.",
+      "supports": "Reorderable variant with the canonical 44px gutter / 7px accent rail"
+    },
+    "status_badge": {
+      "tones": ["neutral", "success", "warning", "error", "disabled"],
+      "geometry": { "radius_role": "circular (999 pill)", "padding": "control (12) horizontal, related (8) vertical", "background": "tone color at 12% opacity", "border": "1px tone color", "icon": 18 },
+      "rule": "Every tone carries an icon and text so meaning never depends on color alone; the disabled tone appends ', disabled' to the semantic label.",
+      "icons_observed": { "neutral": "info_outline", "success": "check_circle_outline", "warning": "warning_amber_rounded", "error": "error_outline", "disabled": "block" }
+    },
+    "corner_badge": {
+      "geometry": { "position": "top-right of card", "radius": "bottom-left corner only, group (20)", "padding": "18/10/16/10", "icon": 16 },
+      "surface": "Solid tone color with on-surface (scheme.surface) icon and labelMedium text",
+      "use": "Compact count/status ribbon integrated into the card corner; does not consume a content row and never uses a pill silhouette"
+    },
+    "metric_chip": {
+      "geometry": { "radius_role": "control (12)", "padding": "related (8) horizontal, compact (4) vertical", "background": "accent_soft at 42% opacity" },
+      "use": "Single-line tonal value chip for compact card metrics; semantic label 'value'; keep values unit-free when the unit belongs to the label.",
+      "variants_observed": ["metric_chip (one line)", "inset_metric (value over label, radius control, padding related, value titleSmall w500, label bodySmall)", "metric_value_row (icon + bodyMedium label + titleMedium value in a wrap)"]
+    },
+    "section_header": {
+      "typography": "title role (titleLarge)",
+      "geometry": { "padding": "compact (4) left/right, related (8) bottom" },
+      "behavior": "Semantics header; optional single trailing action"
+    },
+    "centered_page_header": {
+      "geometry": { "height": 64, "back_control": "48px circular tonal (filledTonal, arrow_back)", "text_inset": "64 horizontal" },
+      "structure": "Centered title (titleLarge); optional eyebrow (labelSmall, accent, +1.8 letter spacing); optional subtitle (labelSmall, secondary); one optional trailing action",
+      "rule": "Long titles ellipsize; Back and the trailing action are never displaced. Exactly one back affordance per screen."
+    },
+    "settings_group_row": {
+      "group": { "surface": "surface role", "radius_role": "group (20)", "dividers": "hairline, indent group (16), optional" },
+      "row": { "min_height": 48, "content_padding": "group (16) horizontal, compact (4) vertical", "trailing": "chevron for navigation, switch for toggles", "semantics": "Combined label; button when tappable; toggled state exposed; ', disabled' appended when disabled" }
+    },
+    "buttons": {
+      "primary": { "fill": "accent", "foreground": "text_on_accent", "radius_role": "control (12)", "padding": "24 horizontal, 12 vertical", "elevation": 1 },
+      "outlined": { "foreground": "accent", "border": "1px accent", "radius_role": "control (12)", "padding": "24 horizontal, 12 vertical" },
+      "text": { "foreground": "accent", "radius_role": "control (12)", "padding": "16 horizontal, 8 vertical" },
+      "states": "Material state overlays, progress indicators, disabled semantics, visible keyboard focus"
+    },
+    "input_field": {
+      "fill": "surface_raised",
+      "radius_role": "control (12)",
+      "padding": "16 all sides",
+      "border": "1px divider at rest; 2px accent on focus; error color, strengthened to 2px while focused",
+      "disabled": "Lower-emphasis semantic color plus explicit unavailable state — never opacity alone"
+    },
+    "navigation": {
+      "mobile": "Bottom navigation for the compact set of primary destinations; stacks + system Back for hierarchy; optional unread badge (accent tonal) with accessible unread announcement",
+      "desktop": "Always-labeled navigation rail; extended 260px rail for detailed administration",
+      "active_state": "accent_soft tonal background with accent icon/foreground",
+      "footer_actions": "Signature mobile action: 64x32 tonal icon pill above a centered compact label inside a 112-wide, min-72-high target; actions wrap as a centered group and remain understandable without the icon"
+    },
+    "state_view": {
+      "variants": ["empty", "error"],
+      "structure": "40px icon, centered title (title role), message (body role), Retry filled button on error",
+      "semantics": "Container with combined label; error variant is a live region"
+    },
+    "inline_notice": {
+      "structure": "Status badge + optional outlined retry action, wrapped",
+      "semantics": "Live region for warning and error tones"
+    },
+    "interaction_states": {
+      "focus": "Visible keyboard focus via Material state overlays; 2px accent field outline",
+      "selected_chip": "Shifts to accent_soft tonal container",
+      "loading": "Slim edge strobe on cards; semantics announce updating state",
+      "reorder": "Uniform contained grabber/gutter treatment (44px gutter, 7px accent rail); surrounding page never scrolls during reorder"
+    }
+  },
+  "accessibility": {
+    "contrast": {
+      "accent_light_vs_white_label": { "ratio": 4.9, "meets": "WCAG AA normal text", "confidence": 0.8, "note": "Computed from the documented #397C76; the visual standard asserts AA compliance for white action labels. The shipped dark-teal light accent (#143633) computes to roughly 13:1 — see EVID-DRIFT-1." },
+      "accent_dark_vs_on_accent_dark": { "ratio": 6.7, "meets": "WCAG AA normal text", "confidence": 0.7, "note": "Computed from documented #78B8B0 vs #102A28." },
+      "rule": "Do not assert a numeric contrast ratio without recomputing for the exact pair in use; keep the adjusted-accent approach (preserve hue, adjust lightness to meet AA for white labels) when overriding."
+    },
+    "focus": "Visible keyboard focus everywhere (Material state overlays, 2px accent field outlines); FocusTraversalGroup ordering — reading order for grids, ordered traversal in groups, explicit numeric focus orders where interactions are non-linear",
+    "target_size": {
+      "minimum": "44pt iOS / 48dp Android",
+      "observed": ["settings rows minHeight 48", "circular back control 48", "footer action target 112x72", "centered header reserves 64px horizontal insets around Back and trailing action"]
+    },
+    "color_independence": "Status and state never rely on color alone: every status tone pairs icon + text; disabled pairs reduced emphasis with an icon, label, or semantic announcement; selected chips shift tone",
+    "text_scaling": "System text scaling passes through with no application-level maximum; essential actions must remain reachable at 1x and 2x scale; Poppins carries the branded hierarchy while native text honors user scaling",
+    "semantics": "Combined semantic labels on composite widgets ('label, value'); live regions on warnings/errors; disabled and toggled states announced; tooltips on icon-only controls (Back)",
+    "motion": {
+      "reduced_motion": "Reduced-motion preferences preserved (DESIGN.md); no motion token observed in code — confidence 0.5, inferred",
+      "loading": "Non-blocking strobe rather than modal spinners for card refresh"
+    }
+  },
+  "confidence": 0.85,
+  "evidence": [
+    "OBSERVED: semantic palette (light+dark) documented twice, consistently — DESIGN.md frontmatter and docs/MERCURY_VISUAL_STANDARD.md palette table (sampled from approved task #60 captures).",
+    "OBSERVED: spacing scale 4/8/12/16/24/32 identical in DESIGN.md, MERCURY_VISUAL_STANDARD.md, MercurySpacing, and AppSpacing (legacy names xs..xxxl) in app_spacing.dart.",
+    "OBSERVED: radii 8/12/20/28/999 identical in DESIGN.md and MercuryRadii (mercury_tokens.dart).",
+    "OBSERVED: elevations 0/2/3/4 with 10%/24% black ambient in DESIGN.md shadow vocabulary, matched by MercuryElevation and card theme (elevation 2, shadowColor black at 10%) in app_theme.dart.",
+    "OBSERVED: input focus 2px accent border and focused-error 2px error border in app_theme.dart inputDecorationTheme.",
+    "OBSERVED: card theme — surface color, radius 20, elevation 2, anti-aliased clip, transparent surfaceTint; app bar flat (elevation 0) with page background and centered title (app_theme.dart).",
+    "OBSERVED: buttons — primary fill padding 24x12 radius 12 elevation 1; text button padding 16x8; outlined 1px accent border (app_theme.dart).",
+    "OBSERVED: chips radius 8 with divider hairline border; selected chips use a tonal container (app_theme.dart chipTheme + DESIGN.md).",
+    "OBSERVED: status badge — five tones, pill radius, 12% tint background, 1px tone border, 18px icon, label; disabled tone appends ', disabled' (MercuryStatusBadge).",
+    "OBSERVED: metric chips — accent_soft at 42% opacity, radius 12, padding 8h/4v (MercuryMetricChip); inset metric variant adds value-over-label at radius 12 (MercuryInsetMetric).",
+    "OBSERVED: settings group — surface, radius 20, hairline dividers indented 16 (MercurySettingsGroup); settings row — minHeight 48, content padding 16h/4v, chevron or switch trailing, combined semantics (MercurySettingsRow).",
+    "OBSERVED: section header — titleLarge, 4px side / 8px bottom padding, optional trailing action, semantics header (MercurySectionHeader).",
+    "OBSERVED: centered page header — 64px height, 48px circular tonal back (filledTonal), centered titleLarge, optional eyebrow in accent with +1.8 letter spacing, 64px horizontal text insets (MercuryCenteredPageHeader, MercuryCircularBackButton).",
+    "OBSERVED: home card — surface, radius 20, elevation 2 with 10% black, 16 padding, accent icon, titleMedium title, bodySmall subtitle, chevron, corner-badge slot, loading strobe (MercuryHomeCard).",
+    "OBSERVED: grouped panel — surface, radius 20, elevation 2, hairline dividers indented 16, reorderable variant (MercuryGroupedPanel); canonical reorder gutter 44px wide with 7px accent rail (MercuryReorderGutter).",
+    "OBSERVED: responsive grid — 1 column below 600, 2 at 600, 3 at 1024; gutter 16 at 1 column else 24 (MercuryResponsiveGrid).",
+    "OBSERVED: shell — width >= 1024 renders NavigationRail with labelType all plus a 1px vertical divider; below 1024 renders a bottom NavigationBar (mercury_shell.dart ~lines 1317-1358, MercuryBreakpoints.expandedNavigation).",
+    "OBSERVED: no-bold — all user-facing weights capped at 500 (DESIGN.md, MERCURY_VISUAL_STANDARD.md, UI contract line 7).",
+    "OBSERVED: status color independence — MercuryStatusTone docstring 'Every variant also carries an icon and semantic text, so its meaning never depends on color alone.'",
+    "EVID-DRIFT-1 (flagged): shipped MercuryThemeTokens light values differ from the documented palette — page #E6EBF2 vs #EEF1F8, surface #EFEFF5 vs #F8FAFE, accent #143633 vs #397C76, accent_soft #143633 vs #CFE5E2, divider #B8BEC4 vs #D9DEE8; dark accent #64CBBF vs documented #78B8B0. app_theme.dart derives the runtime accent from base hue/saturation with fixed lightness (0.14 light, 0.59 dark), so the operative light accent is the near-black teal, not the documented Mercury Teal. Both sets are observed; which is canonical for NEW builds is an owner decision. This template binds the documented palette (authority chain: DESIGN.md + visual standard outrank implementation defaults) and requires owner reconciliation at first real use.",
+    "EVID-DRIFT-2 (flagged): app_theme.dart pins every semantic text role to FontWeight.w300 ('minimum owner-approved weight that remains legible'), below the documented 400/500 range. The No-Bold cap (never above 500) is unaffected. New builds default to the documented 400/500; the 300 baseline is an owner-approved Mercury exception, not a template default.",
+    "INFERRED (confidence 0.5): reduced-motion handling — asserted by DESIGN.md do's ('preserve reduced-motion preferences') but no motion token or MediaQuery.disableAnimations handling was observed in the extracted sources.",
+    "INFERRED (confidence 0.8): contrast ratios 4.9:1 (documented light accent vs white) and 6.7:1 (documented dark accent vs dark on-accent) computed from hex values, not measured from rendered captures.",
+    "INFERRED (confidence 0.6): intermediate breakpoints 720/840/900 documented in DESIGN.md prose but not present as code constants; treat as workflow guidance, not enforced law. The 600 and 1024 thresholds are code-observed.",
+    "NOT EXTRACTED: exact Poppins font files (vendored in Mercury under the SIL Open Font License) are not embedded here; consuming apps must supply Poppins (or accept the sans-serif fallback) and include the OFL license notice. Map-specific palettes (route option colors, congestion reds/ambers) and print-world run-sheet hex literals are owner-approved Mercury exceptions and are deliberately out of template scope."
+  ]
+}

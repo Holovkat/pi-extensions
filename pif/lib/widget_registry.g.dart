@@ -2,6 +2,8 @@
 import 'core/plugin.dart';
 import 'widgets/agent_console/agent_console.dart';
 import 'widgets/diff_viewer/diff_viewer.dart';
+import 'file:///private/tmp/pif158/ws/pif_app/widgets/home/home.dart';
+import 'file:///private/tmp/pif158/ws/pif_app/widgets/metrics/metrics.dart';
 import 'widgets/session_rail/session_rail.dart';
 import 'widgets/status_bar/status_bar.dart';
 import 'widgets/terminal/terminal.dart';
@@ -11,13 +13,25 @@ import 'widgets/workspace_clock/workspace_clock.dart';
 
 Map<String, PifWidgetPlugin Function()> pifWidgetFactories() {
   return {
+    // source: base
     'agent_console': () => AgentConsolePlugin(),
+    // source: base
     'diff_viewer': () => DiffViewerPlugin(),
+    // source: project
+    'home': () => HomePlugin(),
+    // source: project
+    'metrics': () => MetricsPlugin(),
+    // source: base
     'session_rail': () => SessionRailPlugin(),
+    // source: base
     'status_bar': () => StatusBarPlugin(),
+    // source: base
     'terminal': () => TerminalPlugin(),
+    // source: base
     'tracker_board': () => TrackerBoardPlugin(),
+    // source: base
     'widget_store': () => WidgetStorePlugin(),
+    // source: base
     'workspace_clock': () => WorkspaceClockPlugin(),
   };
 }

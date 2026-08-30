@@ -1,0 +1,6 @@
+id: metrics
+name: Metrics
+slot: page
+version: 0.1.0
+core: false
+description: Page Metrics for the project app

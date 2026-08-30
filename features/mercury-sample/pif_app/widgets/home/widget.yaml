@@ -1,0 +1,6 @@
+id: home
+name: Home
+slot: page
+version: 0.1.0
+core: false
+description: Page Home for the project app

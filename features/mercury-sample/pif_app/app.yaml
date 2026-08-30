@@ -1,0 +1,8 @@
+id: team-pulse
+name: Team Pulse
+version: 0.1.0
+home: home
+pages:
+  - home
+  - metrics
+template: mercury

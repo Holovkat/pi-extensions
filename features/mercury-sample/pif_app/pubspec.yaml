@@ -1,0 +1,9 @@
+name: pif_app
+publish_to: none
+environment:
+  sdk: ^3.5.0
+dependencies:
+  flutter:
+    sdk: flutter
+  pif:
+    path: ../../../../../Users/tonyholovka/workspace/pi-extensions/pif
