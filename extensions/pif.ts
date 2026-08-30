@@ -816,7 +816,7 @@ class PifHub {
 		const file = this.appManifestPath();
 		if (!fs.existsSync(file)) { this.state.app = null; this.state.appError = null; return; }
 		const parsed = parseAppManifest(fs.readFileSync(file, "utf8"));
-		if (parsed.error) { this.state.appError = parsed.error; this.changed(this.state); return; }
+		if (parsed.error) { this.state.appError = parsed.error; this.broadcastSnapshot(); return; }
 		this.state.app = parsed.manifest ?? null;
 		this.state.appError = null;
 	}
@@ -891,7 +891,7 @@ class PifHub {
 
 	async appInit(params: any) {
 		this.assertNoApp();
-		const name = String(params.name ?? "My App").trim() || "My App";
+		const name = (String(params.name ?? "My App").trim() || "My App").replace(/[\r\n]+/g, " ").slice(0, 120);
 		const template = params.template ? String(params.template) : undefined;
 		if (template && !/^[a-z0-9][a-z0-9-]*$/.test(template)) throw new Error(`Template id must be a kebab identifier — got '${template}'`);
 		const manifest: PifAppManifest = { id: slugifyAppId(name), name, version: "0.1.0", home: "home", pages: ["home"], template, dependencies: [] };
@@ -904,31 +904,47 @@ class PifHub {
 			fs.cpSync(source, to, { recursive: true });
 		}
 		this.writeAppManifest(manifest);
-		this.scaffoldAppPackage();
-		await this.scaffoldWidget("home", "Home", "page");
-		await this.installOrFail("home", "Home page");
+		try {
+			this.scaffoldAppPackage();
+			await this.scaffoldWidget("home", "Home", "page");
+			await this.installOrFail("home", "Home page");
+		} catch (error) {
+			// Roll back the attempt so a retry is possible: the manifest and
+			// the scaffolded page go; the pinned template and design.md stay.
+			fs.rmSync(path.join(this.state.health.workspace, "pif_app", "widgets", "home"), { recursive: true, force: true });
+			fs.rmSync(this.appManifestPath(), { force: true });
+			this.loadAppManifest();
+			throw error;
+		}
 		this.loadAppManifest();
 		return { ok: true, id: manifest.id, name: manifest.name, template: template ?? null, pages: manifest.pages, note: template ? "template layers pinned to pif_app/template/" : "minimal unstyled app" };
 	}
 
 	async appPageAdd(params: any) {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
-		const name = String(params.name ?? "").trim();
+		const name = String(params.name ?? "").trim().replace(/[\r\n]+/g, " ").slice(0, 120);
 		if (!name) throw new Error("Page name is required");
 		const id = params.id ? String(params.id) : slugifyAppId(name).replace(/-/g, "_");
 		const parsed = addAppPage(this.state.app, id);
 		if (parsed.error) throw new Error(parsed.error);
-		await this.scaffoldWidget(id, name, "page");
-		await this.installOrFail(id, "Page");
+		try {
+			await this.scaffoldWidget(id, name, "page");
+			await this.installOrFail(id, "Page");
+		} catch (error) {
+			fs.rmSync(path.join(this.state.health.workspace, "pif_app", "widgets", id), { recursive: true, force: true });
+			this.scanWidgets();
+			throw error;
+		}
 		this.writeAppManifest(parsed.manifest!);
 		return { ok: true, page: id, pages: this.state.app!.pages };
 	}
 
 	async appWidgetAdd(params: any) {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
-		const name = String(params.name ?? "").trim();
+		const name = String(params.name ?? "").trim().replace(/[\r\n]+/g, " ").slice(0, 120);
 		if (!name) throw new Error("Widget name is required");
 		const id = params.id ? String(params.id) : slugifyAppId(name).replace(/-/g, "_");
+		if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error(`Widget id must be a lowercase identifier (snake_case) — got '${id}'`);
 		const slot = String(params.slot ?? "center");
 		if (!["left", "center", "right", "bottom", "status"].includes(slot)) throw new Error(`Slot must be one of left|center|right|bottom|status — got '${slot}'`);
 		if (this.state.widgets[id]) throw new Error(`Widget id '${id}' is already installed`);
@@ -959,7 +975,7 @@ class PifHub {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
 		const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "build-pif-project-app.sh");
 		if (!fs.existsSync(script)) throw new Error(`Export script not found at ${script} — exporting requires the pif dev checkout`);
-		const name = String(params?.name ?? this.state.app.name);
+		const name = (String(params?.name ?? this.state.app.name).trim() || this.state.app.name).replace(/[\r\n/]+/g, " ").slice(0, 80);
 		const child = spawn(script, [this.state.health.workspace, name], {
 			cwd: this.state.health.workspace,
 			env: { ...process.env, PIF_APP_NAME: name },
@@ -988,7 +1004,7 @@ class PifHub {
 	shutdown() { this.stop().catch(() => { /* partial startup */ }); setTimeout(() => process.exit(0), 250).unref(); return Promise.resolve({ ok: true, stopping: true }); }
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
-			case "pif_app.init": return this.appInit(params); case "pif_app.page_add": return this.appPageAdd(params); case "pif_app.widget_add": return this.appWidgetAdd(params); case "pif_app.home_set": return this.appHomeSet(params); case "pif_app.list": return this.appList(); case "pif_app.build": return this.appBuild(); case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
+			case "pif_app.init": return this.appInit(params); case "pif_app.page_add": return this.appPageAdd(params); case "pif_app.widget_add": return this.appWidgetAdd(params); case "pif_app.home_set": return this.appHomeSet(params); case "pif_app.list": return this.appList(); case "pif_app.build": return this.appBuild(params); case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
 			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
 			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list(); case "tracker.create": return this.trackerAction("create", params); case "tracker.update": return this.trackerAction("update", params); case "tracker.delete": return this.trackerAction("delete", params);
 			case "shell.shutdown": return this.shutdown();

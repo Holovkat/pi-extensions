@@ -671,7 +671,9 @@ class _DockingShellState extends State<DockingShell>
   /// other widget surface. Only page widgets ever render here.
   Widget _pageStage() {
     final id = _activePageId;
-    final plugin = id == null ? null : _factories[id]?.call();
+    // A page disabled via pif_widget_toggle drops to the placeholder like
+    // any uninstalled page — app mode honours the enabled flag (#160 review).
+    final plugin = (id == null || !enabled.contains(id)) ? null : _factories[id]?.call();
     if (plugin == null) {
       return Center(
         child: Text(

@@ -920,3 +920,30 @@ pi --no-extensions -e ./extensions/council.ts --name net-bob --project council-u
 Ask Alice to use `council_list` first, choose the best council member by purpose/tags/capabilities, then ask that member with `council_send` using the exact listed name. `council_send` is async by default: Alice should not await unless the user explicitly asks for synchronous/chained work with `synchronous=true`; Bob's eventual reply is delivered back to Alice, and default `response_mode="agent"` lets Alice continue/reply to Bob without the human answering for her.
 
 See [`docs/comms.md`](docs/comms.md) for same-machine, localhost, LAN, remote/TLS, package install, council async response, structured-response, and UAT notes.
+
+
+## pif App Builder (epic #152)
+
+pif projects can declare and build their own applications:
+
+- **App model**: a project declares `pif_app/app.yaml` (id, name, version,
+  home, ordered pages, optional template + dependencies). The hub surfaces
+  the manifest in the snapshot and the shell boots **app mode** — the
+  declared home page full-viewport with responsive navigation (rail on wide
+  screens, bottom bar on narrow), the full IDE one dev-toggle away.
+- **Tools**: `pif_app_init` (scaffolds the manifest + Home page; supports
+  `--template mercury`), `pif_app_page_add`, `pif_app_widget_add`,
+  `pif_app_home_set`, `pif_app_list`, `pif_app_build` (export; async).
+- **Templates**: the repo ships the Mercury template
+  (`pif/templates/mercury/` — tokens, named rules, component kit, responsive
+  shell pattern); the hub mirrors repo templates into the global catalog
+  (`~/.pi/pif/catalog/templates/`) at start.
+- **Agentic build flow**: the `pif-app-designer` skill runs the design pass
+  (brief → `pif_app/design.md`, owner-approved before any widget is built);
+  the `pif-app-builder` skill runs the build loop. The generated sample
+  lives at `features/mercury-sample/`.
+- **Export**: `scripts/build-pif-project-app.sh <project-dir>` compiles the
+  project (pinned widget registry, AOT) into a standalone macOS app that
+  boots straight to its home page — secrets are scanned out of the bundle
+  and models are provisioned on the target machine at first run. The widget
+  set is frozen at export time (AOT); rebuild to change it.

@@ -240,3 +240,20 @@ All registered beside the `pif_widget_*` tools, callable from host and child ses
 - Flutter 3.44.8 stable + Dart 3.12.2 installed on macOS arm64.
 - pi RPC mode (`--mode rpc`, `prompt`/`steer`/`follow_up`/`abort`, `--session <file> -c` reuse) is production-proven in dev-pipeline.
 - Extension-to-host-session message injection (`pi.sendMessage` with `deliverAs: "followUp"`) is production-proven in coms.
+
+
+## Shipped reality (epic verification #160, 2026-08-30)
+
+Addendum after implementation: board UX shipped **unified content cards** on
+all views (`#NNN — Title` + ≤5-line excerpt, theme tokens only) with an
+Epics overview filtered to open epics and per-epic drill-down; the ticket
+detail sheet is chrome-free (inline title/body editing at w300 body weight,
+pill tabs Body/Attachments/Attributes, width-tagged inline images, local
+attributes with tags syncing as labels). Export composition ships the full
+IDE shell switched to app mode via `PIF_EXPORTED=1` (launcher-set) rather
+than the settled second entrypoint — functionally equivalent for the owner
+surface (app mode boots without the picker) at the cost of a wider bundle;
+a second entrypoint remains the slimming follow-up. Known follow-ups from
+epic verification: uninstall-archive provenance badge, dev-toggle hub
+control method, `dependencies` validation in init/build, and a wider
+default board (done epic #179+ backlog).

@@ -572,6 +572,7 @@ class _TicketSheetState extends State<_TicketSheet> {
   final _tagInput = TextEditingController();
   late String _originalTitle;
   late String _originalBody;
+  late List<String> _originalTags;
 
   @override
   void initState() {
@@ -591,6 +592,7 @@ class _TicketSheetState extends State<_TicketSheet> {
     _createColumn = openColumns.isNotEmpty ? '${openColumns.first['id']}' : '';
     _type = '${_card?['type'] ?? 'task'}';
     _loadAttributes();
+    _originalTags = List.of(_tags);
     _restoreSize();
     _subscription = widget.host.bus.events.listen((event) {
       if (event.channel == 'tracker/op' && event.type == 'op_result') {
@@ -646,7 +648,9 @@ class _TicketSheetState extends State<_TicketSheet> {
   }
 
   bool get _dirty =>
-      _title.text != _originalTitle || _body.text != _originalBody;
+      _title.text != _originalTitle ||
+      _body.text != _originalBody ||
+      List.of(_tags).join('\u0000') != List.of(_originalTags).join('\u0000');
 
   /// The single exit (#189): a clean sheet closes; a dirty one asks.
   void _handleClose() {
@@ -724,6 +728,7 @@ class _TicketSheetState extends State<_TicketSheet> {
           _busy = false;
           _originalTitle = _title.text;
           _originalBody = _body.text;
+          _originalTags = List.of(_tags);
           if (_closeAfterSave) {
             _closeAfterSave = false;
             Navigator.of(context).pop();

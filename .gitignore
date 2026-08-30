@@ -16,3 +16,4 @@ dist/
 # pif runtime + build output
 build/
 .pi-subagents/
+node_modules/

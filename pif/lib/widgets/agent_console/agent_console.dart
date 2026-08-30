@@ -575,15 +575,21 @@ class _AgentConsoleState extends State<_AgentConsole> {
                       color: Color(0xffcf8d55),
                     ),
                     const SizedBox(width: 4),
-                    const Text(
-                      'Workspace access',
-                      style: TextStyle(fontSize: 11, color: Color(0xffcf8d55)),
+                    // Shrinks before the send button can clip (#160 dogfood:
+                    // the 440px console overlay overflowed this row).
+                    Flexible(
+                      child: Text(
+                        'Workspace access',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 11, color: Color(0xffcf8d55)),
+                      ),
                     ),
                     const Spacer(),
                     if (selected != null) ...[
-                      _modelSelector(selected),
+                      Flexible(child: _modelSelector(selected)),
                       const SizedBox(width: 5),
-                      _thinkingSelector(selected),
+                      Flexible(child: _thinkingSelector(selected)),
                       const SizedBox(width: 5),
                     ],
                     if (running)
