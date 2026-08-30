@@ -955,8 +955,28 @@ class PifHub {
 		};
 	}
 
-	appBuild() {
-		return { ok: false, error: "not-built-yet: the export pipeline lands in task #159 — pif_app_build is registered ahead of it per plan" };
+	appBuild(params: any) {
+		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
+		const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "build-pif-project-app.sh");
+		if (!fs.existsSync(script)) throw new Error(`Export script not found at ${script} — exporting requires the pif dev checkout`);
+		const name = String(params?.name ?? this.state.app.name);
+		const child = spawn(script, [this.state.health.workspace, name], {
+			cwd: this.state.health.workspace,
+			env: { ...process.env, PIF_APP_NAME: name },
+			encoding: "utf8",
+			timeout: 30 * 60_000,
+		});
+		let output = "";
+		child.stdout?.on("data", (chunk) => { output += String(chunk); });
+		child.stderr?.on("data", (chunk) => { output += String(chunk); });
+		void new Promise<void>((resolve) => {
+			child.on("exit", (code) => {
+				const result = { ok: code === 0, name, code: code ?? -1, output: output.slice(-4000) };
+				this.broadcast("app/build", "build_result", result);
+				resolve();
+			});
+		});
+		return { ok: true, started: true, name, note: "Export runs asynchronously; the result arrives on the app/build channel." };
 	}
 
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
@@ -1005,7 +1025,7 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_app_widget_add", "pif app widget add", "Add a widget-extension to the project app (dock or status slot).", Type.Object({ name: Type.String(), id: Type.Optional(Type.String()), slot: Type.Optional(Type.String()) }), "pif_app.widget_add");
 	register("pif_app_home_set", "pif app home set", "Set the app's home page (must be a declared page).", Type.Object({ id: Type.String() }), "pif_app.home_set");
 	register("pif_app_list", "pif app list", "List the project app manifest and its pages with install state.", Type.Object({}), "pif_app.list");
-	register("pif_app_build", "pif app build", "Export the project app as a standalone application. Registered ahead of the export pipeline (task #159).", Type.Object({}), "pif_app.build");
+	register("pif_app_build", "pif app build", "Export the project app as a standalone macOS application (builds asynchronously; result on the app/build channel).", Type.Object({ name: Type.Optional(Type.String()) }), "pif_app.build");
 	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
 	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
 	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:ui' show AppExitResponse;
 import 'package:flutter/material.dart';
 import 'core/bus.dart';
@@ -41,6 +42,13 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _checkExistingHub();
+    // Exported apps (#159) boot straight into their bundled workspace —
+    // no project picker. The launcher script sets both variables.
+    final exported = Platform.environment['PIF_EXPORTED'] == '1';
+    final exportedWorkspace = Platform.environment['PIF_WORKSPACE'];
+    if (exported && exportedWorkspace != null && exportedWorkspace.isNotEmpty) {
+      _launchProject(exportedWorkspace);
+    }
   }
 
   @override
