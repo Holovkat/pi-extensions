@@ -127,9 +127,9 @@ void main() {
     final (bus, _) = await _pump(tester);
     expect(find.text('All work'), findsOneWidget);
     expect(find.text('Epics'), findsOneWidget);
-    expect(find.text('Unrelated thing'), findsOneWidget);
-    expect(find.text('Task: design pass'), findsOneWidget);
-    expect(find.text('#10 — Epic: notes trial'), findsNothing);
+    expect(find.textContaining('Unrelated thing'), findsOneWidget);
+    expect(find.textContaining('Task: design pass'), findsOneWidget);
+    expect(find.textContaining('#10 — Epic: notes trial'), findsOneWidget);
     await bus.dispose();
   });
 
@@ -178,7 +178,7 @@ void main() {
     // All work remains available and shows everything again.
     await tester.tap(find.text('All work'));
     await tester.pump();
-    expect(find.text('Unrelated thing'), findsOneWidget);
+    expect(find.textContaining('Unrelated thing'), findsOneWidget);
     await bus.dispose();
   });
 
@@ -228,7 +228,7 @@ void main() {
 
   testWidgets('clean sheet closes on X without prompting', (tester) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byTooltip('Close'));
     await tester.pump();
@@ -241,7 +241,7 @@ void main() {
     tester,
   ) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pump();
@@ -261,7 +261,7 @@ void main() {
       isEmpty,
     );
     // Reopen, edit, and confirm the save path.
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pump();
@@ -295,7 +295,7 @@ void main() {
     tester,
   ) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pump();
@@ -328,7 +328,7 @@ void main() {
     tester,
   ) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byKey(const Key('tracker_pill_attachments')));
     await tester.pump();
@@ -349,7 +349,7 @@ void main() {
     tester,
   ) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byIcon(Icons.edit_outlined));
     await tester.pump();
@@ -370,7 +370,7 @@ void main() {
 
   testWidgets('tags added in attributes sync as labels on save', (tester) async {
     final (bus, _) = await _pump(tester);
-    await tester.tap(find.text('Task: design pass'));
+    await tester.tap(find.textContaining('Task: design pass'));
     await tester.pump();
     await tester.tap(find.byKey(const Key('tracker_pill_attributes')));
     await tester.pump();

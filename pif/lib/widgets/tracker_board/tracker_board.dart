@@ -350,7 +350,7 @@ class _BoardState extends State<_Board> {
               columns[index],
               theme,
               pool: family,
-              contentCards: true,
+              draggable: true,
               width: 300,
             ),
           ),
@@ -369,6 +369,7 @@ class _BoardState extends State<_Board> {
     String? countsSummary,
     double? width,
     required VoidCallback onTap,
+    bool draggable = false,
   }) {
     final number = card['number'] as int;
     final type = '${card['type'] ?? 'issue'}';
@@ -442,7 +443,13 @@ class _BoardState extends State<_Board> {
         ],
       ),
     );
-    return InkWell(onTap: onTap, child: surface);
+    if (!draggable) return InkWell(onTap: onTap, child: surface);
+    return Draggable<Map>(
+      data: card,
+      feedback: SizedBox(width: width ?? 280, child: surface),
+      childWhenDragging: Opacity(opacity: 0.4, child: surface),
+      child: InkWell(onTap: onTap, child: surface),
+    );
   }
 
   Widget _column(
@@ -450,7 +457,7 @@ class _BoardState extends State<_Board> {
     Map<String, dynamic> column,
     PifTheme theme, {
     List<Map<String, dynamic>>? pool,
-    bool contentCards = false,
+    bool draggable = false,
     double width = 260,
   }) {
     final columnId = '${column['id']}';
@@ -490,14 +497,13 @@ class _BoardState extends State<_Board> {
               child: ListView.builder(
                 padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
                 itemCount: columnCards.length,
-                itemBuilder: (context, index) => contentCards
-                    ? _contentCard(
-                        context,
-                        card: columnCards[index],
-                        theme: theme,
-                        onTap: () => _openSheet(card: columnCards[index]),
-                      )
-                    : _card(context, columnCards[index], theme),
+                itemBuilder: (context, index) => _contentCard(
+                  context,
+                  card: columnCards[index],
+                  theme: theme,
+                  draggable: true,
+                  onTap: () => _openSheet(card: columnCards[index]),
+                ),
               ),
             ),
           ],
@@ -505,95 +511,6 @@ class _BoardState extends State<_Board> {
       ),
     );
   }
-
-  Widget _card(
-    BuildContext context,
-    Map<String, dynamic> card,
-    PifTheme theme,
-  ) {
-    final number = card['number'] as int;
-    final type = '${card['type'] ?? 'issue'}';
-    return Draggable<Map>(
-      data: card,
-      feedback: SizedBox(
-        width: 236,
-        child: Card(
-          color: theme.panelRaised,
-          child: Padding(
-            padding: const EdgeInsets.all(8),
-            child: Text(
-              '#$number  ${card['title'] ?? ''}',
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 12),
-            ),
-          ),
-        ),
-      ),
-      childWhenDragging: Opacity(
-        opacity: 0.4,
-        child: _cardSurface(card, theme, number, type),
-      ),
-      child: InkWell(
-        onTap: () => _openSheet(card: card),
-        child: _cardSurface(card, theme, number, type),
-      ),
-    );
-  }
-
-  Widget _cardSurface(
-    Map<String, dynamic> card,
-    PifTheme theme,
-    int number,
-    String type,
-  ) => Card(
-    color: const Color(0xff10141c),
-    margin: const EdgeInsets.only(bottom: 6),
-    child: Padding(
-      padding: const EdgeInsets.all(8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-                decoration: BoxDecoration(
-                  color: _typeColor(type),
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: Text(
-                  type.toUpperCase(),
-                  style: const TextStyle(fontSize: 9, letterSpacing: 0.5),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Text(
-                '#$number',
-                style: TextStyle(color: theme.textMuted, fontSize: 10),
-              ),
-              if (card['state'] == 'closed')
-                Padding(
-                  padding: const EdgeInsets.only(left: 6),
-                  child: Icon(
-                    Icons.check_circle_outline,
-                    size: 11,
-                    color: theme.accent,
-                  ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Text(
-            '${card['title'] ?? ''}',
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w300),
-          ),
-        ],
-      ),
-    ),
-  );
 
   Color _typeColor(String type) => switch (type) {
     'epic' => const Color(0x669b6dff),

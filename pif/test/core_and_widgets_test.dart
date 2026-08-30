@@ -678,7 +678,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    await tester.tap(find.text('Epic: tracker panel'));
+    await tester.tap(find.textContaining('Epic: tracker panel'));
     await tester.pumpAndSettle();
     expect(find.textContaining('acme/widgets/issues/10'), findsNothing);
     expect(find.text('Epic body heading'), findsOneWidget);
@@ -697,7 +697,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    final card = find.text('Task: build board');
+    final card = find.textContaining('Task: build board');
     final doing = find.text('Doing  0');
     await tester.drag(card, tester.getCenter(doing) - tester.getCenter(card));
     await tester.pumpAndSettle();
@@ -793,7 +793,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    await tester.tap(find.text('Task: build board'));
+    await tester.tap(find.textContaining('Task: build board'));
     await tester.pumpAndSettle();
     expect(find.text('Task body'), findsOneWidget);
     await tester.tap(find.byIcon(Icons.edit_outlined));
@@ -822,7 +822,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    await tester.tap(find.text('Task: build board'));
+    await tester.tap(find.textContaining('Task: build board'));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const Key('tracker_sheet_move')));
     await tester.pumpAndSettle();
@@ -847,7 +847,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    await tester.tap(find.text('Shipped thing'));
+    await tester.tap(find.textContaining('Shipped thing'));
     await tester.pumpAndSettle();
     await tester.tap(find.byIcon(Icons.delete_outline));
     await tester.pumpAndSettle();
@@ -873,7 +873,7 @@ void main() {
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
-    await tester.tap(find.text('Task: build board'));
+    await tester.tap(find.textContaining('Task: build board'));
     await tester.pumpAndSettle();
     final before = tester.getSize(find.byKey(const Key('tracker_sheet_box')));
     await tester.drag(find.byKey(const Key('tracker_sheet_resize')), const Offset(90, 60));
