@@ -8,6 +8,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import {
 	PIF_DEFAULT_PORT,
 	assertSafeWidgetPath,
@@ -39,6 +40,13 @@ interface PifSession {
 	cwd: string; transcript: unknown[]; sessionFile?: string; exit?: { code: number | null; signal: string | null };
 }
 interface WidgetRecord extends PifWidgetManifest { enabled: boolean; installed: boolean; source: PifWidgetSource; }
+interface ExportBuildRecord {
+	pid: number;
+	finished: Promise<void>;
+	resolveFinished: () => void;
+	cleanup: Promise<void> | null;
+	settled: boolean;
+}
 interface HubState {
 	sessions: Record<string, PifSession>;
 	widgets: Record<string, WidgetRecord>;
@@ -239,6 +247,7 @@ class PifHub {
 	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
+	private exportBuilds = new Map<string, ExportBuildRecord>();
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
 	private tracker: TrackerSync;
@@ -283,7 +292,21 @@ class PifHub {
 		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token });
 	}
 	async stop() {
-		for (const child of this.children.values()) this.terminateChild(child);
+		const buildFinalizations: Promise<void>[] = [];
+		for (const [key, child] of this.children.entries()) {
+			if (key.startsWith("app-build:")) {
+				const record = this.exportBuilds.get(key);
+				if (record) {
+					buildFinalizations.push(record.finished);
+					void this.startExportBuildCleanup(record).catch(() => {});
+				} else if (child.exitCode == null && child.signalCode == null) {
+					this.terminateChild(child);
+				}
+				continue;
+			}
+			this.terminateChild(child);
+		}
+		await Promise.all(buildFinalizations);
 		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.safe("upsert", () => this.store.upsert(session));
 		this.children.clear(); this.tracker.stop(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
@@ -294,6 +317,26 @@ class PifHub {
 		let exited = false; child.once("exit", () => { exited = true; });
 		child.kill("SIGTERM");
 		setTimeout(() => { if (!exited) { try { child.kill("SIGKILL"); } catch { /* already gone */ } } }, 1_000).unref();
+	}
+	private async waitForProcessGroupExit(pid: number, timeoutMs: number) {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			try { process.kill(-pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return true; throw error; }
+			await delay(50);
+		}
+		return false;
+	}
+	private async terminateProcessGroup(pid: number) {
+		if (!pid) return;
+		for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+			try { process.kill(-pid, signal); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return; throw error; }
+			if (await this.waitForProcessGroupExit(pid, 1_000)) return;
+		}
+	}
+	private startExportBuildCleanup(record: ExportBuildRecord) {
+		if (record.cleanup) return record.cleanup;
+		record.cleanup = record.pid ? this.terminateProcessGroup(record.pid) : Promise.resolve();
+		return record.cleanup;
 	}
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
@@ -1074,14 +1117,45 @@ class PifHub {
 		let output = "";
 		let error: string | undefined;
 		let published = false;
+		let timeout: NodeJS.Timeout | null = null;
 		const appendOutput = (chunk: unknown) => {
 			output = `${output}${String(chunk)}`.slice(-4000);
 		};
 		const publishResult = (code: number | null, signal: NodeJS.Signals | null = null) => {
 			if (published) return;
 			published = true;
-			this.children.delete(buildKey);
 			this.broadcast("app/build", "build_result", { ok: code === 0 && !error, buildId, name, code: code ?? -1, output, ...(error ? { error } : {}), ...(signal ? { signal } : {}) });
+		};
+		let resolveFinished!: () => void;
+		const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
+		const record: ExportBuildRecord = { pid: 0, finished, resolveFinished, cleanup: null, settled: false };
+		this.exportBuilds.set(buildKey, record);
+		const settleAfterCleanup = async (code: number | null, signal: NodeJS.Signals | null = null) => {
+			if (record.settled) return;
+			record.settled = true;
+			if (timeout) { clearTimeout(timeout); timeout = null; }
+			try {
+				await this.startExportBuildCleanup(record);
+			} catch (cleanupError) {
+				error = error ?? (cleanupError instanceof Error ? cleanupError.message : String(cleanupError));
+			} finally {
+				publishResult(code, signal);
+				resolveFinished();
+				this.children.delete(buildKey);
+				this.exportBuilds.delete(buildKey);
+			}
+		};
+		const settleWithImmediatePublish = (code: number | null, signal: NodeJS.Signals | null = null) => {
+			if (record.settled) return;
+			record.settled = true;
+			if (timeout) { clearTimeout(timeout); timeout = null; }
+			const cleanup = this.startExportBuildCleanup(record);
+			publishResult(code, signal);
+			void cleanup.then(() => {}, () => {}).then(() => {
+				resolveFinished();
+				this.children.delete(buildKey);
+				this.exportBuilds.delete(buildKey);
+			});
 		};
 		const started = await new Promise<boolean>((resolve) => {
 			let child: ChildProcessWithoutNullStreams;
@@ -1089,21 +1163,28 @@ class PifHub {
 				child = spawn(script, [this.state.health.workspace, name], {
 					cwd: this.state.health.workspace,
 					env: { ...process.env, PIF_APP_NAME: name },
-					timeout: 30 * 60_000,
+					detached: true,
 				});
 			} catch (cause) {
 				error = cause instanceof Error ? cause.message : String(cause);
-				publishResult(null); resolve(false); return;
+				void settleWithImmediatePublish(null); resolve(false); return;
 			}
+			record.pid = child.pid ?? 0;
+			timeout = setTimeout(() => {
+				error = error ?? "Export timed out after 30 minutes";
+				void settleAfterCleanup(null);
+			}, 30 * 60_000);
+			timeout.unref?.();
 			this.children.set(buildKey, child);
 			child.once("spawn", () => resolve(true));
+			child.once("exit", () => { void this.startExportBuildCleanup(record).catch(() => {}); });
 			child.on("error", (cause) => {
 				error = cause instanceof Error ? cause.message : String(cause);
-				publishResult(null);
+				settleWithImmediatePublish(null);
 				resolve(false);
 			});
 			// close follows error/exit and waits for stdout/stderr to drain.
-			child.once("close", publishResult);
+			child.once("close", (code, signal) => { void settleAfterCleanup(code, signal); });
 			child.stdout.on("data", appendOutput);
 			child.stderr.on("data", appendOutput);
 		});
@@ -1116,7 +1197,7 @@ class PifHub {
 	async reload(restart = false) { this.state.health.reload = "running"; this.broadcast("shell/health", "health", this.state.health); try { const result = await this.supervisor.reload(restart); this.state.health.reload = "idle"; return result; } catch (error) { this.state.health.reload = "failed"; throw error; } finally { this.broadcast("shell/health", "health", this.state.health); } }
 	/** Stop the hub and exit the pi process — used by app clients adopting a
 	 * standalone hub and by the shell.shutdown control method. */
-	shutdown() { this.stop().catch(() => { /* partial startup */ }); setTimeout(() => process.exit(0), 250).unref(); return Promise.resolve({ ok: true, stopping: true }); }
+	shutdown() { void this.stop().then(() => process.exit(0)).catch(() => process.exit(1)); return Promise.resolve({ ok: true, stopping: true }); }
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
 			case "pif_app.init": return this.appInit(params); case "pif_app.page_add": return this.appPageAdd(params); case "pif_app.widget_add": return this.appWidgetAdd(params); case "pif_app.home_set": return this.appHomeSet(params); case "pif_app.list": return this.appList(); case "pif_app.build": return this.appBuild(params); case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
