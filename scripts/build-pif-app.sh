@@ -5,6 +5,7 @@
 # Usage: ./scripts/build-pif-app.sh [output-dir]
 #
 # Produces: <output-dir>/pif.app  (default: build/)
+# Runtime override: PIF_NODE_BIN=/path/to/standalone/node
 #
 # The resulting .app can be dragged to /Applications and launched
 # by double-clicking. No external dependencies required (Node.js
@@ -15,6 +16,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="${1:-$REPO_ROOT/build}"
+
+source "$SCRIPT_DIR/pif-node-runtime.sh"
+pif_select_node_runtime
 
 echo "=== Building pif macOS app ==="
 
@@ -44,13 +48,8 @@ mkdir -p "$RESOURCES/pi/extensions"
 mkdir -p "$RESOURCES/app"
 
 # 3. Bundle Node.js binary
-if ! NODE_BIN="$(command -v node)"; then
-  echo "ERROR: node not found on PATH. Install Node.js (e.g. via nvm) and re-run."
-  exit 1
-fi
-NODE_VERSION="$(node --version)"
-echo "3. Bundling Node.js $NODE_VERSION from $NODE_BIN ..."
-cp "$NODE_BIN" "$RESOURCES/pi/node"
+echo "3. Bundling Node.js $PIF_BUNDLE_NODE_VERSION from $PIF_BUNDLE_NODE ..."
+pif_bundle_node_runtime "$RESOURCES/pi/node"
 
 # 4. Bundle pi CLI
 if ! PI_SYMLINK="$(command -v pi)"; then
@@ -115,6 +114,7 @@ if ! codesign --verify --deep --strict "$APP"; then
   echo "ERROR: codesign verification failed for $APP"
   exit 1
 fi
+pif_validate_node_runtime "$RESOURCES/pi/node" > /dev/null
 
 # 8. Summary
 echo ""

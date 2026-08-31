@@ -27,4 +27,5 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 | [pif export scanner now fails closed on bundled credential shapes](./2026-08-31T01-29-13Z-pif-export-secret-scan-hardening.md) | 2026-08-31T01:29:13Z | pi-extensions, pif, export, secrets, scanner, symlink, app-builder | #199 |
 | [Reviewer model standardization on GPT-5.6 Sol](./2026-07-25-reviewer-model-standardization.md) | 2026-07-25 | agents, reviewers, models, compliance, uat, pi-blueprint | — |
 | [Mercury App Template and pif-app-designer Skill Authored (#178)](./2026-08-29T07-34-46Z-pif-mercury-template-and-app-designer-skill.md) | 2026-08-29T07:34:46Z | pif, templates, mercury, design-system, skills, extract-design | #178 |
+| [Pif stock and export bundles require a portable Node runtime](./2026-08-31T04-51-25Z-pif-portable-node-packaging.md) | 2026-08-31T04:51:25Z | pif, packaging, export, macos, node, remediation | #160, #217 |
 <!-- Rows added by session synthesis (agent-written), removed by curation agent -->

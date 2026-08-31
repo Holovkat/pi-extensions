@@ -10,6 +10,7 @@
 #   <project-dir>  a workspace containing pif_app/app.yaml (the manifest)
 #   [app-name]     display name override (default: manifest name)
 #   [output-dir]   default: <project-dir>/build
+# Runtime override: PIF_NODE_BIN=/path/to/standalone/node
 #
 # Secrets policy: the bundle ships without dev models.json, settings.json,
 # .env files, or API keys — models are provisioned on the target machine at
@@ -34,6 +35,9 @@ if [ ! -f "$MANIFEST" ]; then
   echo "ERROR: $MANIFEST not found — this project has no app model (run pif_app_init first)."
   exit 1
 fi
+
+source "$SCRIPT_DIR/pif-node-runtime.sh"
+pif_select_node_runtime
 
 echo "=== Exporting pif project app ==="
 
@@ -408,9 +412,8 @@ mkdir -p "$RESOURCES/pi/cli" "$RESOURCES/pi/extensions" "$RESOURCES/app" "$RESOU
 echo "5. Assembled $APP"
 
 # 6. Bundle Node.js
-if ! NODE_BIN="$(command -v node)"; then echo "ERROR: node not found on PATH."; exit 1; fi
-echo "6. Bundling Node.js $(node --version) ..."
-cp "$NODE_BIN" "$RESOURCES/pi/node"
+echo "6. Bundling Node.js $PIF_BUNDLE_NODE_VERSION from $PIF_BUNDLE_NODE ..."
+pif_bundle_node_runtime "$RESOURCES/pi/node"
 
 # 7. Bundle pi CLI (same resolution as the stock build)
 if ! PI_SYMLINK="$(command -v pi)"; then echo "ERROR: pi not found on PATH."; exit 1; fi
@@ -570,6 +573,7 @@ else
 fi
 rm -f "$ENTITLEMENTS"
 if ! codesign --verify --deep --strict "$APP"; then echo "ERROR: codesign verification failed for $APP"; exit 1; fi
+pif_validate_node_runtime "$RESOURCES/pi/node" > /dev/null
 
 # 13. Secrets scan: fail closed on bundled credential-shaped material.
 #    Coverage: exact file names (models.json, settings.json, .env) plus
