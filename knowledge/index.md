@@ -14,7 +14,7 @@
 | [Process](./process/index.md) | 8 | How workflows operate |
 | [Deprecation](./deprecation/index.md) | 0 | Superseded concepts |
 | [State](./state/index.md) | 2 | Current state of play |
-| [Inbox](./inbox/index.md) | 13 | Items awaiting curation |
+| [Inbox](./inbox/index.md) | 14 | Items awaiting curation |
 
 ## Quick Links
 

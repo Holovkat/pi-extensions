@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T03:38:50Z - Corrected pif handoff snapshot with live #215 and #205 review state
+
+Updated the current pif state snapshot again to remove the stale tracker precursor claim, carry forward the live #205 review status, add #215 to the live tracker surface, and call out the #214 evidence commit and 25-child parent count. Kept the active #158/#159/#160 contract surface anchored to the live issue pages and left all source and test files untouched.
+
 ## 2026-08-31T03:32:02Z - Corrected pif handoff state and candidate links
 
 Updated the current pif state snapshot to reflect the live remediation branch, the review slices through #214, the open owner gates, and the still-blocked #160 final verification ticket. Added the corrective #205 inbox synthesis and aligned the inbox/root counts and handoff references without changing any source or test files.
