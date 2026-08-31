@@ -583,6 +583,7 @@ class _DockingShellState extends State<DockingShell>
   /// app stays operable without leaving app mode.
   Widget _appScaffold() {
     final statusWidgets = inSlot(PifSlot.status);
+    final hasNavigation = _pageIds.length > 1;
     return Scaffold(
       body: Column(
         children: [
@@ -592,10 +593,13 @@ class _DockingShellState extends State<DockingShell>
               builder: (context, constraints) {
                 final wide = constraints.maxWidth >= 1024;
                 final stage = _pageStage();
+                // A single-page app uses the current responsive shell
+                // without navigation chrome; multi-page apps keep the rail
+                // / bottom bar split unchanged.
                 return Stack(
                   children: [
                     Positioned.fill(
-                      child: wide
+                      child: hasNavigation && wide
                           ? Row(
                               children: [
                                 _navRail(),
@@ -603,12 +607,14 @@ class _DockingShellState extends State<DockingShell>
                                 Expanded(child: stage),
                               ],
                             )
-                          : Column(
+                          : hasNavigation
+                          ? Column(
                               children: [
                                 Expanded(child: stage),
                                 _navBottomBar(),
                               ],
-                            ),
+                            )
+                          : stage,
                     ),
                     if (_consoleOpen && !_devMode) _consoleOverlay(),
                   ],
@@ -673,7 +679,9 @@ class _DockingShellState extends State<DockingShell>
     final id = _activePageId;
     // A page disabled via pif_widget_toggle drops to the placeholder like
     // any uninstalled page — app mode honours the enabled flag (#160 review).
-    final plugin = (id == null || !enabled.contains(id)) ? null : _factories[id]?.call();
+    final plugin = (id == null || !enabled.contains(id))
+        ? null
+        : _factories[id]?.call();
     if (plugin == null) {
       return Center(
         child: Text(
