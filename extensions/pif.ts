@@ -473,7 +473,7 @@ class PifHub {
 	}
 	private loadShellState() {
 		const shell = this.readShellState(false);
-		this.state.devMode = typeof shell.devMode === "boolean" ? shell.devMode : false;
+		this.state.devMode = process.env.PIF_EXPORTED === "1" ? false : typeof shell.devMode === "boolean" ? shell.devMode : false;
 	}
 	private saveShellState(devMode: boolean) {
 		const current = this.readShellState(true);

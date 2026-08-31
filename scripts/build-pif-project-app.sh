@@ -276,37 +276,125 @@ fs.writeFileSync(path.join(pinnedDir, "required-widgets.json"), JSON.stringify(r
 console.log(`   pinned ${resolution.resolved?.length ?? 0} required widgets`);
 NODE
 
-# 3. Generate the pinned registry over the staged widget set
+# 3. Prune unrelated base widgets and generate the pinned widget registry
 echo "3. Generating the pinned widget registry ..."
-STAGE_WIDGET_ROOT="$STAGE/lib/widgets" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
+STAGE_WIDGET_ROOT="$STAGE/lib/widgets" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const repoRoot = process.env.REPO_ROOT;
 const root = process.env.STAGE_WIDGET_ROOT;
+const projectWidgetsDir = process.env.PROJECT_WIDGETS_DIR;
+const rawResolution = process.env.RESOLVED_WIDGETS_JSON;
 if (!repoRoot || !root) {
   console.error("ERROR: registry generation environment missing.");
   process.exit(1);
 }
+if (!projectWidgetsDir || !rawResolution) {
+  console.error("ERROR: registry selection environment missing.");
+  process.exit(1);
+}
 
 const shared = await import(pathToFileURL(path.join(repoRoot, "extensions", "pif-shared.ts")).href);
+const resolution = JSON.parse(rawResolution);
+const projectIds = new Set(
+  fs.readdirSync(projectWidgetsDir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((id) => fs.existsSync(path.join(projectWidgetsDir, id, "widget.yaml"))),
+);
+const requiredIds = new Set((resolution.resolved ?? []).map((entry) => entry.id));
+const baseCoreIds = new Set();
+for (const entry of fs.readdirSync(path.join(repoRoot, "pif", "lib", "widgets"), { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  const manifestPath = path.join(repoRoot, "pif", "lib", "widgets", entry.name, "widget.yaml");
+  if (!fs.existsSync(manifestPath)) continue;
+  try {
+    const raw = fs.readFileSync(manifestPath, "utf8");
+    if (!/^[ \t]*core:[ \t]*true[ \t]*$/m.test(raw)) continue;
+    const manifest = shared.parseWidgetManifest(raw);
+    if (manifest.core) baseCoreIds.add(manifest.id);
+  } catch (error) {
+    console.error(`ERROR: failed to inspect base widget ${entry.name}: ${String(error.message || error)}`);
+    process.exit(1);
+  }
+}
+const selectedIds = [...new Set([...projectIds, ...requiredIds, ...baseCoreIds])].sort((left, right) => left.localeCompare(right));
+const selectedSources = new Map();
+for (const id of projectIds) selectedSources.set(id, "project");
+for (const entry of resolution.resolved ?? []) {
+  if (!selectedSources.has(entry.id)) selectedSources.set(entry.id, entry.source);
+}
+for (const id of baseCoreIds) if (!selectedSources.has(id)) selectedSources.set(id, "base");
+
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  const manifestPath = path.join(root, entry.name, "widget.yaml");
+  if (!fs.existsSync(manifestPath)) continue;
+  if (!selectedIds.includes(entry.name)) fs.rmSync(path.join(root, entry.name), { recursive: true, force: true });
+}
+
 const manifests = [];
-for (const entry of fs.readdirSync(root, { withFileTypes: true }).filter((candidate) => candidate.isDirectory())) {
-  const file = path.join(root, entry.name, "widget.yaml");
-  if (!fs.existsSync(file)) continue;
-  manifests.push({ ...shared.parseWidgetManifest(fs.readFileSync(file, "utf8")), core: false });
+for (const id of selectedIds) {
+  const manifestPath = path.join(root, id, "widget.yaml");
+  if (!fs.existsSync(manifestPath)) {
+    console.error(`ERROR: selected widget '${id}' is missing from staged source at ${manifestPath}`);
+    process.exit(1);
+  }
+  const manifest = shared.parseWidgetManifest(fs.readFileSync(manifestPath, "utf8"));
+  manifests.push({ ...manifest, ...(selectedSources.has(id) ? { source: selectedSources.get(id) } : {}) });
 }
 manifests.sort((left, right) => left.id.localeCompare(right.id));
 fs.writeFileSync(path.join(root, "..", "widget_registry.g.dart"), shared.generateWidgetRegistry(manifests));
 console.log(`   pinned ${manifests.length} widgets`);
 NODE
 
+# 3b. Resolve Dart packages from the selected staged widget manifests.
+echo "3b. Resolving widget Dart dependencies ..."
+STAGE_WIDGET_ROOT="$STAGE/lib/widgets" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
+
+const root = process.env.STAGE_WIDGET_ROOT;
+const shared = await import(pathToFileURL(path.join(process.env.REPO_ROOT, "extensions", "pif-shared.ts")).href);
+const dependencyOwners = new Map();
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  const manifestPath = path.join(root, entry.name, "widget.yaml");
+  if (!fs.existsSync(manifestPath)) continue; // shared helper directories are not widgets
+  const manifest = shared.parseWidgetManifest(fs.readFileSync(manifestPath, "utf8"));
+  for (const dependency of manifest.dart_dependencies) {
+    const spec = dependency.trim();
+    if (!/^[a-zA-Z0-9_]+(?::[^\s]+)?$/.test(spec)) {
+      throw new Error(`Widget '${manifest.id}' declares an invalid Dart dependency '${dependency}'`);
+    }
+    const packageName = spec.split(":", 1)[0];
+    const existing = dependencyOwners.get(packageName);
+    if (existing && existing.spec !== spec) {
+      throw new Error(`Dart dependency conflict for '${packageName}': '${existing.spec}' from ${existing.widget} vs '${spec}' from ${manifest.id}`);
+    }
+    dependencyOwners.set(packageName, {spec, widget: manifest.id});
+  }
+}
+const specs = [...dependencyOwners.values()].map((entry) => entry.spec).sort();
+if (specs.length) {
+  const result = spawnSync("flutter", ["pub", "add", ...specs], {
+    cwd: path.resolve(root, "..", ".."), stdio: "inherit", timeout: 120_000,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) process.exit(result.status ?? 1);
+}
+NODE
+
 # 4. Build the Flutter release binary from the staged source
-echo "4. flutter pub get + build macos --release (staged) ..."
+if [ ! -f "$STAGE/lib/export_main.dart" ]; then echo "ERROR: export entrypoint missing at $STAGE/lib/export_main.dart."; exit 1; fi
+echo "4. flutter pub get + build macos --release -t lib/export_main.dart (staged) ..."
 cd "$STAGE"
 flutter pub get
-flutter build macos --release
+flutter build macos --release -t lib/export_main.dart
 
 APP_BUNDLE="$STAGE/build/macos/Build/Products/Release/pif.app"
 if [ ! -d "$APP_BUNDLE" ]; then echo "ERROR: staged build output missing."; exit 1; fi
