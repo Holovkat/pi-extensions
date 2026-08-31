@@ -44,6 +44,7 @@ interface HubState {
 	widgets: Record<string, WidgetRecord>;
 	catalog: Record<string, WidgetRecord>;
 	layout: Record<string, unknown>;
+	devMode: boolean;
 	models: string[];
 	modelProviders: Record<string, any>;
 	tracker: TrackerState;
@@ -227,7 +228,7 @@ class FlutterSupervisor {
 }
 
 class PifHub {
-	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string; readonly prefsPath: string;
+	readonly appDir: string; readonly pifDir: string; readonly controlPath: string; readonly layoutPath: string; readonly registryStatePath: string; readonly prefsPath: string; readonly shellStatePath: string;
 	readonly globalCatalogPath: string;
 	readonly state: HubState;
 	readonly modelsPath: string;
@@ -252,8 +253,8 @@ class PifHub {
 		// where the app itself runs from.
 		this.globalCatalogPath = process.env.PIF_GLOBAL_CATALOG || path.join(os.homedir(), ".pi", "pif", "catalog");
 		this.pifDir = path.join(workspace, ".pi", "pif");
-		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
+		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json"); this.shellStatePath = path.join(this.pifDir, "storage", "shell.json");
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, devMode: false, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -264,7 +265,7 @@ class PifHub {
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
-		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout();
+		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout(); this.loadShellState();
 		await this.store.init();
 		await this.tracker.init(); this.tracker.start();
 		// Ephemeral control-socket credential: same-user processes can read
@@ -358,6 +359,44 @@ class PifHub {
 		fs.mkdirSync(path.dirname(this.prefsPath), { recursive: true });
 		fs.writeFileSync(this.prefsPath, JSON.stringify({ ...this.loadPrefs(), ...patch }, null, 2) + "\n");
 	}
+	private readShellState(strict = false): Record<string, unknown> {
+		try {
+			const raw = fs.readFileSync(this.shellStatePath, "utf8");
+			const parsed = JSON.parse(raw);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("shell.json must contain an object");
+			return parsed as Record<string, unknown>;
+		} catch (cause) {
+			const code = cause && typeof cause === "object" ? String((cause as { code?: unknown }).code ?? "") : "";
+			if (code === "ENOENT") return {};
+			if (!strict) return {};
+			const rawMessage = cause instanceof Error ? cause.message : String(cause);
+			const message = cause instanceof SyntaxError || /Unexpected (?:token|end of JSON input)|shell\.json must contain an object/i.test(rawMessage) ? "invalid shell JSON" : rawMessage;
+			throw new Error(`Unable to read existing shell state at ${this.shellStatePath}: ${message}`);
+		}
+	}
+	private loadShellState() {
+		const shell = this.readShellState(false);
+		this.state.devMode = typeof shell.devMode === "boolean" ? shell.devMode : false;
+	}
+	private saveShellState(devMode: boolean) {
+		const current = this.readShellState(true);
+		const next = { ...current, devMode };
+		fs.mkdirSync(path.dirname(this.shellStatePath), { recursive: true });
+		const temp = `${this.shellStatePath}.tmp`;
+		fs.writeFileSync(temp, JSON.stringify(next, null, 2) + "\n");
+		fs.renameSync(temp, this.shellStatePath);
+	}
+	private parseDevModeEnabled(payload: any): boolean {
+		if (payload && typeof payload === "object" && !Array.isArray(payload) && typeof payload.enabled === "boolean") return payload.enabled;
+		throw new Error("shell.dev_mode requires { enabled: boolean }");
+	}
+	private setDevMode(payload: any) {
+		const enabled = this.parseDevModeEnabled(payload);
+		this.saveShellState(enabled);
+		this.state.devMode = enabled;
+		this.broadcastSnapshot();
+		return { ok: true, devMode: enabled };
+	}
 	private startWebSocket() {
 		return new Promise<void>((resolve, reject) => {
 			// Health discloses only identity + coarse state — never the
@@ -438,6 +477,7 @@ class PifHub {
 		try {
 			if (env.channel === "shell/state" && env.type === "snapshot_request") return peer.send(this.snapshotEnvelope());
 			if (env.channel === "shell/state" && env.type === "shutdown_request") return void this.shutdown();
+			if (env.channel === "shell/control") return this.shellControlAction(env.type, env.payload as any);
 			if (env.channel === "session/control" && env.type === "transcript") return peer.send(createEnvelope("session/transcript", "history", this.sessionTranscript((env.payload as any)?.sessionId)));
 			if (env.channel.startsWith("session/")) await this.sessionAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
@@ -446,6 +486,10 @@ class PifHub {
 			else if (env.channel.startsWith("tracker/")) this.trackerAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("shell/")) await this.layoutAction(env.type, env.payload as any);
 		} catch (error) { peer.send(createEnvelope("shell/error", "action_failed", { requestId: env.id, error: String((error as Error).message) })); }
+	}
+	private shellControlAction(type: string, payload: any) {
+		if (type === "dev_mode_set") return this.setDevMode(payload);
+		throw new Error(`Unknown shell control type: ${type}`);
 	}
 	hostEvent(type: string, payload: unknown) {
 		const host = this.state.sessions.host; if (!host) return;
@@ -1040,7 +1084,7 @@ class PifHub {
 	async control(method: string, params: any): Promise<any> {
 		switch (method) {
 			case "pif_app.init": return this.appInit(params); case "pif_app.page_add": return this.appPageAdd(params); case "pif_app.widget_add": return this.appWidgetAdd(params); case "pif_app.home_set": return this.appHomeSet(params); case "pif_app.list": return this.appList(); case "pif_app.build": return this.appBuild(params); case "widget.create": return this.createWidget(params); case "widget.install": return this.installWidget(params); case "widget.toggle": return this.toggleWidget(params); case "widget.uninstall": return this.uninstallWidget(params);
-			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
+			case "widget.list": this.scanWidgets(); return { installed: this.state.widgets, catalog: this.state.catalog }; case "layout": return this.layoutAction(params.action || "open", params); case "shell.status": return this.snapshot(); case "shell.reload": return this.reload(Boolean(params.restart)); case "shell.dev_mode": return this.setDevMode(params); case "session.spawn": return this.spawnSession(params); case "models.save": return this.modelsAction("save", params); case "models.refresh": return this.modelsAction("refresh", params);
 			case "tracker.refresh": return this.tracker.refresh(); case "tracker.move": return this.trackerAction("move", params); case "tracker.list": return this.tracker.list(); case "tracker.create": return this.trackerAction("create", params); case "tracker.update": return this.trackerAction("update", params); case "tracker.delete": return this.trackerAction("delete", params);
 			case "shell.shutdown": return this.shutdown();
 			default: throw new Error(`Unknown pif control method: ${method}`);
@@ -1077,6 +1121,7 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_app_home_set", "pif app home set", "Set the app's home page (must be a declared page).", Type.Object({ id: Type.String() }), "pif_app.home_set");
 	register("pif_app_list", "pif app list", "List the project app manifest and its pages with install state.", Type.Object({}), "pif_app.list");
 	register("pif_app_build", "pif app build", "Export the project app as a standalone macOS application (builds asynchronously; app/build build_result includes the returned buildId).", Type.Object({ name: Type.Optional(Type.String()) }), "pif_app.build");
+	register("pif_shell_dev_mode", "pif shell dev mode", "Set the shell's dev/app mode and persist it in the hub-owned shell.json state.", Type.Object({ enabled: Type.Boolean() }), "shell.dev_mode");
 	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
 	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
 	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");

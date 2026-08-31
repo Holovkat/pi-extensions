@@ -54,8 +54,8 @@ class _DockingShellState extends State<DockingShell>
   List<String> _pageIds = const [];
   String? _activePageId;
   // Dev toggle: false renders the page stage (app mode), true exposes the
-  // full IDE docking. Persisted as a shell setting; the hub-side control
-  // method is the hub lane's surface.
+  // full IDE docking. The hub snapshot is authoritative; Flutter only
+  // requests a change and waits for the acknowledged snapshot.
   bool _devMode = false;
   bool _consoleOpen = false;
   // Dock sizes — user-resizable via the dividers, persisted per project
@@ -96,7 +96,6 @@ class _DockingShellState extends State<DockingShell>
           Platform.environment['PIF_WORKSPACE'] ??
           Directory.current.path;
     host.storage.workspace = host.workspace;
-    _devMode = host.storage.read('shell', 'devMode') == true;
     events = widget.bus.events.listen(_event, onError: (_) {});
     errors = widget.bus.errors.listen(_showError);
     widget.bus.connect();
@@ -216,6 +215,7 @@ class _DockingShellState extends State<DockingShell>
         Map<String, dynamic>.from(snapshot['sessions'] as Map? ?? {}),
       );
       host.requestTranscript(host.activeSessionId);
+      _applyDevMode(snapshot['devMode']);
       final widgets = Map<String, dynamic>.from(
         snapshot['widgets'] as Map? ?? {},
       );
@@ -291,6 +291,12 @@ class _DockingShellState extends State<DockingShell>
       );
       if (mounted) setState(() {});
     }
+  }
+
+  /// The hub owns the acknowledged dev-mode state. Old snapshots may not
+  /// carry the field yet, so preserve the current value when absent.
+  void _applyDevMode(Object? raw) {
+    if (raw is bool) _devMode = raw;
   }
 
   @override
@@ -758,10 +764,7 @@ class _DockingShellState extends State<DockingShell>
   }
 
   void _toggleDevMode() {
-    setState(() => _devMode = !_devMode);
-    // Persisted shell setting; the hub control method for the toggle is
-    // the hub lane's surface (issue #156).
-    unawaited(host.storage.write('shell', 'devMode', _devMode));
+    widget.bus.send('shell/control', 'dev_mode_set', {'enabled': !_devMode});
   }
 
   final FocusNode _escapeFocus = FocusNode();
