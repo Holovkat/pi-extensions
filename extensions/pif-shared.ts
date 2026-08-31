@@ -188,7 +188,7 @@ export function parseAppManifest(text: string): { manifest?: PifAppManifest; err
     const line = raw.replace(/#.*$/, "").trim();
     if (!line) { currentList = null; continue; }
     if (currentList && /^-\s+/.test(line)) {
-      lists.get(currentList)!.push(line.replace(/^-.s*/, "").trim().replace(/^["']|["']$/g, ""));
+      lists.get(currentList)!.push(line.replace(/^-\s+/, "").trim().replace(/^["']|["']$/g, ""));
       continue;
     }
     const pair = /^(\w+)\s*:\s*(.*)$/.exec(line);
