@@ -34,3 +34,7 @@ This is focused implementation evidence. The complete gate, final artifact UI wa
 ## Independent review corrections before the complete gate
 
 The independent review found two further cases: a provider may reuse a tool-call ID in a later turn, and stored partial terminal answers may lack a separate agent_end. Root scoped the tool-card map to each turn and retained terminal abort/failure metadata in synthesized footers. A failed or aborted partial answer no longer displays a green completion footer after reopening. Two regression cases cover reused call_0 across turns and both partial failure/abort across repeated reopening without agent_end. All seven focused #215 Flutter cases pass in 215-review-corrections-root.log. The full gate still has not run at this point.
+
+## First combined-gate follow-up
+
+The first full gate exposed a legacy control metadata regression: normalized text deltas no longer retained the optional command field used to identify a streamed Steer response. The field is now preserved without changing text filtering. The focused native cases pass and the real hub smoke progressed through Send, Steer and Abort after this correction; its later catalog assertion is a separate #207 follow-up. The failed full-gate result is retained; no passing full gate is claimed.

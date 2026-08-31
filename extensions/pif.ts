@@ -609,7 +609,7 @@ class PifHub {
 			if (type === "message_start" && role === "assistant") return { type, role };
 			const update = p.assistantMessageEvent;
 			const delta = update ? (update.type === "text_delta" ? update.delta : undefined) : p.delta;
-			if (typeof delta === "string" && delta) return { type: "message_update", delta };
+			if (typeof delta === "string" && delta) return { type: "message_update", delta, ...(p.command !== undefined ? { command: String(p.command) } : {}) };
 			// Native thinking/tool-call deltas and text_end snapshots are not
 			// answer text; tool execution has its own correlated events.
 			return { type };
