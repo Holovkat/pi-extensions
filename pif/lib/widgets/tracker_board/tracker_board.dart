@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:markdown/markdown.dart' as md;
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
@@ -112,6 +113,7 @@ class _BoardState extends State<_Board> {
   void _openSheet({Map<String, dynamic>? card}) {
     showDialog<void>(
       context: context,
+      barrierDismissible: false,
       builder: (dialogContext) => _TicketSheet(
         host: widget.host,
         card: card,
@@ -553,6 +555,7 @@ class _TicketSheetState extends State<_TicketSheet> {
   // Track the in-flight tracker op so save acknowledgements still land
   // when the sheet is closed over a view-mode change.
   String? _pendingOp;
+  String? _pendingRequestId;
   int? _pendingNumber;
   _Pane _pane = _Pane.body;
   String? _error;
@@ -759,6 +762,10 @@ class _TicketSheetState extends State<_TicketSheet> {
 
   bool _matchesPendingOp(String op, Map payload) {
     if (_pendingOp != op) return false;
+    final requestId = '${payload['requestId'] ?? ''}'.trim();
+    if (_pendingRequestId == null || requestId.isEmpty || requestId != _pendingRequestId) {
+      return false;
+    }
     if (_pendingNumber == null) return true;
     final payloadNumber = payload['number'];
     if (payloadNumber is num) return payloadNumber.toInt() == _pendingNumber;
@@ -769,6 +776,7 @@ class _TicketSheetState extends State<_TicketSheet> {
   void _resetPendingOp() {
     _busy = false;
     _pendingOp = null;
+    _pendingRequestId = null;
     _pendingNumber = null;
   }
 
@@ -796,14 +804,20 @@ class _TicketSheetState extends State<_TicketSheet> {
   }
 
   void _send(String op, Map<String, Object?> payload) {
+    final requestId =
+        '${DateTime.now().microsecondsSinceEpoch}-${Random().nextInt(1 << 32)}';
     setState(() {
       _busy = true;
       _error = null;
       _pendingOp = op;
+      _pendingRequestId = requestId;
       final number = payload['number'];
       _pendingNumber = number is num ? number.toInt() : int.tryParse('$number');
     });
-    widget.host.bus.send('tracker/control', op, payload);
+    widget.host.bus.send('tracker/control', op, {
+      ...payload,
+      'requestId': requestId,
+    });
   }
 
   void _submitCreate() {

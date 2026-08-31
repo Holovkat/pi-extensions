@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Tracker request identity and dialog ownership (#216)](./2026-08-31T04-19-37Z-pif-tracker-request-id-correlation.md) | 2026-08-31T04:19:37Z | pif, tracker, request-correlation | #216 |
 | [Export entrypoint, pinned widgets and startup ownership (#211)](./2026-08-31T04-06-56Z-pif-export-entrypoint-adoption-race-guard.md) | 2026-08-31T04:06:56Z | pif, export, startup | #211 |
 | [Exported native Pi profile isolation (#201)](./2026-08-31T04-19-03Z-pif-exported-native-profile-isolation.md) | 2026-08-31T04:19:03Z | pif, export, native-profile | #201 |
 | [Required widget resolution before export (#209)](./2026-08-31T03-51-07Z-pif-required-widget-resolution-preflight.md) | 2026-08-31T03:51:07Z | pif, widgets, export, preflight | #209 |

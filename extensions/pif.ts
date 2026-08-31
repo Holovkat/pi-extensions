@@ -906,7 +906,7 @@ class PifHub {
 	private trackerAction(type: string, payload: any) {
 		if (type === "refresh") return this.tracker.refresh();
 		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
-		if (type === "create" || type === "update" || type === "delete") { const result = this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result }); return result; }
+		if (type === "create" || type === "update" || type === "delete") { const result = this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result, ...(typeof payload?.requestId === "string" ? { requestId: payload.requestId } : {}) }); return result; }
 		throw new Error(`Unknown tracker action: ${type}`);
 	}
 	private async modelsAction(type: string, payload: any) {
