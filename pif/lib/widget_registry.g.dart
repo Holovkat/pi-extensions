@@ -2,6 +2,7 @@
 import 'core/plugin.dart';
 import 'widgets/agent_console/agent_console.dart';
 import 'widgets/diff_viewer/diff_viewer.dart';
+import 'widgets/pif_settings/pif_settings.dart';
 import 'widgets/session_rail/session_rail.dart';
 import 'widgets/status_bar/status_bar.dart';
 import 'widgets/terminal/terminal.dart';
@@ -15,6 +16,8 @@ Map<String, PifWidgetPlugin Function()> pifWidgetFactories() {
     'agent_console': () => AgentConsolePlugin(),
     // source: base
     'diff_viewer': () => DiffViewerPlugin(),
+    // source: base
+    'pif_settings': () => PifSettingsPlugin(),
     // source: base
     'session_rail': () => SessionRailPlugin(),
     // source: base

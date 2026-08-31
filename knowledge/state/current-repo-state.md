@@ -4,7 +4,7 @@ title: Current Repo State
 description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-31T09:18:03Z
+timestamp: 2026-08-31T10:18:00Z
 status: active
 ---
 
@@ -25,7 +25,7 @@ The pif epic (#120, closed) delivered a native macOS shell on top of the pi CLI:
 - **Shell** (`pif/`, Flutter macOS app) is a stateless renderer over a docking shell; widgets live in `pif/lib/widgets/<id>/` with `widget.yaml` manifests, available-but-uninstalled sources in `pif/catalog/`.
 - **Bus**: token-authenticated WebSocket on `ws://127.0.0.1:31415/pif` (protocol v1 envelopes, channels `session/widget/store/shell/models`), plus a Unix control socket at `.pi/pif/control.sock`.
 - **Persistence**: per-project SQLite session store at `.pi/pif/sessions.db` via `node:sqlite` (JSON fallback); child sessions reload as read-only ended sessions when a project is reopened. Resume of live host sessions remains terminal-side.
-- **Distribution**: `scripts/install-pif.sh` installs globally to `~/.pi/pif/app` + `~/.pi/agent/extensions`; `scripts/build-pif-app.sh` produces a self-contained ~290MB `.app` bundling Node.js + pi CLI + pif extensions + the Flutter app.
+- **Distribution**: `scripts/install-pif.sh` installs globally to `~/.pi/pif/app` + `~/.pi/agent/extensions`; `scripts/build-pif-app.sh` produces a self-contained ~526MB `.app` including Node.js, Pi, extensions, Flutter and the immutable builder kit. Runtime and authoring prerequisites are distinct.
 
 ## Asset Management
 
@@ -41,19 +41,22 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 - Epic #152 "pif app builder" is open and active: agentic applications composed on the pif foundation.
 - Tracker precursor sprint #163–#166 (repo-synced Kanban tracker panel v0.1: sprint, hub sync layer, board widget, verification) is historical shipped context and no longer the active planning surface for this snapshot.
 
-### pif App Builder Remediation Snapshot (#160, 31 August 2026)
+### Earlier pif App Builder Remediation Snapshot (#160, 31 August 2026)
 - Tested and pushed code candidate: `dc45ff40` on `codex/pif-app-builder-154`. Documentation handoff does not change the built revision.
-- The earlier E2E checkpoint had 27 native remediation children. Following the owner requirement extension below, #160 now has 33: 24 in Review, seven To Do, and #206/#212 blocked on independent sample design/appearance approval. Canonical requirements remain #158/#159/#160 with the explicit #152 extension.
+- The earlier E2E checkpoint had 27 native remediation children. The owner extension brought #160 to 33; at planning time 24 were in Review, seven To Do and #206/#212 blocked on independent sample design/appearance approval. The added implementation is described below. Canonical requirements remain #158/#159/#160 with the explicit #152 extension.
 - Fresh full gate passes at dc45ff40: 66 Node tests, clean Dart analysis and 81 Flutter tests in one clean-checkout run. Prior failed gates and the earlier bdfe5bb4 pass are preserved in the report.
 - This E2E run additionally fixed native model setup/selection, empty-failure history contamination and URI-encoded filesystem paths. Existing legacy host history is preserved by a verified no-overwrite copy into the canonical path.
-- Stock at `/Applications/pif.app` passed real child/Steer/Abort/tool recovery and widget checks, then reopened at the clean picker as PID 81004. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` passed empty-profile guidance, configured write/read, migration and restart persistence; final PID 80355 normally quit. Both bundles remain unchanged and pass strict signatures.
-- The owner has resolved the export support boundary: installed authoring/export is required. #160 remains open for its implementation/verification, approved Mercury sample/appearance implementation and owner acceptance. Native folder chooser completion and new OAuth/denied-permission provisioning are not proven. The technical scaffold export is not Mercury sample acceptance.
-- [Current report](../../docs/reviews/2026-08-31-remediation-verification.md) links final evidence and remaining gates. Historical owner approvals #154/#155/#156/#157/#178/#188/#189 and the original review remain unchanged.
+- Earlier stock passed real child/Steer/Abort/tool recovery and widget checks as PID 81004. It has since been replaced by the installed-builder candidate below; those UI results do not transfer automatically. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` passed empty-profile guidance, configured write/read, migration and restart persistence; final PID 80355 normally quit.
+- The owner resolved the export support boundary in favor of installed authoring/export, subsequently narrowed authentication to secure tokens only and added central Settings. Native folder chooser completion and live Keychain/permission provisioning are not proven by the earlier candidate. The technical scaffold export is not Mercury sample acceptance.
+- [Earlier report](../../docs/reviews/2026-08-31-remediation-verification.md) preserves baseline evidence. Historical owner approvals #154/#155/#156/#157/#178/#188/#189 and the original review remain unchanged.
 
-### Installed Builder and GitHub Setup Requirement (31 August 2026)
+### Installed Builder and GitHub Integration Candidate (31 August 2026)
 - Owner direction extends existing epic [#152](https://github.com/Holovkat/pi-extensions/issues/152): installed pif must build apps and create local development environments which can create more environments, without this repository checkout. A follow-up adds GitHub repository creation and secure application Settings; the earlier repository-creation deferral is superseded.
-- Native children of #160: #218 bundled builder resources → #219 repeatable development environments → #220 installed export. #223 central Settings/Appearance may be prepared independently; #221 environment-token integration follows #219 identity and #223; #222 repository creation/tracker binding follows #219/#221. These tasks are To Do, not implemented.
-- #204 moves from Blocked to To Do: the owner decision is settled; canonical spec/support-matrix reconciliation remains. #160 stays the sole verification gate and must prove the installed-app and two-generation environment workflow. The previous passing dc45ff40 candidate does not prove added scope.
+- Native children #218–#223 are implemented as an integrated candidate: bundled immutable resources, writable repeatable environments, installed export, secure environment tokens, repository/tracker onboarding and central Settings. #204 now has a canonical six-contract disposition matrix. Their execution evidence and remaining gates belong to #160; implementation is not acceptance.
+- Current automated evidence: clean Dart analysis, **129 Flutter tests** and **79 affected Node tests** pass. The native repeat-build failure caused by readonly kit directories was fixed by staged publication with rollback and safe owned cleanup. Repaired and repeat stock builds pass.
+- Installed `/Applications/pif.app` launched as **PID 44308**, strict signature passes and changed source comparisons match. Builder version `38599d45c7dbff7e2a6c89210213d82d534f7a9ae3f1da1e126dc887874513cd`. Previous stock is preserved at `/tmp/pif160-installed.oHQBm9/previous-pif.app`.
+- Computer Use could not start because macOS was locked; the user was asked to unlock it. Live token/repository fixtures also require explicit authorization. These are outstanding native evidence gates, not passing UI results. Separate #206/#212 sample approvals remain unchanged.
+- [Current installed-builder report](../../docs/reviews/2026-08-31-installed-builder-verification.md) records this candidate, failure/repair history and subsequent evidence. The earlier passing dc45ff40 baseline does not prove added scope.
 - Latest owner simplification: #221 is token-only, stored in macOS Keychain per environment UUID; no browser/device/OAuth flow, global-login fallback or automatic credential sharing. #223 adds one central Settings tab with just Appearance (Light/Dark/System) and GitHub; it borrows Mercury’s grouping without advanced sliders or unrelated sections. Allocate local environment identity before token/GitHub setup.
 - GitHub is the ticket authority; local-only mode remains explicitly disconnected. Secrets stay in secure OS storage and out of projects/exports; created environments do not copy parent runtime state or tickets. Ordinary AOT exports and the deferred RFW lane remain distinct from editable environments. #190 runtime self-management remains related backlog.
 

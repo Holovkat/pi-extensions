@@ -14,88 +14,75 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-OUTPUT_DIR="${1:-$REPO_ROOT/build}"
-
 source "$SCRIPT_DIR/pif-node-runtime.sh"
-pif_select_node_runtime
+pif_select_build_resources "$SCRIPT_DIR"
+REPO_ROOT="$PIF_SOURCE_ROOT"
+if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+  OUTPUT_DIR="${1:-$PWD/build}"
+else
+  OUTPUT_DIR="${1:-$REPO_ROOT/build}"
+fi
+OUTPUT_DIR="$("$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" writable "$OUTPUT_DIR" "${PIF_BUILDER_ROOT:-}")"
 
 echo "=== Building pif macOS app ==="
 
 # 1. Build the Flutter release binary
 echo "1. flutter build macos --release ..."
-cd "$REPO_ROOT/pif"
-flutter build macos --release
+BUILD_SOURCE="$PIF_APP_TEMPLATE_DIR"
+if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+  # Dependency restore/codegen/output must never touch the signed kit.
+  mkdir -p "$OUTPUT_DIR"
+  BUILD_SOURCE="$(mktemp -d "$OUTPUT_DIR/pif-source.XXXXXX")/pif"
+  "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-source "$PIF_APP_TEMPLATE_DIR" "$BUILD_SOURCE" > /dev/null
+fi
+cd "$BUILD_SOURCE"
+"${PIF_FLUTTER_BIN:-flutter}" pub get
+"${PIF_FLUTTER_BIN:-flutter}" build macos --release
 
-APP_BUNDLE="$REPO_ROOT/pif/build/macos/Build/Products/Release/pif.app"
+APP_BUNDLE="$BUILD_SOURCE/build/macos/Build/Products/Release/pif.app"
 
 if [ ! -d "$APP_BUNDLE" ]; then
   echo "ERROR: Build output not found at $APP_BUNDLE"
   exit 1
 fi
 
-# 2. Copy to output directory
+# 2. Assemble beside the final output; preserve the previous app until every
+# packaging, signature and integrity check has passed.
 mkdir -p "$OUTPUT_DIR"
-if [ -d "$OUTPUT_DIR/pif.app" ]; then
-  rm -rf "$OUTPUT_DIR/pif.app"
-fi
-cp -R "$APP_BUNDLE" "$OUTPUT_DIR/"
-APP="$OUTPUT_DIR/pif.app"
-echo "2. Copied to $APP"
+FINAL_APP="$OUTPUT_DIR/pif.app"
+ASSEMBLY_DIR="$(mktemp -d "$OUTPUT_DIR/.pif-assembly.XXXXXX")"
+trap 'if [ -d "$ASSEMBLY_DIR" ]; then "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" discard-assembly "$ASSEMBLY_DIR" "${PIF_BUILDER_ROOT:-}" > /dev/null || true; fi' EXIT
+APP="$ASSEMBLY_DIR/pif.app"
+cp -R "$APP_BUNDLE" "$APP"
+echo "2. Staged $APP"
 
 RESOURCES="$APP/Contents/Resources"
 mkdir -p "$RESOURCES/pi/extensions"
-mkdir -p "$RESOURCES/app"
 
 # 3. Bundle Node.js binary
 echo "3. Bundling Node.js $PIF_BUNDLE_NODE_VERSION from $PIF_BUNDLE_NODE ..."
 pif_bundle_node_runtime "$RESOURCES/pi/node"
 
-# 4. Bundle pi CLI
-if ! PI_SYMLINK="$(command -v pi)"; then
-  echo "ERROR: pi not found on PATH. Install the pi CLI (npm i -g @mariozechner/pi-coding-agent) and re-run."
-  exit 1
-fi
-PI_PKG_DIR="${PI_PKG_DIR:-}"
-if [ -z "$PI_PKG_DIR" ]; then
-  PI_REAL="$(readlink -f "$PI_SYMLINK" 2>/dev/null || echo "$PI_SYMLINK")"
-  PI_PKG_DIR="$(dirname "$(dirname "$PI_REAL")")"
-  # A wrapper script or shim resolves outside the package; fall back to the
-  # global npm root. Either way the package must contain dist/cli.js.
-  if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then
-    NPM_GLOBAL="$(npm root -g 2>/dev/null || true)"
-    for CANDIDATE in "$NPM_GLOBAL/@mariozechner/pi-coding-agent" "$NPM_GLOBAL/pi-coding-agent"; do
-      if [ -n "$NPM_GLOBAL" ] && [ -f "$CANDIDATE/dist/cli.js" ]; then
-        PI_PKG_DIR="$CANDIDATE"
-        break
-      fi
-    done
-  fi
-fi
-if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then
-  echo "ERROR: could not locate the pi package directory from '$PI_SYMLINK'."
-  echo "       Expected <package>/dist/cli.js to exist. If pi lives elsewhere,"
-  echo "       re-run with PI_PKG_DIR=/path/to/pi-coding-agent."
-  exit 1
-fi
+# 4. Bundle Pi from the exact selected build input.
 echo "4. Bundling pi CLI from $PI_PKG_DIR ..."
-cp -R "$PI_PKG_DIR" "$RESOURCES/pi/cli"
+mkdir -p "$RESOURCES/pi/cli"
+rsync -a --exclude='*.d.ts' "$PI_PKG_DIR/" "$RESOURCES/pi/cli/"
 
 # 5. Bundle pif extensions
 echo "5. Bundling pif extensions ..."
-cp "$REPO_ROOT/extensions/pif.ts" "$RESOURCES/pi/extensions/pif.ts"
-cp "$REPO_ROOT/extensions/pif-shared.ts" "$RESOURCES/pi/extensions/pif-shared.ts"
+for EXTENSION in "$REPO_ROOT"/extensions/pif*.ts; do
+  case "$EXTENSION" in *.test.ts) continue ;; esac
+  cp "$EXTENSION" "$RESOURCES/pi/extensions/"
+done
 
 # 6. Bundle Flutter app source (for widget scanning and catalog)
 echo "6. Bundling Flutter app source ..."
-rsync -a \
-  --exclude='.dart_tool' \
-  --exclude='build' \
-  --exclude='.flutter-plugins' \
-  --exclude='.flutter-plugins-dependencies' \
-  --exclude='macos' \
-  --exclude='test' \
-  "$REPO_ROOT/pif/" "$RESOURCES/app/"
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-runtime-source "$PIF_APP_TEMPLATE_DIR" "$RESOURCES/app" > /dev/null
+
+# 6b. Complete, version-matched inputs for installed authoring and export.
+echo "6b. Bundling the versioned builder kit ..."
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" create "$REPO_ROOT" "$RESOURCES/builder" "$PIF_BUNDLE_NODE" "$PI_PKG_DIR" "$PIF_APP_TEMPLATE_DIR" > /dev/null
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" scan "$RESOURCES" > /dev/null
 
 # 7. Re-sign the bundle: inserting resources invalidated the release
 #    signature, and an invalid seal can make Apple Silicon refuse to
@@ -109,12 +96,26 @@ if codesign -d --entitlements :- "$APP" > /dev/null 2>&1 && \
 else
   codesign --force --deep --sign - "$APP"
 fi
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" seal "$RESOURCES/builder" > /dev/null
+if [ -s "$ENTITLEMENTS" ]; then
+  codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP"
+else
+  codesign --force --sign - "$APP"
+fi
 rm -f "$ENTITLEMENTS"
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" validate "$RESOURCES/builder" > /dev/null
 if ! codesign --verify --deep --strict "$APP"; then
   echo "ERROR: codesign verification failed for $APP"
   exit 1
 fi
 pif_validate_node_runtime "$RESOURCES/pi/node" > /dev/null
+pif_validate_pi_runtime "$RESOURCES/builder/runtime/node" "$RESOURCES/builder/runtime/pi" > /dev/null
+
+# Publish only the fully validated artifact. The helper safely removes
+# read-only directories in the old owned output without following symlinks.
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" publish-app "$APP" "$FINAL_APP" "${PIF_BUILDER_ROOT:-}"
+APP="$FINAL_APP"
+RESOURCES="$APP/Contents/Resources"
 
 # 8. Summary
 echo ""
@@ -122,7 +123,8 @@ echo "=== Build complete ==="
 echo "  App: $APP"
 echo "  Size: $(du -sh "$APP" | cut -f1)"
 echo ""
-echo "To install: ditto $OUTPUT_DIR/pif.app /Applications/pif.app"
+echo "To install: quit pif and move any existing /Applications/pif.app aside first."
+echo "Then: ditto $OUTPUT_DIR/pif.app /Applications/pif.app"
 echo "To run: open /Applications/pif.app"
 echo ""
 echo "The app will show a project picker on first launch. Select a"

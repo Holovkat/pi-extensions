@@ -14,9 +14,11 @@ class DockingShell extends StatefulWidget {
     required this.bus,
     this.workspace,
     this.factories,
+    this.onOpenProject,
   });
   final PifBus bus;
   final String? workspace;
+  final VoidCallback? onOpenProject;
 
   /// Widget factory override (test seam). Defaults to the generated
   /// registry; app mode resolves page widgets from the same table.
@@ -103,6 +105,12 @@ class _DockingShellState extends State<DockingShell>
     // subscribed (broadcast streams do not replay); ask again now that the
     // listener is attached so state always lands.
     widget.bus.send('shell/state', 'snapshot_request', const {});
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    host.theme = PifTheme(brightness: Theme.of(context).brightness);
   }
 
   /// Hub rejections (failed resume, unknown session, rejected save…) were
@@ -309,7 +317,15 @@ class _DockingShellState extends State<DockingShell>
   }
 
   List<PifWidgetPlugin> inSlot(PifSlot slot) {
+    final settingsPanel = (host.snapshot['layout'] as Map?)?['panels'] as Map?;
     final plugins = enabled
+        // A core widget is compiled and available, but Settings opens only
+        // through the normal layout action (or its persisted open state).
+        .where(
+          (id) =>
+              id != 'pif_settings' ||
+              (settingsPanel?['pif_settings'] as Map?)?['open'] == true,
+        )
         .where((id) => !hiddenPanels.contains(id))
         .where((id) => !unpinnedIds.contains(id))
         .map((id) => _factories[id]?.call())
@@ -323,11 +339,7 @@ class _DockingShellState extends State<DockingShell>
               (slotOverrides[plugin.meta.id] ?? plugin.meta.slot) == slot,
         )
         .toList();
-    plugins.sort((a, b) {
-      if (a.meta.id == focusedWidgetId) return -1;
-      if (b.meta.id == focusedWidgetId) return 1;
-      return a.meta.name.compareTo(b.meta.name);
-    });
+    plugins.sort((a, b) => a.meta.name.compareTo(b.meta.name));
     return plugins;
   }
 
@@ -950,7 +962,7 @@ class _DockingShellState extends State<DockingShell>
     final appName = (_appManifest?['name'] as String?) ?? 'app';
     return Container(
       height: 42,
-      color: const Color(0xff11151d),
+      color: host.theme.titleBar,
       padding: const EdgeInsets.only(left: 78, right: 10),
       child: Row(
         children: [
@@ -967,11 +979,18 @@ class _DockingShellState extends State<DockingShell>
               style: TextStyle(
                 fontSize: 10,
                 letterSpacing: 1.4,
-                color: Color(0xff69758a),
+                color: host.theme.textMuted,
               ),
             ),
           ),
           const Spacer(),
+          if (widget.onOpenProject != null)
+            IconButton(
+              key: const Key('pif_open_project'),
+              onPressed: widget.onOpenProject,
+              tooltip: 'New or open development environment',
+              icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+            ),
           if (appMode && !ideVisible)
             IconButton(
               onPressed: () => setState(() => _consoleOpen = !_consoleOpen),
@@ -985,6 +1004,14 @@ class _DockingShellState extends State<DockingShell>
               ),
             ),
           if (ideVisible) ...[
+            if (_factories.containsKey('pif_settings'))
+              IconButton(
+                key: const Key('pif_open_settings'),
+                onPressed: () =>
+                    host.layout.open('pif_settings', slot: PifSlot.center),
+                tooltip: 'Settings',
+                icon: const Icon(Icons.settings_outlined, size: 18),
+              ),
             IconButton(
               onPressed: () {
                 final visible = enabled.contains('widget_store');
@@ -1077,61 +1104,52 @@ class _DockingShellState extends State<DockingShell>
       duration: const Duration(milliseconds: 120),
       decoration: BoxDecoration(
         color: candidates.isNotEmpty
-            ? const Color(0xff1e342b)
-            : const Color(0xff11151d),
+            ? host.theme.accent.withValues(alpha: 0.12)
+            : host.theme.titleBar,
         border: candidates.isNotEmpty
             ? Border.all(color: const Color(0xff78dba9))
             : null,
       ),
       child: plugins.isEmpty
           ? _empty(slot)
-          : plugins.length == 1
-          ? _panel(plugins.first, chrome: chrome)
-          : _tabs(plugins, chrome: chrome),
+          : _tabs(slot, plugins, chrome: chrome),
     ),
   );
 
   Widget _center(List<PifWidgetPlugin> plugins) {
-    if (!centerSplit || plugins.length < 2)
-      return _dock(PifSlot.center, plugins);
+    if (!centerSplit) return _dock(PifSlot.center, plugins);
     return DragTarget<String>(
       onAcceptWithDetails: (details) => move(details.data, PifSlot.center),
       builder: (context, candidates, rejected) => Row(
         children: [
           for (var i = 0; i < plugins.length; i++) ...[
             if (i > 0) const VerticalDivider(width: 1),
-            Expanded(child: _panel(plugins[i])),
+            Expanded(
+              key: ValueKey(plugins[i].meta.id),
+              child: _panel(plugins[i]),
+            ),
           ],
         ],
       ),
     );
   }
 
-  Widget _tabs(List<PifWidgetPlugin> plugins, {bool chrome = true}) =>
-      DefaultTabController(
-        key: ValueKey(focusedWidgetId),
-        length: plugins.length,
-        child: Column(
-          children: [
-            if (chrome)
-              SizedBox(
-                height: 36,
-                child: TabBar(
-                  isScrollable: true,
-                  tabAlignment: TabAlignment.start,
-                  tabs: plugins.map(_draggableTab).toList(),
-                ),
-              ),
-            Expanded(
-              child: TabBarView(
-                children: plugins
-                    .map((plugin) => _panel(plugin, chrome: false))
-                    .toList(),
-              ),
-            ),
-          ],
-        ),
-      );
+  Widget _tabs(
+    PifSlot slot,
+    List<PifWidgetPlugin> plugins, {
+    bool chrome = true,
+  }) => _PersistentDockTabs(
+    key: ValueKey(slot),
+    plugins: plugins,
+    focusedWidgetId: focusedWidgetId,
+    chrome: chrome,
+    tabBuilder: _draggableTab,
+    headerBuilder: _panelHeader,
+    panelBuilder: (plugin) => _panel(plugin, chrome: false),
+    onSelected: (id) {
+      if (focusedWidgetId != id) setState(() => focusedWidgetId = id);
+    },
+  );
 
   /// Tabbed panels have no panel-header chrome, so the tab itself is the
   /// drag affordance for moving the widget to another slot.
@@ -1142,32 +1160,38 @@ class _DockingShellState extends State<DockingShell>
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(
-          color: const Color(0xff273143),
+          color: host.theme.panelRaised,
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(
           plugin.meta.name,
-          style: const TextStyle(fontSize: 12, color: Colors.white),
+          style: TextStyle(fontSize: 12, color: host.theme.textPrimary),
         ),
       ),
     ),
-    childWhenDragging: Opacity(
-      opacity: 0.4,
-      child: _tabLabel(plugin.meta.name),
-    ),
-    child: _tabLabel(plugin.meta.name),
+    childWhenDragging: Opacity(opacity: 0.4, child: _tabLabel(plugin)),
+    child: _tabLabel(plugin),
   );
 
-  Widget _tabLabel(String name) => Row(
+  Widget _tabLabel(PifWidgetPlugin plugin) => Row(
     mainAxisSize: MainAxisSize.min,
     children: [
       const Icon(Icons.drag_indicator, size: 12, color: Color(0xff69758a)),
       const SizedBox(width: 4),
-      Text(name),
+      Text(plugin.meta.name),
+      if (plugin.meta.id == 'pif_settings')
+        IconButton(
+          constraints: const BoxConstraints.tightFor(width: 28, height: 28),
+          padding: EdgeInsets.zero,
+          onPressed: () => host.layout.close(plugin.meta.id),
+          tooltip: 'Close Settings',
+          icon: const Icon(Icons.close, size: 13),
+        ),
     ],
   );
 
   Widget _panel(PifWidgetPlugin plugin, {bool chrome = true}) => Container(
+    key: ValueKey(plugin.meta.id),
     color: host.theme.panel,
     child: Column(
       children: [
@@ -1191,7 +1215,7 @@ class _DockingShellState extends State<DockingShell>
         width: 190,
         padding: const EdgeInsets.all(9),
         decoration: BoxDecoration(
-          color: const Color(0xff273143),
+          color: host.theme.panelRaised,
           borderRadius: BorderRadius.circular(6),
         ),
         child: Text(plugin.meta.name),
@@ -1223,9 +1247,10 @@ class _DockingShellState extends State<DockingShell>
               tooltip: 'Unpin panel (slides to the edge)',
               icon: const Icon(Icons.push_pin, size: 13),
             ),
-          if (!plugin.meta.core)
+          if (!plugin.meta.core || plugin.meta.id == 'pif_settings')
             IconButton(
               onPressed: () => host.layout.close(plugin.meta.id),
+              tooltip: 'Close ${plugin.meta.name}',
               icon: const Icon(Icons.close, size: 13),
             ),
         ],
@@ -1238,5 +1263,125 @@ class _DockingShellState extends State<DockingShell>
       'Drop widget in ${slot.name}',
       style: const TextStyle(fontSize: 11, color: Color(0xff566175)),
     ),
+  );
+}
+
+/// Keep live panel elements mounted when a tab is focused, opened or closed.
+/// A controller may change length, but keyed IndexedStack children retain the
+/// console draft, tracker selection and other local widget state.
+class _PersistentDockTabs extends StatefulWidget {
+  const _PersistentDockTabs({
+    super.key,
+    required this.plugins,
+    required this.focusedWidgetId,
+    required this.chrome,
+    required this.tabBuilder,
+    required this.headerBuilder,
+    required this.panelBuilder,
+    required this.onSelected,
+  });
+
+  final List<PifWidgetPlugin> plugins;
+  final String? focusedWidgetId;
+  final bool chrome;
+  final Widget Function(PifWidgetPlugin) tabBuilder;
+  final Widget Function(PifWidgetPlugin) headerBuilder;
+  final Widget Function(PifWidgetPlugin) panelBuilder;
+  final ValueChanged<String> onSelected;
+
+  @override
+  State<_PersistentDockTabs> createState() => _PersistentDockTabsState();
+}
+
+class _PersistentDockTabsState extends State<_PersistentDockTabs>
+    with TickerProviderStateMixin {
+  late TabController _controller;
+
+  int _indexOf(String? id) {
+    final index = widget.plugins.indexWhere((plugin) => plugin.meta.id == id);
+    return index < 0 ? 0 : index;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TabController(
+      length: widget.plugins.length,
+      initialIndex: _indexOf(widget.focusedWidgetId),
+      vsync: this,
+    )..addListener(_selectionChanged);
+  }
+
+  @override
+  void didUpdateWidget(_PersistentDockTabs oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final previousId = oldWidget.plugins[_controller.index].meta.id;
+    final requestedId =
+        widget.focusedWidgetId != oldWidget.focusedWidgetId &&
+            widget.plugins.any(
+              (plugin) => plugin.meta.id == widget.focusedWidgetId,
+            )
+        ? widget.focusedWidgetId
+        : previousId;
+    final nextIndex = _indexOf(requestedId);
+    _controller.removeListener(_selectionChanged);
+    if (_controller.length != widget.plugins.length) {
+      _controller.dispose();
+      _controller = TabController(
+        length: widget.plugins.length,
+        initialIndex: nextIndex,
+        vsync: this,
+      );
+    } else {
+      _controller.index = nextIndex;
+    }
+    _controller.addListener(_selectionChanged);
+  }
+
+  void _selectionChanged() {
+    if (!mounted) return;
+    setState(() {});
+    widget.onSelected(widget.plugins[_controller.index].meta.id);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(
+    children: [
+      if (widget.chrome)
+        if (widget.plugins.length == 1)
+          widget.headerBuilder(widget.plugins.single)
+        else
+          SizedBox(
+            height: 36,
+            child: TabBar(
+              controller: _controller,
+              isScrollable: true,
+              tabAlignment: TabAlignment.start,
+              tabs: widget.plugins.map(widget.tabBuilder).toList(),
+            ),
+          ),
+      Expanded(
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            for (var i = 0; i < widget.plugins.length; i++)
+              Offstage(
+                key: ValueKey(widget.plugins[i].meta.id),
+                offstage: i != _controller.index,
+                child: TickerMode(
+                  enabled: i == _controller.index,
+                  child: widget.panelBuilder(widget.plugins[i]),
+                ),
+              ),
+          ],
+        ),
+      ),
+    ],
   );
 }

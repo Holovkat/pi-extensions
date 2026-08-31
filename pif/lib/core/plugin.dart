@@ -292,12 +292,35 @@ class PifStorage {
 }
 
 class PifTheme {
-  const PifTheme();
-  Color get panel => const Color(0xff151922);
-  Color get panelRaised => const Color(0xff1d2330);
-  Color get accent => const Color(0xff78dba9);
-  Color get border => const Color(0xff2c3547);
-  Color get textMuted => const Color(0xff8b96aa);
+  const PifTheme({this.brightness = Brightness.dark});
+  final Brightness brightness;
+  bool get isDark => brightness == Brightness.dark;
+  Color get background =>
+      isDark ? const Color(0xff0e1117) : const Color(0xfff2f5f7);
+  Color get titleBar =>
+      isDark ? const Color(0xff11151d) : const Color(0xffe9eef2);
+  Color get panel => isDark ? const Color(0xff151922) : const Color(0xfffbfcfd);
+  Color get panelRaised =>
+      isDark ? const Color(0xff1d2330) : const Color(0xffeaf0f3);
+  Color get accent =>
+      isDark ? const Color(0xff78dba9) : const Color(0xff167147);
+  Color get border =>
+      isDark ? const Color(0xff2c3547) : const Color(0xffcbd5dd);
+  Color get textPrimary =>
+      isDark ? const Color(0xffdce3ec) : const Color(0xff202c38);
+  Color get textMuted =>
+      isDark ? const Color(0xff8b96aa) : const Color(0xff59697a);
+
+  ThemeData get materialTheme => ThemeData(
+    useMaterial3: true,
+    brightness: brightness,
+    scaffoldBackgroundColor: background,
+    colorScheme: ColorScheme.fromSeed(
+      seedColor: accent,
+      brightness: brightness,
+    ),
+    dividerColor: border,
+  );
 }
 
 class PifHost {
@@ -314,7 +337,9 @@ class PifHost {
   final PifSessions sessions;
   final PifLayout layout;
   final PifStorage storage;
-  final PifTheme theme;
+  // Updated from the inherited Material theme without replacing this host or
+  // its sessions when appearance changes.
+  PifTheme theme;
   String activeSessionId = 'host';
   String workspace = '';
   List<String> models = const [];

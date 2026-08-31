@@ -87,14 +87,14 @@ class _StatusState extends State<_Status> {
 
   @override
   Widget build(BuildContext context) => Container(
-    color: const Color(0xff18231f),
+    color: widget.host.theme.panelRaised,
     padding: const EdgeInsets.symmetric(horizontal: 10),
     child: Row(
       children: [
         Icon(
           connected ? Icons.link : Icons.link_off,
           size: 13,
-          color: connected ? const Color(0xff78dba9) : Colors.redAccent,
+          color: connected ? widget.host.theme.accent : Colors.redAccent,
         ),
         const SizedBox(width: 5),
         Text(
@@ -119,14 +119,14 @@ class _StatusState extends State<_Status> {
         const Spacer(),
         Text(
           '$model · $tokens tokens',
-          style: const TextStyle(fontSize: 11, color: Color(0xffa8b1c1)),
+          style: TextStyle(fontSize: 11, color: widget.host.theme.textMuted),
         ),
         const SizedBox(width: 18),
         Flexible(
           child: Text(
             widget.host.workspace,
             overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 11, color: Color(0xffa8b1c1)),
+            style: TextStyle(fontSize: 11, color: widget.host.theme.textMuted),
           ),
         ),
       ],

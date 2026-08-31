@@ -214,11 +214,12 @@ class FlutterSupervisor {
 	start(env: NodeJS.ProcessEnv) {
 		if (this.process) return;
 		this.state = "starting"; this.changed(this.state);
-		const child = spawn("flutter", ["run", "--machine", "-d", "macos"], { cwd: this.appDir, env, stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(env.PIF_FLUTTER_BIN || "flutter", ["run", "--machine", "-d", "macos"], { cwd: this.appDir, env, stdio: ["pipe", "pipe", "pipe"] });
 		this.process = child;
 		let stdout = "";
 		child.stdout.on("data", (chunk) => { stdout += chunk; let at; while ((at = stdout.indexOf("\n")) >= 0) { const line = stdout.slice(0, at).trim(); stdout = stdout.slice(at + 1); if (line) this.consume(line); } });
 		child.stderr.on("data", (chunk) => this.changed("diagnostic", chunk.toString()));
+		child.on("error", (error) => { this.process = null; this.appId = null; this.state = "failed"; this.changed(this.state, error.message); });
 		child.on("exit", (code, signal) => { this.process = null; this.appId = null; this.state = "stopped"; this.changed(this.state, { code, signal }); });
 	}
 	private consume(line: string) {
@@ -264,6 +265,8 @@ class PifHub {
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
 	private exportBuilds = new Map<string, ExportBuildRecord>();
+	private builderChecks = new Map<string, { cancel: () => void; finished: Promise<void> }>();
+	private stopping = false;
 	private enabled = new Set<string>(); private installed = new Set<string>();
 	private supervisor: FlutterSupervisor;
 	private tracker: TrackerSync;
@@ -278,9 +281,9 @@ class PifHub {
 		// where the app itself runs from.
 		this.globalCatalogPath = process.env.PIF_GLOBAL_CATALOG || path.join(os.homedir(), ".pi", "pif", "catalog");
 		this.pifDir = path.join(workspace, ".pi", "pif");
-		this.appBundled = isInsideAppBundle(this.appDir);
+		this.appBundled = isInsideAppBundle(this.appDir) || process.env.PIF_RUNTIME_ONLY === "1";
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json"); this.shellStatePath = path.join(this.pifDir, "storage", "shell.json");
-		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, devMode: false, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
+		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, devMode: false, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null, connection: "disconnected", writable: false, message: "Connect GitHub in Settings to use this workspace tracker." }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 		this.nativeAgentDir = path.resolve(agentDir === "~" ? os.homedir() : agentDir.startsWith("~/") ? path.join(os.homedir(), agentDir.slice(2)) : agentDir);
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(this.nativeAgentDir, "models.json");
@@ -293,6 +296,7 @@ class PifHub {
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
+		this.stopping = false;
 		if (launchFlutter && this.appBundled) throw new Error("Bundled widgets are compiled into this app; Flutter launch is unavailable");
 		const pifDir = assertWritablePifPath(this.pifDir);
 		this.pifDir = pifDir;
@@ -316,7 +320,9 @@ class PifHub {
 		if (launchFlutter) this.supervisor.start({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token });
 	}
 	async stop() {
+		this.stopping = true;
 		const buildFinalizations: Promise<void>[] = [];
+		for (const check of this.builderChecks.values()) { check.cancel(); buildFinalizations.push(check.finished); }
 		for (const [key, child] of this.children.entries()) {
 			if (key.startsWith("app-build:")) {
 				const record = this.exportBuilds.get(key);
@@ -632,7 +638,7 @@ class PifHub {
 			else if (env.channel.startsWith("widget/")) await this.widgetAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("store/")) await this.storeAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("models/")) await this.modelsAction(env.type, env.payload as any);
-			else if (env.channel.startsWith("tracker/")) this.trackerAction(env.type, env.payload as any);
+			else if (env.channel.startsWith("tracker/")) await this.trackerAction(env.type, env.payload as any);
 			else if (env.channel.startsWith("shell/")) await this.layoutAction(env.type, env.payload as any);
 		} catch (error) { peer.send(createEnvelope("shell/error", "action_failed", { requestId: env.id, error: String((error as Error).message) })); }
 	}
@@ -890,7 +896,13 @@ class PifHub {
 		else if (type === "pin") { if (!payload.widgetId) throw new Error("widgetId is required to pin"); const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), widgetId: payload.widgetId, pinned: payload.pinned !== false }; }
 		else if (type === "resize") { const sizes = ((this.state.layout as any).sizes ??= {}); for (const slot of ["left", "right", "bottom"]) { const value = payload?.sizes?.[slot]; if (typeof value === "number" && Number.isFinite(value)) sizes[slot] = Math.min(Math.max(value, 80), 2_000); } }
 		else if (type === "layout_change") this.state.layout = payload;
-		else { const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), ...payload, open: type !== "close", action: type }; }
+		else {
+			const panels = (this.state.layout.panels ??= {}) as Record<string, any>;
+			if (type === "open" || type === "focus") {
+				for (const panel of Object.values(panels)) if (panel && typeof panel === "object") delete panel.action;
+			}
+			panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), ...payload, open: type !== "close", action: type };
+		}
 		this.saveLayout(); this.broadcast("shell/layout", "layout_state", this.state.layout); return this.state.layout;
 	}
 	/** Layered widget roots (settled app-builder spec, Task #154). Resolution
@@ -943,6 +955,9 @@ class PifHub {
 		for (const [id, record] of Object.entries(widgets)) if (record.source === "project" || this.state.catalog[id]?.source === "base") delete this.state.catalog[id];
 		const freshRegistry = !this.registryStateExists && !this.registrySeeded;
 		if (freshRegistry) { this.enabled = new Set(Object.keys(widgets)); this.registrySeeded = true; }
+		// Settings is a core surface even for an older persisted widget set.
+		// Its panel remains closed until the user opens it from the header.
+		if (widgets.pif_settings?.core) this.enabled.add("pif_settings");
 		for (const record of Object.values(widgets)) record.enabled = this.enabled.has(record.id);
 		this.loadAppManifest();
 	}
@@ -967,10 +982,10 @@ class PifHub {
 		await (this.ctx as any).modelRegistry?.refresh?.({ allowNetwork: false });
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot();
 	}
-	private trackerAction(type: string, payload: any) {
+	private async trackerAction(type: string, payload: any) {
 		if (type === "refresh") return this.tracker.refresh();
-		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
-		if (type === "create" || type === "update" || type === "delete") { const result = this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result, ...(typeof payload?.requestId === "string" ? { requestId: payload.requestId } : {}) }); return result; }
+		if (type === "move") { const result = await this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
+		if (type === "create" || type === "update" || type === "delete") { const result = await this.tracker[type](payload); this.broadcast("tracker/op", "op_result", { op: type, ...result, ...(typeof payload?.requestId === "string" ? { requestId: payload.requestId } : {}) }); return result; }
 		throw new Error(`Unknown tracker action: ${type}`);
 	}
 	private async modelsAction(type: string, payload: any) {
@@ -1012,7 +1027,7 @@ class PifHub {
 		fs.writeFileSync(source, `import 'package:flutter/material.dart';\nimport '../../core/plugin.dart';\n\nclass ${widgetClassName(id)} implements PifWidgetPlugin {\n  @override\n  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: ${JSON.stringify(name)}, slot: PifSlot.${slot});\n\n  @override\n  Widget build(BuildContext context, PifHost host) => const Center(child: Text(${JSON.stringify(String(params.spec || name))}));\n}\n`);
 		return { id, directory: dir, manifest, source };
 	}
-	private analyzeWidget(dir: string) { const result = spawnSync("dart", ["analyze", dir], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); return { ok: result.status === 0, diagnostics: `${result.stdout || ""}${result.stderr || ""}`.trim() }; }
+	private analyzeWidget(dir: string) { const result = spawnSync(process.env.PIF_DART_BIN || "dart", ["analyze", dir], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); return { ok: result.status === 0, diagnostics: `${result.stdout || ""}${result.stderr || ""}`.trim() }; }
 	private restoreFile(file: string, previous: Buffer | null) { if (previous) fs.writeFileSync(file, previous); else fs.rmSync(file, { force: true }); }
 	async installWidget(params: any) {
 		this.assertBundledMutationAllowed("installWidget");
@@ -1041,7 +1056,7 @@ class PifHub {
 		const pubspecPath = path.join(this.appDir, "pubspec.yaml"), lockPath = path.join(this.appDir, "pubspec.lock");
 		const pubspecBefore = fs.existsSync(pubspecPath) ? fs.readFileSync(pubspecPath) : null, lockBefore = fs.existsSync(lockPath) ? fs.readFileSync(lockPath) : null;
 		const rejectInstall = (phase: string, diagnostics: string) => {
-			if (manifest.dart_dependencies.length) { this.restoreFile(pubspecPath, pubspecBefore); this.restoreFile(lockPath, lockBefore); spawnSync("flutter", ["pub", "get"], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); }
+			if (manifest.dart_dependencies.length) { this.restoreFile(pubspecPath, pubspecBefore); this.restoreFile(lockPath, lockBefore); spawnSync(process.env.PIF_FLUTTER_BIN || "flutter", ["pub", "get"], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); }
 			if (copied) fs.rmSync(dir, { recursive: true, force: true });
 			this.enabled = enabledBefore;
 			this.restoreFile(registryFile, registryBefore);
@@ -1053,7 +1068,7 @@ class PifHub {
 		};
 		if (manifest.dart_dependencies.length) {
 			for (const dependency of manifest.dart_dependencies) if (!/^[a-zA-Z0-9_]+(?::[^\s]+)?$/.test(dependency)) throw new Error(`Invalid Dart dependency: ${dependency}`);
-			const pubGet = spawnSync("flutter", ["pub", "add", ...manifest.dart_dependencies], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 });
+			const pubGet = spawnSync(process.env.PIF_FLUTTER_BIN || "flutter", ["pub", "add", ...manifest.dart_dependencies], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 });
 			if (pubGet.status !== 0) return rejectInstall("pub_get", `${pubGet.stdout}${pubGet.stderr}`);
 		}
 		const analysis = this.analyzeWidget(dir); if (!analysis.ok) return rejectInstall("analyze", analysis.diagnostics);
@@ -1148,7 +1163,7 @@ class PifHub {
 			const appRef = path.relative(root, this.appDir).split(path.sep).join("/");
 			fs.writeFileSync(pubspec, `name: pif_app\npublish_to: none\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  flutter:\n    sdk: flutter\n  pif:\n    path: ${appRef}\n`);
 		}
-		const pubGet = spawnSync("flutter", ["pub", "get"], { cwd: path.dirname(pubspec), encoding: "utf8", timeout: 180_000 });
+		const pubGet = spawnSync(process.env.PIF_FLUTTER_BIN || "flutter", ["pub", "get"], { cwd: path.dirname(pubspec), encoding: "utf8", timeout: 180_000 });
 		if (pubGet.status !== 0) throw new Error(`flutter pub get failed in pif_app: ${pubGet.stdout}${pubGet.stderr}`);
 	}
 
@@ -1318,21 +1333,55 @@ class PifHub {
 		};
 	}
 	relaunchShell() { if (this.appBundled) throw new Error("Widgets are compiled into this app; Flutter relaunch is unavailable"); this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
+	private async builderResources(): Promise<{ root: string; script: string; appTemplateDir: string; manifest?: { builderVersion: string } }> {
+		if (this.stopping) throw new Error("The environment is closing; export was cancelled.");
+		const moduleRoot = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+		const resourcesAt = moduleRoot.indexOf(`${path.sep}Contents${path.sep}Resources${path.sep}`);
+		const bundleRoot = resourcesAt >= 0 ? path.join(moduleRoot.slice(0, resourcesAt), "Contents", "Resources", "builder") : null;
+		const workspaceKit = path.join(this.workspace, ".pif", "builder");
+		const builderRoot = process.env.PIF_BUILDER_ROOT || (fs.existsSync(path.join(workspaceKit, "manifest.json")) ? workspaceKit : bundleRoot);
+		const sourceRoot = !builderRoot && !isInsideAppBundle(moduleRoot) ? moduleRoot : undefined;
+		const helper = path.join(builderRoot || sourceRoot || "", "scripts", "pif-builder-kit.mjs");
+		if (!fs.existsSync(helper)) throw new Error("Builder resources are unavailable. Open this project in pif and prepare a development environment; runtime exports do not contain the authoring kit.");
+		const appTemplateDir = process.env.PIF_APP_TEMPLATE_DIR || (!this.appBundled && fs.existsSync(path.join(this.appDir, "pubspec.yaml")) ? this.appDir : undefined);
+		const options = { builderRoot, sourceRoot, appTemplateDir, expectedVersion: process.env.PIF_BUILDER_VERSION };
+		// Integrity hashing and secret scans run off the hub's event loop.
+		return new Promise((resolve, reject) => {
+			const child = spawn(process.execPath, [helper, "resolve", JSON.stringify(options)], { cwd: this.workspace, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
+			child.stdin.end();
+			const checkId = crypto.randomUUID();
+			let finish!: () => void;
+			const finished = new Promise<void>((resolve) => { finish = resolve; });
+			this.builderChecks.set(checkId, { finished, cancel: () => this.terminateChild(child) });
+			let stdout = "", stderr = "";
+			const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("Builder resource validation timed out; retry after checking the installed kit.")); }, 120_000);
+			child.stdout.on("data", (data) => { stdout += data; if (stdout.length > 1024 * 1024) { child.kill("SIGKILL"); reject(new Error("Builder resource response exceeded its limit.")); } });
+			child.stderr.on("data", (data) => { stderr = `${stderr}${data}`.slice(-4000); });
+			child.once("error", (error) => { clearTimeout(timer); reject(error); });
+			child.once("close", (code) => {
+				clearTimeout(timer);
+				this.builderChecks.delete(checkId); finish();
+				if (code !== 0) return reject(new Error(stderr.trim() || "Builder resource validation failed"));
+				try { resolve(JSON.parse(stdout)); } catch { reject(new Error("Builder resource response was invalid")); }
+			});
+		});
+	}
 
 	/** Async export: the acknowledgement and app/build build_result share a
 	 * buildId. Results retain ok/name/code/output, plus error/signal on failure. */
 	async appBuild(params: any) {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
-		const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "build-pif-project-app.sh");
-		if (!fs.existsSync(script)) throw new Error(`Export script not found at ${script} — exporting requires the pif dev checkout`);
-		const exportRoot = path.dirname(path.dirname(script));
+		const resources = await this.builderResources();
+		if (this.stopping) throw new Error("The environment closed during build validation; export was cancelled.");
+		const script = resources.script;
 		const required = resolveRequiredWidgetSet(this.state.app.dependencies ?? [], {
 			project: path.join(this.workspace, "pif_app", "widgets"),
 			catalog: this.globalCatalogPath,
-			base: [path.join(exportRoot, "pif", "lib", "widgets"), path.join(exportRoot, "pif", "catalog")],
+			base: [path.join(resources.appTemplateDir, "lib", "widgets"), path.join(resources.appTemplateDir, "catalog")],
 		});
 		if (!required.ok) throw new Error(`Required widget resolution failed before export:\n${formatWidgetResolutionProblems(required.problems)}`);
 		const name = (String(params?.name ?? this.state.app.name).trim() || this.state.app.name).replace(/[\r\n/]+/g, " ").slice(0, 80);
+		const artifactPath = path.join(this.workspace, "build", `${name}.app`);
 		const buildId = crypto.randomUUID();
 		const buildKey = `app-build:${buildId}`;
 		let output = "";
@@ -1345,7 +1394,8 @@ class PifHub {
 		const publishResult = (code: number | null, signal: NodeJS.Signals | null = null) => {
 			if (published) return;
 			published = true;
-			this.broadcast("app/build", "build_result", { ok: code === 0 && !error, buildId, name, code: code ?? -1, output, ...(error ? { error } : {}), ...(signal ? { signal } : {}) });
+			if (code === 0 && !error && !fs.existsSync(path.join(artifactPath, "Contents", "MacOS", "pif"))) error = "Export finished without the expected app artifact.";
+			this.broadcast("app/build", "build_result", { ok: code === 0 && !error, buildId, name, code: code ?? -1, output, ...(code === 0 && !error ? { artifactPath } : {}), ...(error ? { error } : {}), ...(signal ? { signal } : {}) });
 		};
 		let resolveFinished!: () => void;
 		const finished = new Promise<void>((resolve) => { resolveFinished = resolve; });
@@ -1383,7 +1433,7 @@ class PifHub {
 			try {
 				child = spawn(script, [this.state.health.workspace, name], {
 					cwd: this.state.health.workspace,
-					env: { ...process.env, PIF_APP_NAME: name, PIF_GLOBAL_CATALOG: this.globalCatalogPath },
+					env: { ...childEnvironment(process.env), PIF_APP_NAME: name, PIF_GLOBAL_CATALOG: this.globalCatalogPath, PIF_APP_TEMPLATE_DIR: resources.appTemplateDir, ...(resources.manifest ? { PIF_BUILDER_ROOT: resources.root, PIF_BUILDER_VERSION: resources.manifest.builderVersion } : {}) },
 					detached: true,
 				});
 			} catch (cause) {
@@ -1459,9 +1509,9 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_app_list", "pif app list", "List the project app manifest and its pages with install state.", Type.Object({}), "pif_app.list");
 	register("pif_app_build", "pif app build", "Export the project app as a standalone macOS application (builds asynchronously; app/build build_result includes the returned buildId).", Type.Object({ name: Type.Optional(Type.String()) }), "pif_app.build");
 	register("pif_shell_dev_mode", "pif shell dev mode", "Set the shell's dev/app mode and persist it in the hub-owned shell.json state.", Type.Object({ enabled: Type.Boolean() }), "shell.dev_mode");
-	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
-	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
-	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");
+	register("pif_tracker_create", "pif tracker create", "Create a ticket in the verified workspace repo. type epic|sprint|task|issue maps to labels; column applies the board label; parent links a native GitHub sub-issue.", Type.Object({ repo: Type.Optional(Type.String()), title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()), parent: Type.Optional(Type.Integer({ minimum: 1 })) }), "tracker.create");
+	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ repo: Type.Optional(Type.String()), number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
+	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ repo: Type.Optional(Type.String()), number: Type.Number() }), "tracker.delete");
 	register("pif_layout", "pif layout", "Open, focus, move, close, reset, pin, save, or load pif panels; reset restores the default docking design and pin controls slide-in overlay mode.", Type.Object({ action: Type.Union([Type.Literal("open"), Type.Literal("focus"), Type.Literal("move"), Type.Literal("close"), Type.Literal("reset"), Type.Literal("pin"), Type.Literal("save"), Type.Literal("load")]), widgetId: Type.Optional(Type.String()), slot: Type.Optional(Type.String()), preset: Type.Optional(Type.String()), pinned: Type.Optional(Type.Boolean()) }), "layout");
 	register("pif_shell_status", "pif shell status", "Return pif hub, shell, sessions, widgets, and layout health.", Type.Object({}), "shell.status");
 	register("pif_reload", "pif reload", "Hot reload or hot restart the pif Flutter shell.", Type.Object({ restart: Type.Optional(Type.Boolean()) }), "shell.reload");

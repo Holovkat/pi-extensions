@@ -37,6 +37,7 @@ class _DiffViewerState extends State<_DiffViewer> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = PifTheme(brightness: Theme.of(context).brightness);
     final left = before.text.split('\n');
     final right = after.text.split('\n');
     final rows = <Widget>[];
@@ -55,7 +56,11 @@ class _DiffViewerState extends State<_DiffViewer> {
             Expanded(
               child: _line(
                 oldLine,
-                changed ? const Color(0xff3b2028) : Colors.transparent,
+                changed
+                    ? theme.isDark
+                          ? const Color(0xff3b2028)
+                          : const Color(0xffffe9ed)
+                    : Colors.transparent,
                 changed ? '-' : ' ',
               ),
             ),
@@ -63,7 +68,11 @@ class _DiffViewerState extends State<_DiffViewer> {
             Expanded(
               child: _line(
                 newLine,
-                changed ? const Color(0xff16372a) : Colors.transparent,
+                changed
+                    ? theme.isDark
+                          ? const Color(0xff16372a)
+                          : const Color(0xffdcf4e6)
+                    : Colors.transparent,
                 changed ? '+' : ' ',
               ),
             ),

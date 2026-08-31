@@ -249,11 +249,61 @@ all views (`#NNN — Title` + ≤5-line excerpt, theme tokens only) with an
 Epics overview filtered to open epics and per-epic drill-down; the ticket
 detail sheet is chrome-free (inline title/body editing at w300 body weight,
 pill tabs Body/Attachments/Attributes, width-tagged inline images, local
-attributes with tags syncing as labels). Export composition ships the full
-IDE shell switched to app mode via `PIF_EXPORTED=1` (launcher-set) rather
-than the settled second entrypoint — functionally equivalent for the owner
-surface (app mode boots without the picker) at the cost of a wider bundle;
-a second entrypoint remains the slimming follow-up. Known follow-ups from
-epic verification: uninstall-archive provenance badge, dev-toggle hub
-control method, `dependencies` validation in init/build, and a wider
-default board (done epic #179+ backlog).
+attributes with tags syncing as labels).
+
+The earlier deferrals for export composition, archive provenance, hub dev
+mode and dependency validation are superseded by the #160 remediations
+below. They were required repairs, not approved scope waivers.
+
+### Requirement disposition (#204, 31 August 2026)
+
+| Binding contract | Current implementation and owner | Disposition / evidence |
+|---|---|---|
+| Project overrides catalog, catalog overrides base | `PifHub.scanWidgets` / install resolution, #207 | Required precedence restored; affected Node integration passes, including catalog collisions and retained project sources. |
+| Hub-controlled dev toggle | `PifHub.setDevMode`, `shell.dev_mode`, shell bus state, #208 | Implemented with persistent hub authority; Node and Flutter regression gates pass. |
+| Validate app dependencies before export | App manifest and required-widget resolution in `pif-shared.ts`, `PifHub.appBuild` and the canonical exporter, #209 | Missing dependencies fail before staging/build; validation and export-preflight regressions pass. |
+| Actual archive provenance in Store | Hub uninstall/catalog source metadata and `widget_store.dart`, #210 | Implemented and retained in the current affected regression gate. |
+| Dedicated export entrypoint and pinned composition | `export_main.dart`, generated required-widget registry and canonical project build script, #211 | Export compiles the settled entrypoint; launches in app mode without a picker. AOT products do not dynamically load new Dart widgets. |
+| Installed authoring/export without the source checkout | Bundled resolver/kit #218, writable environments #219, hub/export #220 | Owner requires this capability; checkout-only waiver rejected. Implemented candidate, with native installed/two-generation/re-export proof owned by #160. |
+
+The [installed-builder verification report](../../reviews/2026-08-31-installed-builder-verification.md)
+records current evidence and unresolved gates. This matrix does not close
+#160; live GitHub/security checks and independent sample acceptance remain
+explicit requirements. The wider default board was delivered by epic #179.
+
+
+## Installed authoring requirement (settled 2026-08-31, #204, #218–#223)
+
+This owner decision supersedes the run-from-source-only entry in the
+historical roadmap above. Installed pif is an authoring host: it packages
+one versioned immutable builder kit, provisions writable local development
+environments, and exports AOT runtime applications from those environments
+without a pi-extensions checkout. Every development environment retains the
+same create/open/build capability. Runtime exports remain compiled products;
+adding Dart widgets requires authoring and recompilation, not live AOT loading.
+
+Each environment receives a fresh UUID before toolchain or account setup.
+Mutable source, sessions, caches, ports and hub tokens belong to that
+workspace. Copying a kit never copies a creator's credentials or mutable
+state. This is process/workspace isolation, not a sandbox against arbitrary
+code authorized by the user. Missing Flutter/Xcode/Git prerequisites produce
+setup guidance, never implicit software installation or license acceptance.
+
+The primary New Project journey can create a GitHub repository, after an
+explicit owner/name/private-or-public review, or connect an existing one.
+Local only is a supported disconnected alternative. GitHub remains the
+tracker authority, including native epic/task sub-issue relationships.
+A conflicting origin is preserved, repository creation is retry-safe, and
+commit/push of project content requires a separate explicit action.
+
+Authentication is token-only. The selected environment's UUID and github.com
+scope address a native secure-store entry; no token is persisted in project
+JSON, sent through the hub bus, inherited by child environments or bundled
+in exports. Machine-wide gh profiles and GH_TOKEN are not authentication
+fallbacks. A small central Settings tab exposes connection validation,
+replacement and removal beside Light/Dark/System appearance, borrowing
+Mercury's section grouping without importing its product-specific settings.
+
+#160 owns integration, security, installed two-generation authoring/export
+verification and remaining acceptance. The independent #206/#212 sample
+design approvals remain unchanged by this implementation requirement.

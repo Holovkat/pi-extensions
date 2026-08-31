@@ -808,7 +808,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
         .where((s) => s.id == widget.host.activeSessionId)
         .firstOrNull;
     return Container(
-      color: const Color(0xff171717),
+      color: widget.host.theme.isDark
+          ? const Color(0xff171717)
+          : widget.host.theme.panel,
       child: Column(
         children: [
           _header(selected),
@@ -910,9 +912,11 @@ class _AgentConsoleState extends State<_AgentConsole> {
         constraints: const BoxConstraints(maxWidth: _conversationMaxWidth),
         child: DecoratedBox(
           decoration: BoxDecoration(
-            color: const Color(0xff242424),
+            color: widget.host.theme.isDark
+                ? const Color(0xff242424)
+                : widget.host.theme.panelRaised,
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: const Color(0xff343434)),
+            border: Border.all(color: widget.host.theme.border),
           ),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(14, 8, 8, 7),
@@ -925,16 +929,19 @@ class _AgentConsoleState extends State<_AgentConsole> {
                   maxLines: 6,
                   onSubmitted: (_) => submit(),
                   enabled: selected != null,
-                  style: const TextStyle(fontSize: 14, color: Colors.white),
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: widget.host.theme.textPrimary,
+                  ),
                   decoration: InputDecoration(
                     hintText: selected == null
                         ? 'Create a session to begin…'
                         : running
                         ? 'Steer the running agent…'
                         : 'Ask Pi anything…',
-                    hintStyle: const TextStyle(
+                    hintStyle: TextStyle(
                       fontSize: 14,
-                      color: Color(0xff8d8d8d),
+                      color: widget.host.theme.textMuted,
                     ),
                     isDense: true,
                     border: InputBorder.none,
@@ -1014,7 +1021,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
       key: const Key('agent_console_add'),
       onPressed: null,
       icon: const Icon(Icons.add, size: 18),
-      color: const Color(0xffb0b0b0),
+      color: widget.host.theme.textMuted,
       visualDensity: VisualDensity.compact,
     ),
   );
@@ -1032,7 +1039,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
     icon: const Icon(Icons.arrow_upward, size: 14),
     label: const Text('Steer'),
     style: TextButton.styleFrom(
-      foregroundColor: const Color(0xffb0b0b0),
+      foregroundColor: widget.host.theme.textMuted,
       padding: const EdgeInsets.symmetric(horizontal: 7),
       minimumSize: const Size(0, 30),
     ),
@@ -1059,9 +1066,11 @@ class _AgentConsoleState extends State<_AgentConsole> {
       backgroundColor: running
           ? const Color(0xff9c5b5b)
           : widget.host.theme.accent,
-      foregroundColor: const Color(0xff10141c),
-      disabledBackgroundColor: const Color(0xff3b3b3b),
-      disabledForegroundColor: const Color(0xff777777),
+      foregroundColor: widget.host.theme.isDark
+          ? const Color(0xff10141c)
+          : Colors.white,
+      disabledBackgroundColor: widget.host.theme.panelRaised,
+      disabledForegroundColor: widget.host.theme.textMuted,
     ),
     icon: Icon(running ? Icons.stop_rounded : Icons.arrow_upward, size: 18),
   );
@@ -1075,7 +1084,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
           isDense: true,
           isExpanded: true,
           iconSize: 14,
-          style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
+          style: TextStyle(fontSize: 11, color: widget.host.theme.textMuted),
           value: resolved,
           hint: const Text(
             'Model',
@@ -1128,7 +1137,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
         isDense: true,
         isExpanded: true,
         iconSize: 14,
-        style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
+        style: TextStyle(fontSize: 11, color: widget.host.theme.textMuted),
         value: selected.thinking,
         items: const [
           DropdownMenuItem(
@@ -1164,22 +1173,30 @@ class _AgentConsoleState extends State<_AgentConsole> {
 class _ConsoleEmpty extends StatelessWidget {
   const _ConsoleEmpty();
   @override
-  Widget build(BuildContext context) => const Center(
+  Widget build(BuildContext context) => Center(
     child: SingleChildScrollView(
-      padding: EdgeInsets.all(8),
+      padding: const EdgeInsets.all(8),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.auto_awesome, size: 34, color: Color(0xff78dba9)),
-          SizedBox(height: 12),
-          Text(
+          Icon(
+            Icons.auto_awesome,
+            size: 34,
+            color: Theme.of(context).colorScheme.primary,
+          ),
+          const SizedBox(height: 12),
+          const Text(
             'Build the workspace with Pi',
             style: TextStyle(fontSize: 18, fontWeight: FontWeight.w300),
           ),
-          SizedBox(height: 4),
+          const SizedBox(height: 4),
           Text(
             'Messages, tool calls, and live output appear here.',
-            style: TextStyle(color: Color(0xff8b96aa)),
+            style: TextStyle(
+              color: PifTheme(
+                brightness: Theme.of(context).brightness,
+              ).textMuted,
+            ),
           ),
         ],
       ),
@@ -1196,13 +1213,16 @@ class _EntryCard extends StatelessWidget {
   static const TextStyle _conversationStyle = TextStyle(
     fontSize: 13,
     fontWeight: FontWeight.w300,
-    color: Color(0xffc9d3df),
   );
 
   @override
   Widget build(BuildContext context) {
     final kind = entry['kind'] as String? ?? 'raw';
     final text = entry['text'] as String? ?? '';
+    final theme = PifTheme(brightness: Theme.of(context).brightness);
+    final conversationStyle = _conversationStyle.copyWith(
+      color: theme.isDark ? const Color(0xffc9d3df) : theme.textPrimary,
+    );
 
     if (kind == 'user') {
       return Align(
@@ -1213,16 +1233,16 @@ class _EntryCard extends StatelessWidget {
             key: const Key('agent_console_user_bubble'),
             margin: const EdgeInsets.only(bottom: 16, left: 40),
             padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 11),
-            decoration: const BoxDecoration(
-              color: Color(0xff2b2b2b),
-              borderRadius: BorderRadius.only(
+            decoration: BoxDecoration(
+              color: theme.isDark ? const Color(0xff2b2b2b) : theme.panelRaised,
+              borderRadius: const BorderRadius.only(
                 topLeft: Radius.circular(16),
                 topRight: Radius.circular(16),
                 bottomLeft: Radius.circular(16),
                 bottomRight: Radius.circular(5),
               ),
             ),
-            child: SelectableText(text, style: _conversationStyle),
+            child: SelectableText(text, style: conversationStyle),
           ),
         ),
       );
@@ -1235,11 +1255,9 @@ class _EntryCard extends StatelessWidget {
         child: MarkdownBody(
           data: text,
           styleSheet: MarkdownStyleSheet.fromTheme(Theme.of(context)).copyWith(
-            p: _conversationStyle,
-            listBullet: _conversationStyle,
-            blockquote: _conversationStyle.copyWith(
-              color: const Color(0xff8b96aa),
-            ),
+            p: conversationStyle,
+            listBullet: conversationStyle,
+            blockquote: conversationStyle.copyWith(color: theme.textMuted),
           ),
         ),
       );
@@ -1257,19 +1275,19 @@ class _EntryCard extends StatelessWidget {
           ? Icons.cancel_outlined
           : null;
       final trailingColor = status == 'done'
-          ? const Color(0xff78dba9)
+          ? theme.accent
           : status == 'failed'
-          ? const Color(0xfff28b82)
-          : status == 'canceled'
+          ? Theme.of(context).colorScheme.error
+          : theme.isDark
           ? Colors.amber
-          : Colors.amber;
+          : const Color(0xff805600);
       return Container(
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
         decoration: BoxDecoration(
-          color: const Color(0xff20241f),
+          color: theme.isDark ? const Color(0xff20241f) : theme.panelRaised,
           borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: const Color(0xff303b34)),
+          border: Border.all(color: theme.border),
         ),
         child: Material(
           type: MaterialType.transparency,
@@ -1360,12 +1378,9 @@ class _EntryCard extends StatelessWidget {
         padding: const EdgeInsets.only(bottom: 6),
         child: Row(
           children: [
-            const Icon(Icons.circle, size: 6, color: Color(0xff78dba9)),
+            Icon(Icons.circle, size: 6, color: theme.accent),
             const SizedBox(width: 6),
-            Text(
-              text,
-              style: const TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
-            ),
+            Text(text, style: TextStyle(fontSize: 11, color: theme.textMuted)),
           ],
         ),
       );
@@ -1380,15 +1395,15 @@ class _EntryCard extends StatelessWidget {
       margin: const EdgeInsets.only(bottom: 6),
       padding: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: const Color(0xff10141c),
+        color: theme.isDark ? const Color(0xff10141c) : theme.panelRaised,
         borderRadius: BorderRadius.circular(6),
       ),
       child: SelectableText(
         text,
-        style: const TextStyle(
+        style: TextStyle(
           fontFamily: 'monospace',
           fontSize: 11,
-          color: Color(0xff8b96aa),
+          color: theme.textMuted,
         ),
       ),
     );
@@ -1411,6 +1426,7 @@ class _TurnEndCardState extends State<_TurnEndCard> {
   @override
   Widget build(BuildContext context) {
     final entry = widget.entry;
+    final theme = PifTheme(brightness: Theme.of(context).brightness);
     final duration = entry['duration'] as Duration?;
     final response = entry['response'] as String? ?? '';
     final aborted = entry['aborted'] == true;
@@ -1440,21 +1456,18 @@ class _TurnEndCardState extends State<_TurnEndCard> {
                         ? Colors.amber
                         : failed
                         ? const Color(0xfff28b82)
-                        : const Color(0xff78dba9),
+                        : theme.accent,
                   ),
                   const SizedBox(width: 7),
-                  const Text(
+                  Text(
                     'Worked for',
-                    style: TextStyle(fontSize: 11, color: Color(0xff8b96aa)),
+                    style: TextStyle(fontSize: 11, color: theme.textMuted),
                   ),
                   if (duration != null) ...[
                     const SizedBox(width: 4),
                     Text(
                       _formatDuration(duration),
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: Color(0xff8b96aa),
-                      ),
+                      style: TextStyle(fontSize: 11, color: theme.textMuted),
                     ),
                   ],
                   if (aborted || failed) ...[
@@ -1529,7 +1542,7 @@ class _TurnEndCardState extends State<_TurnEndCard> {
         child: Icon(
           copied == key ? Icons.check : icon,
           size: 13,
-          color: const Color(0xff8b96aa),
+          color: PifTheme(brightness: Theme.of(context).brightness).textMuted,
         ),
       ),
     ),

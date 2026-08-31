@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { runEnvironmentGithub } from "./pif-github.ts";
 
 export const PIF_PROTOCOL_VERSION = 1 as const;
 export const PIF_DEFAULT_PORT = 31415;
@@ -578,182 +579,330 @@ export function plannedTrackerMove(card: PifTrackerCard, column: PifBoardColumn)
 	return { add, remove, state: column.state === "closed" ? "closed" : "open" };
 }
 
-export interface TrackerState { repo: string | null; columns: { id: string; name: string }[]; cards: PifTrackerCard[]; stale: boolean; fetchedAt: string | null; error: string | null; }
-export type SpawnRunner = (command: string, args: string[], options: { cwd: string; timeout: number }) => { status: number | null; stdout: string; stderr: string };
+export interface TrackerState { repo: string | null; columns: { id: string; name: string }[]; cards: PifTrackerCard[]; stale: boolean; fetchedAt: string | null; error: string | null; connection: "disconnected" | "unverified" | "connected" | "error"; writable: boolean; message: string | null; }
+export interface TrackerRunResult { status: number | null; stdout: string; stderr: string; code?: string; }
+export type SpawnRunner = (command: string, args: string[], options: { cwd: string; timeout: number; input?: string }) => TrackerRunResult | Promise<TrackerRunResult>;
+type TrackerTarget = { repo: string; version: number; writable: boolean; message: string | null };
+type TrackerResult = { ok: boolean; repo?: string; number?: number; column?: string; error?: string; partial?: boolean; uncertain?: boolean };
+type TrackerCreateIntent = { repo: string; fingerprint: string; number?: number };
 
-const trackerRunner: SpawnRunner = (command, args, options) => { const result = spawnSync(command, args, { ...options, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 }); return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" }; };
+/** Parse an origin, never a substring that merely contains github.com. */
+function githubRepoFromOrigin(origin: string): string | null {
+	const scp = /^git@github\.com:([^\s]+)$/i.exec(origin);
+	let pathname: string;
+	if (scp) pathname = `/${scp[1]}`;
+	else {
+		let url: URL; try { url = new URL(origin); } catch { return null; }
+		if (url.hostname.toLowerCase() !== "github.com" || url.password || url.search || url.hash) return null;
+		if (url.protocol === "https:") { if (url.username || url.port) return null; }
+		else if (url.protocol === "ssh:") { if (url.username !== "git" || (url.port && url.port !== "22")) return null; }
+		else if (url.protocol === "git:") { if (url.username || url.port) return null; }
+		else return null;
+		pathname = url.pathname;
+	}
+	const match = /^\/([a-z\d](?:[a-z\d-]*[a-z\d])?)\/([a-z\d._-]+?)(?:\.git)?\/?$/i.exec(pathname);
+	if (!match || match[2] === "." || match[2] === "..") return null;
+	return `${match[1]}/${match[2]}`.toLowerCase();
+}
 
-/** Board data for the tracker widget: reads the workspace repo's issues via
- * the ambient gh session, writes card moves back per the repo's board rules
- * (`.pif/board.yaml`, default board when absent), and caches to SQLite (JSON
- * fallback) so the board stays readable when the tracker is unreachable. */
+/** GitHub owns all tickets. The environment's native connection owns auth;
+ * these per-repository caches are only offline read snapshots. */
 export class TrackerSync {
-	readonly state: TrackerState = { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null };
+	readonly state: TrackerState = { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null, connection: "disconnected", writable: false, message: "Connect GitHub in Settings to use this workspace's tracker." };
+	private repoObserved: string | null | undefined;
+	private repoVersion = 0;
+	private originRead = 0;
+	private refreshSequence = 0;
+	private pendingMutations = 0;
+	private mutationTail: Promise<unknown> = Promise.resolve();
+	private stopped = false;
+	private timer: NodeJS.Timeout | null = null;
+	private kick: NodeJS.Timeout | null = null;
+	private db: any = null;
+	private cacheDir = "";
 	private workspace: string;
 	private changed: (state: TrackerState) => void;
-	private runner: SpawnRunner;
+	private runner?: SpawnRunner;
 	private preferJsonCache: boolean;
-	private repoCache: string | null | undefined;
-	private timer: NodeJS.Timeout | null = null;
-	private db: any = null; private jsonPath = "";
-	constructor(workspace: string, changed: (state: TrackerState) => void, runner: SpawnRunner = trackerRunner, preferJsonCache = false) {
+	constructor(workspace: string, changed: (state: TrackerState) => void, runner?: SpawnRunner, preferJsonCache = false) {
 		this.workspace = workspace; this.changed = changed; this.runner = runner; this.preferJsonCache = preferJsonCache;
 	}
 	async init() {
-		const cacheDir = assertWritablePifPath(path.join(this.workspace, ".pi", "pif", "cache"));
-		const dbPath = assertWritablePifPath(path.join(cacheDir, "tracker.db"));
+		this.cacheDir = assertWritablePifPath(path.join(this.workspace, ".pi", "pif", "cache"));
+		this.legacyCacheFile();
+		const dbPath = assertWritablePifPath(path.join(this.cacheDir, "tracker.db"));
 		for (const suffix of ["-wal", "-shm", "-journal"]) assertWritablePifPath(`${dbPath}${suffix}`);
-		this.jsonPath = assertWritablePifPath(path.join(cacheDir, "tracker-cache.json"));
 		if (!this.preferJsonCache) {
 			try {
 				const { DatabaseSync } = await import("node:sqlite");
-				fs.mkdirSync(cacheDir, { recursive: true });
-				this.db = new DatabaseSync(dbPath);
-				this.db.exec("CREATE TABLE IF NOT EXISTS tracker (id INTEGER PRIMARY KEY, repo TEXT, fetched_at TEXT, cards TEXT)");
+				fs.mkdirSync(this.cacheDir, { recursive: true }); this.db = new DatabaseSync(dbPath);
+				this.db.exec("CREATE TABLE IF NOT EXISTS tracker_repos (repo TEXT PRIMARY KEY, fetched_at TEXT, cards TEXT)");
 			} catch { this.db = null; }
 		}
-		this.loadCache();
+		await this.resolveRepo();
 	}
-	start() { const kick = setTimeout(() => this.refresh(), 250); kick.unref?.(); this.timer = setInterval(() => this.refresh(), 300_000); this.timer.unref?.(); }
-	stop() { if (this.timer) clearInterval(this.timer); this.timer = null; }
-	private ghBin() { return process.env.PIF_GH_BIN || "gh"; }
-	private boardPath() { return path.join(this.workspace, ".pif", "board.yaml"); }
-	private boardConfig(): PifBoardConfig { try { return parseBoardConfig(fs.readFileSync(this.boardPath(), "utf8")); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultBoardConfig(); throw error; } }
-	private columnNames(config: PifBoardConfig) { return config.columns.map(({ id, name }) => ({ id, name })); }
-	private resolveRepo(): string | null {
-		if (this.repoCache !== undefined) return this.repoCache;
-		const git = this.runner("git", ["remote", "get-url", "origin"], { cwd: this.workspace, timeout: 10_000 });
-		const match = git.status === 0 ? /github\.com[/:]([^/\s]+)\/([^/\s]+?)(?:\.git)?\s*$/.exec(git.stdout.trim()) : null;
-		this.repoCache = match ? `${match[1]}/${match[2]}` : null;
-		return this.repoCache;
+	start() { this.stop(); this.stopped = false; this.kick = setTimeout(() => void this.refresh(), 250); this.kick.unref?.(); this.timer = setInterval(() => void this.refresh(), 300_000); this.timer.unref?.(); }
+	stop() { if (this.timer) clearInterval(this.timer); if (this.kick) clearTimeout(this.kick); this.timer = null; this.kick = null; this.stopped = true; ++this.refreshSequence; ++this.repoVersion; }
+	private boardConfig(): PifBoardConfig { try { return parseBoardConfig(fs.readFileSync(path.join(this.workspace, ".pif", "board.yaml"), "utf8")); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaultBoardConfig(); throw new Error(`Invalid board.yaml: ${String((error as Error).message)}`); } }
+	private async git(args: string[]): Promise<TrackerRunResult> {
+		const command = process.env.PIF_GIT_BIN || "git";
+		return this.runner ? await this.runner(command, args, { cwd: this.workspace, timeout: 10_000 }) : spawnSync(command, args, { cwd: this.workspace, timeout: 10_000, encoding: "utf8" });
 	}
-	refresh(): { ok: boolean; error?: string } {
-		let config: PifBoardConfig;
-		try { config = this.boardConfig(); } catch (error) { this.state.error = `Invalid board.yaml: ${String((error as Error).message)}`; this.changed(this.state); return { ok: false, error: this.state.error }; }
-		const repo = this.resolveRepo();
-		if (!repo) { this.state.error = "Workspace has no GitHub origin remote"; this.state.stale = true; this.changed(this.state); return { ok: false, error: this.state.error }; }
-		const list = this.runner(this.ghBin(), ["issue", "list", "-R", repo, "--state", "all", "--limit", "300", "--json", "number,title,state,labels,updatedAt,url,body"], { cwd: this.workspace, timeout: 30_000 });
-		this.state.repo = repo; this.state.columns = this.columnNames(config);
-		if (list.status !== 0) {
-			this.state.stale = true; this.state.error = `${list.stderr || list.stdout}`.trim() || "gh issue list failed";
-			this.changed(this.state); return { ok: false, error: this.state.error };
+	private async resolveRepo(): Promise<string | null> {
+		const read = ++this.originRead;
+		let result: TrackerRunResult = { status: 1, stdout: "", stderr: "" };
+		try {
+			const root = await this.git(["rev-parse", "--show-toplevel"]);
+			// Git searches ancestor directories. A local-only child environment
+			// must not inherit its creator's origin or ticket authority.
+			if (root.status === 0 && fs.realpathSync(String(root.stdout ?? "").trim()) === fs.realpathSync(this.workspace)) {
+				result = await this.git(["remote", "get-url", "origin"]);
+			}
+		} catch { /* no repository owned by this workspace: disconnected */ }
+		if (read !== this.originRead) return this.state.repo;
+		const repo = result.status === 0 ? githubRepoFromOrigin(String(result.stdout ?? "").trim()) : null;
+		if (repo !== this.repoObserved) {
+			this.repoObserved = repo; ++this.repoVersion; ++this.refreshSequence;
+			Object.assign(this.state, { repo, cards: [], fetchedAt: null, stale: true, error: null, writable: false, connection: repo ? "unverified" : "disconnected", message: repo ? "Verify this repository through the environment's GitHub connection." : "Tracker disconnected. Connect GitHub in Settings after adding a GitHub origin." });
+			this.state.columns = defaultBoardConfig().columns.map(({ id, name }) => ({ id, name }));
+			if (repo) this.loadCache(repo);
+			this.changed(this.state);
 		}
-		let issues: any[] = []; try { const parsed = JSON.parse(list.stdout); if (Array.isArray(parsed)) issues = parsed; } catch { /* empty board */ }
-		this.state.cards = issues.map((issue) => normalizeGhIssue(issue, config)).sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
-		this.state.stale = false; this.state.fetchedAt = new Date().toISOString(); this.state.error = null;
-		this.writeCache(); this.changed(this.state);
-		return { ok: true };
+		return repo;
 	}
-	move(params: any): { ok: boolean; number?: number; column?: string; error?: string } {
-		const number = Number(params.number); const columnId = String(params.column ?? "");
-		const card = this.state.cards.find((candidate) => candidate.number === number);
-		if (!card) return { ok: false, error: `Unknown card #${number}` };
-		let config: PifBoardConfig; try { config = this.boardConfig(); } catch (error) { return { ok: false, error: `Invalid board.yaml: ${String((error as Error).message)}` }; }
-		const column = config.columns.find((candidate) => candidate.id === columnId);
+	private async assertTarget(target: TrackerTarget) {
+		const repo = await this.resolveRepo();
+		if (this.stopped || repo !== target.repo || this.repoVersion !== target.version) throw new Error("The workspace repository changed. Refresh the tracker before continuing; no further write was sent.");
+	}
+	private async github(target: TrackerTarget, args: string[], input?: string): Promise<TrackerRunResult> {
+		await this.assertTarget(target);
+		try { return this.runner ? await this.runner("gh", args, { cwd: this.workspace, timeout: 30_000, ...(input === undefined ? {} : { input }) }) : await runEnvironmentGithub(this.workspace, args, { timeout: 30_000, ...(input === undefined ? {} : { input }) }); }
+		catch { return { status: 1, stdout: "", stderr: "GitHub did not complete the request. Check the environment connection before retrying a write.", code: "connection_lost" }; }
+	}
+	private failure(result: TrackerRunResult, fallback: string): Error { return new Error(result.stderr.trim() || fallback); }
+	private parseObject(result: TrackerRunResult, fallback: string): any {
+		if (result.status !== 0) throw this.failure(result, fallback);
+		try { const value = JSON.parse(result.stdout); if (value && typeof value === "object" && !Array.isArray(value)) return value; } catch { /* malformed response */ }
+		throw new Error(`${fallback}: GitHub returned an invalid response.`);
+	}
+	private async verifyTarget(forWrite = true): Promise<TrackerTarget> {
+		const repo = await this.resolveRepo();
+		if (!repo) throw new Error("Tracker disconnected. Add a GitHub origin and connect this environment in Settings.");
+		const target: TrackerTarget = { repo, version: this.repoVersion, writable: false, message: null };
+		const metadata = this.parseObject(await this.github(target, ["api", `repos/${repo}`]), "Could not verify the GitHub repository");
+		await this.assertTarget(target);
+		if (String(metadata.full_name ?? "").toLowerCase() !== repo || metadata.has_issues !== true) throw new Error("GitHub did not confirm the workspace repository with issues enabled. Tracker writes remain disabled.");
+		const permissions = metadata.permissions;
+		const permissionKeys = ["admin", "maintain", "push", "triage"];
+		const reportedPermissions = permissionKeys.map((key) => permissions?.[key]).filter((value) => typeof value === "boolean");
+		const knownReadOnly = reportedPermissions.length > 0 && !reportedPermissions.includes(true);
+		target.writable = !knownReadOnly;
+		target.message = knownReadOnly ? "This GitHub repository is read-only for the connected account." : !reportedPermissions.length ? "GitHub did not report repository write permissions; each requested write is checked by GitHub." : null;
+		if (forWrite && knownReadOnly) throw new Error(target.message!);
+		return target;
+	}
+	private async subIssues(target: TrackerTarget, parent: number): Promise<any[]> {
+		const children: any[] = [];
+		for (let page = 1; page <= 3; page++) {
+			const result = await this.github(target, ["api", `repos/${target.repo}/issues/${parent}/sub_issues?per_page=100&page=${page}`]);
+			if (result.status !== 0) throw this.failure(result, `Could not read sub-issues of #${parent}`);
+			let values: any; try { values = JSON.parse(result.stdout); } catch { throw new Error(`Invalid sub-issue response for #${parent}`); }
+			if (!Array.isArray(values)) throw new Error(`Invalid sub-issue response for #${parent}`);
+			children.push(...values);
+			if (values.length < 100) break;
+		}
+		return children;
+	}
+	private sameRepositoryIssue(issue: any, repo: string): boolean {
+		if (issue.repository_url !== undefined) return String(issue.repository_url).toLowerCase() === `https://api.github.com/repos/${repo}`;
+		return String(issue.html_url ?? "").toLowerCase().startsWith(`https://github.com/${repo}/issues/`);
+	}
+	async refresh(): Promise<TrackerResult> {
+		await this.resolveRepo();
+		if (!this.state.repo) return { ok: true };
+		if (this.pendingMutations || this.stopped) return { ok: false, error: "Tracker update is already in progress." };
+		const sequence = ++this.refreshSequence;
+		const version = this.repoVersion;
+		try {
+			const config = this.boardConfig();
+			const target = await this.verifyTarget(false);
+			const result = await this.github(target, ["issue", "list", "-R", target.repo, "--state", "all", "--limit", "300", "--json", "number,title,state,labels,updatedAt,url,body"]);
+			if (result.status !== 0) throw this.failure(result, "Could not read GitHub issues");
+			let issues: any; try { issues = JSON.parse(result.stdout); } catch { throw new Error("GitHub returned invalid issue data."); }
+			if (!Array.isArray(issues)) throw new Error("GitHub returned invalid issue data.");
+			const cards: PifTrackerCard[] = issues.map((issue) => normalizeGhIssue(issue, config));
+			const nativeParents = new Map<number, number>();
+			for (const parent of cards.filter((card) => card.type === "epic" || card.type === "sprint")) {
+				for (const child of await this.subIssues(target, parent.number)) {
+					if (!this.sameRepositoryIssue(child, target.repo)) continue;
+					const number = Number(child.number);
+					if (nativeParents.has(number) && nativeParents.get(number) !== parent.number) throw new Error(`GitHub returned conflicting parents for #${number}.`);
+					nativeParents.set(number, parent.number);
+				}
+			}
+			await this.assertTarget(target);
+			if (sequence !== this.refreshSequence || this.pendingMutations) return { ok: false, error: "A newer tracker operation superseded this refresh." };
+			for (const card of cards) if (nativeParents.has(card.number)) card.parent = nativeParents.get(card.number)!;
+			Object.assign(this.state, { cards: cards.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)), columns: config.columns.map(({ id, name }) => ({ id, name })), stale: false, fetchedAt: new Date().toISOString(), error: null, writable: target.writable, connection: "connected", message: target.message });
+			this.writeCache(); this.changed(this.state); return { ok: true };
+		} catch (error) {
+			if (sequence !== this.refreshSequence || version !== this.repoVersion || this.stopped) return { ok: false, error: "A newer workspace or tracker operation superseded this refresh." };
+			this.state.stale = true; this.state.writable = false; this.state.connection = "error"; this.state.error = String((error as Error).message); this.changed(this.state);
+			return { ok: false, error: this.state.error };
+		}
+	}
+	private mutate(params: any, operation: () => Promise<TrackerResult>): Promise<TrackerResult> {
+		// Capture the board the user acted on, not whichever origin happens to
+		// be current when a queued mutation eventually gets its turn.
+		const requestedRepo = this.state.repo; const requestedVersion = this.repoVersion;
+		++this.pendingMutations; ++this.refreshSequence;
+		const run = async () => { try {
+			await this.resolveRepo();
+			if (requestedRepo !== this.state.repo || requestedVersion !== this.repoVersion || this.stopped) throw new Error("The workspace repository changed. Refresh the tracker before retrying this action.");
+			if (params?.repo !== undefined && String(params.repo).toLowerCase() !== this.state.repo) throw new Error("This action belongs to a different repository. Reopen the ticket from the current tracker.");
+			return { ...await operation(), ...(requestedRepo ? { repo: requestedRepo } : {}) };
+		} catch (error) { return { ok: false, ...(requestedRepo ? { repo: requestedRepo } : {}), error: String((error as Error).message) }; } };
+		const result = this.mutationTail.then(run, run);
+		this.mutationTail = result;
+		return result.finally(() => { --this.pendingMutations; ++this.refreshSequence; });
+	}
+	private async readCard(target: TrackerTarget, number: number, config: PifBoardConfig): Promise<PifTrackerCard> {
+		const issue = this.parseObject(await this.github(target, ["issue", "view", String(number), "-R", target.repo, "--json", "number,title,state,labels,updatedAt,url,body"]), `Could not read issue #${number}`);
+		if (Number(issue.number) !== number) throw new Error("GitHub returned a different issue. No write was sent.");
+		const card = normalizeGhIssue(issue, config);
+		card.parent = this.state.cards.find((candidate) => candidate.number === number)?.parent ?? card.parent;
+		return card;
+	}
+	private publishCard(card: PifTrackerCard) { this.state.cards = [card, ...this.state.cards.filter((candidate) => candidate.number !== card.number)].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)); this.writeCache(); this.changed(this.state); }
+	private async ensureLabels(target: TrackerTarget, labels: string[]) {
+		for (const name of [...new Set(labels)]) {
+			if (!name || Buffer.byteLength(name) > 100 || name.includes("/")) throw new Error("Tracker labels must be non-empty, at most 100 bytes, and contain no slash.");
+			const args = ["api", `repos/${target.repo}/labels/${encodeURIComponent(name)}`];
+			const found = await this.github(target, args);
+			if (found.status === 0) continue;
+			if (found.code !== "not_found") throw this.failure(found, `Could not check label ${name}`);
+			const created = await this.github(target, ["api", "--method", "POST", `repos/${target.repo}/labels`, "--input", "-"], JSON.stringify({ name, color: "ededed", description: "pif tracker label" }));
+			if (created.status !== 0) {
+				// Labels are unique by name. Read back a concurrent/uncertain create;
+				// never drop labels or retry issue creation as a fallback.
+				const readback = await this.github(target, args);
+				if (readback.status !== 0) throw this.failure(created, `Could not create label ${name}`);
+			}
+		}
+	}
+	move(params: any): Promise<TrackerResult> { return this.mutate(params, async () => {
+		const target = await this.verifyTarget(); const number = Number(params.number);
+		if (!Number.isSafeInteger(number) || number < 1 || !this.state.cards.some((card) => card.number === number)) return { ok: false, error: `Unknown card #${number}` };
+		const config = this.boardConfig(); const columnId = String(params.column ?? ""); const column = config.columns.find((candidate) => candidate.id === columnId);
 		if (!column) return { ok: false, error: `Unknown column: ${columnId}` };
-		const repo = this.state.repo ?? this.resolveRepo();
-		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
-		const plan = plannedTrackerMove(card, column);
+		const card = await this.readCard(target, number, config); const plan = plannedTrackerMove(card, column);
+		await this.ensureLabels(target, plan.add);
 		if (plan.add.length || plan.remove.length) {
-			const args = ["issue", "edit", String(number), "-R", repo];
-			for (const label of plan.add) args.push("--add-label", label);
-			for (const label of plan.remove) args.push("--remove-label", label);
-			const edit = this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
-			if (edit.status !== 0) return { ok: false, error: `${edit.stderr || edit.stdout}`.trim() || "gh issue edit failed" };
+			const args = ["issue", "edit", String(number), "-R", target.repo];
+			for (const label of plan.add) args.push("--add-label", label); for (const label of plan.remove) args.push("--remove-label", label);
+			const result = await this.github(target, args); if (result.status !== 0) throw this.failure(result, "Could not update tracker labels");
 		}
-		if (plan.state !== card.state) {
-			const flip = this.runner(this.ghBin(), ["issue", plan.state === "closed" ? "close" : "reopen", String(number), "-R", repo], { cwd: this.workspace, timeout: 30_000 });
-			if (flip.status !== 0) return { ok: false, error: `${flip.stderr || flip.stdout}`.trim() || `gh issue ${plan.state} failed` };
-		}
-		card.labels = [...card.labels.filter((label) => !plan.remove.includes(label)), ...plan.add];
-		card.state = plan.state; card.column = columnForCard(card.labels, card.state, config);
-		this.writeCache(); this.changed(this.state);
-		return { ok: true, number, column: columnId };
+		if (plan.state !== card.state) { const result = await this.github(target, ["issue", plan.state === "closed" ? "close" : "reopen", String(number), "-R", target.repo]); if (result.status !== 0) throw this.failure(result, "Could not change issue state; refresh to see any completed label changes"); }
+		const updated = await this.readCard(target, number, config); await this.assertTarget(target); this.publishCard(updated); return { ok: true, number, column: updated.column };
+	}); }
+	async list() { await this.resolveRepo(); return { ...this.state, cards: this.state.cards.map(({ body, ...card }) => card) }; }
+	private intentFile(repo: string, fingerprint: string): string { return assertWritablePifPath(path.join(this.cacheDir || path.join(this.workspace, ".pi", "pif", "cache"), `tracker-create-${crypto.createHash("sha256").update(repo).digest("hex").slice(0, 16)}-${fingerprint}.json`)); }
+	private readIntent(repo: string, fingerprint: string): TrackerCreateIntent | null { const file = this.intentFile(repo, fingerprint); if (!fs.existsSync(file)) return null; const value = JSON.parse(fs.readFileSync(file, "utf8")); if (value.repo !== repo || value.fingerprint !== fingerprint || (value.number !== undefined && (!Number.isSafeInteger(value.number) || value.number < 1))) throw new Error("The pending issue creation record is invalid. Inspect GitHub before retrying."); return value; }
+	private writeIntent(value: TrackerCreateIntent) { const file = this.intentFile(value.repo, value.fingerprint); const temporary = assertWritablePifPath(`${file}.tmp`); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(temporary, JSON.stringify(value) + "\n", { mode: 0o600 }); fs.renameSync(temporary, file); }
+	private async linkParent(target: TrackerTarget, parent: number, number: number) {
+		if ((await this.subIssues(target, parent)).some((child) => Number(child.number) === number && this.sameRepositoryIssue(child, target.repo))) return;
+		const child = this.parseObject(await this.github(target, ["api", `repos/${target.repo}/issues/${number}`]), `Could not resolve issue #${number}`);
+		if (!Number.isSafeInteger(child.id) || Number(child.number) !== number || !this.sameRepositoryIssue(child, target.repo)) throw new Error("GitHub did not confirm the newly created issue identity.");
+		const linked = await this.github(target, ["api", "--method", "POST", `repos/${target.repo}/issues/${parent}/sub_issues`, "--input", "-"], JSON.stringify({ sub_issue_id: child.id }));
+		if (linked.status !== 0 && !(await this.subIssues(target, parent)).some((candidate) => Number(candidate.number) === number && this.sameRepositoryIssue(candidate, target.repo))) throw this.failure(linked, `Could not link #${number} under #${parent}`);
 	}
-	list() { return { repo: this.state.repo, columns: this.state.columns, stale: this.state.stale, fetchedAt: this.state.fetchedAt, error: this.state.error, cards: this.state.cards.map(({ body, ...card }) => card) }; }
-	create(params: any): { ok: boolean; number?: number; error?: string } {
+	create(params: any): Promise<TrackerResult> { return this.mutate(params, async () => {
 		const title = String(params.title ?? "").trim(); if (!title) return { ok: false, error: "Title is required" };
-		const type = TRACKER_TYPES.find((candidate) => candidate === String(params.type ?? "")) ?? "issue";
-		const repo = this.state.repo ?? this.resolveRepo();
-		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
-		let config: PifBoardConfig; try { config = this.boardConfig(); } catch (error) { return { ok: false, error: `Invalid board.yaml: ${String((error as Error).message)}` }; }
-		const column = params.column !== undefined && params.column !== null && String(params.column) !== "" ? config.columns.find((candidate) => candidate.id === String(params.column)) : undefined;
+		const target = await this.verifyTarget(); const config = this.boardConfig(); const type = TRACKER_TYPES.find((candidate) => candidate === String(params.type ?? "")) ?? "issue"; const body = String(params.body ?? "");
+		const column = params.column ? config.columns.find((candidate) => candidate.id === String(params.column)) : undefined;
 		if (params.column && !column) return { ok: false, error: `Unknown column: ${params.column}` };
+		const parent = params.parent === undefined || params.parent === null ? trackerParentRef(body, type) : Number(params.parent);
+		if (parent !== null) {
+			if (!Number.isSafeInteger(parent) || parent < 1 || type === "epic") return { ok: false, error: "A child ticket requires a valid parent epic or sprint number." };
+			const parentIssue = this.parseObject(await this.github(target, ["api", `repos/${target.repo}/issues/${parent}`]), `Could not verify parent #${parent}`);
+			const parentType = normalizeGhIssue(parentIssue, config).type;
+			if (Number(parentIssue.number) !== parent || !this.sameRepositoryIssue(parentIssue, target.repo) || (parentType !== "epic" && parentType !== "sprint")) return { ok: false, error: "The parent must be an epic or sprint in this workspace's GitHub repository." };
+		}
 		const labels = [...(type === "issue" ? [] : [type]), ...(column?.label ? [column.label] : [])];
-		const run = (withLabels: boolean) => {
-			const args = ["issue", "create", "-R", repo, "--title", title, "--body", String(params.body ?? "")];
-			if (withLabels) for (const label of labels) args.push("--label", label);
-			return this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
-		};
-		let created = run(labels.length > 0);
-		if (created.status !== 0 && labels.length > 0) created = run(false);
-		if (created.status !== 0) return { ok: false, error: `${created.stderr || created.stdout}`.trim() || "gh issue create failed" };
-		const number = Number(/issues\/(\d+)/.exec(created.stdout)?.[1] ?? 0);
-		if (!number) return { ok: false, error: `Could not parse the created issue number: ${created.stdout.trim()}` };
-		const card: PifTrackerCard = { number, title, type, state: "open", labels, body: String(params.body ?? "").slice(0, 20_000), updatedAt: new Date().toISOString(), url: `https://github.com/${repo}/issues/${number}`, column: columnForCard(labels, "open", config) };
-		this.state.cards = [card, ...this.state.cards]; this.writeCache(); this.changed(this.state);
-		return { ok: true, number };
-	}
-	update(params: any): { ok: boolean; number?: number; error?: string } {
-		const number = Number(params.number);
-		const card = this.state.cards.find((candidate) => candidate.number === number);
-		if (!card) return { ok: false, error: `Unknown card #${number}` };
-		const title = params.title !== undefined ? String(params.title).trim() : undefined;
-		if (title !== undefined && !title) return { ok: false, error: "Title cannot be empty" };
-		const body = params.body !== undefined ? String(params.body) : undefined;
-		const wantsLabelChange = Array.isArray(params.labels) && plannedLabelChange(card.labels, params.labels.map(String), card.type).add.length + plannedLabelChange(card.labels, params.labels.map(String), card.type).remove.length > 0;
-		if (title === undefined && body === undefined && !wantsLabelChange) return { ok: false, error: "Nothing to update" };
-		const repo = this.state.repo ?? this.resolveRepo();
-		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
-		const args = ["issue", "edit", String(number), "-R", repo];
-		if (title !== undefined) args.push("--title", title);
-		if (body !== undefined) args.push("--body", body);
-		const labelPlan = Array.isArray(params.labels) ? plannedLabelChange(card.labels, params.labels.map(String), card.type) : null;
-		if (labelPlan) {
-			for (const label of labelPlan.add) args.push("--add-label", label);
-			for (const label of labelPlan.remove) args.push("--remove-label", label);
+		const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ title, body, type, column: column?.id ?? null, parent })).digest("hex").slice(0, 24);
+		let intent = this.readIntent(target.repo, fingerprint);
+		if (intent && !intent.number) return { ok: false, uncertain: true, error: "A previous creation of this ticket may already exist on GitHub. It was not repeated. Refresh and inspect the repository before creating another ticket." };
+		if (!intent) {
+			await this.ensureLabels(target, labels);
+			intent = { repo: target.repo, fingerprint }; this.writeIntent(intent);
+			const args = ["issue", "create", "-R", target.repo, "--title", title, "--body", body]; for (const label of labels) args.push("--label", label);
+			let created: TrackerRunResult;
+			try { created = await this.github(target, args); }
+			catch (error) {
+				// github() throws only when its local target guard rejects before
+				// dispatch. Transport/remote uncertainty is returned, never thrown.
+				fs.rmSync(this.intentFile(target.repo, fingerprint), { force: true }); throw error;
+			}
+			if (created.status !== 0) {
+				const definite = ["missing_token", "invalid_token", "insufficient_permissions", "not_found", "unsupported_operation", "environment_required"].includes(created.code ?? "");
+				if (definite) fs.rmSync(this.intentFile(target.repo, fingerprint), { force: true });
+				return { ok: false, uncertain: !definite, error: `${created.stderr.trim() || "GitHub did not confirm issue creation."}${definite ? "" : " This creation will not be automatically repeated; inspect GitHub before retrying."}` };
+			}
+			const url = created.stdout.trim().split(/\s+/).find((value) => /^https:\/\/github\.com\//.test(value));
+			const parsed = url ? new URL(url) : null; const match = parsed ? /^\/([^/]+\/[^/]+)\/issues\/([1-9]\d*)$/.exec(parsed.pathname) : null;
+			if (!match || match[1].toLowerCase() !== target.repo) return { ok: false, uncertain: true, error: "GitHub accepted creation but did not return the expected issue URL. Inspect the repository; this creation will not be repeated." };
+			intent.number = Number(match[2]);
+			try { this.writeIntent(intent); } catch { return { ok: false, number: intent.number, partial: true, error: `GitHub created #${intent.number}, but its recovery record could not be saved. Inspect that issue before continuing; creation will not be repeated.` }; }
 		}
-		if (title === undefined && body === undefined && (!labelPlan || (!labelPlan.add.length && !labelPlan.remove.length))) return { ok: false, error: "Nothing to update" };
-		const edit = this.runner(this.ghBin(), args, { cwd: this.workspace, timeout: 30_000 });
-		if (edit.status !== 0) return { ok: false, error: `${edit.stderr || edit.stdout}`.trim() || "gh issue edit failed" };
-		if (title !== undefined) card.title = title;
-		if (body !== undefined) card.body = body.slice(0, 20_000);
-		if (labelPlan) card.labels = [...card.labels.filter((l) => !labelPlan.remove.includes(l) || l.startsWith("status:") || l === card.type), ...labelPlan.add];
-		card.updatedAt = new Date().toISOString();
-		this.writeCache(); this.changed(this.state);
-		return { ok: true, number };
-	}
-	delete(params: any): { ok: boolean; number?: number; error?: string } {
-		const number = Number(params.number);
-		const card = this.state.cards.find((candidate) => candidate.number === number);
-		if (!card) return { ok: false, error: `Unknown card #${number}` };
-		const repo = this.state.repo ?? this.resolveRepo();
-		if (!repo) return { ok: false, error: "Workspace has no GitHub origin remote" };
-		const removed = this.runner(this.ghBin(), ["issue", "delete", String(number), "-R", repo, "--yes"], { cwd: this.workspace, timeout: 30_000 });
-		if (removed.status !== 0) return { ok: false, error: `${removed.stderr || removed.stdout}`.trim() || "gh issue delete failed" };
-		this.state.cards = this.state.cards.filter((candidate) => candidate.number !== number);
-		this.writeCache(); this.changed(this.state);
-		return { ok: true, number };
-	}
-	private loadCache() {
+		const number = intent.number!;
+		try {
+			if (parent !== null) await this.linkParent(target, parent, number);
+			if (column?.state === "closed") { const result = await this.github(target, ["issue", "close", String(number), "-R", target.repo]); if (result.status !== 0) throw this.failure(result, "Could not close the created ticket"); }
+			const card = await this.readCard(target, number, config); if (parent !== null) card.parent = parent;
+			await this.assertTarget(target); this.publishCard(card); fs.rmSync(this.intentFile(target.repo, fingerprint), { force: true }); return { ok: true, number };
+		} catch (error) { return { ok: false, number, partial: true, error: `Created #${number}, but completion is pending: ${String((error as Error).message)} Retry reuses this issue rather than creating another.` }; }
+	}); }
+	update(params: any): Promise<TrackerResult> { return this.mutate(params, async () => {
+		const target = await this.verifyTarget(); const number = Number(params.number);
+		if (!Number.isSafeInteger(number) || number < 1 || !this.state.cards.some((card) => card.number === number)) return { ok: false, error: `Unknown card #${number}` };
+		const title = params.title !== undefined ? String(params.title).trim() : undefined; if (title !== undefined && !title) return { ok: false, error: "Title cannot be empty" };
+		const body = params.body !== undefined ? String(params.body) : undefined; const config = this.boardConfig(); const card = await this.readCard(target, number, config);
+		const labelPlan = Array.isArray(params.labels) ? plannedLabelChange(card.labels, params.labels.map(String), card.type) : { add: [], remove: [] };
+		if (title === undefined && body === undefined && !labelPlan.add.length && !labelPlan.remove.length) return { ok: false, error: "Nothing to update" };
+		await this.ensureLabels(target, labelPlan.add);
+		const args = ["issue", "edit", String(number), "-R", target.repo]; if (title !== undefined) args.push("--title", title); if (body !== undefined) args.push("--body", body);
+		for (const label of labelPlan.add) args.push("--add-label", label); for (const label of labelPlan.remove) args.push("--remove-label", label);
+		const result = await this.github(target, args); if (result.status !== 0) throw this.failure(result, "Could not update GitHub issue");
+		const updated = await this.readCard(target, number, config); await this.assertTarget(target); this.publishCard(updated); return { ok: true, number };
+	}); }
+	delete(params: any): Promise<TrackerResult> { return this.mutate(params, async () => {
+		const target = await this.verifyTarget(); const number = Number(params.number);
+		if (!Number.isSafeInteger(number) || number < 1 || !this.state.cards.some((card) => card.number === number)) return { ok: false, error: `Unknown card #${number}` };
+		const result = await this.github(target, ["issue", "delete", String(number), "-R", target.repo, "--yes"]); if (result.status !== 0) throw this.failure(result, "Could not delete GitHub issue");
+		await this.assertTarget(target); this.state.cards = this.state.cards.filter((card) => card.number !== number); this.writeCache(); this.changed(this.state); return { ok: true, number };
+	}); }
+	private cacheFile(repo: string): string { return assertWritablePifPath(path.join(this.cacheDir, `tracker-${crypto.createHash("sha256").update(repo).digest("hex").slice(0, 16)}.json`)); }
+	private legacyCacheFile(): string { return assertWritablePifPath(path.join(this.cacheDir, "tracker-cache.json")); }
+	private loadCache(repo: string) {
+		let value: any;
 		if (this.db) {
-			try { const row = this.db.prepare("SELECT repo, fetched_at, cards FROM tracker WHERE id = 1").get(); if (row) { this.applyCache(String(row.repo ?? "") || null, String(row.fetched_at ?? "") || null, JSON.parse(String(row.cards ?? "[]"))); return; } } catch { /* fall through to json */ }
+			try { value = this.db.prepare("SELECT repo, fetched_at AS fetchedAt, cards FROM tracker_repos WHERE repo = ?").get(repo); if (value) value.cards = JSON.parse(value.cards); } catch { /* no usable current cache */ }
+			if (!value) try { const row = this.db.prepare("SELECT repo, fetched_at AS fetchedAt, cards FROM tracker WHERE id = 1 AND repo = ?").get(repo); if (row) value = { ...row, cards: JSON.parse(row.cards) }; } catch { /* no legacy table */ }
 		}
-		try { const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8")); this.applyCache(parsed.repo ?? null, parsed.fetchedAt ?? null, Array.isArray(parsed.cards) ? parsed.cards : []); } catch { /* absent */ }
-	}
-	private applyCache(repo: string | null, fetchedAt: string | null, cards: any[]) {
-		if (!Array.isArray(cards) || !cards.length) return;
-		this.state.repo = repo; this.state.cards = cards; this.state.fetchedAt = fetchedAt; this.state.stale = true;
-		if (!this.state.columns.length) this.state.columns = this.columnNames(defaultBoardConfig());
+		if (!value && this.cacheDir) for (const file of [this.cacheFile(repo), this.legacyCacheFile()]) {
+			try { const candidate = JSON.parse(fs.readFileSync(file, "utf8")); if (candidate.repo?.toLowerCase() === repo) { value = candidate; break; } } catch { /* no matching cache */ }
+		}
+		if (value?.repo?.toLowerCase() !== repo || !Array.isArray(value.cards)) return;
+		this.state.cards = value.cards; this.state.fetchedAt = value.fetchedAt ?? null; this.state.stale = true;
 	}
 	private writeCache() {
-		if (this.db) { this.db.prepare("INSERT INTO tracker (id, repo, fetched_at, cards) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET repo = excluded.repo, fetched_at = excluded.fetched_at, cards = excluded.cards").run(this.state.repo, this.state.fetchedAt, JSON.stringify(this.state.cards)); return; }
-		const file = assertWritablePifPath(this.jsonPath);
-		fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify({ repo: this.state.repo, fetchedAt: this.state.fetchedAt, cards: this.state.cards }, null, 2) + "\n");
+		if (!this.state.repo || !this.cacheDir) return;
+		if (this.db) { this.db.prepare("INSERT INTO tracker_repos (repo, fetched_at, cards) VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET fetched_at = excluded.fetched_at, cards = excluded.cards").run(this.state.repo, this.state.fetchedAt, JSON.stringify(this.state.cards)); return; }
+		const file = this.cacheFile(this.state.repo); const temporary = assertWritablePifPath(`${file}.tmp`); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(temporary, JSON.stringify({ repo: this.state.repo, fetchedAt: this.state.fetchedAt, cards: this.state.cards }, null, 2) + "\n"); fs.renameSync(temporary, file);
 	}
 }
 
-const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT", "PIF_TOKEN", "PIF_ALLOWED_ORIGINS"] as const;
+const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT", "PIF_TOKEN", "PIF_ALLOWED_ORIGINS", "PIF_GH_BIN", "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GH_HOST"] as const;
 
 /** Environment for spawned child sessions: hub lifecycle vars must not
  * propagate, or every child tries to autostart a second hub on our port.
@@ -762,6 +911,7 @@ const CHILD_SCRUBBED_ENV_KEYS = ["PIF_AUTOSTART", "PIF_NO_FLUTTER", "PIF_PORT", 
 export function childEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 	const child = { ...env };
 	for (const key of CHILD_SCRUBBED_ENV_KEYS) delete child[key];
+	for (const key of Object.keys(child)) if (key.startsWith("PIF_GITHUB_BRIDGE_")) delete child[key];
 	return child;
 }
 

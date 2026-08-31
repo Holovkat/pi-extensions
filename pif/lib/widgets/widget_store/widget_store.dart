@@ -97,7 +97,7 @@ class _StoreState extends State<_Store> {
           _heading('Compiler / reload', 0),
           Container(
             padding: const EdgeInsets.all(10),
-            color: const Color(0xff10141c),
+            color: widget.host.theme.panelRaised,
             child: SelectableText(
               diagnostics,
               style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
@@ -111,8 +111,8 @@ class _StoreState extends State<_Store> {
     padding: const EdgeInsets.only(bottom: 7),
     child: Text(
       '$label${count > 0 ? '  $count' : ''}',
-      style: const TextStyle(
-        color: Color(0xff8b96aa),
+      style: TextStyle(
+        color: widget.host.theme.textMuted,
         fontSize: 11,
         fontWeight: FontWeight.w300,
       ),
@@ -176,9 +176,9 @@ class _StoreState extends State<_Store> {
                   '${item['description'] ?? ''}',
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 11,
-                    color: Color(0xff8b96aa),
+                    color: widget.host.theme.textMuted,
                   ),
                 ),
               ],

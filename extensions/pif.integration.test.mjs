@@ -53,16 +53,17 @@ test('direct export rejects invalid requirements before staging even with quoted
 test('canonical export scanner rejects declared credential classes without revealing values (#199)', (t) => {
   const root = tempDir('pif-scan-');
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
-  const runner = path.join(root, 'scan.mjs');
-  fs.writeFileSync(runner, exportHelperSource('ROOT="$bundle_root" node --input-type=module <<\'NODE\'\n'));
-  const scan = (directory) => spawnSync(process.execPath, [runner], {
-    env: fixtureEnvironment(root, {ROOT: directory}), encoding: 'utf8', timeout: 10_000,
+  const runner = path.join(repo, 'scripts', 'pif-builder-kit.mjs');
+  const scan = (directory) => spawnSync(process.execPath, [runner, 'scan', directory], {
+    env: fixtureEnvironment(root), encoding: 'utf8', timeout: 10_000,
   });
   const cases = [
     ['clean', 'sample.txt', 'ordinary sample content', true],
     ['models-file', 'models.json', '{}', false],
     ['settings-file', 'settings.json', '{}', false],
     ['env-file', '.env', 'EXAMPLE=demo', false],
+    ['auth-file', 'auth.json', '{}', false],
+    ['credentials-file', 'credentials.json', '{}', false],
     ['project-token', 'sample.txt', `sk-proj-${'xY2_'.repeat(12)}`, false],
     ['service-token', 'sample.txt', `sk-svcacct-${'xY2-'.repeat(12)}`, false],
     ['github-pat', 'sample.txt', `github_pat_${'A1_'.repeat(20)}`, false],
@@ -109,6 +110,7 @@ test('canonical manifest bootstrap upgrades atomically and rejects bundle destin
   fs.mkdirSync(helperDir, {recursive: true});
   fs.mkdirSync(extensionDir, {recursive: true});
   fs.copyFileSync(path.join(repo, 'extensions', 'pif-shared.ts'), path.join(extensionDir, 'pif-shared.ts'));
+  fs.copyFileSync(path.join(repo, 'extensions', 'pif-github.ts'), path.join(extensionDir, 'pif-github.ts'));
   const runner = path.join(helperDir, 'bootstrap-manifest.mjs');
   fs.writeFileSync(runner, exportHelperSource('cat > "$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs" <<\'NODE\'\n'));
   const source = path.join(helperDir, 'app.yaml');
@@ -930,19 +932,26 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   send(socket, 'models/control', 'refresh', {});
   await modelsRefreshed; checkpoint('models channel envelope accepted');
 
-  // Tracker surface: the temp workspace has no GitHub remote — errors surface over the bus and the empty cache stays stale.
+  // Local-only work is explicitly disconnected; refresh does not invoke GitHub.
   assert.equal(snapshot.payload.tracker.repo, null);
-  const trackerState = nextMessage(socket, (value) => value.channel === 'tracker/state');
   const refreshed = await control(controlPath, 'tracker.refresh');
-  assert.equal(refreshed.ok, false); assert.match(refreshed.error, /no GitHub origin remote/);
-  await trackerState; checkpoint('tracker error surfaced');
+  assert.equal(refreshed.ok, true);
   const board = await control(controlPath, 'tracker.list');
-  assert.deepEqual(board.columns, []); assert.equal(board.cards.length, 0); assert.equal(board.stale, true);
+  assert.deepEqual(board.columns.map((column) => column.id), ['backlog', 'in_progress', 'done']);
+  assert.equal(board.cards.length, 0); assert.equal(board.stale, true);
+  assert.equal(board.connection, 'disconnected'); assert.equal(board.writable, false);
   const moveReject = await control(controlPath, 'tracker.move', {number: 1, column: 'todo'});
-  assert.equal(moveReject.ok, false); assert.match(moveReject.error, /Unknown card/);
+  assert.equal(moveReject.ok, false); assert.match(moveReject.error, /disconnected/);
   checkpoint('tracker controls verified');
 
+  // Native model validation is asynchronous. Observe its completed update
+  // before checking persistence; thinking/name updates can overtake it.
+  const modelUpdated = nextMessage(socket, (value) => {
+    if (value.channel === 'shell/error') throw new Error(value.payload?.error || 'Model selection failed');
+    return value.channel === 'session/state' && value.type === 'updated' && value.payload?.model === 'fixture/fast';
+  });
   send(socket, 'session/control', 'setModel', {sessionId: 'host', model: 'fixture/fast'});
+  await modelUpdated;
   send(socket, 'session/control', 'setThinking', {sessionId: 'host', thinking: 'low'});
   await nextMessage(socket, (value) => value.type === 'updated' && value.payload?.thinking === 'low');
   send(socket, 'session/control', 'rename', {sessionId: 'host', name: 'My Workspace'});

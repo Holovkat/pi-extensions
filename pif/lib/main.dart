@@ -2,10 +2,16 @@ import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:ui' show AppExitResponse;
 import 'package:flutter/material.dart';
+import 'core/appearance.dart';
 import 'core/bus.dart';
 import 'core/docking_shell.dart';
+import 'core/development_environment.dart';
+import 'core/github_connection.dart';
 import 'core/pi_launcher.dart';
+import 'core/plugin.dart';
 import 'core/project_picker.dart';
+import 'core/project_onboarding.dart';
+import 'widgets/pif_settings/pif_settings.dart';
 
 void main() {
   runPifApp();
@@ -32,6 +38,12 @@ class PifApp extends StatefulWidget {
 }
 
 class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
+  final _github = GithubConnectionService();
+  final _environments = DevelopmentEnvironmentService();
+  final _navigatorKey = GlobalKey<NavigatorState>();
+  String? _githubStateKey;
+  bool _onboardingInFlight = false;
+  PifAppearanceService? _appearance;
   PiLauncher? _launcher;
   PifBus? _bus;
   String? _workspace;
@@ -50,6 +62,8 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
+    _github.addListener(_githubChanged);
+    if (!widget.exportMode) _appearance = PifAppearanceService();
     WidgetsBinding.instance.addObserver(this);
     if (widget.exportMode) {
       // Exported apps boot straight into their bundled workspace, skipping
@@ -67,6 +81,8 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _appearance?.dispose();
+    _github.dispose();
     WidgetsBinding.instance.removeObserver(this);
     _cleanup();
     super.dispose();
@@ -74,6 +90,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
 
   @override
   Future<AppExitResponse> didRequestAppExit() async {
+    await _appearance?.flush();
     await _cleanup();
     return AppExitResponse.exit;
   }
@@ -95,6 +112,17 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
         return;
       }
       _bus = bus;
+      final inheritedWorkspace = Platform.environment['PIF_WORKSPACE'];
+      if (inheritedWorkspace != null && inheritedWorkspace.isNotEmpty) {
+        final identity = await EnvironmentIdentity.ensure(inheritedWorkspace);
+        if (!mounted || generation != _startupGeneration) {
+          if (_bus == bus) _bus = null;
+          await bus.dispose();
+          return;
+        }
+        _workspace = inheritedWorkspace;
+        await _selectEnvironment(identity);
+      }
       if (!_watchBus(bus, generation)) {
         if (_bus == bus) _bus = null;
         await bus.dispose();
@@ -119,6 +147,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     try {
       await _cleanup();
       if (!mounted) return;
+      await _selectEnvironment(await EnvironmentIdentity.ensure(workspace));
       await _startPiSession();
     } finally {
       _startupInFlight = false;
@@ -154,7 +183,30 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     _launcher = launcher;
     PifBus? bus;
     try {
-      await launcher.start(workspace: workspace);
+      final identity = await EnvironmentIdentity.ensure(workspace);
+      if (_github.environmentId != identity.id ||
+          _github.workspace != identity.workspacePath) {
+        await _selectEnvironment(identity);
+      }
+      try {
+        await _github.startBridge();
+      } catch (error) {
+        // Local authoring remains available if the optional tracker bridge
+        // cannot start. Settings shows the actionable connection diagnostic.
+        _github.reportBridgeUnavailable(
+          error is StateError
+              ? error.message.toString()
+              : 'The local GitHub connection could not start. Check folder permissions and reopen this environment.',
+        );
+      }
+      final development = widget.exportMode
+          ? null
+          : await _environments.inspect(identity);
+      await launcher.start(
+        workspace: workspace,
+        development: development,
+        launchPreview: development?.canBuild == true,
+      );
       if (!mounted || _launcher != launcher) {
         await launcher.stop();
         return;
@@ -167,16 +219,17 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
       if (!ready) {
         throw StateError('hub did not start within 20 seconds');
       }
-      // The token file is the designed recovery path when an orphaned hub
-      // from a previous launch still holds the requested port and answers
-      // with its own token — resolve fresh instead of caching the minted
-      // one so upgrades never 401 against a hub we cannot restart.
+      // This launcher owns a fresh port and token. A sibling opening the same
+      // folder may replace the recovery file, but cannot replace our identity.
       bus = PifBus(
         uri: Uri.parse('ws://127.0.0.1:${launcher.port}/pif'),
-        tokenResolver: () => PiLauncher.resolveWorkspaceToken(workspace),
+        tokenResolver: () =>
+            launcher.token ?? PiLauncher.resolveWorkspaceToken(workspace),
       );
       await bus.connect();
-      if (!mounted || _launcher != launcher || generation != _startupGeneration) {
+      if (!mounted ||
+          _launcher != launcher ||
+          generation != _startupGeneration) {
         await bus.dispose();
         await launcher.stop();
         return;
@@ -247,11 +300,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     _watchdog = Timer(_watchdogTimeout, () {
       final connected = _bus?.connected ?? false;
       if (connected && _snapshotSeen) return;
-      _recover(
-        connected
-            ? 'hub did not deliver state'
-            : 'hub connection lost',
-      );
+      _recover(connected ? 'hub did not deliver state' : 'hub connection lost');
     });
   }
 
@@ -319,26 +368,149 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     _snapshotSeen = false;
     await _launcher?.stop();
     _launcher = null;
+    await _github.stopBridge();
+  }
+
+  Future<void> _selectEnvironment(EnvironmentIdentity identity) async {
+    if (_github.environmentId == identity.id &&
+        _github.workspace == identity.workspacePath)
+      return;
+    await _github.selectEnvironment(
+      environmentId: identity.id,
+      workspace: identity.workspacePath,
+    );
+  }
+
+  Future<void> _openSettingsPage() async {
+    final context = _navigatorKey.currentContext;
+    if (context == null) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => Dialog(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 820, maxHeight: 720),
+          child: Column(
+            children: [
+              Align(
+                alignment: Alignment.centerRight,
+                child: IconButton(
+                  tooltip: 'Close Settings',
+                  icon: const Icon(Icons.close),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ),
+              const Expanded(child: PifSettingsPage()),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _newProject() async {
+    if (_onboardingInFlight) return;
+    final context = _navigatorKey.currentContext;
+    if (context == null) return;
+    _onboardingInFlight = true;
+    try {
+      final identity = await showProjectOnboarding(
+        context,
+        environments: _environments,
+        github: _github,
+        onEnvironmentSelected: _selectEnvironment,
+        onOpenSettings: _openSettingsPage,
+      );
+      if (identity != null && mounted)
+        await _launchProject(identity.workspacePath);
+    } finally {
+      _onboardingInFlight = false;
+    }
+  }
+
+  Future<void> _connectRepository() async {
+    if (_onboardingInFlight) return;
+    final context = _navigatorKey.currentContext;
+    final workspace = _github.workspace;
+    if (context == null || workspace == null) return;
+    _onboardingInFlight = true;
+    try {
+      final identity = await EnvironmentIdentity.ensure(workspace);
+      if (!context.mounted) return;
+      await showProjectOnboarding(
+        context,
+        environment: identity,
+        environments: _environments,
+        github: _github,
+        onEnvironmentSelected: _selectEnvironment,
+        onOpenSettings: _openSettingsPage,
+      );
+      _bus?.send('tracker/control', 'refresh', const {});
+    } finally {
+      _onboardingInFlight = false;
+    }
+  }
+
+  void _githubChanged() {
+    final state = _github.state;
+    final key =
+        '${_github.environmentId}:${state.saved}:${state.validated}:'
+        '${state.code}:${state.account}:${state.creationCapability}';
+    if (_githubStateKey == key) return;
+    _githubStateKey = key;
+    _bus?.send('tracker/control', 'refresh', const {});
+  }
+
+  Future<void> _openProjectPicker() async {
+    if (_startupInFlight) return;
+    _startupGeneration++;
+    await _cleanup();
+    _workspace = null;
+    _startupError = null;
+    if (mounted) setState(() {});
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      title: 'pif',
-      theme: ThemeData.dark(useMaterial3: true).copyWith(
-        scaffoldBackgroundColor: const Color(0xff0e1117),
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff78dba9),
-          brightness: Brightness.dark,
-        ),
-        dividerColor: const Color(0xff2c3547),
+    final appearance = _appearance;
+    // Exported products retain their own pinned theme path. A preference in
+    // the authoring app must not silently restyle a generated product.
+    if (appearance == null) return _application(ThemeMode.dark);
+    return PifAppearanceScope(
+      service: appearance,
+      child: ListenableBuilder(
+        listenable: appearance,
+        builder: (context, child) => _application(appearance.mode),
       ),
-      home: _bus != null
-          ? DockingShell(bus: _bus!, workspace: _workspace)
-          : widget.exportMode
-              ? _exportStartupSurface()
-              : ProjectPicker(onLaunch: _launchProject),
+    );
+  }
+
+  Widget _application(ThemeMode mode) {
+    return GithubConnectionScope(
+      service: _github,
+      onConnectRepository: widget.exportMode ? null : _connectRepository,
+      child: MaterialApp(
+        navigatorKey: _navigatorKey,
+        debugShowCheckedModeBanner: false,
+        title: 'pif',
+        theme: const PifTheme(brightness: Brightness.light).materialTheme,
+        darkTheme: const PifTheme().materialTheme,
+        themeMode: mode,
+        home: _bus != null
+            ? DockingShell(
+                bus: _bus!,
+                workspace: _workspace,
+                onOpenProject: widget.exportMode ? null : _openProjectPicker,
+              )
+            : widget.exportMode
+            ? _exportStartupSurface()
+            : ProjectPicker(
+                onLaunch: _launchProject,
+                onCreateProject: _newProject,
+                onOpenSettings: _openSettingsPage,
+                environments: _environments,
+                onEnvironmentSelected: _selectEnvironment,
+              ),
+      ),
     );
   }
 
@@ -359,7 +531,9 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
                 const Icon(Icons.launch, size: 48, color: Color(0xff78dba9)),
                 const SizedBox(height: 18),
                 Text(
-                  error == null ? 'Launching exported app…' : 'Exported app needs attention',
+                  error == null
+                      ? 'Launching exported app…'
+                      : 'Exported app needs attention',
                   style: Theme.of(context).textTheme.titleLarge,
                   textAlign: TextAlign.center,
                 ),
@@ -367,7 +541,8 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
                 Text(
                   launching
                       ? 'Starting the bundled workspace and waiting for the hub.'
-                      : error ?? 'Starting the bundled workspace and waiting for the hub.',
+                      : error ??
+                            'Starting the bundled workspace and waiting for the hub.',
                   textAlign: TextAlign.center,
                 ),
                 if (launching) ...[

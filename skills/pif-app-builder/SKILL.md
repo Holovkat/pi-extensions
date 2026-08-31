@@ -72,6 +72,27 @@ never improvise layout inside the build loop.
    are the run's evidence. Note anything the flow made awkward; that is
    next-sprint input, not a manual-edit invitation.
 
+## Authoring and export environment
+
+Use a prepared writable development environment from installed pif's New
+Project/Open Development Environment flow. Its `pif/` source and versioned
+`.pif/builder/` kit are the build inputs. Check readiness before scaffolding;
+missing Flutter/Dart, Xcode, CocoaPods or Git requires explicit setup by the
+owner. Do not edit the signed application or substitute a developer checkout
+when installed resources are missing or damaged.
+
+GitHub is optional for local authoring. For a connected tracker, the owner
+sets an environment-scoped token in central Settings and explicitly creates
+or connects a repository. Never read or copy another environment's token,
+use ambient gh authentication, or create a remote as a side effect of a build.
+
+After the page walkthrough, `pif_app_build` acknowledges a build ID; wait for
+its matching `app/build` result and verify the returned artifact path. A
+failed or incomplete export is not success. Exported apps are runtime AOT
+products; make widget changes in the development environment and rebuild.
+A child development environment is created through New Project, not by
+copying the parent's mutable workspace or exported runtime bundle.
+
 ## Child sessions
 
 For pieces worth parallel attention, dispatch a child session with a

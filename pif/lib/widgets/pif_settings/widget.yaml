@@ -1,0 +1,8 @@
+id: pif_settings
+name: "Settings"
+version: 0.1.0
+description: "Application appearance and environment GitHub connection"
+slot: center
+core: true
+tags: [core, settings]
+dart_dependencies: []

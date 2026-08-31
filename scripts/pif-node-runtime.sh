@@ -76,7 +76,13 @@ _pif_node_candidates() {
 
 pif_select_node_runtime() {
   local candidate version
-  if [ -n "${PIF_NODE_BIN:-}" ]; then
+  if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+    candidate="$PIF_BUILDER_ROOT/runtime/node"
+    if ! version="$(pif_validate_node_runtime "$candidate")"; then
+      echo "ERROR: The installed builder Node runtime is unsuitable; repair this builder kit." >&2
+      return 1
+    fi
+  elif [ -n "${PIF_NODE_BIN:-}" ]; then
     candidate="$PIF_NODE_BIN"
     if ! version="$(pif_validate_node_runtime "$candidate")"; then
       echo "ERROR: PIF_NODE_BIN is unsuitable; choose a standalone Node >=22.19.0 macOS binary for this architecture." >&2
@@ -99,6 +105,82 @@ pif_select_node_runtime() {
   # Anchor relative overrides/PATH entries before either builder changes cwd.
   PIF_BUNDLE_NODE="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
   PIF_BUNDLE_NODE_VERSION="$version"
+}
+
+# Both builders use this explicit root contract. A kit never falls back to
+# workstation Pi/Node; source checkout builds retain their documented lookup.
+pif_select_build_resources() {
+  local script_dir="$1" pi_command pi_real npm_global candidate
+  PIF_SOURCE_ROOT="$(dirname "$script_dir")"
+  if [ -z "${PIF_BUILDER_ROOT:-}" ] && [ -f "$PIF_SOURCE_ROOT/manifest.json" ]; then
+    PIF_BUILDER_ROOT="$PIF_SOURCE_ROOT"
+  fi
+  if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+    PIF_BUILDER_ROOT="$(cd "$PIF_BUILDER_ROOT" && pwd -P)"
+    PIF_SOURCE_ROOT="$PIF_BUILDER_ROOT"
+  fi
+  pif_select_node_runtime || return 1
+  PIF_BUILDER_HELPER="$script_dir/pif-builder-kit.mjs"
+  if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+    "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" validate "$PIF_BUILDER_ROOT" "${PIF_BUILDER_VERSION:-}" > /dev/null || return 1
+    PI_PKG_DIR="$PIF_BUILDER_ROOT/runtime/pi"
+  else
+    PI_PKG_DIR="${PI_PKG_DIR:-}"
+    if [ -z "$PI_PKG_DIR" ]; then
+      pi_command="$(command -v pi 2>/dev/null || true)"
+      if [ -n "$pi_command" ]; then
+        pi_real="$(readlink -f "$pi_command" 2>/dev/null || printf '%s' "$pi_command")"
+        PI_PKG_DIR="$(dirname "$(dirname "$pi_real")")"
+      fi
+      if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then
+        npm_global="$(npm root -g 2>/dev/null || true)"
+        for candidate in "$npm_global/@mariozechner/pi-coding-agent" "$npm_global/pi-coding-agent"; do
+          if [ -n "$npm_global" ] && [ -f "$candidate/dist/cli.js" ]; then PI_PKG_DIR="$candidate"; break; fi
+        done
+      fi
+    fi
+    if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then
+      echo "ERROR: Pi CLI build input is missing. Set PI_PKG_DIR to the package containing dist/cli.js, or use an installed builder kit." >&2
+      return 1
+    fi
+    PI_PKG_DIR="$(cd "$PI_PKG_DIR" && pwd -P)"
+  fi
+  PIF_APP_TEMPLATE_DIR="${PIF_APP_TEMPLATE_DIR:-$PIF_SOURCE_ROOT/pif}"
+  PIF_APP_TEMPLATE_DIR="$(cd "$PIF_APP_TEMPLATE_DIR" && pwd -P)"
+  for candidate in pubspec.yaml lib/main.dart lib/export_main.dart macos/Runner.xcodeproj/project.pbxproj; do
+    if [ ! -f "$PIF_APP_TEMPLATE_DIR/$candidate" ]; then
+      echo "ERROR: Complete Flutter/macOS app template required; missing $candidate." >&2
+      return 1
+    fi
+  done
+  export PIF_BUILDER_ROOT PIF_SOURCE_ROOT PIF_APP_TEMPLATE_DIR
+}
+
+# Start the copied dependency tree before publishing either app. A valid Node
+# binary alone cannot detect missing package build/dist modules.
+pif_validate_pi_runtime() {
+  /usr/bin/env -i PATH=/usr/bin:/bin "$1" --input-type=module - "$1" "$2" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+const [node, piRoot] = process.argv.slice(2);
+const profile = fs.mkdtempSync('/tmp/pif-pi-smoke.');
+try {
+  const expected = JSON.parse(fs.readFileSync(path.join(piRoot, 'package.json'), 'utf8')).version;
+  const result = spawnSync(node, [path.join(piRoot, 'dist/cli.js'), '--version'], {
+    encoding: 'utf8', timeout: 15_000,
+    env: { PATH: '/usr/bin:/bin', PI_CODING_AGENT_DIR: profile },
+  });
+  if (result.error || result.status !== 0 || !expected || result.stdout.trim() !== expected) {
+    throw new Error(result.error?.message || result.stderr.trim() || `Expected Pi ${expected}; received ${result.stdout.trim() || `exit ${result.status}`}`);
+  }
+  process.stdout.write(`${result.stdout.trim()}\n`);
+} catch (error) {
+  console.error(`ERROR: Copied Pi runtime failed its clean --version smoke check: ${error.message}`);
+  process.exitCode = 1;
+} finally { fs.rmSync(profile, { recursive: true, force: true }); }
+NODE
 }
 
 pif_bundle_node_runtime() {

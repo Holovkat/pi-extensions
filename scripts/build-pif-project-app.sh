@@ -24,8 +24,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
-PROJECT_DIR="$(cd "$1" && pwd)"
+if [ "$#" -lt 1 ]; then echo "Usage: $0 <project-dir> [app-name] [output-dir]" >&2; exit 1; fi
+PROJECT_DIR="$(cd "$1" && pwd -P)"
 APP_NAME="${2:-}"
 OUTPUT_DIR="${3:-$PROJECT_DIR/build}"
 GLOBAL_CATALOG_DIR="${PIF_GLOBAL_CATALOG:-$HOME/.pi/pif/catalog}"
@@ -37,13 +37,15 @@ if [ ! -f "$MANIFEST" ]; then
 fi
 
 source "$SCRIPT_DIR/pif-node-runtime.sh"
-pif_select_node_runtime
+pif_select_build_resources "$SCRIPT_DIR"
+REPO_ROOT="$PIF_SOURCE_ROOT"
+export PIF_APP_TEMPLATE_DIR
 
 echo "=== Exporting pif project app ==="
 
 # Resolve id/name/version from the manifest with the hub's own parser.
 MANIFEST_JSON="$(
-REPO_ROOT="$REPO_ROOT" MANIFEST="$MANIFEST" node --experimental-strip-types <<'NODE'
+REPO_ROOT="$REPO_ROOT" MANIFEST="$MANIFEST" "$PIF_BUNDLE_NODE" --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -65,8 +67,8 @@ process.stdout.write(JSON.stringify(parsed.manifest));
 NODE
 )"
 if [ -z "$MANIFEST_JSON" ]; then echo "ERROR: manifest parse failed."; exit 1; fi
-APP_ID="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")"
-MANIFEST_NAME="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).name))")"
+APP_ID="$(printf '%s' "$MANIFEST_JSON" | "$PIF_BUNDLE_NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")"
+MANIFEST_NAME="$(printf '%s' "$MANIFEST_JSON" | "$PIF_BUNDLE_NODE" -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).name))")"
 APP_NAME="${APP_NAME:-$MANIFEST_NAME}"
 
 # Resolve the widget dependencies before any stage copy. The shared helper
@@ -74,7 +76,7 @@ APP_NAME="${APP_NAME:-$MANIFEST_NAME}"
 # returns the selected source for each dependency so the export can materialize
 # the pinned set deterministically.
 RESOLVED_WIDGETS_JSON="$(
-REPO_ROOT="$REPO_ROOT" MANIFEST_JSON="$MANIFEST_JSON" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" GLOBAL_CATALOG_DIR="$GLOBAL_CATALOG_DIR" node --experimental-strip-types <<'NODE'
+REPO_ROOT="$REPO_ROOT" MANIFEST_JSON="$MANIFEST_JSON" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" GLOBAL_CATALOG_DIR="$GLOBAL_CATALOG_DIR" "$PIF_BUNDLE_NODE" --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -93,7 +95,7 @@ const manifest = JSON.parse(manifestJson);
 const resolution = shared.resolveRequiredWidgetSet(manifest.dependencies ?? [], {
   project: [projectWidgetsDir],
   catalog: [globalCatalogDir],
-  base: [path.join(repoRoot, "pif", "lib", "widgets"), path.join(repoRoot, "pif", "catalog")],
+  base: [path.join(process.env.PIF_APP_TEMPLATE_DIR, "lib", "widgets"), path.join(process.env.PIF_APP_TEMPLATE_DIR, "catalog")],
 });
 if (!resolution.ok) {
   console.error("ERROR: required widget resolution failed before staging:");
@@ -105,147 +107,21 @@ NODE
 )"
 
 scan_export_bundle_for_secrets() {
-  local bundle_root="$1"
-  ROOT="$bundle_root" node --input-type=module <<'NODE'
-import fs from 'node:fs';
-import path from 'node:path';
-
-const root = process.env.ROOT;
-if (!root) {
-  console.error('ERROR: secret scan root missing.');
-  process.exit(1);
+  "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" scan "$1"
 }
 
-const fileNameRules = [
-  { label: 'models.json', test: (name) => name === 'models.json' },
-  { label: 'settings.json', test: (name) => name === 'settings.json' },
-  { label: '.env', test: (name) => name === '.env' },
-];
+if [[ "$APP_NAME" == */* || "$APP_NAME" == *$'\n'* || "$APP_NAME" == *$'\r'* || "$APP_NAME" == . || "$APP_NAME" == .. ]]; then
+  echo "ERROR: App display name cannot contain a path or newline." >&2
+  exit 1
+fi
+OUTPUT_DIR="$("$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" writable "$OUTPUT_DIR" "${PIF_BUILDER_ROOT:-}")"
 
-const textRules = [
-  { label: 'generic-sk-token', regex: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
-  { label: 'github-token', regex: /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{36,})\b/ },
-  { label: 'aws-access-key', regex: /\b(?:AKIA|ASIA|AIDA|AROA|ANPA|ANVA|AGPA|ACCA|ABIA|A3T)[A-Z0-9]{16}\b/ },
-  { label: 'google-api-key', regex: /\bAIza[0-9A-Za-z_-]{35}\b/ },
-  { label: 'google-oauth-token', regex: /\bya29\.[0-9A-Za-z_-]+\b/ },
-];
-
-const hits = [];
-const seen = new Set();
-const visitedDirs = new Set();
-const visitedFiles = new Set();
-const rootReal = fs.realpathSync(root);
-const rootPrefix = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
-
-function ensureUnderRoot(targetPath, sourcePath) {
-  let resolvedTarget;
-  try {
-    resolvedTarget = fs.realpathSync(targetPath);
-  } catch (error) {
-    console.error(`ERROR: secret scan could not resolve symlink target ${sourcePath}: ${error.message}`);
-    process.exit(1);
-  }
-  if (resolvedTarget !== rootReal && !resolvedTarget.startsWith(rootPrefix)) {
-    console.error(`ERROR: secret scan refuses symlink target outside the export bundle: ${sourcePath} -> ${resolvedTarget}`);
-    process.exit(1);
-  }
-  return resolvedTarget;
-}
-
-function record(label, file) {
-  const key = `${label}\u0000${file}`;
-  if (seen.has(key)) return;
-  seen.add(key);
-  hits.push({ label, file });
-}
-
-function scanFile(file, logicalPath = file) {
-  const base = path.basename(logicalPath);
-  for (const rule of fileNameRules) {
-    if (rule.test(base)) record(rule.label, logicalPath);
-  }
-
-  const canonical = ensureUnderRoot(file, logicalPath);
-  if (visitedFiles.has(canonical)) return;
-  visitedFiles.add(canonical);
-
-  let buffer;
-  try {
-    buffer = fs.readFileSync(canonical);
-  } catch (error) {
-    console.error(`ERROR: secret scan could not read ${canonical}: ${error.message}`);
-    process.exit(1);
-  }
-
-  if (buffer.includes(0)) return;
-
-  const text = buffer.toString('utf8');
-  for (const rule of textRules) {
-    if (rule.regex.test(text)) record(rule.label, canonical);
-  }
-}
-
-function walk(dir) {
-  const canonical = ensureUnderRoot(dir, dir);
-  if (visitedDirs.has(canonical)) return;
-  visitedDirs.add(canonical);
-
-  let entries;
-  try {
-    entries = fs.readdirSync(canonical, { withFileTypes: true });
-  } catch (error) {
-    console.error(`ERROR: secret scan could not read ${canonical}: ${error.message}`);
-    process.exit(1);
-  }
-
-  for (const entry of entries) {
-    const file = path.join(canonical, entry.name);
-    if (entry.isSymbolicLink()) {
-      const target = ensureUnderRoot(file, file);
-      const stat = fs.statSync(target);
-      if (stat.isDirectory()) {
-        walk(target);
-      } else if (stat.isFile()) {
-        scanFile(target, file);
-      }
-    } else if (entry.isDirectory()) {
-      walk(file);
-    } else if (entry.isFile()) {
-      scanFile(file);
-    }
-  }
-}
-
-walk(root);
-hits.sort((left, right) => left.file.localeCompare(right.file) || left.label.localeCompare(right.label));
-
-if (hits.length) {
-  console.error('ERROR: credential-shaped material found in the export bundle:');
-  for (const { label, file } of hits) {
-    console.error(`  - ${label}: ${file}`);
-  }
-  console.error('Coverage: exact file names (models.json, settings.json, .env) plus GitHub/AWS/Google/token-shaped text scans.');
-  console.error('False positives: redacted fixtures or docs that intentionally contain these shapes may trip the scan.');
-  console.error('Unsupported: encrypted blobs, compressed archives, and binary-only secret payloads are not inspected.');
-  process.exit(1);
-}
-
-console.log('    clean.');
-NODE
-}
-
-STAGE="$OUTPUT_DIR/$APP_ID-stage"
-rm -rf "$STAGE"
 mkdir -p "$OUTPUT_DIR"
+STAGE="$(mktemp -d "$OUTPUT_DIR/.pif-export-$APP_ID.XXXXXX")/pif"
 
 # 1. Stage the app source (fresh copy; excludes build state)
 echo "1. Staging app source at $STAGE ..."
-rsync -a \
-  --exclude='.dart_tool' \
-  --exclude='build' \
-  --exclude='.flutter-plugins' \
-  --exclude='.flutter-plugins-dependencies' \
-  "$REPO_ROOT/pif/" "$STAGE/"
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-source "$PIF_APP_TEMPLATE_DIR" "$STAGE" > /dev/null
 
 # 2. Pin the project's widget set into the staged app source
 echo "2. Pinning project widgets into lib/widgets/ ..."
@@ -254,7 +130,7 @@ cp -R "$PROJECT_DIR/pif_app/widgets/" "$STAGE/lib/widgets/"
 # 2b. Materialize the resolved required widgets and persist the pinned set
 #     inside the staged app source before registry generation.
 echo "2b. Materializing resolved required widgets ..."
-RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" STAGE="$STAGE" node --experimental-strip-types <<'NODE'
+RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" STAGE="$STAGE" "$PIF_BUNDLE_NODE" --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 
@@ -276,13 +152,13 @@ for (const widget of resolution.resolved ?? []) {
 }
 const pinnedDir = path.join(stage, "pif_app-manifest");
 fs.mkdirSync(pinnedDir, { recursive: true });
-fs.writeFileSync(path.join(pinnedDir, "required-widgets.json"), JSON.stringify(resolution, null, 2) + "\n");
+fs.writeFileSync(path.join(pinnedDir, "required-widgets.json"), JSON.stringify({ ...resolution, resolved: (resolution.resolved ?? []).map(({ directory, ...widget }) => widget) }, null, 2) + "\n");
 console.log(`   pinned ${resolution.resolved?.length ?? 0} required widgets`);
 NODE
 
 # 3. Prune unrelated base widgets and generate the pinned widget registry
 echo "3. Generating the pinned widget registry ..."
-STAGE_WIDGET_ROOT="$STAGE/lib/widgets" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
+STAGE_WIDGET_ROOT="$STAGE/lib/widgets" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" REPO_ROOT="$REPO_ROOT" "$PIF_BUNDLE_NODE" --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -310,9 +186,9 @@ const projectIds = new Set(
 );
 const requiredIds = new Set((resolution.resolved ?? []).map((entry) => entry.id));
 const baseCoreIds = new Set();
-for (const entry of fs.readdirSync(path.join(repoRoot, "pif", "lib", "widgets"), { withFileTypes: true })) {
+for (const entry of fs.readdirSync(path.join(process.env.PIF_APP_TEMPLATE_DIR, "lib", "widgets"), { withFileTypes: true })) {
   if (!entry.isDirectory()) continue;
-  const manifestPath = path.join(repoRoot, "pif", "lib", "widgets", entry.name, "widget.yaml");
+  const manifestPath = path.join(process.env.PIF_APP_TEMPLATE_DIR, "lib", "widgets", entry.name, "widget.yaml");
   if (!fs.existsSync(manifestPath)) continue;
   try {
     const raw = fs.readFileSync(manifestPath, "utf8");
@@ -356,7 +232,7 @@ NODE
 
 # 3b. Resolve Dart packages from the selected staged widget manifests.
 echo "3b. Resolving widget Dart dependencies ..."
-STAGE_WIDGET_ROOT="$STAGE/lib/widgets" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
+STAGE_WIDGET_ROOT="$STAGE/lib/widgets" REPO_ROOT="$REPO_ROOT" "$PIF_BUNDLE_NODE" --experimental-strip-types <<'NODE'
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -397,63 +273,47 @@ NODE
 if [ ! -f "$STAGE/lib/export_main.dart" ]; then echo "ERROR: export entrypoint missing at $STAGE/lib/export_main.dart."; exit 1; fi
 echo "4. flutter pub get + build macos --release -t lib/export_main.dart (staged) ..."
 cd "$STAGE"
-flutter pub get
-flutter build macos --release -t lib/export_main.dart
+"${PIF_FLUTTER_BIN:-flutter}" pub get
+"${PIF_FLUTTER_BIN:-flutter}" build macos --release -t lib/export_main.dart
 
 APP_BUNDLE="$STAGE/build/macos/Build/Products/Release/pif.app"
 if [ ! -d "$APP_BUNDLE" ]; then echo "ERROR: staged build output missing."; exit 1; fi
 
-# 5. Assemble the exported bundle
-APP="$OUTPUT_DIR/$APP_NAME.app"
-rm -rf "$APP"
+# 5. Assemble beside the final output. Failed packaging never removes the
+# previous valid export, including its immutable builder kit.
+FINAL_APP="$OUTPUT_DIR/$APP_NAME.app"
+ASSEMBLY_DIR="$(mktemp -d "$OUTPUT_DIR/.pif-assembly.XXXXXX")"
+trap 'if [ -d "$ASSEMBLY_DIR" ]; then "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" discard-assembly "$ASSEMBLY_DIR" "${PIF_BUILDER_ROOT:-}" > /dev/null || true; fi' EXIT
+APP="$ASSEMBLY_DIR/$APP_NAME.app"
 cp -R "$APP_BUNDLE" "$APP"
 RESOURCES="$APP/Contents/Resources"
-mkdir -p "$RESOURCES/pi/cli" "$RESOURCES/pi/extensions" "$RESOURCES/app" "$RESOURCES/pif_app-manifest"
+mkdir -p "$RESOURCES/pi/cli" "$RESOURCES/pi/extensions" "$RESOURCES/pif_app-manifest"
 echo "5. Assembled $APP"
 
 # 6. Bundle Node.js
 echo "6. Bundling Node.js $PIF_BUNDLE_NODE_VERSION from $PIF_BUNDLE_NODE ..."
 pif_bundle_node_runtime "$RESOURCES/pi/node"
 
-# 7. Bundle pi CLI (same resolution as the stock build)
-if ! PI_SYMLINK="$(command -v pi)"; then echo "ERROR: pi not found on PATH."; exit 1; fi
-PI_PKG_DIR="${PI_PKG_DIR:-}"
-if [ -z "$PI_PKG_DIR" ]; then
-  PI_REAL="$(readlink -f "$PI_SYMLINK" 2>/dev/null || echo "$PI_SYMLINK")"
-  PI_PKG_DIR="$(dirname "$(dirname "$PI_REAL")")"
-  if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then
-    NPM_GLOBAL="$(npm root -g 2>/dev/null || true)"
-    for CANDIDATE in "$NPM_GLOBAL/@mariozechner/pi-coding-agent" "$NPM_GLOBAL/pi-coding-agent"; do
-      if [ -n "$NPM_GLOBAL" ] && [ -f "$CANDIDATE/dist/cli.js" ]; then PI_PKG_DIR="$CANDIDATE"; break; fi
-    done
-  fi
-fi
-if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then echo "ERROR: could not locate the pi package directory."; exit 1; fi
+# 7. Bundle the selected portable Pi resources (kit input or explicit source input).
 echo "7. Bundling pi CLI from $PI_PKG_DIR ..."
-# Keep runtime JS/assets, but skip TypeScript declaration files: historical
-# packages carry example-shaped text in non-runtime *.d.ts files that should
-# not enter the exported bundle.
-rsync -a \
-  --exclude='*.d.ts' \
-  "$PI_PKG_DIR/" \
-  "$RESOURCES/pi/cli/"
+rsync -a --exclude='*.d.ts' "$PI_PKG_DIR/" "$RESOURCES/pi/cli/"
 
 # 8. Bundle pif extensions (hub runtime)
 echo "8. Bundling pif extensions ..."
-cp "$REPO_ROOT/extensions/pif.ts" "$RESOURCES/pi/extensions/pif.ts"
-cp "$REPO_ROOT/extensions/pif-shared.ts" "$RESOURCES/pi/extensions/pif-shared.ts"
+for EXTENSION in "$REPO_ROOT"/extensions/pif*.ts; do
+  case "$EXTENSION" in *.test.ts) continue ;; esac
+  cp "$EXTENSION" "$RESOURCES/pi/extensions/"
+done
 
 # 9. Bundle the staged app source — includes the project widgets and the
 #    pinned registry (the hub scans this tree for base widgets).
 echo "9. Bundling app source ..."
-rsync -a \
-  --exclude='.dart_tool' \
-  --exclude='build' \
-  --exclude='.flutter-plugins' \
-  --exclude='.flutter-plugins-dependencies' \
-  --exclude='macos' \
-  --exclude='test' \
-  "$STAGE/" "$RESOURCES/app/"
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-runtime-source "$STAGE" "$RESOURCES/app" > /dev/null
+
+# 9b. Retain the complete builder for future editable environments. Only the
+# known source inputs are copied; no stage outputs, profiles or parent bundles.
+echo "9b. Bundling the versioned builder kit ..."
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" create "$REPO_ROOT" "$RESOURCES/builder" "$PIF_BUNDLE_NODE" "$PI_PKG_DIR" "$PIF_APP_TEMPLATE_DIR" > /dev/null
 
 # 10. Ship the app manifest for first-run workspace bootstrap
 echo "10. Bundling the app manifest ..."
@@ -571,9 +431,17 @@ if codesign -d --entitlements :- "$APP" > /dev/null 2>&1 && \
 else
   codesign --force --deep --sign - "$APP"
 fi
+PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" seal "$RESOURCES/builder" > /dev/null
+if [ -s "$ENTITLEMENTS" ]; then
+  codesign --force --sign - --entitlements "$ENTITLEMENTS" "$APP"
+else
+  codesign --force --sign - "$APP"
+fi
 rm -f "$ENTITLEMENTS"
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" validate "$RESOURCES/builder" > /dev/null
 if ! codesign --verify --deep --strict "$APP"; then echo "ERROR: codesign verification failed for $APP"; exit 1; fi
 pif_validate_node_runtime "$RESOURCES/pi/node" > /dev/null
+pif_validate_pi_runtime "$RESOURCES/builder/runtime/node" "$RESOURCES/builder/runtime/pi" > /dev/null
 
 # 13. Secrets scan: fail closed on bundled credential-shaped material.
 #    Coverage: exact file names (models.json, settings.json, .env) plus
@@ -584,6 +452,12 @@ pif_validate_node_runtime "$RESOURCES/pi/node" > /dev/null
 #    secret payloads are not inspected.
 echo "13. Secrets scan ..."
 scan_export_bundle_for_secrets "$RESOURCES"
+
+# Publish only the fully validated artifact. The helper safely removes
+# read-only directories in the old owned output without following symlinks.
+"$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" publish-app "$APP" "$FINAL_APP" "${PIF_BUILDER_ROOT:-}"
+APP="$FINAL_APP"
+RESOURCES="$APP/Contents/Resources"
 
 # 14. Summary
 echo ""

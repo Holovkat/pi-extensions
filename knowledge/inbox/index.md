@@ -4,6 +4,12 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Installed builder, environment GitHub and Settings integration](./2026-08-31T10-09-00Z-pif-installed-builder-integration.md) | 2026-08-31T10:09:00Z | pif, implementation, verification | #160 |
+| [Environment-bound asynchronous GitHub tracker (#222)](./2026-08-31T09-45-43Z-pif-environment-bound-async-tracker.md) | 2026-08-31T09:45:43Z | pif, implementation, verification | #160 |
+| [Environment-bound GitHub token broker prepared for integration](./2026-08-31T09-40-55Z-pif-environment-github-token-t1.md) | 2026-08-31T09:40:55Z | pif, implementation, verification | #160 |
+| [Central pif Settings and shared application appearance T1](./2026-08-31T09-40-16Z-pif-central-settings-appearance-t1.md) | 2026-08-31T09:40:16Z | pif, implementation, verification | #160 |
+| [Installed pif builder kit implementation for integration](./2026-08-31T09-39-37Z-pif-installed-builder-kit.md) | 2026-08-31T09:39:37Z | pif, implementation, verification | #160 |
+| [Reopenable installed pif development environments (#219)](./2026-08-31-pif-development-environments-219.md) | 2026-08-31T10:00:00Z | pif, implementation, verification | #160 |
 | [Token-only GitHub and central Settings scope](./2026-08-31T09-18-03Z-pif-token-only-central-settings.md) | 2026-08-31T09:18:03Z | pif, settings, github, appearance | #152, #160, #221, #223 |
 | [Installed builder and GitHub project setup required](./2026-08-31T09-06-31Z-pif-installed-builder-github-requirement.md) | 2026-08-31T09:06:31Z | pif, planning, environments, github | #152, #160, #204, #218–#222 |
 | [Final full gate and native recovery workflow proof](./2026-08-31T07-13-51Z-pif-end-to-end-final-candidate.md) | 2026-08-31T07:13:51Z | pif, verification, computer-use | #160, #201, #204, #205, #206, #212, #215 |

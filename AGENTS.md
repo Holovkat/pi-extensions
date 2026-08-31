@@ -91,12 +91,22 @@ pif can be built into a self-contained `.app` that bundles Node.js + pi CLI + pi
 ./scripts/build-pif-app.sh
 ```
 
-Produces `build/pif.app` (~290MB). Install with:
+Produces `build/pif.app` (~526MB including the immutable builder kit). Install with:
 
 ```bash
-cp -R build/pif.app /Applications/pif.app
+PIF_INSTALL_BACKUP="$(mktemp -d /tmp/pif-previous.XXXXXX)"
+if [ -d /Applications/pif.app ]; then
+  mv /Applications/pif.app "$PIF_INSTALL_BACKUP/pif.app"
+fi
+ditto build/pif.app /Applications/pif.app
+codesign --verify --deep --strict /Applications/pif.app
 open /Applications/pif.app
 ```
+
+Stop the installed app before replacement. Keep the previous bundle until
+the new installation verifies; do not merge into or recursively delete its
+read-only builder kit. Restore the named backup if installation fails.
+Runtime use bundles Node/Pi; authoring still needs the documented build tools.
 
 ### Build via the pif-builder droid
 
@@ -114,7 +124,11 @@ reporting it as ready:
 (cd pif && flutter test)
 node --test extensions/pif.integration.test.mjs
 ./scripts/build-pif-app.sh
-pkill -TERM -f '/Applications/pif.app/Contents/MacOS/pif' || true
+pkill -TERM -f '^/Applications/pif.app/Contents/MacOS/pif$' || true
+PIF_INSTALL_BACKUP="$(mktemp -d /tmp/pif-previous.XXXXXX)"
+if [ -d /Applications/pif.app ]; then
+  mv /Applications/pif.app "$PIF_INSTALL_BACKUP/pif.app"
+fi
 ditto build/pif.app /Applications/pif.app
 open /Applications/pif.app
 sleep 2

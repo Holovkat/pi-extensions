@@ -7,7 +7,7 @@
 #
 # Installs:
 #   ~/.pi/pif/app/        Flutter shell (shared across projects)
-#   ~/.pi/agent/extensions/pif.ts + pif-shared.ts  Hub extension
+#   ~/.pi/agent/extensions/pif*.ts  Hub extension and required modules
 #
 # After install, run `pi` in any project directory and type /pif to launch the shell.
 
@@ -43,6 +43,7 @@ echo "Installing pif hub extension to $GLOBAL_EXT ..."
 mkdir -p "$GLOBAL_EXT"
 cp "$REPO_ROOT/extensions/pif.ts" "$GLOBAL_EXT/pif.ts"
 cp "$REPO_ROOT/extensions/pif-shared.ts" "$GLOBAL_EXT/pif-shared.ts"
+cp "$REPO_ROOT/extensions/pif-github.ts" "$GLOBAL_EXT/pif-github.ts"
 
 echo "Running flutter pub get in global app ..."
 cd "$GLOBAL_APP" && flutter pub get

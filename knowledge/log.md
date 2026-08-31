@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T10:18:00Z - Recorded installed builder and secure Settings integration
+
+Indexed six implementation/integration syntheses and updated current state for #204/#218–#223. Recorded 79 Node tests, 129 Flutter tests, clean analysis, repaired repeat builds and installed signed candidate PID48193. Preserved prior baseline evidence and the remaining Computer Use, live token/GitHub and sample-approval boundaries. Added the six-contract disposition matrix; no release acceptance is claimed.
+
 ## 2026-08-31T09:18:03Z - Narrowed GitHub auth and added central Settings foundation
 
 Updated #221 to environment-scoped secure tokens only and created #223 for Mercury-inspired Appearance/GitHub groups in one central tab. Removed browser-first/shared-account requirements and aligned #152/#153/#160/#204/#219/#222. No application implementation or runtime acceptance is claimed.

@@ -211,7 +211,7 @@ class _SessionRailState extends State<_SessionRail> {
             padding: const EdgeInsets.fromLTRB(14, 14, 8, 8),
             child: Row(
               children: [
-                const Flexible(
+                Flexible(
                   child: Text(
                     'SESSIONS',
                     maxLines: 1,
@@ -220,7 +220,7 @@ class _SessionRailState extends State<_SessionRail> {
                       fontSize: 11,
                       fontWeight: FontWeight.w300,
                       letterSpacing: 1.2,
-                      color: Color(0xff8b96aa),
+                      color: widget.host.theme.textMuted,
                     ),
                   ),
                 ),
@@ -247,7 +247,7 @@ class _SessionRailState extends State<_SessionRail> {
                       _cardMenu(details.globalPosition, session),
                   child: ListTile(
                     selected: selected,
-                    selectedTileColor: const Color(0xff222c36),
+                    selectedTileColor: widget.host.theme.panelRaised,
                     dense: true,
                     onTap: () {
                       setState(() => widget.host.activeSessionId = session.id);

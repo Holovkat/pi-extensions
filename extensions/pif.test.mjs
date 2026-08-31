@@ -9,6 +9,7 @@ const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, assertWritablePifPath, isInsideAppBundle, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
 import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange, parseAppManifest, renderAppManifest, addAppPage, setAppHome, slugifyAppId } from './pif-shared.ts';
 import { __test as __pif } from './pif.ts';
+import { sealBuilderKit, createBuilderKit, copyBuilderKit, validateBuilderKit, publishBuiltApp, discardBuilderAssembly } from '../scripts/pif-builder-kit.mjs';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
@@ -49,11 +50,23 @@ function makeBuildChild() {
   return child;
 }
 
-function patchBuildSpawn(plans) {
+function patchBuildSpawn(plans, {resolveResources = false} = {}) {
   const originalSpawn = childProcess.spawn;
-  const harness = { calls: [], children: [], plans: plans.map((plan) => ({...plan})) };
-  childProcess.spawn = (command, args) => {
-    harness.calls.push({command, args});
+  const harness = { calls: [], children: [], resolverCalls: [], plans: plans.map((plan) => ({...plan})) };
+  childProcess.spawn = (command, args, options) => {
+    if (args[1] === 'resolve' && path.basename(args[0]) === 'pif-builder-kit.mjs' && resolveResources) {
+      harness.resolverCalls.push({command, args, options});
+      if (resolveResources === 'real') return originalSpawn(command, args, options);
+      const child = makeBuildChild();
+      const requested = JSON.parse(args[2]);
+      const root = requested.builderRoot || requested.sourceRoot;
+      queueMicrotask(() => {
+        child.stdout.emit('data', JSON.stringify({root,script:path.join(root,'scripts/build-pif-project-app.sh'),appTemplateDir:requested.appTemplateDir || path.join(root,'pif'), ...(requested.builderRoot ? {manifest:{builderVersion:'fixture-version'}} : {})}));
+        child.emitClose(0);
+      });
+      return child;
+    }
+    harness.calls.push({command, args, options});
     const plan = harness.plans.shift();
     if (!plan) throw new Error(`Unexpected spawn: ${command}`);
     if (plan.kind === 'throw') throw new Error(plan.message);
@@ -148,7 +161,9 @@ test('widget path guard line-stops traversal outside managed roots', () => {
 });
 
 test('child environment scrubs hub lifecycle variables and credentials', () => {
-  const child = childEnvironment({PIF_AUTOSTART: '1', PIF_NO_FLUTTER: '1', PIF_PORT: '31415', PIF_TOKEN: 'secret-token', PIF_ALLOWED_ORIGINS: 'https://app.local', PIF_PI_BIN: '/fake/pi', PATH: '/usr/bin'});
+  const githubSecrets = {GH_TOKEN:'synthetic',GITHUB_TOKEN:'synthetic',GH_ENTERPRISE_TOKEN:'synthetic',GITHUB_ENTERPRISE_TOKEN:'synthetic',GH_CONFIG_DIR:'/fixture/profile',GH_HOST:'github.com',PIF_GH_BIN:'/untrusted/gh',PIF_GITHUB_BRIDGE_TOKEN:'synthetic'};
+  const child = childEnvironment({PIF_AUTOSTART: '1', PIF_NO_FLUTTER: '1', PIF_PORT: '31415', PIF_TOKEN: 'secret-token', PIF_ALLOWED_ORIGINS: 'https://app.local', PIF_PI_BIN: '/fake/pi', PATH: '/usr/bin', ...githubSecrets});
+  for (const key of Object.keys(githubSecrets)) assert.equal(child[key],undefined,`child must not inherit ${key}`);
   assert.equal(child.PIF_AUTOSTART, undefined);
   assert.equal(child.PIF_NO_FLUTTER, undefined);
   assert.equal(child.PIF_PORT, undefined);
@@ -258,207 +273,338 @@ test('planned tracker moves map columns to label and state mutations', () => {
   assert.deepEqual(plannedTrackerMove(card, config.columns[2]), {add: [], remove: ['status:todo'], state: 'closed'});
 });
 
-function stubRunner(responses) {
-  const calls = [];
-  const runner = (command, args) => {
-    calls.push({command, args});
-    for (const response of responses) if (response.match(command, args)) return {status: response.status ?? 0, stdout: response.stdout ?? '', stderr: response.stderr ?? ''};
-    return {status: 0, stdout: '', stderr: ''};
-  };
-  runner.calls = calls;
-  return runner;
-}
-
 const ghIssuesFixture = [
   {number: 10, title: 'Epic: widgets', state: 'OPEN', labels: [{name: 'epic'}, {name: 'planning'}], body: '# Epic body', updatedAt: '2026-08-23T01:00:00Z', url: 'https://github.com/acme/widgets/issues/10'},
   {number: 11, title: 'Task: build', state: 'open', labels: [{name: 'task'}, {name: 'status:todo'}], body: 'Task body', updatedAt: '2026-08-23T02:00:00Z', url: 'https://github.com/acme/widgets/issues/11'},
   {number: 12, title: 'Done thing', state: 'closed', labels: [], body: '', updatedAt: '2026-08-22T00:00:00Z', url: 'https://github.com/acme/widgets/issues/12'},
 ];
 
-function onlineRunner() {
-  return stubRunner([
-    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
-    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
-  ]);
+// A stateful remote fixture: successful writes only become visible through
+// the same subsequent reads required of GitHub. Unexpected calls fail closed.
+function trackerRunner(options = {}) {
+  const state = {
+    repo: options.repo ?? 'acme/widgets', origin: options.origin ?? 'https://github.com/acme/widgets.git',
+    issues: new Map(structuredClone(options.issues ?? ghIssuesFixture).map((issue) => [issue.number, issue])),
+    labels: new Set(['epic', 'planning', 'task', 'status:todo']), children: new Map([[10, [11]]]),
+    permissions: options.permissions ?? {push: true}, hook: options.hook, nextNumber: 20, calls: [],
+  };
+  const ok = (value = '') => ({status: 0, stdout: typeof value === 'string' ? value : JSON.stringify(value), stderr: ''});
+  const restIssue = (number) => {
+    const issue = state.issues.get(number);
+    assert.ok(issue, `fixture issue #${number}`);
+    return {...issue, id: number + 1000, repository_url: `https://api.github.com/repos/${state.repo}`, html_url: `https://github.com/${state.repo}/issues/${number}`};
+  };
+  const runner = async (command, args, runOptions) => {
+    const call = {command, args, options: runOptions}; state.calls.push(call);
+    const override = await state.hook?.(call, state, ok);
+    if (override !== undefined) return override;
+    if (command === 'git') {
+      if (args[0] === 'rev-parse') { assert.deepEqual(args, ['rev-parse', '--show-toplevel']); return ok(fs.realpathSync(runOptions.cwd)); }
+      assert.deepEqual(args, ['remote', 'get-url', 'origin']);
+      return state.origin ? ok(`${state.origin}\n`) : {status: 1, stdout: '', stderr: 'fatal: no such remote'};
+    }
+    assert.equal(command, 'gh');
+    if (args[0] === 'api') {
+      const endpoint = args.find((value) => value.startsWith('repos/'));
+      assert.ok(endpoint?.startsWith(`repos/${state.repo}`), `fixture API target: ${endpoint}`);
+      const resource = endpoint.slice(`repos/${state.repo}`.length);
+      if (!resource) return ok({full_name: state.repo, has_issues: true, permissions: state.permissions});
+      if (resource.startsWith('/labels/')) {
+        const label = decodeURIComponent(resource.slice('/labels/'.length));
+        return state.labels.has(label) ? ok({name: label}) : {status: 1, stdout: '', stderr: 'label not found', code: 'not_found'};
+      }
+      if (resource === '/labels' && args.includes('POST')) {
+        const payload = JSON.parse(runOptions.input); state.labels.add(payload.name); return ok({name: payload.name});
+      }
+      const children = /^\/issues\/(\d+)\/sub_issues(?:\?.*)?$/.exec(resource);
+      if (children) {
+        const parent = Number(children[1]);
+        if (args.includes('POST')) {
+          const payload = JSON.parse(runOptions.input);
+          const number = payload.sub_issue_id - 1000;
+          state.children.set(parent, [...new Set([...(state.children.get(parent) ?? []), number])]);
+          return ok(restIssue(number));
+        }
+        return ok((state.children.get(parent) ?? []).map(restIssue));
+      }
+      const issue = /^\/issues\/(\d+)$/.exec(resource);
+      if (issue) return ok(restIssue(Number(issue[1])));
+      throw Error(`Unexpected API call: ${args.join(' ')}`);
+    }
+    assert.equal(args[0], 'issue');
+    assert.equal(args[args.indexOf('-R') + 1], state.repo, 'every operation names its repository');
+    if (args[1] === 'list') return ok([...state.issues.values()]);
+    const number = Number(args[2]);
+    if (args[1] === 'view') return ok(state.issues.get(number));
+    if (args[1] === 'create') {
+      const newNumber = state.nextNumber++;
+      const labels = args.flatMap((arg, index) => arg === '--label' ? [args[index + 1]] : []);
+      state.issues.set(newNumber, {number: newNumber, title: args[args.indexOf('--title') + 1], body: args[args.indexOf('--body') + 1], labels: labels.map((name) => ({name})), state: 'open', updatedAt: '2026-08-24T00:00:00Z', url: `https://github.com/${state.repo}/issues/${newNumber}`});
+      return ok(`https://github.com/${state.repo}/issues/${newNumber}\n`);
+    }
+    if (args[1] === 'delete') { state.issues.delete(number); return ok(); }
+    const issue = state.issues.get(number); assert.ok(issue);
+    if (args[1] === 'edit') {
+      if (args.includes('--title')) issue.title = args[args.indexOf('--title') + 1];
+      if (args.includes('--body')) issue.body = args[args.indexOf('--body') + 1];
+      for (let index = 0; index < args.length; index++) {
+        if (args[index] === '--add-label') issue.labels.push({name: args[index + 1]});
+        if (args[index] === '--remove-label') issue.labels = issue.labels.filter((label) => label.name !== args[index + 1]);
+      }
+    } else if (['close', 'reopen'].includes(args[1])) issue.state = args[1] === 'close' ? 'closed' : 'open';
+    else throw Error(`Unexpected issue call: ${args.join(' ')}`);
+    issue.updatedAt = '2026-08-24T00:00:00Z';
+    return ok();
+  };
+  runner.state = state; runner.calls = state.calls;
+  return runner;
 }
 
-test('tracker sync refreshes via gh, caches offline, and reloads the cache', async () => {
+function trackerWorkspace(t, board = false) {
   const workspace = tempDir('pif-tracker-');
-  const boards = [];
-  const tracker = new TrackerSync(workspace, (state) => boards.push(state), onlineRunner(), true);
-  await tracker.init();
-  assert.equal(tracker.state.cards.length, 0);
-  const refreshed = tracker.refresh();
-  assert.equal(refreshed.ok, true);
+  t.after(() => fs.rmSync(workspace, {recursive: true, force: true}));
+  if (board) {
+    fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
+    fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\ncolumn doing:\n  name: Doing\n  label: status:doing\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
+  }
+  return workspace;
+}
+const trackerWrites = (runner) => runner.calls.filter(({command, args}) => command === 'gh' && (['create', 'edit', 'close', 'reopen', 'delete'].includes(args[1]) || args.includes('POST')));
+
+async function initializedTracker(workspace, runner, changed = () => {}) {
+  const tracker = new TrackerSync(workspace, changed, runner, true);
+  await tracker.init(); assert.equal((await tracker.refresh()).ok, true);
+  return tracker;
+}
+
+test('tracker sync verifies repository metadata, native parents, and repo-scoped offline cache', async (t) => {
+  const workspace = trackerWorkspace(t); const boards = [];
+  const tracker = new TrackerSync(workspace, (state) => boards.push(structuredClone(state)), trackerRunner(), true);
+  await tracker.init(); assert.equal(tracker.state.cards.length, 0);
+  assert.equal((await tracker.refresh()).ok, true);
   assert.equal(tracker.state.repo, 'acme/widgets');
   assert.deepEqual(tracker.state.columns.map((column) => column.id), ['backlog', 'in_progress', 'done']);
-  assert.equal(tracker.state.cards.length, 3);
-  assert.equal(tracker.state.stale, false);
-  assert.ok(fs.existsSync(path.join(workspace, '.pi', 'pif', 'cache', 'tracker-cache.json')));
-  const listed = tracker.list();
-  assert.ok(listed.cards.every((card) => !('body' in card)));
-  assert.equal(boards.length, 1);
-
-  const offline = new TrackerSync(workspace, () => {}, stubRunner([
-    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
-    {match: (command, args) => command === 'gh' && args[1] === 'list', status: 1, stderr: 'gh: authentication required'},
-  ]), true);
-  await offline.init();
-  assert.equal(offline.state.cards.length, 3);
-  assert.equal(offline.state.stale, true);
-  const failed = offline.refresh();
-  assert.equal(failed.ok, false);
-  assert.match(offline.state.error, /authentication required/);
-  assert.equal(offline.state.cards.length, 3);
-  fs.rmSync(workspace, {recursive: true, force: true});
+  assert.equal(tracker.state.cards.length, 3); assert.equal(tracker.state.stale, false);
+  assert.equal(tracker.state.connection, 'connected'); assert.equal(tracker.state.writable, true);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).parent, 10, 'native sub-issue parent wins without body references');
+  assert.ok(fs.readdirSync(path.join(workspace, '.pi/pif/cache')).some((file) => /^tracker-[a-f0-9]{16}\.json$/.test(file)));
+  assert.ok((await tracker.list()).cards.every((card) => !('body' in card)));
+  assert.equal(boards.at(-1).stale, false);
+  const offline = new TrackerSync(workspace, () => {}, trackerRunner({hook: ({command}) => command === 'gh' ? {status: 1, stdout: '', stderr: 'fixture authentication required', code: 'missing_token'} : undefined}), true);
+  await offline.init(); assert.equal(offline.state.cards.length, 3); assert.equal(offline.state.stale, true);
+  assert.equal((await offline.refresh()).ok, false); assert.match(offline.state.error, /authentication required/);
+  assert.equal(offline.state.cards.length, 3); assert.equal(offline.state.writable, false);
 });
 
-test('tracker move writes back through gh and reverts nothing on failure', async () => {
-  const workspace = tempDir('pif-tracker-');
-  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
-  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\n\ncolumn doing:\n  name: Doing\n  label: status:doing\n\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
-  const runner = onlineRunner();
-  const tracker = new TrackerSync(workspace, () => {}, runner, true);
-  await tracker.init();
-  tracker.refresh();
-
-  const moved = tracker.move({number: 11, column: 'doing'});
-  assert.equal(moved.ok, true);
-  const edit = runner.calls.find((call) => call.args[1] === 'edit');
-  assert.deepEqual(edit.args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--add-label', 'status:doing', '--remove-label', 'status:todo']);
-  const card = tracker.state.cards.find((candidate) => candidate.number === 11);
-  assert.deepEqual(card.labels, ['task', 'status:doing']);
-  assert.equal(card.column, 'doing');
-
-  const shipped = tracker.move({number: 11, column: 'shipped'});
-  assert.equal(shipped.ok, true);
-  const flip = runner.calls.filter((call) => call.args[1] !== 'list').pop();
-  assert.deepEqual(flip.args, ['issue', 'close', '11', '-R', 'acme/widgets']);
-  assert.equal(card.state, 'closed');
-  assert.equal(card.column, 'shipped');
-
-  const rejected = tracker.move({number: 404, column: 'doing'});
-  assert.equal(rejected.ok, false);
-  assert.match(rejected.error, /Unknown card/);
-
-  const failing = new TrackerSync(workspace, () => {}, stubRunner([
-    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
-    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
-    {match: (command, args) => command === 'gh' && args[1] === 'edit', status: 1, stderr: 'gh: label does not exist'},
-  ]), true);
-  await failing.init();
-  failing.refresh();
-  const failed = failing.move({number: 11, column: 'doing'});
-  assert.equal(failed.ok, false);
-  assert.match(failed.error, /label does not exist/);
-  const unchanged = failing.state.cards.find((candidate) => candidate.number === 11);
-  assert.equal(unchanged.column, 'todo');
-  assert.deepEqual(unchanged.labels, ['task', 'status:todo']);
-  fs.rmSync(workspace, {recursive: true, force: true});
+test('tracker move writes labels and state through GitHub and publishes readback only', async (t) => {
+  const workspace = trackerWorkspace(t, true); const runner = trackerRunner();
+  const tracker = await initializedTracker(workspace, runner);
+  assert.equal((await tracker.move({number: 11, column: 'doing'})).ok, true);
+  assert.deepEqual(runner.calls.find((call) => call.args[1] === 'edit').args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--add-label', 'status:doing', '--remove-label', 'status:todo']);
+  assert.deepEqual(tracker.state.cards.find((card) => card.number === 11).labels, ['task', 'status:doing']);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).column, 'doing');
+  assert.equal((await tracker.move({number: 11, column: 'shipped'})).ok, true);
+  assert.deepEqual(runner.calls.find((call) => call.args[1] === 'close').args, ['issue', 'close', '11', '-R', 'acme/widgets']);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).state, 'closed');
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).column, 'shipped');
+  assert.match((await tracker.move({number: 404, column: 'doing'})).error, /Unknown card/);
+  const failingRunner = trackerRunner({hook: ({args}) => args[1] === 'edit' ? {status: 1, stdout: '', stderr: 'fixture label permission denied'} : undefined});
+  const failing = await initializedTracker(workspace, failingRunner);
+  assert.match((await failing.move({number: 11, column: 'doing'})).error, /permission denied/);
+  assert.equal(failing.state.cards.find((card) => card.number === 11).column, 'todo');
+  assert.deepEqual(failing.state.cards.find((card) => card.number === 11).labels, ['task', 'status:todo']);
 });
 
-test('tracker create writes through gh, falls back without labels, and prepends the card', async () => {
-  const workspace = tempDir('pif-tracker-');
-  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
-  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\ncolumn doing:\n  name: Doing\n  label: status:doing\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
-  const runner = stubRunner([
-    {match: (command) => command === 'git', stdout: 'git@github.com:acme/widgets.git\n'},
-    {match: (command, args) => command === 'gh' && args[0] === 'issue' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
-    {match: (command, args) => command === 'gh' && args[1] === 'create' && args.includes('status:todo'), status: 1, stderr: "could not add label: 'status:todo' not found"},
-    {match: (command, args) => command === 'gh' && args[1] === 'create', stdout: 'https://github.com/acme/widgets/issues/20\n'},
-  ]);
-  const tracker = new TrackerSync(workspace, () => {}, runner, true);
-  await tracker.init();
-  tracker.refresh();
-  const missingTitle = tracker.create({body: 'no title'});
-  assert.equal(missingTitle.ok, false);
-  assert.match(missingTitle.error, /Title is required/);
-  const badColumn = tracker.create({title: 'X', column: 'nowhere'});
-  assert.equal(badColumn.ok, false);
-  assert.match(badColumn.error, /Unknown column/);
-  const created = tracker.create({title: 'New ticket', body: 'Body text', type: 'task', column: 'todo'});
-  assert.equal(created.ok, true);
-  assert.equal(created.number, 20);
-  const createArgs = runner.calls.filter((call) => call.args[1] === 'create');
-  assert.equal(createArgs.length, 2);
-  assert.ok(createArgs[0].args.includes('status:todo'));
-  assert.ok(!createArgs[1].args.includes('--label'));
-  const card = tracker.state.cards.find((candidate) => candidate.number === 20);
-  assert.equal(card.title, 'New ticket');
-  assert.equal(card.type, 'task');
-  assert.equal(card.column, 'todo');
+test('tracker create preflights labels once, links native parent, and publishes confirmed readback', async (t) => {
+  const workspace = trackerWorkspace(t, true); const runner = trackerRunner(); runner.state.labels.delete('task');
+  const tracker = await initializedTracker(workspace, runner);
+  assert.match((await tracker.create({body: 'no title'})).error, /Title is required/);
+  assert.match((await tracker.create({title: 'X', column: 'nowhere'})).error, /Unknown column/);
+  const created = await tracker.create({title: 'New ticket', body: 'Body text', type: 'task', column: 'todo', parent: 10});
+  assert.equal(created.ok, true); assert.equal(created.number, 20);
+  const creates = runner.calls.filter((call) => call.args[1] === 'create');
+  assert.equal(creates.length, 1, 'issue creation must never retry with labels removed');
+  assert.deepEqual(creates[0].args, ['issue', 'create', '-R', 'acme/widgets', '--title', 'New ticket', '--body', 'Body text', '--label', 'task', '--label', 'status:todo']);
+  const labelCreate = runner.calls.find((call) => call.args.includes('repos/acme/widgets/labels') && call.args.includes('POST'));
+  assert.equal(JSON.parse(labelCreate.options.input).name, 'task');
+  assert.ok(runner.calls.indexOf(labelCreate) < runner.calls.indexOf(creates[0]));
+  const link = runner.calls.find((call) => call.args.includes('repos/acme/widgets/issues/10/sub_issues') && call.args.includes('POST'));
+  assert.deepEqual(JSON.parse(link.options.input), {sub_issue_id: 1020});
+  const card = tracker.state.cards.find((card) => card.number === 20);
+  assert.equal(card.title, 'New ticket'); assert.equal(card.type, 'task'); assert.equal(card.column, 'todo'); assert.equal(card.parent, 10);
   assert.equal(tracker.state.cards[0].number, 20);
-  fs.rmSync(workspace, {recursive: true, force: true});
 });
 
-test('tracker update edits title and body through gh and patches locally', async () => {
-  const workspace = tempDir('pif-tracker-');
-  const runner = onlineRunner();
-  const tracker = new TrackerSync(workspace, () => {}, runner, true);
-  await tracker.init();
-  tracker.refresh();
-  const empty = tracker.update({number: 11, title: '  '});
-  assert.equal(empty.ok, false);
-  assert.match(empty.error, /Title cannot be empty/);
-  const nothing = tracker.update({number: 11});
-  assert.equal(nothing.ok, false);
-  const unknown = tracker.update({number: 999, title: 'x'});
-  assert.equal(unknown.ok, false);
-  const updated = tracker.update({number: 11, title: 'Task: renamed', body: 'New body'});
+test('tracker update preserves local state until title and body readback succeeds', async (t) => {
+  const workspace = trackerWorkspace(t); const runner = trackerRunner(); const tracker = await initializedTracker(workspace, runner);
+  assert.match((await tracker.update({number: 11, title: '  '})).error, /Title cannot be empty/);
+  assert.equal((await tracker.update({number: 11})).ok, false);
+  assert.equal((await tracker.update({number: 999, title: 'x'})).ok, false);
+  const updated = await tracker.update({number: 11, title: 'Task: renamed', body: 'New body'});
   assert.equal(updated.ok, true);
-  const edit = runner.calls.filter((call) => call.args[1] === 'edit').pop();
-  assert.deepEqual(edit.args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--title', 'Task: renamed', '--body', 'New body']);
-  const card = tracker.state.cards.find((candidate) => candidate.number === 11);
-  assert.equal(card.title, 'Task: renamed');
-  assert.equal(card.body, 'New body');
-  fs.rmSync(workspace, {recursive: true, force: true});
+  assert.deepEqual(runner.calls.find((call) => call.args[1] === 'edit').args, ['issue', 'edit', '11', '-R', 'acme/widgets', '--title', 'Task: renamed', '--body', 'New body']);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).title, 'Task: renamed');
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).body, 'New body');
+  runner.state.hook = ({args}) => args[1] === 'view' && runner.state.issues.get(11).title === 'Task: remote only' ? {status: 1, stdout: '', stderr: 'fixture readback failed'} : undefined;
+  assert.equal((await tracker.update({number: 11, title: 'Task: remote only'})).ok, false);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).title, 'Task: renamed');
 });
 
-test('tracker delete removes the card through gh and keeps state on failure', async () => {
-  const workspace = tempDir('pif-tracker-');
-  const failing = stubRunner([
-    {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
-    {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
-    {match: (command, args) => command === 'gh' && args[1] === 'delete', status: 1, stderr: 'gh: no delete permission'},
-  ]);
-  const tracker = new TrackerSync(workspace, () => {}, failing, true);
-  await tracker.init();
-  tracker.refresh();
-  const failed = tracker.delete({number: 11});
-  assert.equal(failed.ok, false);
-  assert.match(failed.error, /no delete permission/);
-  assert.ok(tracker.state.cards.some((candidate) => candidate.number === 11));
-
-  const runner = onlineRunner();
-  const working = new TrackerSync(workspace, () => {}, runner, true);
-  await working.init();
-  working.refresh();
-  const removed = working.delete({number: 11});
-  assert.equal(removed.ok, true);
-  const deleteCall = runner.calls.filter((call) => call.args[1] === 'delete').pop();
-  assert.deepEqual(deleteCall.args, ['issue', 'delete', '11', '-R', 'acme/widgets', '--yes']);
-  assert.ok(!working.state.cards.some((candidate) => candidate.number === 11));
-  fs.rmSync(workspace, {recursive: true, force: true});
+test('tracker delete names its repository and keeps state on failure', async (t) => {
+  const workspace = trackerWorkspace(t); const runner = trackerRunner(); const tracker = await initializedTracker(workspace, runner);
+  runner.state.hook = ({args}) => args[1] === 'delete' ? {status: 1, stdout: '', stderr: 'fixture no delete permission'} : undefined;
+  assert.match((await tracker.delete({number: 11})).error, /no delete permission/);
+  assert.ok(tracker.state.cards.some((card) => card.number === 11));
+  runner.state.hook = undefined;
+  assert.equal((await tracker.delete({number: 11})).ok, true);
+  assert.deepEqual(runner.calls.filter((call) => call.args[1] === 'delete').at(-1).args, ['issue', 'delete', '11', '-R', 'acme/widgets', '--yes']);
+  assert.ok(!tracker.state.cards.some((card) => card.number === 11));
 });
 
-test('tracker surfaces invalid board config and missing github remote as errors', async () => {
-  const workspace = tempDir('pif-tracker-');
-  fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
-  fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column broken:\n  state: sideways\n');
-  const invalid = new TrackerSync(workspace, () => {}, onlineRunner(), true);
-  await invalid.init();
-  const result = invalid.refresh();
-  assert.equal(result.ok, false);
-  assert.match(invalid.state.error, /Invalid board\.yaml/);
+test('tracker rejects invalid board config while local-only work stays explicitly disconnected', async (t) => {
+  const workspace = trackerWorkspace(t, true);
+  fs.writeFileSync(path.join(workspace, '.pif/board.yaml'), 'column broken:\n  state: sideways\n');
+  const invalid = new TrackerSync(workspace, () => {}, trackerRunner(), true); await invalid.init();
+  assert.equal((await invalid.refresh()).ok, false); assert.match(invalid.state.error, /Invalid board\.yaml/);
+  for (const origin of [null, 'https://github.com.attacker.example/acme/widgets.git', 'https://user:password@github.com/acme/widgets.git']) {
+    const runner = trackerRunner({origin: origin ?? ''}); const tracker = new TrackerSync(trackerWorkspace(t), () => {}, runner, true);
+    await tracker.init(); assert.equal((await tracker.refresh()).ok, true);
+    assert.equal(tracker.state.connection, 'disconnected'); assert.equal(tracker.state.repo, null); assert.equal(tracker.state.writable, false);
+    assert.match((await tracker.move({number: 1, column: 'todo'})).error, /disconnected/);
+    assert.equal(runner.calls.filter(({command}) => command === 'gh').length, 0);
+  }
+});
 
-  const remoteless = new TrackerSync(tempDir('pif-tracker-'), () => {}, stubRunner([
-    {match: (command) => command === 'git', status: 1, stderr: 'fatal: no such remote'},
-  ]), true);
-  await remoteless.init();
-  const noRepo = remoteless.refresh();
-  assert.equal(noRepo.ok, false);
-  assert.match(remoteless.state.error, /no GitHub origin remote/);
-  fs.rmSync(workspace, {recursive: true, force: true});
+test('tracker isolates repository caches and rejects actions after origin changes', async (t) => {
+  const workspace = trackerWorkspace(t); const runner = trackerRunner(); const tracker = await initializedTracker(workspace, runner);
+  const original = structuredClone(tracker.state.cards);
+  runner.state.repo = 'acme/other'; runner.state.origin = 'git@github.com:acme/other.git'; runner.state.issues.clear(); runner.state.children.clear();
+  assert.equal((await tracker.list()).repo, 'acme/other'); assert.deepEqual(tracker.state.cards, []); assert.equal(tracker.state.connection, 'unverified');
+  assert.match((await tracker.delete({number: 11, repo: 'acme/widgets'})).error, /different repository/);
+  assert.equal(trackerWrites(runner).length, 0);
+  assert.equal((await tracker.refresh()).ok, true);
+  runner.state.repo = 'acme/widgets'; runner.state.origin = 'https://github.com/acme/widgets.git';
+  await tracker.list(); assert.deepEqual(tracker.state.cards, original); assert.equal(tracker.state.stale, true);
+  const otherWorkspace = trackerWorkspace(t); const second = new TrackerSync(otherWorkspace, () => {}, trackerRunner(), true); await second.init();
+  assert.deepEqual(second.state.cards, [], 'another environment does not inherit this workspace cache');
+});
+
+test('tracker denies confirmed read-only metadata and mismatched repository responses before writes', async (t) => {
+  for (const permissions of [{push: false, admin: false, maintain: false, triage: false}]) {
+    const runner = trackerRunner({permissions}); const tracker = await initializedTracker(trackerWorkspace(t), runner);
+    assert.equal(tracker.state.connection, 'connected'); assert.equal(tracker.state.writable, false);
+    assert.match((await tracker.delete({number: 11})).error, /read-only/); assert.equal(trackerWrites(runner).length, 0);
+  }
+  const runner = trackerRunner({hook: ({args}, state, ok) => args[0] === 'api' && args[1] === `repos/${state.repo}` ? ok({full_name:'acme/wrong',has_issues:true,permissions:{push:true}}) : undefined});
+  const tracker = new TrackerSync(trackerWorkspace(t), () => {}, runner, true); await tracker.init();
+  assert.equal((await tracker.refresh()).ok, false); assert.equal(tracker.state.writable, false);
+  assert.equal((await tracker.create({title:'Never sent'})).ok, false); assert.equal(trackerWrites(runner).length, 0);
+});
+
+test('late tracker refresh cannot overwrite a confirmed mutation or switched repository', async (t) => {
+  const runner = trackerRunner(); const tracker = await initializedTracker(trackerWorkspace(t), runner);
+  let release; let captured;
+  runner.state.hook = ({args}, state, ok) => {
+    if (args[1] !== 'list') return undefined;
+    captured = ok([...state.issues.values()]);
+    return new Promise((resolve) => { release = () => resolve(captured); });
+  };
+  const refresh = tracker.refresh(); await waitFor(() => release, 'held issue list');
+  assert.equal((await tracker.update({number:11,title:'Task: new truth'})).ok, true);
+  release(); assert.equal((await refresh).ok, false);
+  assert.equal(tracker.state.cards.find((card) => card.number === 11).title, 'Task: new truth');
+  release = undefined; const switched = tracker.refresh(); await waitFor(() => release, 'second held list');
+  runner.state.repo = 'acme/other'; runner.state.origin = 'https://github.com/acme/other.git';
+  await tracker.list(); release(); assert.equal((await switched).ok, false);
+  assert.equal(tracker.state.repo, 'acme/other'); assert.deepEqual(tracker.state.cards, []); assert.equal(tracker.state.error, null);
+});
+
+test('uncertain tracker creation is not repeated after retry or reopening', async (t) => {
+  const workspace = trackerWorkspace(t); const runner = trackerRunner(); const tracker = await initializedTracker(workspace, runner);
+  runner.state.hook = ({args}) => args[1] === 'create' ? {status: 1, stdout: '', stderr: 'fixture network timeout after send', code: 'timeout'} : undefined;
+  const params = {title:'Possibly created',body:'Preserve intent',type:'task'};
+  const first = await tracker.create(params); assert.equal(first.ok, false); assert.equal(first.uncertain, true);
+  const repeated = await tracker.create(params); assert.equal(repeated.uncertain, true);
+  const reopened = new TrackerSync(workspace, () => {}, runner, true); await reopened.init();
+  assert.equal((await reopened.create(params)).uncertain, true);
+  assert.equal(runner.calls.filter(({args}) => args[1] === 'create').length, 1);
+  const intents = fs.readdirSync(path.join(workspace,'.pi/pif/cache')).filter((file) => file.startsWith('tracker-create-'));
+  assert.equal(intents.length,1); assert.equal(fs.statSync(path.join(workspace,'.pi/pif/cache',intents[0])).mode & 0o777,0o600);
+});
+
+test('partial native parent linking retries completion without creating a second issue', async (t) => {
+  const workspace = trackerWorkspace(t); const runner = trackerRunner(); const tracker = await initializedTracker(workspace, runner);
+  runner.state.hook = ({args}) => args.includes('POST') && args.includes('repos/acme/widgets/issues/10/sub_issues') ? {status:1,stdout:'',stderr:'fixture parent link unavailable',code:'timeout'} : undefined;
+  const params = {title:'Child',body:'Native hierarchy',type:'task',parent:10};
+  const partial = await tracker.create(params); assert.equal(partial.partial,true); assert.equal(partial.number,20);
+  assert.ok(!tracker.state.cards.some((card) => card.number === 20));
+  runner.state.hook = undefined;
+  const resumed = await tracker.create(params); assert.equal(resumed.ok,true); assert.equal(resumed.number,20);
+  assert.equal(runner.calls.filter(({args}) => args[1] === 'create').length,1);
+  assert.equal(tracker.state.cards.find((card) => card.number===20).parent,10);
+});
+
+
+test('tracker rejects ancestor Git roots before consulting origin or GitHub', async (t) => {
+  for (const missing of [false, true]) {
+    const workspace = trackerWorkspace(t);
+    const runner = trackerRunner({hook: ({command,args,options}, state, ok) => {
+      if (command !== 'git' || args[0] !== 'rev-parse') return undefined;
+      return missing ? {status:1,stdout:'',stderr:'not a repository'} : ok(path.dirname(options.cwd));
+    }});
+    const tracker = new TrackerSync(workspace,()=>{},runner,true); await tracker.init();
+    assert.equal((await tracker.refresh()).ok,true); assert.equal(tracker.state.connection,'disconnected');
+    assert.equal((await tracker.create({title:'Never sent'})).ok,false);
+    assert.ok(runner.calls.every(({command,args})=>command==='git' && args[0]==='rev-parse'));
+  }
+});
+
+test('queued tracker writes retain their original repository after an origin switch', async (t) => {
+  const runner = trackerRunner(); const tracker = await initializedTracker(trackerWorkspace(t),runner);
+  let release;
+  runner.state.hook = ({args},state,ok) => args[1]==='edit' ? new Promise((resolve)=>{release=()=>resolve(ok());}) : undefined;
+  const first = tracker.update({number:11,title:'Pending edit'}); await waitFor(()=>release,'held remote edit');
+  const queued = tracker.delete({number:12});
+  runner.state.repo='acme/other'; runner.state.origin='https://github.com/acme/other.git';
+  await tracker.list(); release();
+  const firstResult = await first; const queuedResult = await queued;
+  assert.equal(firstResult.ok,false); assert.equal(firstResult.repo,'acme/widgets');
+  assert.equal(queuedResult.ok,false); assert.equal(queuedResult.repo,'acme/widgets');
+  assert.match(queuedResult.error,/repository changed/);
+  assert.equal(tracker.state.repo,'acme/other'); assert.deepEqual(tracker.state.cards,[]);
+  assert.deepEqual(trackerWrites(runner).map(({args})=>args[1]),['edit']);
+});
+
+test('tracker label uncertainty is read back and never drops labels from issue creation', async (t) => {
+  const runner=trackerRunner(); runner.state.labels.delete('task');
+  const tracker=await initializedTracker(trackerWorkspace(t),runner);
+  runner.state.hook=({args,options},state)=>{
+    if (!args.includes('POST') || !args.includes('repos/acme/widgets/labels')) return undefined;
+    state.labels.add(JSON.parse(options.input).name);
+    return {status:1,stdout:'',stderr:'fixture lost label-create response',code:'timeout'};
+  };
+  assert.equal((await tracker.create({title:'Single issue',type:'task'})).ok,true);
+  const creates=runner.calls.filter(({args})=>args[1]==='create');
+  assert.equal(creates.length,1); assert.ok(creates[0].args.includes('task'));
+  assert.equal(runner.calls.filter(({args})=>args[1]==='repos/acme/widgets/labels/task').length,2);
+  const deniedRunner=trackerRunner(); deniedRunner.state.labels.delete('task');
+  const denied=await initializedTracker(trackerWorkspace(t),deniedRunner);
+  deniedRunner.state.hook=({args})=>args[1]==='repos/acme/widgets/labels/task' ? {status:1,stdout:'',stderr:'fixture permission denied',code:'insufficient_permissions'} : undefined;
+  assert.equal((await denied.create({title:'Not created',type:'task'})).ok,false);
+  assert.equal(deniedRunner.calls.filter(({args})=>args[1]==='create').length,0);
+});
+
+test('tracker ignores foreign native children and rejects conflicting same-repository parents', async (t) => {
+  const runner=trackerRunner(); const tracker=await initializedTracker(trackerWorkspace(t),runner);
+  runner.state.hook=({args},state,ok)=>args[1]?.startsWith('repos/acme/widgets/issues/10/sub_issues?') ? ok([{number:11,repository_url:'https://api.github.com/repos/acme/other'}]) : undefined;
+  assert.equal((await tracker.refresh()).ok,true);
+  assert.equal(tracker.state.cards.find((card)=>card.number===11).parent,null);
+  runner.state.hook=undefined;
+  runner.state.issues.set(13,{number:13,title:'Sprint: fixture',labels:[{name:'sprint'}],state:'open',body:'',updatedAt:'2026-08-24T00:00:00Z',url:'https://github.com/acme/widgets/issues/13'});
+  runner.state.children.set(13,[11]);
+  const before=structuredClone(tracker.state.cards); const result=await tracker.refresh();
+  assert.equal(result.ok,false); assert.match(result.error,/conflicting parents/);
+  assert.deepEqual(tracker.state.cards,before); assert.equal(tracker.state.writable,false);
 });
 
 // ---------------------------------------------------------------------------
@@ -550,7 +696,7 @@ test('required widget preflight rejects bad or incomplete requirements without f
 test('public build preflight rejects required widgets before any build process (#209)', async (t) => {
   const f = layeredFixture(t);
   const hub = layeredHub(f.workspace);
-  const {harness, restore} = patchBuildSpawn([]);
+  const {harness, restore} = patchBuildSpawn([], {resolveResources: true});
   t.after(restore);
   for (const dependencies of [['missing_widget'], ['../invalid'], ['agent_console', 'agent_console']]) {
     hub.state.app = {id: 'fixture', name: 'Fixture', version: '0.1.0', home: 'home', pages: ['home'], dependencies};
@@ -1290,7 +1436,8 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     {kind: 'child'},
     {kind: 'error', message: 'spawn failed asynchronously', code: 127},
     {kind: 'throw', message: 'spawn denied by fixture'},
-  ]);
+    {kind: 'child'},
+  ], {resolveResources: true});
   let hub;
   try {
     process.env.PIF_APP_DIR = appDir;
@@ -1304,6 +1451,7 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     // Fake children only: this checks the app/build contract, not real process cleanup.
 
     const success = hub.control('pif_app.build', { name: 'Exported App' });
+    await waitFor(() => harness.children.length === 1, 'validated build spawn');
     const successChild = harness.children[0];
     assert.equal(path.basename(harness.calls[0].command), path.basename(buildScript));
     assert.deepEqual(harness.calls[0].args, [workspace, 'Exported App']);
@@ -1318,6 +1466,9 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     const stderrChunk = 'stderr-'.repeat(400);
     successChild.stdout.emit('data', stdoutChunk);
     successChild.stderr.emit('data', stderrChunk);
+    const artifact = path.join(workspace, 'build', 'Exported App.app');
+    fs.mkdirSync(path.join(artifact, 'Contents', 'MacOS'), {recursive: true});
+    fs.writeFileSync(path.join(artifact, 'Contents', 'MacOS', 'pif'), 'fixture artifact');
     successChild.emitClose(0);
     successChild.emitClose(0);
     await waitFor(() => peerMessages.length === 1, 'first build_result');
@@ -1328,10 +1479,12 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     assert.equal(peerMessages[0].payload.name, 'Exported App');
     assert.equal(peerMessages[0].payload.ok, true);
     assert.equal(peerMessages[0].payload.code, 0);
+    assert.equal(peerMessages[0].payload.artifactPath, artifact);
     assert.equal(peerMessages[0].payload.output.length, 4000);
     assert.equal(peerMessages[0].payload.output, `${stdoutChunk}${stderrChunk}`.slice(-4000));
 
     const nonzero = hub.control('pif_app.build', { name: 'Broken App' });
+    await waitFor(() => harness.children.length === 2, 'second validated build spawn');
     const nonzeroChild = harness.children[1];
     assert.deepEqual(harness.calls[1].args, [workspace, 'Broken App']);
     nonzeroChild.emitSpawn();
@@ -1375,6 +1528,16 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     assert.equal(peerMessages[3].payload.code, -1);
     assert.match(peerMessages[3].payload.error, /spawn denied by fixture/);
     assert.equal(peerMessages[3].payload.output, '');
+
+    const absent = hub.control('pif_app.build', {name: 'No Artifact'});
+    await waitFor(() => harness.children.length === 4, 'missing artifact build spawn');
+    const absentChild = harness.children[3]; absentChild.emitSpawn(); const absentAck = await absent;
+    absentChild.emitClose(0); await waitFor(() => peerMessages.length === 5, 'missing artifact failure');
+    assert.equal(peerMessages[4].payload.buildId, absentAck.buildId);
+    assert.equal(peerMessages[4].payload.ok, false);
+    assert.match(peerMessages[4].payload.error, /expected app artifact/);
+    assert.equal(peerMessages[4].payload.artifactPath, undefined);
+    assert.equal(harness.resolverCalls.length, 5, 'every build validates resources before spawning');
   } finally {
     if (hub) await hub.stop();
     restore();
@@ -1385,5 +1548,206 @@ test('pif_app.build publishes correlated build_result envelopes and stays respon
     fs.rmSync(workspace, { recursive: true, force: true });
     fs.rmSync(appDir, { recursive: true, force: true });
     fs.rmSync(globalCatalog, { recursive: true, force: true });
+  }
+});
+
+// Small structural kit for resolver/integrity coverage only. Its placeholder
+// runtime is never executed and this fixture does not claim build acceptance.
+function builderKitFixture(root, destination) {
+  const stage = path.join(root, 'kit-stage');
+  const files = {
+    'package.json': '{"type":"module"}', 'package-lock.json': '{}',
+    'pif/pubspec.yaml': 'name: pif\nversion: 1.0.0+1\n', 'pif/pubspec.lock': '# fixture',
+    'pif/lib/main.dart': '// main', 'pif/lib/export_main.dart': '// export',
+    'pif/lib/widget_registry.g.dart': '// registry', 'pif/lib/core/plugin.dart': '// core',
+    'pif/lib/widgets/fixture/widget.yaml': 'id: fixture\nname: Fixture\nslot: center\n',
+    'pif/lib/widgets/fixture/fixture.dart': '// widget',
+    'pif/macos/Runner.xcodeproj/project.pbxproj': '// project', 'pif/macos/Podfile': '# Podfile',
+    'skills/pif-app-builder/SKILL.md': '# Builder', 'skills/pif-app-designer/SKILL.md': '# Designer',
+    'runtime/node': '#!/bin/sh\nexit 64\n', 'runtime/pi/package.json': '{"version":"fixture"}',
+    'runtime/pi/dist/cli.js': '// fixture runtime is not executed',
+  };
+  for (const [relative, content] of Object.entries(files)) {
+    const file = path.join(stage, relative); fs.mkdirSync(path.dirname(file), {recursive: true}); fs.writeFileSync(file, content);
+  }
+  for (const directory of ['pif/catalog', 'pif/templates']) fs.mkdirSync(path.join(stage, directory), {recursive: true});
+  for (const script of ['pif-builder-kit.mjs', 'pif-node-runtime.sh', 'build-pif-app.sh', 'build-pif-project-app.sh']) {
+    fs.mkdirSync(path.join(stage,'scripts'), {recursive:true}); fs.copyFileSync(path.join(repo,'scripts',script),path.join(stage,'scripts',script));
+  }
+  fs.mkdirSync(path.join(stage,'extensions'), {recursive:true});
+  for (const extension of fs.readdirSync(path.join(repo,'extensions')).filter((name) => /^pif.*\.ts$/.test(name) && !name.includes('.test.'))) fs.copyFileSync(path.join(repo,'extensions',extension),path.join(stage,'extensions',extension));
+  const manifest = sealBuilderKit(stage);
+  fs.mkdirSync(path.dirname(destination), {recursive:true}); fs.renameSync(stage,destination);
+  return manifest;
+}
+
+function preserveEnvironment(t, keys) {
+  const previous = Object.fromEntries(keys.map((key) => [key,process.env[key]]));
+  t.after(() => { for (const [key,value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } });
+}
+
+test('installed builder resolves explicit resources asynchronously, without ambient GitHub credentials', async (t) => {
+  const f = layeredFixture(t); preserveEnvironment(t,['PIF_BUILDER_ROOT','PIF_BUILDER_VERSION','PIF_APP_TEMPLATE_DIR','GH_TOKEN','GH_CONFIG_DIR']);
+  const kit = path.join(f.workspace,'Authoring.app/Contents/Resources/builder');
+  const manifest = builderKitFixture(f.workspace,kit);
+  process.env.PIF_BUILDER_ROOT = kit; process.env.PIF_BUILDER_VERSION = manifest.builderVersion;
+  process.env.PIF_APP_DIR = path.join(kit,'pif'); delete process.env.PIF_APP_TEMPLATE_DIR;
+  process.env.GH_TOKEN = 'SYNTHETIC_PARENT_CREDENTIAL'; process.env.GH_CONFIG_DIR = '/synthetic/global-gh';
+  const hub = layeredHub(f.workspace); t.after(() => hub.stop());
+  hub.state.app = parseAppManifest('id: fixture\nname: Fixture\nhome: home\npages: [home]\n').manifest;
+  const events = []; hub.broadcast = (channel,type,payload) => events.push({channel,type,payload});
+  const {harness,restore} = patchBuildSpawn([{kind:'child'}],{resolveResources:'real'}); t.after(restore);
+  let settled = false; const build = hub.control('pif_app.build',{name:'Installed Fixture'}).then((value) => { settled=true; return value; });
+  assert.equal((await hub.control('shell.status')).app.id,'fixture'); assert.equal(settled,false,'hub responds while helper subprocess validates');
+  await waitFor(() => harness.children.length === 1,'installed build after actual helper validation');
+  const call = harness.calls[0];
+  assert.equal(fs.realpathSync(call.command),fs.realpathSync(path.join(kit,'scripts/build-pif-project-app.sh')));
+  assert.equal(fs.realpathSync(call.options.env.PIF_BUILDER_ROOT),fs.realpathSync(kit));
+  assert.equal(call.options.env.PIF_BUILDER_VERSION,manifest.builderVersion);
+  assert.equal(fs.realpathSync(call.options.env.PIF_APP_TEMPLATE_DIR),fs.realpathSync(path.join(kit,'pif')));
+  assert.equal(call.options.env.GH_TOKEN,undefined); assert.equal(call.options.env.GH_CONFIG_DIR,undefined);
+  assert.equal(harness.resolverCalls[0].options.env.GH_TOKEN,undefined);
+  const artifact = path.join(f.workspace,'build/Installed Fixture.app/Contents/MacOS/pif');
+  fs.mkdirSync(path.dirname(artifact),{recursive:true}); fs.writeFileSync(artifact,'fixture executable');
+  harness.children[0].emitSpawn(); const ack = await build; assert.equal(ack.started,true);
+  harness.children[0].emitClose(0); await waitFor(() => events.some((event)=>event.type==='build_result'),'installed build result');
+  const result = events.find((event)=>event.type==='build_result').payload;
+  assert.equal(result.ok,true); assert.equal(result.buildId,ack.buildId); assert.equal(result.artifactPath,path.dirname(path.dirname(path.dirname(artifact))));
+});
+
+test('installed builder rejects missing, damaged, and mismatched kits before any build process', async (t) => {
+  const f = layeredFixture(t); preserveEnvironment(t,['PIF_BUILDER_ROOT','PIF_BUILDER_VERSION','PIF_APP_TEMPLATE_DIR']);
+  const kit = path.join(f.workspace,'builder'); const manifest = builderKitFixture(f.workspace,kit);
+  const hub = layeredHub(f.workspace); t.after(() => hub.stop());
+  hub.state.app = parseAppManifest('id: fixture\nname: Fixture\nhome: home\npages: [home]\n').manifest;
+  const {harness,restore} = patchBuildSpawn([],{resolveResources:'real'}); t.after(restore);
+  process.env.PIF_BUILDER_ROOT = path.join(f.workspace,'absent-kit');
+  await assert.rejects(hub.control('pif_app.build',{}),/Builder resources are unavailable/);
+  process.env.PIF_BUILDER_ROOT = kit; process.env.PIF_BUILDER_VERSION = '0'.repeat(64);
+  await assert.rejects(hub.control('pif_app.build',{}),/version does not match/);
+  process.env.PIF_BUILDER_VERSION = manifest.builderVersion;
+  fs.appendFileSync(path.join(kit,'pif/lib/main.dart'),'\n// changed');
+  await assert.rejects(hub.control('pif_app.build',{}),/integrity check failed/);
+  assert.equal(harness.calls.length,0); assert.equal(hub.exportBuilds.size,0);
+});
+
+function stagedPublishFixture(parent, name = 'pif.app', marker = 'NEW_APP') {
+  const assembly = fs.mkdtempSync(path.join(parent, '.pif-assembly.'));
+  const app = path.join(assembly, name);
+  const executable = path.join(app, 'Contents/MacOS/pif');
+  fs.mkdirSync(path.dirname(executable), {recursive: true}); fs.writeFileSync(executable, marker);
+  builderKitFixture(assembly, path.join(app, 'Contents/Resources/builder'));
+  return {assembly, app};
+}
+
+function readonlyFixtureDirectories(root) {
+  for (const entry of fs.readdirSync(root, {withFileTypes: true})) {
+    if (entry.isDirectory()) readonlyFixtureDirectories(path.join(root, entry.name));
+  }
+  fs.chmodSync(root, 0o555);
+}
+
+test('builder output publication replaces read-only kits without following old-output symlinks', (t) => {
+  const root = tempDir('pif-publish-'); t.after(() => {
+    const input = path.join(root, 'input-kit'); if (fs.existsSync(input)) fs.chmodSync(input, 0o755);
+    fs.rmSync(root, {recursive: true, force: true});
+  });
+  const outside = path.join(root, 'input-kit'); fs.mkdirSync(outside); const sentinel = path.join(outside, 'keep.txt');
+  fs.writeFileSync(sentinel, 'INPUT_UNCHANGED'); fs.chmodSync(outside, 0o555);
+  const output = path.join(root, 'pif.app');
+  const first = stagedPublishFixture(root, 'pif.app', 'FIRST_APP');
+  assert.equal(publishBuiltApp(first.app, output).appPath, fs.realpathSync(output));
+  fs.symlinkSync(outside, path.join(output, 'Contents/Resources/linked-input'));
+  readonlyFixtureDirectories(output);
+  const second = stagedPublishFixture(root, 'pif.app', 'SECOND_APP');
+  readonlyFixtureDirectories(path.join(second.app, 'Contents/Resources/builder'));
+  assert.equal(publishBuiltApp(second.app, output).appPath, fs.realpathSync(output));
+  assert.equal(fs.readFileSync(path.join(output, 'Contents/MacOS/pif'), 'utf8'), 'SECOND_APP');
+  assert.equal(fs.statSync(path.join(output, 'Contents/Resources/builder')).mode & 0o777, 0o555);
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'INPUT_UNCHANGED');
+  assert.equal(fs.statSync(outside).mode & 0o777, 0o555, 'cleanup must not chmod through a symlink');
+  assert.ok(fs.readdirSync(root).every((name) => !name.startsWith('.pif-replaced.') && !name.startsWith('.pif-assembly.')));
+  // Restore only test-owned output directory modes for the test runner cleanup.
+  const finalAssembly = fs.mkdtempSync(path.join(root, '.pif-assembly.'));
+  fs.renameSync(output, path.join(finalAssembly, 'pif.app')); discardBuilderAssembly(finalAssembly);
+});
+
+test('builder publication keeps previous output on validation or rename failure and rejects output symlinks', (t) => {
+  const root = tempDir('pif-publish-fail-'); t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const output = path.join(root, 'pif.app'); const first = stagedPublishFixture(root, 'pif.app', 'PREVIOUS_VALID');
+  publishBuiltApp(first.app, output);
+  const damaged = stagedPublishFixture(root); fs.appendFileSync(path.join(damaged.app, 'Contents/Resources/builder/pif/lib/main.dart'), '// damaged');
+  assert.throws(() => publishBuiltApp(damaged.app, output), /integrity check failed/);
+  assert.equal(fs.readFileSync(path.join(output, 'Contents/MacOS/pif'), 'utf8'), 'PREVIOUS_VALID');
+  readonlyFixtureDirectories(damaged.assembly); discardBuilderAssembly(damaged.assembly);
+  const candidate = stagedPublishFixture(root); const rename = fs.renameSync;
+  fs.renameSync = (source, destination) => {
+    if (fs.realpathSync(source) === fs.realpathSync(candidate.app)) throw new Error('fixture publish rename failed');
+    return rename(source, destination);
+  };
+  try { assert.throws(() => publishBuiltApp(candidate.app, output), /fixture publish rename failed/); }
+  finally { fs.renameSync = rename; }
+  assert.equal(fs.readFileSync(path.join(output, 'Contents/MacOS/pif'), 'utf8'), 'PREVIOUS_VALID');
+  assert.ok(fs.existsSync(candidate.app));
+  assert.ok(fs.readdirSync(root).every((name) => !name.startsWith('.pif-replaced.')));
+  const foreign = path.join(root, 'foreign.app'); fs.renameSync(output, foreign); fs.symlinkSync(foreign, output);
+  assert.throws(() => publishBuiltApp(candidate.app, output), /symlink or non-directory/);
+  assert.equal(fs.readFileSync(path.join(foreign, 'Contents/MacOS/pif'), 'utf8'), 'PREVIOUS_VALID');
+  assert.throws(() => discardBuilderAssembly(path.join(candidate.app, 'Contents/Resources/builder')), /signed app bundle|owned builder assembly/);
+  discardBuilderAssembly(candidate.assembly);
+});
+
+test('builder runtime copying preserves dependency build code and copies existing kit inventory exactly', (t) => {
+  const root = tempDir('pif-runtime-copy-');
+  const assembly = fs.mkdtempSync(path.join(root, '.pif-assembly.'));
+  t.after(() => { discardBuilderAssembly(assembly); fs.rmSync(root, {recursive:true,force:true}); });
+  const source = path.join(assembly, 'source'); builderKitFixture(assembly, source);
+  const write = (relative, content) => {
+    const file = path.join(source, relative); fs.mkdirSync(path.dirname(file),{recursive:true}); fs.writeFileSync(file,content);
+  };
+  const runtimeFiles = [
+    'runtime/pi/node_modules/typebox/build/index.mjs',
+    'runtime/pi/node_modules/fixture/dist/index.js',
+    'runtime/pi/node_modules/.pif/index.js',
+    'runtime/pi/node_modules/fixture/ephemeral/index.js',
+  ];
+  for (const file of runtimeFiles) write(file, `// required runtime: ${file}\n`);
+  write('runtime/pi/node_modules/fixture/types.d.ts', '// declaration excluded during initial packaging');
+  write('pif/build/compiled-artifact', 'APP_BUILD_CACHE');
+  write('pif/macos/Flutter/ephemeral/generated.xcconfig', 'NATIVE_BUILD_CACHE');
+  write('pif/macos/Pods/generated', 'PODS_CACHE');
+  const generated = path.join(assembly, 'generated');
+  createBuilderKit(source, generated, path.join(source,'runtime/node'), path.join(source,'runtime/pi'));
+  for (const file of runtimeFiles) assert.equal(fs.readFileSync(path.join(generated,file),'utf8'),fs.readFileSync(path.join(source,file),'utf8'),file);
+  for (const file of ['pif/build','pif/macos/Flutter/ephemeral','pif/macos/Pods','runtime/pi/node_modules/fixture/types.d.ts']) assert.equal(fs.existsSync(path.join(generated,file)),false,file);
+  // A validated existing kit may have additional inventoried input types.
+  // Provisioning must reproduce that inventory instead of filtering it again.
+  const inventoriedDeclaration = path.join(generated,'runtime/pi/node_modules/fixture/inventoried.d.ts');
+  fs.writeFileSync(inventoriedDeclaration,'// intentionally inventoried declaration');
+  const manifest = sealBuilderKit(generated);
+  const copied = path.join(assembly, 'child'); copyBuilderKit(generated,copied);
+  assert.deepEqual(validateBuilderKit(copied).files,manifest.files);
+  assert.equal(fs.readFileSync(path.join(copied,'runtime/pi/node_modules/fixture/inventoried.d.ts'),'utf8'),'// intentionally inventoried declaration');
+});
+
+test('canonical copied-Pi smoke catches missing dependency modules with a clean disposable profile', (t) => {
+  const root=tempDir('pif-pi-smoke-check-'); t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const piRoot=path.join(root,'pi'); const dependency=path.join(piRoot,'node_modules/typebox/build/index.mjs');
+  fs.mkdirSync(path.dirname(dependency),{recursive:true}); fs.writeFileSync(dependency,'export const ready = true;');
+  fs.mkdirSync(path.join(piRoot,'dist')); fs.writeFileSync(path.join(piRoot,'package.json'),'{"type":"module","version":"0.0.0-fixture"}');
+  const profileRecord=path.join(root,'used-profile.txt');
+  fs.writeFileSync(path.join(piRoot,'dist/cli.js'), `import fs from 'node:fs';\nimport {ready} from '../node_modules/typebox/build/index.mjs';\nif(!ready || process.env.GH_TOKEN || process.env.NODE_OPTIONS) throw Error('unclean runtime');\nif(Object.keys(process.env).filter((key)=>key!=='__CF_USER_TEXT_ENCODING').sort().join(',') !== 'PATH,PI_CODING_AGENT_DIR') throw Error('unexpected environment');\nfs.writeFileSync(${JSON.stringify(profileRecord)},process.env.PI_CODING_AGENT_DIR);\nfs.writeFileSync(process.env.PI_CODING_AGENT_DIR+'/ephemeral','fixture');\nconsole.log('0.0.0-fixture');\n`);
+  const smoke=()=>childProcess.spawnSync('/bin/bash',['-c','source "$1"; pif_validate_pi_runtime "$2" "$3"','fixture',path.join(repo,'scripts/pif-node-runtime.sh'),process.execPath,piRoot],{encoding:'utf8',timeout:20_000,env:{...process.env,GH_TOKEN:'SYNTHETIC_PARENT_TOKEN',NODE_OPTIONS:'--conditions=fixture'}});
+  const success=smoke(); assert.ifError(success.error); assert.equal(success.status,0,success.stderr);
+  assert.equal(success.stdout.trim(),'0.0.0-fixture');
+  assert.equal(fs.existsSync(fs.readFileSync(profileRecord,'utf8')),false,'smoke profile is removed');
+  fs.rmSync(dependency);
+  const failure=smoke(); assert.ifError(failure.error); assert.notEqual(failure.status,0);
+  assert.match(failure.stderr,/Copied Pi runtime failed|ERR_MODULE_NOT_FOUND/);
+  assert.ok(!failure.stderr.includes('SYNTHETIC_PARENT_TOKEN'));
+  for(const name of ['build-pif-app.sh','build-pif-project-app.sh']) {
+    const script=fs.readFileSync(path.join(repo,'scripts',name),'utf8');
+    const check=script.indexOf('pif_validate_pi_runtime "$RESOURCES/builder/runtime/node"');
+    assert.ok(check>=0 && check<script.indexOf('publish-app "$APP"'),`${name} checks the copied runtime before publishing`);
   }
 });

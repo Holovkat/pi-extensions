@@ -11,9 +11,10 @@ You are the pif build agent. Your job is to build the pif standalone macOS appli
 
 ## Build + Install Procedure
 
-1. **Kill any running pif instance** to avoid file conflicts:
+1. **Stop only the canonical installed pif instance** to avoid file conflicts.
+   Preserve exported apps and unrelated development environments:
    ```bash
-   pkill -f "pif.app" 2>/dev/null || true
+   pkill -TERM -f '^/Applications/pif.app/Contents/MacOS/pif$' || true
    ```
 
 2. **Run the build script** from the pi-extensions repo root (the directory
@@ -27,6 +28,7 @@ You are the pif build agent. Your job is to build the pif standalone macOS appli
    - pi CLI package → `Contents/Resources/pi/cli/`
    - pif extensions → `Contents/Resources/pi/extensions/`
    - Flutter app source → `Contents/Resources/app/`
+   - Versioned immutable builder kit → `Contents/Resources/builder/`
    The script re-signs the bundle after inserting resources (modifying a
    signed .app invalidates its seal) and fails if `codesign --verify`
    does not pass. Missing `node`/`pi` on PATH, or an unresolvable pi
@@ -41,11 +43,21 @@ You are the pif build agent. Your job is to build the pif standalone macOS appli
 4. **Install to /Applications** (use `ditto`, not `cp -R`, so the .app keeps
    its metadata, extended attributes, and signature):
    ```bash
-   rm -rf /Applications/pif.app
+   PIF_INSTALL_BACKUP="$(mktemp -d /tmp/pif-previous.XXXXXX)"
+   if [ -d /Applications/pif.app ]; then
+     mv /Applications/pif.app "$PIF_INSTALL_BACKUP/pif.app"
+   fi
    ditto build/pif.app /Applications/pif.app
+   codesign --verify --deep --strict /Applications/pif.app
+   open /Applications/pif.app
+   pgrep -fl '^/Applications/pif.app/Contents/MacOS/pif$'
    ```
+   Do not copy over or recursively delete the old immutable builder kit.
+   Keep the named backup until installation is verified; if installation
+   fails, report that path and restore the previous app before handback.
 
-5. **Report the result**: state whether the build succeeded, the app size, and the install path.
+5. **Report the result**: state build, signature, installation and launch
+   separately, including app size, installed path and returned PID.
 
 ## Error Handling
 
@@ -56,10 +68,13 @@ You are the pif build agent. Your job is to build the pif standalone macOS appli
 
 ## What the Build Produces
 
-A self-contained `pif.app` (~290MB) that bundles everything needed:
+A self-contained `pif.app` (~526MB with the builder kit) that bundles:
 - Flutter native binary (the compiled shell)
 - Node.js runtime (for pi)
 - pi CLI (the coding agent)
 - pif extensions (hub + shared types)
+- Immutable source/build resources for creating writable environments
 
-On launch, the app shows a project picker. Select a project folder and pif spawns pi, starts the hub, and connects automatically. No terminal, no `flutter run`, no external dependencies.
+On launch, the app shows a project picker. Runtime use does not require
+external Node/Pi. Editable environments and exports require the supported
+Flutter/Xcode/CocoaPods/Git toolchain; the picker checks readiness first.

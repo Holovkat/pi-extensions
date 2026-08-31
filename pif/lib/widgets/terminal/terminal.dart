@@ -96,7 +96,7 @@ class _TerminalPanelState extends State<_TerminalPanel> {
 
   @override
   Widget build(BuildContext context) => Container(
-    color: const Color(0xff0b0e13),
+    color: widget.host.theme.panel,
     child: Column(
       children: [
         SizedBox(
@@ -108,7 +108,7 @@ class _TerminalPanelState extends State<_TerminalPanel> {
                   onTap: () => setState(() => selected = i),
                   child: Container(
                     padding: const EdgeInsets.only(left: 12),
-                    color: selected == i ? const Color(0xff1d2330) : null,
+                    color: selected == i ? widget.host.theme.panelRaised : null,
                     child: Row(
                       children: [
                         Text(

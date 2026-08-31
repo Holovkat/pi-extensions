@@ -21,7 +21,7 @@ class _PanelErrorBoundaryState extends State<PanelErrorBoundary> {
   Widget build(BuildContext context) {
     if (error != null) {
       return Card(
-        color: const Color(0xff391f28),
+        color: Theme.of(context).colorScheme.errorContainer,
         child: Padding(
           padding: const EdgeInsets.all(16),
           child: Column(

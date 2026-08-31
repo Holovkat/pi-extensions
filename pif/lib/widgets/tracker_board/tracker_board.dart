@@ -34,6 +34,8 @@ class _BoardState extends State<_Board> {
   String repo = '';
   bool stale = false;
   String? error;
+  String? connectionMessage;
+  bool writable = false;
   List<Map<String, dynamic>>? _revertOnFailure;
   // Scope (issue #188): "All work" is the original board; the Epics overview
   // lists one card per epic; _scopedEpic drills into a single epic's family
@@ -78,6 +80,8 @@ class _BoardState extends State<_Board> {
     repo = '${state['repo'] ?? ''}';
     stale = state['stale'] as bool? ?? false;
     error = state['error'] as String?;
+    connectionMessage = state['message'] as String?;
+    writable = state['writable'] as bool? ?? (repo.isNotEmpty && !stale);
   }
 
   void _revert() {
@@ -89,7 +93,16 @@ class _BoardState extends State<_Board> {
 
   /// Optimistic move: apply locally, send to the hub, revert to the deep
   /// copy if the hub reports a failed write-back.
-  void _moveCard(int number, String columnId) {
+  void _moveCard(int number, String columnId, [String? expectedRepo]) {
+    if (!writable) return;
+    if (expectedRepo != null && expectedRepo != repo) {
+      widget.host.bus.send('tracker/control', 'move', {
+        'number': number,
+        'column': columnId,
+        'repo': expectedRepo,
+      });
+      return;
+    }
     final index = cards.indexWhere((card) => card['number'] == number);
     if (index < 0 || cards[index]['column'] == columnId) return;
     _revertOnFailure = cards
@@ -101,6 +114,7 @@ class _BoardState extends State<_Board> {
     widget.host.bus.send('tracker/control', 'move', {
       'number': number,
       'column': columnId,
+      'repo': expectedRepo ?? repo,
     });
   }
 
@@ -111,6 +125,26 @@ class _BoardState extends State<_Board> {
   }
 
   void _openSheet({Map<String, dynamic>? card}) {
+    final sheetRepo = repo;
+    if (!writable) {
+      if (card == null) return;
+      showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('${card['title'] ?? ''}'),
+          content: SingleChildScrollView(
+            child: SelectableText('${card['body'] ?? ''}'),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -118,20 +152,42 @@ class _BoardState extends State<_Board> {
         host: widget.host,
         card: card,
         columns: columns,
-        onMove: _moveCard,
+        repo: sheetRepo,
+        onMove: (number, column) => _moveCard(number, column, sheetRepo),
       ),
     );
   }
 
   @override
   Widget build(BuildContext context) {
-    final theme = widget.host.theme;
+    final theme = PifTheme(brightness: Theme.of(context).brightness);
     return Container(
       color: theme.panel,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _header(theme),
+          if (!writable)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              child: Wrap(
+                spacing: 8,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  Text(
+                    connectionMessage ?? 'Connect GitHub to use the tracker.',
+                    style: TextStyle(color: theme.textMuted, fontSize: 12),
+                  ),
+                  TextButton(
+                    onPressed: () => widget.host.layout.open(
+                      'pif_settings',
+                      slot: PifSlot.center,
+                    ),
+                    child: const Text('Open Settings'),
+                  ),
+                ],
+              ),
+            ),
           if (error != null && error!.isNotEmpty)
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
@@ -139,7 +195,10 @@ class _BoardState extends State<_Board> {
                 error!,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Color(0xffe2a4a4), fontSize: 11),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                  fontSize: 11,
+                ),
               ),
             ),
           Expanded(
@@ -194,7 +253,9 @@ class _BoardState extends State<_Board> {
         IconButton(
           tooltip: 'New ticket',
           icon: const Icon(Icons.add, size: 20),
-          onPressed: columns.isEmpty ? null : () => _openSheet(card: null),
+          onPressed: columns.isEmpty || !writable
+              ? null
+              : () => _openSheet(card: null),
         ),
         IconButton(
           tooltip: 'Refresh board',
@@ -219,15 +280,23 @@ class _BoardState extends State<_Board> {
       color: theme.textMuted,
       selectedColor: theme.accent,
       children: const [
-        Padding(padding: EdgeInsets.symmetric(horizontal: 10), child: Text('All work')),
-        Padding(padding: EdgeInsets.symmetric(horizontal: 10), child: Text('Epics')),
+        Padding(
+          padding: EdgeInsets.symmetric(horizontal: 10),
+          child: Text('All work'),
+        ),
+        Padding(
+          padding: EdgeInsets.symmetric(horizontal: 10),
+          child: Text('Epics'),
+        ),
       ],
     ),
   );
 
   Widget _empty(PifTheme theme) => Center(
     child: Text(
-      'No board yet — open a GitHub repo and refresh',
+      repo.isEmpty
+          ? 'Local only — no GitHub repository connected'
+          : 'No board yet — connect GitHub in Settings and refresh',
       style: TextStyle(color: theme.textMuted, fontSize: 12),
     ),
   );
@@ -247,9 +316,11 @@ class _BoardState extends State<_Board> {
     if (card['number'] == epicNumber) return true;
     if (card['parent'] == epicNumber) return true;
     final sprintNumbers = cards
-        .where((candidate) =>
-            '${candidate['type']}' == 'sprint' &&
-            candidate['parent'] == epicNumber)
+        .where(
+          (candidate) =>
+              '${candidate['type']}' == 'sprint' &&
+              candidate['parent'] == epicNumber,
+        )
         .map((candidate) => candidate['number'])
         .toSet();
     return sprintNumbers.contains(card['parent']);
@@ -260,13 +331,17 @@ class _BoardState extends State<_Board> {
   Widget _epicsOverview(PifTheme theme) {
     // Only epics that still need work (#188, owner): closed epics are done —
     // they don't belong on the "what's next" board.
-    final epics = cards
-        .where((card) =>
-            '${card['type']}' == 'epic' && card['state'] != 'closed')
-        .toList()
-      ..sort(
-        (a, b) => '${b['updatedAt'] ?? ''}'.compareTo('${a['updatedAt'] ?? ''}'),
-      );
+    final epics =
+        cards
+            .where(
+              (card) =>
+                  '${card['type']}' == 'epic' && card['state'] != 'closed',
+            )
+            .toList()
+          ..sort(
+            (a, b) =>
+                '${b['updatedAt'] ?? ''}'.compareTo('${a['updatedAt'] ?? ''}'),
+          );
     if (epics.isEmpty) {
       return Center(
         child: Text(
@@ -326,7 +401,8 @@ class _BoardState extends State<_Board> {
     // lane card — so the lanes hold only its sprints and tasks.
     final family = cards
         .where(
-          (card) => card['number'] != epicNumber && _inEpicFamily(card, epicNumber),
+          (card) =>
+              card['number'] != epicNumber && _inEpicFamily(card, epicNumber),
         )
         .toList();
     return Column(
@@ -447,7 +523,7 @@ class _BoardState extends State<_Board> {
     );
     if (!draggable) return InkWell(onTap: onTap, child: surface);
     return Draggable<Map>(
-      data: card,
+      data: {...card, 'repo': repo},
       feedback: SizedBox(width: width ?? 280, child: surface),
       childWhenDragging: Opacity(opacity: 0.4, child: surface),
       child: InkWell(onTap: onTap, child: surface),
@@ -464,12 +540,16 @@ class _BoardState extends State<_Board> {
   }) {
     final columnId = '${column['id']}';
     final source = pool ?? cards;
-    final columnCards =
-        source.where((card) => '${card['column']}' == columnId).toList();
+    final columnCards = source
+        .where((card) => '${card['column']}' == columnId)
+        .toList();
     return DragTarget<Map>(
-      onWillAcceptWithDetails: (details) => true,
-      onAcceptWithDetails: (details) =>
-          _moveCard(details.data['number'] as int, columnId),
+      onWillAcceptWithDetails: (details) => writable,
+      onAcceptWithDetails: (details) => _moveCard(
+        details.data['number'] as int,
+        columnId,
+        details.data['repo'] as String?,
+      ),
       builder: (context, candidates, rejected) => Container(
         width: width,
         margin: const EdgeInsets.only(right: 10),
@@ -535,6 +615,7 @@ class _TicketSheet extends StatefulWidget {
   const _TicketSheet({
     required this.host,
     required this.card,
+    required this.repo,
     required this.columns,
     required this.onMove,
   });
@@ -542,6 +623,7 @@ class _TicketSheet extends StatefulWidget {
   final Map<String, dynamic>? card;
   final List<Map<String, dynamic>> columns;
   final void Function(int number, String column) onMove;
+  final String repo;
   @override
   State<_TicketSheet> createState() => _TicketSheetState();
 }
@@ -563,6 +645,7 @@ class _TicketSheetState extends State<_TicketSheet> {
   late final TextEditingController _body;
   String _type = 'task';
   late String _createColumn;
+  int? _createParent;
   Size _size = const Size(660, 560);
   String? _revertColumn;
   Offset? _position;
@@ -642,16 +725,18 @@ class _TicketSheetState extends State<_TicketSheet> {
   /// silently disappear (#189).
   void _persistAttributes() {
     if (_card == null) return;
-    widget.host.storage.write('tracker_board', 'attr_${_card['number']}', {
-      'date': _attrDate?.toIso8601String(),
-      'time': _attrTime == null
-          ? null
-          : '${_attrTime!.hour.toString().padLeft(2, '0')}:${_attrTime!.minute.toString().padLeft(2, '0')}',
-      'urgent': _urgent,
-      'flag': _flag,
-      'priority': _priority,
-      'tags': _tags,
-    }).catchError((Object _) {});
+    widget.host.storage
+        .write('tracker_board', 'attr_${_card['number']}', {
+          'date': _attrDate?.toIso8601String(),
+          'time': _attrTime == null
+              ? null
+              : '${_attrTime!.hour.toString().padLeft(2, '0')}:${_attrTime!.minute.toString().padLeft(2, '0')}',
+          'urgent': _urgent,
+          'flag': _flag,
+          'priority': _priority,
+          'tags': _tags,
+        })
+        .catchError((Object _) {});
   }
 
   bool get _dirty =>
@@ -763,13 +848,16 @@ class _TicketSheetState extends State<_TicketSheet> {
   bool _matchesPendingOp(String op, Map payload) {
     if (_pendingOp != op) return false;
     final requestId = '${payload['requestId'] ?? ''}'.trim();
-    if (_pendingRequestId == null || requestId.isEmpty || requestId != _pendingRequestId) {
+    if (_pendingRequestId == null ||
+        requestId.isEmpty ||
+        requestId != _pendingRequestId) {
       return false;
     }
     if (_pendingNumber == null) return true;
     final payloadNumber = payload['number'];
     if (payloadNumber is num) return payloadNumber.toInt() == _pendingNumber;
-    if (payloadNumber is String) return int.tryParse(payloadNumber) == _pendingNumber;
+    if (payloadNumber is String)
+      return int.tryParse(payloadNumber) == _pendingNumber;
     return true;
   }
 
@@ -817,6 +905,7 @@ class _TicketSheetState extends State<_TicketSheet> {
     widget.host.bus.send('tracker/control', op, {
       ...payload,
       'requestId': requestId,
+      'repo': widget.repo,
     });
   }
 
@@ -830,6 +919,7 @@ class _TicketSheetState extends State<_TicketSheet> {
       'body': _body.text,
       'type': _type,
       'column': _createColumn,
+      if (_createParent != null) 'parent': _createParent,
     });
   }
 
@@ -902,7 +992,7 @@ class _TicketSheetState extends State<_TicketSheet> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = widget.host.theme;
+    final theme = PifTheme(brightness: Theme.of(context).brightness);
     final maxSize = Size(
       MediaQuery.of(context).size.width - 80,
       MediaQuery.of(context).size.height - 80,
@@ -932,8 +1022,8 @@ class _TicketSheetState extends State<_TicketSheet> {
                         padding: const EdgeInsets.symmetric(horizontal: 16),
                         child: Text(
                           _error!,
-                          style: const TextStyle(
-                            color: Color(0xffe2a4a4),
+                          style: TextStyle(
+                            color: Theme.of(context).colorScheme.error,
                             fontSize: 11,
                           ),
                         ),
@@ -1065,13 +1155,17 @@ class _TicketSheetState extends State<_TicketSheet> {
                       Expanded(child: _columnDropdown(theme)),
                     ],
                   ),
+                if (_creating) _parentDropdown(theme),
                 const SizedBox(height: 4),
                 // Inline title (#189): no border, no label — bold in edit
                 // mode, cursor exactly where the user taps.
                 TextField(
                   key: const Key('tracker_sheet_title'),
                   controller: _title,
-                  style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.w600,
+                  ),
                   maxLines: 2,
                   minLines: 1,
                   textInputAction: TextInputAction.next,
@@ -1096,10 +1190,7 @@ class _TicketSheetState extends State<_TicketSheet> {
                     const SizedBox(width: 8),
                     Text(
                       'Markdown',
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: theme.textMuted,
-                      ),
+                      style: TextStyle(fontSize: 10, color: theme.textMuted),
                     ),
                   ],
                 ),
@@ -1112,7 +1203,10 @@ class _TicketSheetState extends State<_TicketSheet> {
                     maxLines: null,
                     expands: true,
                     textAlignVertical: TextAlignVertical.top,
-                    style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.w300,
+                    ),
                     decoration: const InputDecoration(
                       isDense: true,
                       border: InputBorder.none,
@@ -1130,7 +1224,10 @@ class _TicketSheetState extends State<_TicketSheet> {
                   padding: const EdgeInsets.only(bottom: 4),
                   child: Text(
                     _title.text,
-                    style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w500),
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w500,
+                    ),
                   ),
                 ),
                 Padding(
@@ -1154,14 +1251,23 @@ class _TicketSheetState extends State<_TicketSheet> {
                         data: _body.text,
                         // Normal text sits at w300 (#189 owner note): only
                         // titles and headings keep heavier weights.
-                        styleSheet: MarkdownStyleSheet.fromTheme(
-                          Theme.of(context),
-                        ).copyWith(
-                          p: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
-                          listBullet: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
-                        ),
+                        styleSheet:
+                            MarkdownStyleSheet.fromTheme(
+                              Theme.of(context),
+                            ).copyWith(
+                              p: const TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w300,
+                              ),
+                              listBullet: const TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.w300,
+                              ),
+                            ),
                         builders: {
-                          'img': _SheetImageBuilder(onWidthChange: _setImageWidth),
+                          'img': _SheetImageBuilder(
+                            onWidthChange: _setImageWidth,
+                          ),
                         },
                       ),
                     ),
@@ -1180,10 +1286,7 @@ class _TicketSheetState extends State<_TicketSheet> {
       context: context,
       builder: (dialogContext) => AlertDialog(
         backgroundColor: widget.host.theme.panelRaised,
-        title: const Text(
-          'Insert image',
-          style: TextStyle(fontSize: 15),
-        ),
+        title: const Text('Insert image', style: TextStyle(fontSize: 15)),
         content: TextField(
           key: const Key('tracker_image_source'),
           controller: controller,
@@ -1230,11 +1333,9 @@ class _TicketSheetState extends State<_TicketSheet> {
   }
 
   Widget _attachmentsPane(PifTheme theme) {
-    final assets = RegExp(r'!?\[([^\]]*)\]\(([^)]+)\)')
-        .allMatches(_body.text)
-        .map((match) => match.group(2)!)
-        .toSet()
-        .toList();
+    final assets = RegExp(
+      r'!?\[([^\]]*)\]\(([^)]+)\)',
+    ).allMatches(_body.text).map((match) => match.group(2)!).toSet().toList();
     if (assets.isEmpty) {
       return Padding(
         padding: const EdgeInsets.all(16),
@@ -1265,9 +1366,7 @@ class _TicketSheetState extends State<_TicketSheet> {
             child: Row(
               children: [
                 Icon(
-                  asset.startsWith('http')
-                      ? Icons.link
-                      : Icons.image_outlined,
+                  asset.startsWith('http') ? Icons.link : Icons.image_outlined,
                   size: 15,
                   color: theme.textMuted,
                 ),
@@ -1277,7 +1376,10 @@ class _TicketSheetState extends State<_TicketSheet> {
                     asset,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w300),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w300,
+                    ),
                   ),
                 ),
                 Text(
@@ -1329,7 +1431,9 @@ class _TicketSheetState extends State<_TicketSheet> {
             children: [
               Icon(icon, size: 16, color: theme.textMuted),
               const SizedBox(width: 10),
-              Expanded(child: Text(label, style: const TextStyle(fontSize: 12.5))),
+              Expanded(
+                child: Text(label, style: const TextStyle(fontSize: 12.5)),
+              ),
               if (trailing != null) ...[trailing, const SizedBox(width: 10)],
               Switch(value: value, onChanged: onChanged),
             ],
@@ -1406,7 +1510,10 @@ class _TicketSheetState extends State<_TicketSheet> {
                       _persistAttributes();
                     }
                   },
-                  child: Text(_attrTime!.format(context), style: const TextStyle(fontSize: 11)),
+                  child: Text(
+                    _attrTime!.format(context),
+                    style: const TextStyle(fontSize: 11),
+                  ),
                 ),
         ),
         toggleRow(
@@ -1437,7 +1544,10 @@ class _TicketSheetState extends State<_TicketSheet> {
               Expanded(
                 child: Text(
                   parentCard ?? 'No parent epic',
-                  style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w300),
+                  style: const TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w300,
+                  ),
                 ),
               ),
             ],
@@ -1508,20 +1618,19 @@ class _TicketSheetState extends State<_TicketSheet> {
           ),
         ),
         const Divider(height: 16),
-        toggleRow(
-          'Flag',
-          Icons.flag_outlined,
-          _flag,
-          (on) {
-            setState(() => _flag = on);
-            _persistAttributes();
-          },
-        ),
+        toggleRow('Flag', Icons.flag_outlined, _flag, (on) {
+          setState(() => _flag = on);
+          _persistAttributes();
+        }),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 6),
           child: Row(
             children: [
-              Icon(Icons.low_priority_outlined, size: 16, color: theme.textMuted),
+              Icon(
+                Icons.low_priority_outlined,
+                size: 16,
+                color: theme.textMuted,
+              ),
               const SizedBox(width: 10),
               const Expanded(
                 child: Text('Priority', style: TextStyle(fontSize: 12.5)),
@@ -1534,7 +1643,13 @@ class _TicketSheetState extends State<_TicketSheet> {
                       .map(
                         (level) => DropdownMenuItem(
                           value: level,
-                          child: Text(level, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w300)),
+                          child: Text(
+                            level,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w300,
+                            ),
+                          ),
                         ),
                       )
                       .toList(),
@@ -1557,6 +1672,35 @@ class _TicketSheetState extends State<_TicketSheet> {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _parentDropdown(PifTheme theme) {
+    final tracker = widget.host.snapshot['tracker'];
+    final candidates = tracker is Map
+        ? (tracker['cards'] as List? ?? const [])
+        : const [];
+    final parents = candidates
+        .whereType<Map>()
+        .where((card) => card['type'] == 'epic' || card['type'] == 'sprint')
+        .toList();
+    return DropdownButton<int>(
+      key: const Key('tracker_create_parent'),
+      value: _createParent ?? 0,
+      isExpanded: true,
+      items: [
+        const DropdownMenuItem(value: 0, child: Text('No parent ticket')),
+        for (final card in parents)
+          DropdownMenuItem(
+            value: card['number'] as int,
+            child: Text(
+              '#${card['number']} ${card['title']}',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+      ],
+      onChanged: (value) =>
+          setState(() => _createParent = value == 0 ? null : value),
     );
   }
 

@@ -947,3 +947,45 @@ pif projects can declare and build their own applications:
   boots straight to its home page — secrets are scanned out of the bundle
   and models are provisioned on the target machine at first run. The widget
   set is frozen at export time (AOT); rebuild to change it.
+
+
+### Installed authoring environments (#218–#223)
+
+The installed authoring app carries a versioned build kit in
+`pif.app/Contents/Resources/builder/`. **New Project** creates a writable
+workspace with its own `pif/` source, immutable `.pif/builder/` resources and
+`.pi/pif/environment.json` identity. The same picker is available in the
+editable preview, so it can create another independent environment. Existing
+files are preserved on reopen; a damaged or incompatible kit is reported
+instead of silently borrowing another checkout.
+
+Authoring requires macOS arm64, Flutter 3.44.x/Dart 3.12.2 or newer within
+major version 3, full Xcode selected with its setup completed, CocoaPods
+1.15+, and Git 2+. The app checks installed tools in known locations and
+supports selecting an existing Flutter SDK. It does not install tools,
+accept licenses or upgrade the system. Runtime exports carry Node/Pi and
+compiled widgets and retain the immutable builder resources. They do not
+require Flutter to run or load newly edited Dart widgets dynamically.
+
+The central **Settings** tab contains only **Appearance** (Light, Dark,
+System) and **GitHub**. Appearance is a non-secret device preference.
+GitHub uses a token saved to macOS Keychain for the selected environment
+UUID. There is no browser login or fallback to a global `gh` login or
+`GH_TOKEN`. New environments start disconnected; tokens are never copied
+into children, Git repositories or exported apps. A connection requires a
+short enough local path for the Unix socket (under 104 UTF-8 bytes including
+`/.pi/pif/github.sock`); use a shorter workspace location if Settings
+reports this limit. Local work remains available without that connection.
+
+New Project offers GitHub-backed creation with owner/name/visibility review
+(private by default), connection to an existing repository, or explicit
+Local only. Repository creation happens only after the user confirms it.
+GitHub remains the epic/task authority; local-only projects have a visibly
+disconnected tracker. Connecting does not overwrite an existing origin or
+silently commit/push files. If remote creation succeeds but local setup
+fails, the saved recovery state allows connection to that repository on
+retry without deleting or recreating it.
+
+These source changes are the #160 integration candidate. Installed build,
+native workflow evidence and security acceptance are recorded in the
+verification report; implementation alone is not release sign-off.
