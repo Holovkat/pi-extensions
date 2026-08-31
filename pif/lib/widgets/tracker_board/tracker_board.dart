@@ -606,6 +606,10 @@ class _TicketSheetState extends State<_TicketSheet> {
 
   void _loadAttributes() {
     if (_card == null) return;
+    _tags = [
+      for (final label in (_card['labels'] as List? ?? const []))
+        if ('$label' != _type && !label.startsWith('status:')) '$label',
+    ];
     final stored = widget.host.storage.read(
       'tracker_board',
       'attr_${_card['number']}',
@@ -625,10 +629,6 @@ class _TicketSheetState extends State<_TicketSheet> {
     _urgent = stored['urgent'] == true;
     _flag = stored['flag'] == true;
     _priority = '${stored['priority'] ?? 'none'}';
-    _tags = [
-      for (final label in (_card['labels'] as List? ?? const []))
-        if ('$label' != _type && !label.startsWith('status:')) '$label',
-    ];
   }
 
   /// Attributes persist on every change — local metadata must never
