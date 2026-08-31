@@ -819,6 +819,40 @@ void main() {
     }
   });
 
+  testWidgets('empty failed history cannot taint a later successful turn (#215)', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    for (final reason in ['error', 'aborted']) {
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({'host': {
+        'id': 'host', 'name': 'Host', 'host': true, 'state': 'idle',
+        'model': 'fixture', 'cwd': '/tmp', 'transcript': [
+          {'type': 'input', 'content': 'Unconfigured request', 'ts': '2026-08-31T06:00:00Z'},
+          {'type': 'message', 'role': 'assistant', 'text': '',
+           'stopReason': reason, 'errorMessage': 'Fixture $reason', 'ts': '2026-08-31T06:00:01Z'},
+          {'type': 'input', 'content': 'Configured request', 'ts': '2026-08-31T06:03:00Z'},
+          {'type': 'message', 'role': 'assistant', 'text': 'Recovered answer',
+           'stopReason': 'stop', 'ts': '2026-08-31T06:03:11Z'},
+        ],
+      }});
+      for (var reopen = 0; reopen < 2; reopen++) {
+        await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 950));
+        await tester.pumpAndSettle();
+        expect(find.text('Fixture $reason'), findsOneWidget);
+        expect(tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data, 'Recovered answer');
+        expect(find.byIcon(Icons.check_circle), findsOneWidget);
+        expect(find.text('11s'), findsOneWidget);
+        expect(find.text(reason == 'error' ? 'failed' : 'aborted'), findsNothing,
+            reason: 'the successful answer must not inherit an earlier empty failure');
+        expectNoFlutterErrors(tester);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+      }
+      await bus.dispose();
+    }
+  });
+
   testWidgets('queued input preserves a streamed assistant through live and reopened rendering (#215)', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1440, 1000));
     addTearDown(() => tester.binding.setSurfaceSize(null));

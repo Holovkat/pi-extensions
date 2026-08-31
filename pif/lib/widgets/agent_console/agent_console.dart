@@ -27,7 +27,6 @@ class _AgentConsole extends StatefulWidget {
 class _SessionTranscriptState {
   int turnStartIndex = -1;
   String? turnStartTs;
-  bool sawAssistantContent = false;
   int activeAssistantIndex = -1;
   bool turnAborted = false;
   bool turnFailed = false;
@@ -38,7 +37,6 @@ class _SessionTranscriptState {
   void resetTurn() {
     turnStartIndex = -1;
     turnStartTs = null;
-    sawAssistantContent = false;
     activeAssistantIndex = -1;
     turnAborted = false;
     turnFailed = false;
@@ -249,7 +247,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
     if (type == 'input') {
       final mode = data['mode'] ?? event['mode'];
       final queued = mode == 'steer' || mode == 'follow_up';
-      if (!queued && state.sawAssistantContent) {
+      // Stored native history may omit agent_end, including after an empty
+      // failure. A new prompt must close that turn even without answer text.
+      if (!queued) {
         _finalizeOpenTurn(
           entries,
           state,
@@ -286,7 +286,6 @@ class _AgentConsoleState extends State<_AgentConsole> {
           ..._timestampEntry(timestamp),
         });
       }
-      state.sawAssistantContent = true;
       return;
     }
 
@@ -321,7 +320,6 @@ class _AgentConsoleState extends State<_AgentConsole> {
           ..._timestampEntry(timestamp),
         });
       }
-      state.sawAssistantContent = true;
       state.activeAssistantIndex = -1;
       return;
     }
@@ -329,7 +327,6 @@ class _AgentConsoleState extends State<_AgentConsole> {
     if (type.contains('tool')) {
       _beginTurnIfNeeded(entries, state, timestamp);
       _upsertToolEntry(entries, state, type, data, timestamp);
-      state.sawAssistantContent = true;
       return;
     }
 
@@ -391,7 +388,6 @@ class _AgentConsoleState extends State<_AgentConsole> {
     if (state.turnStartIndex < 0) {
       state.turnStartIndex = entries.length;
       state.turnStartTs = timestamp;
-      state.sawAssistantContent = false;
       return;
     }
     state.turnStartTs ??= timestamp;
@@ -414,7 +410,6 @@ class _AgentConsoleState extends State<_AgentConsole> {
     if (continuingTurn) return;
     state.turnStartIndex = entries.length - 1;
     state.turnStartTs ??= timestamp;
-    state.sawAssistantContent = false;
     state.activeAssistantIndex = -1;
   }
 

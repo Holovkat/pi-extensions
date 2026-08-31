@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T06:53:12Z - Recorded empty-failure history boundary correction
+
+Indexed the #215 native restart finding, minimal ordinary-turn reset and failing-baseline/passing-fix evidence. Kept the earlier error visible while preventing it from marking a subsequent successful reply as failed.
+
 ## 2026-08-31T06:52:34Z - Recorded native profile failure and recovery repair
 
 Indexed the #201 setup/selection synthesis and focused #160 regressions. Empty-profile input now receives safe setup guidance before provider dispatch, and host model selection updates native Pi before preferences. Rebuilt UI and final-candidate acceptance remain pending.
