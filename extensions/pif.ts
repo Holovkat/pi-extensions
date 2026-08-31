@@ -250,6 +250,7 @@ class PifHub {
 	readonly globalCatalogPath: string;
 	readonly state: HubState;
 	readonly modelsPath: string;
+	private readonly nativeAgentDir: string;
 	readonly token: string;
 	readonly pi: ExtensionAPI; readonly ctx: ExtensionContext; readonly workspace: string; readonly port: number;
 	private controlSecret = "";
@@ -280,7 +281,9 @@ class PifHub {
 		this.appBundled = isInsideAppBundle(this.appDir);
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json"); this.shellStatePath = path.join(this.pifDir, "storage", "shell.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, devMode: false, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
-		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
+		const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+		this.nativeAgentDir = path.resolve(agentDir === "~" ? os.homedir() : agentDir.startsWith("~/") ? path.join(os.homedir(), agentDir.slice(2)) : agentDir);
+		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(this.nativeAgentDir, "models.json");
 		this.token = process.env.PIF_TOKEN || crypto.randomBytes(32).toString("hex");
 		this.allowedOrigins = (process.env.PIF_ALLOWED_ORIGINS || "").split(",").map((value) => value.trim()).filter(Boolean);
 		this.supervisor = new FlutterSupervisor(this.appDir, (status, detail) => { this.state.health.flutter = status; this.broadcast("shell/health", "state", { ...this.state.health, detail }); });
@@ -895,7 +898,7 @@ class PifHub {
 	private readModelsList(): string[] {
 		const models = new Set<string>();
 		try { for (const m of ((this.ctx as any).modelRegistry?.getAvailable?.() ?? [])) models.add(`${m.provider}/${m.id}`); } catch {}
-		try { const settings = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "settings.json"), "utf8")); for (const m of (settings.enabledModels ?? [])) models.add(m); } catch {}
+		try { const settings = JSON.parse(fs.readFileSync(path.join(this.nativeAgentDir, "settings.json"), "utf8")); for (const m of (settings.enabledModels ?? [])) models.add(m); } catch {}
 		try { const providers = this.readModelsConfig(); for (const [provider, config] of Object.entries(providers)) { for (const m of ((config as any).models ?? [])) models.add(`${provider}/${m.id}`); } } catch {}
 		return [...models].sort();
 	}

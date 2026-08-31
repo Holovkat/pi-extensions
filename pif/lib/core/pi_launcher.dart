@@ -98,6 +98,17 @@ class PiLauncher {
     return 'extensions/pif.ts';
   }
 
+  /// Find the bundled pif extension and fail closed if the app bundle does
+  /// not contain it.
+  static String _findBundledExtension() {
+    final res = _resourcesDir();
+    if (res != null) {
+      final bundled = '$res/pi/extensions/pif.ts';
+      if (File(bundled).existsSync()) return bundled;
+    }
+    throw StateError('Bundled pif extension is missing from the app bundle');
+  }
+
   /// Find the Flutter app source directory (for widget scanning).
   static String _findAppDir() {
     final res = _resourcesDir();
@@ -193,6 +204,38 @@ class PiLauncher {
   static String _compiledWidgetIdsJson() {
     final ids = pifWidgetFactories().keys.toList()..sort();
     return jsonEncode(ids);
+  }
+
+  static bool _isExportedLaunch() => Platform.environment['PIF_EXPORTED'] == '1';
+
+  static String _homeDir() {
+    final home = Platform.environment['HOME'];
+    if (home == null || home.isEmpty) {
+      throw StateError('HOME is required to resolve PI_CODING_AGENT_DIR');
+    }
+    return home;
+  }
+
+  static String _defaultNativeProfileDir() => '${_homeDir()}/.pi/agent';
+
+  static String _expandTildePath(String path) {
+    if (path == '~') return _homeDir();
+    if (path.startsWith('~/')) return '${_homeDir()}${path.substring(1)}';
+    return path;
+  }
+
+  /// Resolve the native profile before launching the child process. Relative
+  /// env values are anchored to the child workspace because the launcher and
+  /// the native process do not necessarily share the same cwd.
+  static String _resolveNativeProfileDir(String workspace) {
+    final candidate = Platform.environment['PI_CODING_AGENT_DIR'];
+    final resolved = candidate == null || candidate.trim().isEmpty
+        ? _defaultNativeProfileDir()
+        : _expandTildePath(candidate.trim());
+    final absolute = resolved.startsWith('/')
+        ? resolved
+        : Uri.directory(Directory(workspace).absolute.path).resolve(resolved).path;
+    return _ensureWritableDestination(absolute, role: 'native profile');
   }
 
   static String? _compiledWidgetIdsForAppDir(String appDir) {
@@ -302,6 +345,7 @@ class PiLauncher {
     workspace = _ensureWritableDestination(workspace, role: 'workspace');
     _workspace = workspace;
     _token = _generateToken();
+    final exportedLaunch = _isExportedLaunch();
     // Claim the requested port if free; otherwise fall back to a random
     // port so a foreign listener can neither block the launch nor answer
     // the readiness probe and harvest our token.
@@ -309,9 +353,10 @@ class PiLauncher {
 
     final nodeBin = _findNode();
     final piCli = _findPiCli();
-    final extension = _findExtension();
+    final extension = exportedLaunch ? _findBundledExtension() : _findExtension();
     final appDir = _findAppDir();
     final compiledWidgetIds = _compiledWidgetIdsForAppDir(appDir);
+    final nativeProfileDir = _resolveNativeProfileDir(workspace);
     final hostSessionFile = _ensureWritableDestination(
       '$workspace/.pi/pif/sessions/host.jsonl',
       role: 'host session file',
@@ -321,14 +366,27 @@ class PiLauncher {
     hostSession.writeAsStringSync('', mode: FileMode.append);
     final sessionArgs = ['--session', hostSessionFile];
 
-    // Build the command: either "node cli.js --mode rpc -e ext" or "pi --mode rpc -e ext"
-    // --mode rpc is required so pi doesn't exit when stdin isn't a TTY.
-    // The Flutter app keeps stdin open (Process.start pipes) so pi stays alive.
+    // Build the command: either "node cli.js --mode rpc -e ext" or
+    // "pi --mode rpc -e ext". Exported apps explicitly disable ambient
+    // extension, skill, and prompt-template discovery and load only the
+    // bundled pif extension.
     final List<String> cmd;
+    final launchArgs = <String>[
+      '--mode',
+      'rpc',
+      if (exportedLaunch) ...[
+        '--no-extensions',
+        '--no-skills',
+        '--no-prompt-templates',
+      ],
+      '-e',
+      extension,
+      ...sessionArgs,
+    ];
     if (piCli.isNotEmpty) {
-      cmd = [nodeBin, piCli, '--mode', 'rpc', '-e', extension, ...sessionArgs];
+      cmd = [nodeBin, piCli, ...launchArgs];
     } else {
-      cmd = ['pi', '--mode', 'rpc', '-e', extension, ...sessionArgs];
+      cmd = ['pi', ...launchArgs];
     }
 
     final env = {
@@ -338,6 +396,7 @@ class PiLauncher {
       'PIF_PORT': port.toString(),
       'PIF_WORKSPACE': workspace,
       'PIF_APP_DIR': appDir,
+      'PI_CODING_AGENT_DIR': nativeProfileDir,
       'PIF_TOKEN': _token!,
       'PIF_HOST_SESSION_FILE': hostSessionFile,
       // ignore: use_null_aware_elements
