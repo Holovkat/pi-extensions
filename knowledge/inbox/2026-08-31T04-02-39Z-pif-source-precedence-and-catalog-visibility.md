@@ -1,7 +1,7 @@
 ---
 type: Inbox
 title: pif source precedence and catalog visibility alignment (#207)
-description: Reordered layered widget install precedence so project overlays win first, then global catalog copies, then base widgets and archives; catalog collisions now stay visible unless a project definition wins, and failed copied installs rescan after cleanup so state returns to the surviving source
+description: Reordered layered widget install precedence so project overlays win first, then global catalog copies, then base widgets and archives; global catalog collisions stay visible unless a project definition wins; lower-priority archive duplicates stay hidden, and failed copied installs rescan after cleanup so state returns to the surviving source
 tags: [pi-extensions, pif, widgets, install-precedence, catalog, rollback, okf]
 timestamp: 2026-08-31T04:02:39Z
 generated_at: 2026-08-31T04:02:39Z
@@ -15,7 +15,7 @@ capture_tier: session
 
 # What Was Done
 
-Updated `extensions/pif.ts` so layered widget install resolution now prefers the project overlay first, then the global catalog copy path, then base widgets, then the app-local archive. Bundled and source scans now keep catalog collisions visible when a base widget is installed and hide them only when a project definition actually wins. Failed copied installs now remove the attempt-owned directory first, restore the prior registry snapshot and `registryStateExists` flag, rescan, and rebroadcast the surviving widget/catalog state so the live source provenance matches the rolled-back filesystem. Core uninstall now consults the underlying base manifest before allowing a project shadow to deregister, so a non-core override can no longer mask a core base widget.
+Updated `extensions/pif.ts` so layered widget install resolution now prefers the project overlay first, then the global catalog copy path, then base widgets, then the app-local archive. Bundled and source scans keep global catalog collisions visible when a base widget is installed. They hide lower-priority app-local archive duplicates and all catalog copies when a project definition wins. Failed copied installs now remove the attempt-owned directory first, restore the prior registry snapshot and `registryStateExists` flag, rescan, and rebroadcast the surviving widget/catalog state so the live source provenance matches the rolled-back filesystem. Core uninstall now consults the underlying base manifest before allowing a project shadow to deregister, so a non-core override can no longer mask a core base widget.
 
 ## Decisions Made
 
@@ -47,3 +47,7 @@ Updated `extensions/pif.ts` so layered widget install resolution now prefers the
   - `git diff --check -- extensions/pif.ts`
   - manual readback of the edited `scanWidgets()` / `installWidget()` / `uninstallWidget()` branches
 - No UI actions or shared-helper edits were run for this slice; `#160` remains responsible for broader final validation.
+
+## Final Gate Follow-up
+
+The combined smoke check exposed a lower-priority archive duplicate after the global catalog visibility change. The scan now distinguishes those sources. The three focused collision, real-hub workflow and layered-source integration cases pass (3/3, 0 failures, 67.7 seconds); the global override remains visible while the installed base archive copy is hidden. Evidence: `/tmp/pif-remediation-2026-08-31/full-gate-1-corrections-catalog.log`. Final combined and artifact gates remain pending.

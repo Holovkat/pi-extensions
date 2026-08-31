@@ -879,7 +879,7 @@ class PifHub {
 		this.state.widgets = widgets;
 		this.state.catalog = { ...appCatalog, ...globalCatalog };
 		this.installed = new Set(Object.keys(widgets));
-		for (const [id, record] of Object.entries(widgets)) if (record.source === "project") delete this.state.catalog[id];
+		for (const [id, record] of Object.entries(widgets)) if (record.source === "project" || this.state.catalog[id]?.source === "base") delete this.state.catalog[id];
 		const freshRegistry = !this.registryStateExists && !this.registrySeeded;
 		if (freshRegistry) { this.enabled = new Set(Object.keys(widgets)); this.registrySeeded = true; }
 		for (const record of Object.values(widgets)) record.enabled = this.enabled.has(record.id);
