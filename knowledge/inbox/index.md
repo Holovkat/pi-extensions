@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [pif export launcher now refreshes workspace manifest atomically](./2026-08-31T02-05-00Z-pif-export-manifest-bootstrap-atomic-upgrade.md) | 2026-08-31T02:05:00Z | pi-extensions, pif, export, bootstrap, manifest, launcher, atomic, backup | #202 |
 | [pif shell dev mode sync, fresh-state persistence, and redacted shell-state failures](./2026-08-31T01-57-06Z-pif-shell-dev-mode-sync-and-redacted-shell-state-failures.md) | 2026-08-31T01:57:06Z | pi-extensions, pif, shell, dev-mode, websocket, diagnostics, okf | #208 |
 | [pif app build bus result proof and bounded export diagnostics](./2026-08-31T01-36-43Z-pif-app-build-bus-result-proof.md) | 2026-08-31T01:36:43Z | pi-extensions, pif, app-build, websocket, diagnostics, okf | #192 |
 | [pif export scanner now fails closed on bundled credential shapes](./2026-08-31T01-29-13Z-pif-export-secret-scan-hardening.md) | 2026-08-31T01:29:13Z | pi-extensions, pif, export, secrets, scanner, symlink, app-builder | #199 |

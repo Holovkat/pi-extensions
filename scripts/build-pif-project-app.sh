@@ -279,6 +279,83 @@ rsync -a \
 echo "10. Bundling the app manifest ..."
 cp "$MANIFEST" "$RESOURCES/pif_app-manifest/app.yaml"
 
+# 10b. Write the bootstrap helper that refreshes the workspace manifest on
+#      launch. It uses the shared parseAppManifest parser, validates the
+#      source before mutating anything, and backs up any differing prior
+#      app.yaml in the same directory before the atomic replace.
+cat > "$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs" <<'NODE'
+#!/usr/bin/env node
+import fs from 'node:fs';
+import path from 'node:path';
+import { parseAppManifest } from '../pi/extensions/pif-shared.ts';
+
+function fail(message) {
+  console.error(`ERROR: ${message}`);
+  process.exit(1);
+}
+
+const workspaceArg = process.argv[2];
+const sourceArg = process.argv[3];
+const appId = process.argv[4];
+if (!workspaceArg || !sourceArg || !appId) fail('usage: bootstrap-manifest.mjs <workspace> <source> <app-id>');
+
+const workspace = path.resolve(workspaceArg);
+const source = path.resolve(sourceArg);
+const manifestDir = path.join(workspace, 'pif_app');
+const target = path.join(manifestDir, 'app.yaml');
+const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+const staging = path.join(manifestDir, `.app.yaml.stage-${process.pid}-${stamp}`);
+const backup = path.join(manifestDir, `app.yaml.export-backup-${stamp}-${process.pid}`);
+const backupStage = `${backup}.stage-${process.pid}`;
+
+let sourceRaw;
+try {
+  sourceRaw = fs.readFileSync(source);
+} catch (error) {
+  fail(`could not read source manifest ${source}: ${error.message}`);
+}
+const parsed = parseAppManifest(sourceRaw.toString('utf8'));
+if (parsed.error) fail(`exported app manifest is invalid: ${parsed.error}`);
+if (parsed.manifest?.id !== appId) {
+  fail(`exported app manifest id '${parsed.manifest?.id ?? '(missing)'}' does not match exported app id '${appId}'`);
+}
+
+fs.mkdirSync(manifestDir, { recursive: true });
+
+function cleanup(file) {
+  try { fs.rmSync(file, { force: true }); } catch (_) { /* best-effort cleanup */ }
+}
+
+try {
+  if (!fs.existsSync(target)) {
+    fs.writeFileSync(staging, sourceRaw);
+    fs.renameSync(staging, target);
+    process.exit(0);
+  }
+
+  const currentRaw = fs.readFileSync(target);
+  if (currentRaw.equals(sourceRaw)) process.exit(0);
+
+  const currentParsed = parseAppManifest(currentRaw.toString('utf8'));
+  if (!currentParsed.error && currentParsed.manifest?.id !== appId) {
+    fail(`workspace manifest id '${currentParsed.manifest?.id ?? '(missing)'}' does not match exported app id '${appId}'`);
+  }
+
+  fs.copyFileSync(target, backupStage);
+  fs.renameSync(backupStage, backup);
+  fs.writeFileSync(staging, sourceRaw);
+  fs.renameSync(staging, target);
+} catch (error) {
+  cleanup(staging);
+  cleanup(backupStage);
+  fail(
+    `could not refresh export-owned manifest for ${appId}: ${error.message}. ` +
+    `Recovery: restore '${target}' from the newest 'app.yaml.export-backup-*' file in ${manifestDir}, then relaunch.`
+  );
+}
+NODE
+chmod +x "$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs"
+
 # 11. Launcher: exported apps boot straight into their workspace — no
 #     project picker. First run provisions the workspace from the bundle.
 echo "11. Writing the exported-app launcher ..."
@@ -286,13 +363,20 @@ mv "$APP/Contents/MacOS/pif" "$APP/Contents/MacOS/pif.bin"
 APP_SUPPORT="$HOME/Library/Application Support/pif-apps/$APP_ID"
 cat > "$APP/Contents/MacOS/pif" << LAUNCHER
 #!/usr/bin/env bash
+set -euo pipefail
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+RESOURCES="\$DIR/../Resources"
 WS="\$HOME/Library/Application Support/pif-apps/$APP_ID"
-mkdir -p "\$WS/pif_app"
-[ -f "\$WS/pif_app/app.yaml" ] || cp "\$DIR/../Resources/pif_app-manifest/app.yaml" "\$WS/pif_app/app.yaml"
+# Export-owned manifest policy:
+# - validate the bundle source before mutating anything
+# - preserve any differing prior workspace app.yaml as
+#   app.yaml.export-backup-<timestamp>-<pid> in the same directory
+# - replace the workspace manifest through same-directory rename so launch
+#   never observes a partial write
 export PIF_EXPORTED=1
 export PIF_WORKSPACE="\$WS"
-export PIF_APP_DIR="\$DIR/../Resources/app"
+export PIF_APP_DIR="\$RESOURCES/app"
+"\$RESOURCES/pi/node" --experimental-strip-types "\$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs" "\$WS" "\$RESOURCES/pif_app-manifest/app.yaml" "$APP_ID"
 exec "\$DIR/pif.bin"
 LAUNCHER
 chmod +x "$APP/Contents/MacOS/pif"
@@ -327,6 +411,8 @@ echo "  App: $APP"
 echo "  Size: $(du -sh "$APP" | cut -f1)"
 echo "  Home page: $MANIFEST-home (from app.yaml: home)"
 echo ""
+echo "Launch policy: each start validates the bundle manifest, backs up any"
+echo "differing workspace app.yaml, and atomically refreshes it before launch."
 echo "First run: the app boots straight to its home page (no picker)."
 echo "Models are provisioned on first run on the target machine — place a"
 echo "models.json in:"
