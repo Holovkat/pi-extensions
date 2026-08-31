@@ -3,6 +3,15 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T21:48:09Z - Approved the corrected Team Pulse design
+
+Replaced the routing-only Home proposal with a useful weekly dashboard, made
+Metrics the sole detailed destination and removed the unsupported About route.
+Froze the shared demo snapshot, real status extension and pinned Mercury paired
+appearance contract. This is a design-only checkpoint: #212 is ready for
+implementation, while #206 follows it and #158/#160 retain workflow and final
+verification.
+
 ## 2026-08-31T12:48:20Z - Checkpointed development and closed implemented PIF tickets
 
 Recorded the owner-authorized development checkpoint: 32 implementation tickets closed with evidence, while #158/#206/#212 remain unfinished and #160 retains final live acceptance. Epic #152 and sprint #153 remain open; no Supabase dependency or unrelated notes-app closure is implied. Product source remains fd0b8149; only tracker/documentation state changed.
