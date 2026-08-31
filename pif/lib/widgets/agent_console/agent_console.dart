@@ -556,92 +556,134 @@ class _AgentConsoleState extends State<_AgentConsole> {
                   ),
                 ),
                 const SizedBox(height: 5),
-                Row(
-                  children: [
-                    Tooltip(
-                      message: 'Attachments are not available yet',
-                      child: IconButton(
-                        key: const Key('agent_console_add'),
-                        onPressed: null,
-                        icon: const Icon(Icons.add, size: 18),
-                        color: const Color(0xffb0b0b0),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    const SizedBox(width: 4),
-                    const Icon(
-                      Icons.lock_open_outlined,
-                      size: 14,
-                      color: Color(0xffcf8d55),
-                    ),
-                    const SizedBox(width: 4),
-                    // Shrinks before the send button can clip (#160 dogfood:
-                    // the 440px console overlay overflowed this row).
-                    Flexible(
-                      child: Text(
-                        'Workspace access',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(fontSize: 11, color: Color(0xffcf8d55)),
-                      ),
-                    ),
-                    const Spacer(),
-                    if (selected != null) ...[
-                      Flexible(child: _modelSelector(selected)),
-                      const SizedBox(width: 5),
-                      Flexible(child: _thinkingSelector(selected)),
-                      const SizedBox(width: 5),
-                    ],
-                    if (running)
-                      TextButton.icon(
-                        key: const Key('agent_console_steer'),
-                        onPressed: submit,
-                        icon: const Icon(Icons.arrow_upward, size: 14),
-                        label: const Text('Steer'),
-                        style: TextButton.styleFrom(
-                          foregroundColor: const Color(0xffb0b0b0),
-                          padding: const EdgeInsets.symmetric(horizontal: 7),
-                          minimumSize: const Size(0, 30),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final narrow = constraints.maxWidth < 560;
+                    if (narrow) {
+                      return Wrap(
+                        spacing: 4,
+                        runSpacing: 4,
+                        crossAxisAlignment: WrapCrossAlignment.center,
+                        children: [
+                          _attachmentsButton(),
+                          const Icon(
+                            Icons.lock_open_outlined,
+                            size: 14,
+                            color: Color(0xffcf8d55),
+                          ),
+                          SizedBox(
+                            width: 112,
+                            child: _workspaceAccessLabel(),
+                          ),
+                          if (selected != null) ...[
+                            SizedBox(
+                              width: 136,
+                              child: _modelSelector(selected),
+                            ),
+                            SizedBox(
+                              width: 90,
+                              child: _thinkingSelector(selected),
+                            ),
+                          ],
+                          if (running) _steerButton(),
+                          _voiceButton(),
+                          _sendButton(selected),
+                        ],
+                      );
+                    }
+                    return Row(
+                      children: [
+                        _attachmentsButton(),
+                        const SizedBox(width: 4),
+                        const Icon(
+                          Icons.lock_open_outlined,
+                          size: 14,
+                          color: Color(0xffcf8d55),
                         ),
-                      ),
-                    const Tooltip(
-                      message: 'Voice input is not available yet',
-                      child: IconButton(
-                        onPressed: null,
-                        icon: Icon(Icons.mic_none, size: 17),
-                        visualDensity: VisualDensity.compact,
-                      ),
-                    ),
-                    IconButton.filled(
-                      key: const Key('agent_console_send'),
-                      onPressed: selected == null
-                          ? null
-                          : running
-                          ? () => widget.host.sessions.abort(
-                              widget.host.activeSessionId,
-                            )
-                          : submit,
-                      tooltip: running ? 'Abort agent' : 'Send message',
-                      style: IconButton.styleFrom(
-                        backgroundColor: running
-                            ? const Color(0xff9c5b5b)
-                            : widget.host.theme.accent,
-                        foregroundColor: const Color(0xff10141c),
-                        disabledBackgroundColor: const Color(0xff3b3b3b),
-                        disabledForegroundColor: const Color(0xff777777),
-                      ),
-                      icon: Icon(
-                        running ? Icons.stop_rounded : Icons.arrow_upward,
-                        size: 18,
-                      ),
-                    ),
-                  ],
+                        const SizedBox(width: 4),
+                        // Shrinks before the send button can clip (#160 dogfood:
+                        // the 440px console overlay overflowed this row).
+                        Flexible(child: _workspaceAccessLabel()),
+                        const Spacer(),
+                        if (selected != null) ...[
+                          Flexible(child: _modelSelector(selected)),
+                          const SizedBox(width: 5),
+                          Flexible(child: _thinkingSelector(selected)),
+                          const SizedBox(width: 5),
+                        ],
+                        if (running) _steerButton(),
+                        _voiceButton(),
+                        _sendButton(selected),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),
           ),
         ),
       ),
+    ),
+  );
+
+  Widget _attachmentsButton() => Tooltip(
+    message: 'Attachments are not available yet',
+    child: IconButton(
+      key: const Key('agent_console_add'),
+      onPressed: null,
+      icon: const Icon(Icons.add, size: 18),
+      color: const Color(0xffb0b0b0),
+      visualDensity: VisualDensity.compact,
+    ),
+  );
+
+  Widget _workspaceAccessLabel() => const Text(
+    'Workspace access',
+    maxLines: 1,
+    overflow: TextOverflow.ellipsis,
+    style: TextStyle(fontSize: 11, color: Color(0xffcf8d55)),
+  );
+
+  Widget _steerButton() => TextButton.icon(
+    key: const Key('agent_console_steer'),
+    onPressed: submit,
+    icon: const Icon(Icons.arrow_upward, size: 14),
+    label: const Text('Steer'),
+    style: TextButton.styleFrom(
+      foregroundColor: const Color(0xffb0b0b0),
+      padding: const EdgeInsets.symmetric(horizontal: 7),
+      minimumSize: const Size(0, 30),
+    ),
+  );
+
+  Widget _voiceButton() => const Tooltip(
+    message: 'Voice input is not available yet',
+    child: IconButton(
+      onPressed: null,
+      icon: Icon(Icons.mic_none, size: 17),
+      visualDensity: VisualDensity.compact,
+    ),
+  );
+
+  Widget _sendButton(PifSession? selected) => IconButton.filled(
+    key: const Key('agent_console_send'),
+    onPressed: selected == null
+        ? null
+        : running
+        ? () => widget.host.sessions.abort(widget.host.activeSessionId)
+        : submit,
+    tooltip: running ? 'Abort agent' : 'Send message',
+    style: IconButton.styleFrom(
+      backgroundColor: running
+          ? const Color(0xff9c5b5b)
+          : widget.host.theme.accent,
+      foregroundColor: const Color(0xff10141c),
+      disabledBackgroundColor: const Color(0xff3b3b3b),
+      disabledForegroundColor: const Color(0xff777777),
+    ),
+    icon: Icon(
+      running ? Icons.stop_rounded : Icons.arrow_upward,
+      size: 18,
     ),
   );
 
@@ -652,22 +694,43 @@ class _AgentConsoleState extends State<_AgentConsole> {
       child: DropdownButtonHideUnderline(
         child: DropdownButton<String>(
           isDense: true,
+          isExpanded: true,
           iconSize: 14,
           style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
           value: resolved,
-          hint: const Text('Model', style: TextStyle(fontSize: 11)),
+          hint: const Text(
+            'Model',
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(fontSize: 11),
+          ),
           items: [
-            const DropdownMenuItem(value: '', child: Text('Default')),
+            const DropdownMenuItem(
+              value: '',
+              child: Text(
+                'Default',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
             ...widget.host.models.map(
               (model) => DropdownMenuItem(
                 value: model,
-                child: Text(model.split('/').last),
+                child: Text(
+                  model.split('/').last,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
             ),
             if (resolved != null && !widget.host.models.contains(resolved))
               DropdownMenuItem(
                 value: resolved,
-                child: Text(resolved.split('/').last),
+                child: Text(
+                  resolved.split('/').last,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
           ],
           onChanged: (value) => widget.host.sessions.setModel(
@@ -684,15 +747,35 @@ class _AgentConsoleState extends State<_AgentConsole> {
     child: DropdownButtonHideUnderline(
       child: DropdownButton<String>(
         isDense: true,
+        isExpanded: true,
         iconSize: 14,
         style: const TextStyle(fontSize: 11, color: Color(0xffb0b0b0)),
         value: selected.thinking,
         items: const [
-          DropdownMenuItem(value: 'none', child: Text('None')),
-          DropdownMenuItem(value: 'low', child: Text('Low')),
-          DropdownMenuItem(value: 'medium', child: Text('Medium')),
-          DropdownMenuItem(value: 'high', child: Text('High')),
-          DropdownMenuItem(value: 'max', child: Text('Max')),
+          DropdownMenuItem(
+            value: 'none',
+            child: Text('None', maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+          DropdownMenuItem(
+            value: 'low',
+            child: Text('Low', maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+          DropdownMenuItem(
+            value: 'medium',
+            child: Text(
+              'Medium',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          DropdownMenuItem(
+            value: 'high',
+            child: Text('High', maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
+          DropdownMenuItem(
+            value: 'max',
+            child: Text('Max', maxLines: 1, overflow: TextOverflow.ellipsis),
+          ),
         ],
         onChanged: (value) => widget.host.sessions.setThinking(
           widget.host.activeSessionId,

@@ -47,6 +47,15 @@ class FakeBus extends PifBus {
   Future<void> dispose() => controller.close();
 }
 
+void expectNoFlutterErrors(WidgetTester tester) {
+  final errors = <Object?>[];
+  Object? error;
+  while ((error = tester.takeException()) != null) {
+    errors.add(error);
+  }
+  expect(errors, isEmpty);
+}
+
 Widget wrap(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
   theme: ThemeData.dark(),
   home: Scaffold(
@@ -58,13 +67,18 @@ Widget wrap(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
   ),
 );
 final navigatorKey = GlobalKey<NavigatorState>();
-Widget panel(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
+Widget panel(
+  PifWidgetPlugin plugin,
+  PifHost host, {
+  double width = 1000,
+  double height = 700,
+}) => MaterialApp(
   navigatorKey: navigatorKey,
   theme: ThemeData.dark(),
   home: Scaffold(
     body: SizedBox(
-      width: 1000,
-      height: 700,
+      width: width,
+      height: height,
       child: Builder(builder: (context) => plugin.build(context, host)),
     ),
   ),
@@ -263,6 +277,156 @@ void main() {
     expect(bus.sent.single['type'], 'abort');
     await bus.dispose();
   });
+
+  testWidgets(
+    'Agent Console composer stays usable across narrow and wide widths while idle',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() async => tester.binding.setSurfaceSize(null));
+      for (final width in [288.0, 320.0, 440.0, 1000.0]) {
+        final bus = FakeBus();
+        final host = _host(bus)
+          ..models = [
+            'fixture/fast',
+            'openai-codex/gpt-5.6-sol',
+          ];
+        host.sessions.applySnapshot({
+          'host': {
+            'id': 'host',
+            'name': 'Host',
+            'host': true,
+            'state': 'idle',
+            'model': 'fixture/fast',
+            'thinking': 'low',
+            'cwd': '/tmp',
+            'transcript': <dynamic>[],
+          },
+        });
+        await tester.pumpWidget(panel(AgentConsolePlugin(), host, width: width));
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+
+        expect(find.byKey(const Key('agent_console_composer')), findsOneWidget);
+        expect(find.byKey(const Key('agent_console_send')), findsOneWidget);
+        expect(find.byKey(const Key('agent_console_steer')), findsNothing);
+        expect(find.text('fast'), findsOneWidget);
+        expect(find.text('Low'), findsOneWidget);
+
+        await tester.tap(find.text('fast'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('gpt-5.6-sol').last);
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'setModel');
+        expect((bus.sent.last['payload'] as Map)['model'], 'openai-codex/gpt-5.6-sol');
+
+        bus.sent.clear();
+        await tester.tap(find.text('Low'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('High').last);
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'setThinking');
+        expect((bus.sent.last['payload'] as Map)['thinking'], 'high');
+
+        bus.sent.clear();
+        await tester.enterText(
+          find.byKey(const Key('agent_console_composer')),
+          'idle prompt',
+        );
+        await tester.tap(find.byKey(const Key('agent_console_send')));
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'input');
+        expect((bus.sent.last['payload'] as Map)['content'], 'idle prompt');
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        await bus.dispose();
+      }
+    },
+  );
+
+  testWidgets(
+    'Agent Console composer stays usable across narrow and wide widths while running',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() async => tester.binding.setSurfaceSize(null));
+      for (final width in [288.0, 320.0, 440.0, 1000.0]) {
+        final bus = FakeBus();
+        final host = _host(bus)
+          ..models = [
+            'fixture/fast',
+            'openai-codex/gpt-5.6-sol',
+          ];
+        host.sessions.applySnapshot({
+          'host': {
+            'id': 'host',
+            'name': 'Host',
+            'host': true,
+            'state': 'running',
+            'model': 'fixture/fast',
+            'thinking': 'medium',
+            'cwd': '/tmp',
+            'transcript': <dynamic>[],
+          },
+        });
+        await tester.pumpWidget(panel(AgentConsolePlugin(), host, width: width));
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+
+        expect(find.byKey(const Key('agent_console_send')), findsOneWidget);
+        expect(find.byKey(const Key('agent_console_steer')), findsOneWidget);
+        expect(find.text('fast'), findsOneWidget);
+        expect(find.text('Medium'), findsOneWidget);
+
+        await tester.tap(find.text('fast'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('gpt-5.6-sol').last);
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'setModel');
+        expect((bus.sent.last['payload'] as Map)['model'], 'openai-codex/gpt-5.6-sol');
+
+        await tester.enterText(
+          find.byKey(const Key('agent_console_composer')),
+          'please rewrite this',
+        );
+        await tester.tap(find.byKey(const Key('agent_console_steer')));
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'steer');
+        expect((bus.sent.last['payload'] as Map)['content'], 'please rewrite this');
+
+        bus.sent.clear();
+        await tester.tap(find.text('Medium'));
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('High').last);
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'setThinking');
+        expect((bus.sent.last['payload'] as Map)['thinking'], 'high');
+
+        bus.sent.clear();
+        await tester.enterText(
+          find.byKey(const Key('agent_console_composer')),
+          'stop now',
+        );
+        await tester.tap(find.byKey(const Key('agent_console_send')));
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        expect(bus.sent.last['type'], 'abort');
+        expect((bus.sent.last['payload'] as Map)['sessionId'], 'host');
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+        expectNoFlutterErrors(tester);
+        await bus.dispose();
+      }
+    },
+  );
+
   testWidgets('model dropdown lists available models and reflects selection', (
     tester,
   ) async {
