@@ -1,10 +1,10 @@
 ---
 type: State
 title: Current Repo State
-description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and roadmap status as of August 2026.
+description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-23T12:00:00Z
+timestamp: 2026-08-31T03:32:02Z
 status: active
 ---
 
@@ -40,6 +40,15 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 ### pif App Builder (#152, Active)
 - Epic #152 "pif app builder" is open and active: agentic applications composed on the pif foundation.
 - Tracker precursor sprint #163–#166 (repo-synced Kanban tracker panel v0.1: sprint, hub sync layer, board widget, verification) is open but planned ahead of execution.
+
+### pif App Builder Remediation Snapshot (#160 / #205)
+- Live branch: `codex/pif-app-builder-154` at `f4bfe769`.
+- Review slices on branch: `#191`, `#192`, `#193`, `#194`, `#195`, `#196`, `#197`, `#198`, `#199`, `#200`, `#202`, `#203`, `#208`, `#210`, `#214`.
+- Supporting harness commits: `6891a1b3`, `a2172be8`, `a010db15`.
+- `#160` remains the blocked final verification ticket; focused Flutter, Node, and native UI diagnostics exist, but `complete_gate_runs = 0` and the final `npm run test:pif`, install/launch, export/signature/provider, and clean-candidate acceptance evidence remain pending.
+- Owner-gated rows `#204`, `#206`, and `#212` remain blocked. Coordination items `#187` and `#211` are in progress; `#201`, `#205`, `#207`, and `#209` are still todo.
+- The historical seven-task approvals (`#154`, `#155`, `#156`, `#157`, `#178`, `#188`, `#189`) remain preserved and are not treated as final candidate acceptance.
+- The live handoff records now point at the current review slice set in `knowledge/inbox/index.md` and the corrective log entry in `knowledge/log.md`.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.

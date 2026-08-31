@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T03:32:02Z - Corrected pif handoff state and candidate links
+
+Updated the current pif state snapshot to reflect the live remediation branch, the review slices through #214, the open owner gates, and the still-blocked #160 final verification ticket. Added the corrective #205 inbox synthesis and aligned the inbox/root counts and handoff references without changing any source or test files.
+
 ## 2026-06-29T15:05:00Z - Seeded knowledge bundle from project documentation
 
 Initial seeding of the pi-extensions OKF knowledge bundle from existing project documentation (README.md, docs/, extension files, agent definitions, PRDs).

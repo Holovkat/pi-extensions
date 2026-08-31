@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [pif handoff state and candidate links now reflect the live review slice](./2026-08-31T03-32-02Z-pif-handoff-state-and-candidate-links.md) | 2026-08-31T03:32:02Z | pi-extensions, pif, okf, state, inbox, handoff, verification | #205, #160, #187, #201, #204, #206, #207, #209, #211, #212, #214 |
 | [pif agent console responsive composer fix for compact center panels](./2026-08-31T03-16-32Z-pif-console-responsive-composer.md) | 2026-08-31T03:16:32Z | pi-extensions, pif, agent-console, responsive-ui, overflow, flutter, okf | #214 |
 | [pif focused regression coverage for view-mode resize, app-mode breakpoints, and widget provenance](./2026-08-31T02-02-55Z-pif-regression-tests-view-mode-save-ack.md) | 2026-08-31T02:28:27Z | pi-extensions, pif, regression, tracker-board, app-mode, widget-store, okf | #160, #197, #198, #208, #210 |
 | [pif hub protocol and live-state regression coverage under test ticket 160](./2026-08-31T02-10-00Z-pif-hub-protocol-and-live-state-regressions.md) | 2026-08-31T02:10:00Z | pi-extensions, pif, testing, protocol, manifest, dev-mode | #160 |
