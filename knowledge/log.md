@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T09:06:31Z - Recorded installed builder and GitHub setup requirement
+
+Owner resolved #204 in favor of installed authoring/export and added repeatable local development environments plus secure GitHub Settings/repository creation. Created #218–#222 under existing #160 and extended #152/#153; updated current state while preserving historical test evidence and separate sample design gates. No capability is claimed implemented.
+
 ## 2026-08-31T07:13:51Z - Recorded final full gate and native end-to-end results
 
 Updated the current report/state with dc45ff40, 66 Node and 81 Flutter passing tests, real missing-auth/recovery/restart proof and unchanged signed bundles. Preserved the three remaining owner gates and native chooser limitation; no epic acceptance or release was claimed.

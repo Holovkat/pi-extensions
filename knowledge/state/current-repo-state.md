@@ -4,7 +4,7 @@ title: Current Repo State
 description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-31T05:17:19Z
+timestamp: 2026-08-31T09:06:31Z
 status: active
 ---
 
@@ -43,12 +43,18 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 
 ### pif App Builder Remediation Snapshot (#160, 31 August 2026)
 - Tested and pushed code candidate: `dc45ff40` on `codex/pif-app-builder-154`. Documentation handoff does not change the built revision.
-- Live #160 readback confirms 27 native remediation children: 24 implementation tasks in Review; owner-gated #204/#206/#212 blocked. Canonical requirements remain #158/#159/#160.
+- The earlier E2E checkpoint had 27 native remediation children. Following the owner requirement extension below, #160 now has 32: 24 in Review, six To Do, and #206/#212 blocked on independent sample design/appearance approval. Canonical requirements remain #158/#159/#160 with the explicit #152 extension.
 - Fresh full gate passes at dc45ff40: 66 Node tests, clean Dart analysis and 81 Flutter tests in one clean-checkout run. Prior failed gates and the earlier bdfe5bb4 pass are preserved in the report.
 - This E2E run additionally fixed native model setup/selection, empty-failure history contamination and URI-encoded filesystem paths. Existing legacy host history is preserved by a verified no-overwrite copy into the canonical path.
 - Stock at `/Applications/pif.app` passed real child/Steer/Abort/tool recovery and widget checks, then reopened at the clean picker as PID 81004. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` passed empty-profile guidance, configured write/read, migration and restart persistence; final PID 80355 normally quit. Both bundles remain unchanged and pass strict signatures.
-- #160 remains open for the export support-boundary decision, approved Mercury sample/appearance implementation and owner acceptance. Native folder chooser completion and new OAuth/denied-permission provisioning are not proven. The technical scaffold export is not Mercury sample acceptance.
+- The owner has resolved the export support boundary: installed authoring/export is required. #160 remains open for its implementation/verification, approved Mercury sample/appearance implementation and owner acceptance. Native folder chooser completion and new OAuth/denied-permission provisioning are not proven. The technical scaffold export is not Mercury sample acceptance.
 - [Current report](../../docs/reviews/2026-08-31-remediation-verification.md) links final evidence and remaining gates. Historical owner approvals #154/#155/#156/#157/#178/#188/#189 and the original review remain unchanged.
+
+### Installed Builder and GitHub Setup Requirement (31 August 2026)
+- Owner direction extends existing epic [#152](https://github.com/Holovkat/pi-extensions/issues/152): installed pif must build apps and create local development environments which can create more environments, without this repository checkout. A follow-up adds GitHub repository creation and secure application Settings; the earlier repository-creation deferral is superseded.
+- Native children of #160: #218 bundled builder resources → #219 repeatable development environments → #220 installed export. #221 secure GitHub connection Settings may be prepared independently; #222 repository creation and tracker binding follows #219/#221. These tasks are To Do, not implemented.
+- #204 moves from Blocked to To Do: the owner decision is settled; canonical spec/support-matrix reconciliation remains. #160 stays the sole verification gate and must prove the installed-app and two-generation environment workflow. The previous passing dc45ff40 candidate does not prove added scope.
+- GitHub is the ticket authority; local-only mode remains explicitly disconnected. Secrets stay in secure OS storage and out of projects/exports; created environments do not copy parent runtime state or tickets. Ordinary AOT exports and the deferred RFW lane remain distinct from editable environments. #190 runtime self-management remains related backlog.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.
