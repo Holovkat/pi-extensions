@@ -36,6 +36,154 @@ export interface PifWidgetManifest {
  * shadows an earlier id wholesale: project > catalog > base. */
 export type PifWidgetSource = "base" | "catalog" | "project";
 
+const PIF_WIDGET_ID_PATTERN = /^[a-z][a-z0-9_]*$/;
+
+export function isWidgetId(value: string): boolean {
+	return PIF_WIDGET_ID_PATTERN.test(value);
+}
+
+export interface PifWidgetLookupRoots {
+	base?: string | readonly string[];
+	catalog?: string | readonly string[];
+	project?: string | readonly string[];
+}
+
+export interface PifResolvedWidgetEntry extends PifRegistryEntry {
+	root: string;
+	directory: string;
+	manifestPath: string;
+}
+
+export interface PifWidgetResolutionProblem {
+	id: string;
+	reason: "invalid" | "duplicate" | "missing" | "unavailable";
+	message: string;
+	index?: number;
+	previousIndex?: number;
+	source?: PifWidgetSource;
+	root?: string;
+}
+
+export interface PifWidgetResolutionResult {
+	ok: boolean;
+	requested: string[];
+	resolved: PifResolvedWidgetEntry[];
+	problems: PifWidgetResolutionProblem[];
+}
+
+function asRootList(value: string | readonly string[] | undefined): string[] {
+	if (value === undefined) return [];
+	return Array.isArray(value) ? [...value] : [value];
+}
+
+function problemMessage(id: string, reason: PifWidgetResolutionProblem["reason"], detail: string, index?: number, previousIndex?: number, source?: PifWidgetSource, root?: string): PifWidgetResolutionProblem {
+	return { id, reason, message: detail, index, previousIndex, source, root };
+}
+
+function readResolvedWidgetEntry(root: string, source: PifWidgetSource, id: string): PifResolvedWidgetEntry | PifWidgetResolutionProblem | null {
+	const resolvedRoot = path.resolve(root);
+	const directory = assertSafeWidgetPath(resolvedRoot, path.join(resolvedRoot, id));
+	if (!fs.existsSync(directory)) return null;
+	let stat: fs.Stats;
+	try {
+		stat = fs.statSync(directory);
+	} catch (error) {
+		return problemMessage(id, "invalid", `required widget '${id}' in ${source} source could not be inspected at ${directory}: ${String((error as Error).message)}`, undefined, undefined, source, resolvedRoot);
+	}
+	if (!stat.isDirectory()) {
+		return problemMessage(id, "invalid", `required widget '${id}' in ${source} source must be a directory at ${directory}`, undefined, undefined, source, resolvedRoot);
+	}
+	const manifestPath = path.join(directory, "widget.yaml");
+	let raw = "";
+	try {
+		raw = fs.readFileSync(manifestPath, "utf8");
+	} catch (error) {
+		return problemMessage(id, "invalid", `required widget '${id}' in ${source} source is missing widget.yaml at ${manifestPath}: ${String((error as Error).message)}`, undefined, undefined, source, resolvedRoot);
+	}
+	try {
+		const manifest = parseWidgetManifest(raw);
+		if (manifest.id !== id) {
+			return problemMessage(id, "invalid", `required widget '${id}' in ${source} source has manifest id '${manifest.id}' at ${manifestPath}`, undefined, undefined, source, resolvedRoot);
+		}
+		const dartPath = path.join(directory, `${id}.dart`);
+		let dartStat: fs.Stats;
+		try {
+			dartStat = fs.statSync(dartPath);
+		} catch (error) {
+			return problemMessage(id, "unavailable", `required widget '${id}' in ${source} source is missing Dart source at ${dartPath}: ${String((error as Error).message)}`, undefined, undefined, source, resolvedRoot);
+		}
+		if (!dartStat.isFile()) {
+			return problemMessage(id, "unavailable", `required widget '${id}' in ${source} source must provide a Dart source file at ${dartPath}`, undefined, undefined, source, resolvedRoot);
+		}
+		return {
+			...manifest,
+			source,
+			root: resolvedRoot,
+			directory,
+			manifestPath,
+			...(source === "project" ? { importPath: dartFileUri(dartPath) } : {}),
+		};
+	} catch (error) {
+		return problemMessage(id, "invalid", `required widget '${id}' in ${source} source has an invalid widget.yaml at ${manifestPath}: ${String((error as Error).message)}`, undefined, undefined, source, resolvedRoot);
+	}
+}
+
+function resolveWidgetFromRoots(id: string, roots: PifWidgetLookupRoots): PifResolvedWidgetEntry | PifWidgetResolutionProblem {
+	for (const source of ["project", "catalog", "base"] as const) {
+		for (const root of asRootList(roots[source])) {
+			const result = readResolvedWidgetEntry(root, source, id);
+			if (result === null) continue;
+			return result;
+		}
+	}
+	return problemMessage(id, "unavailable", `required widget '${id}' was not found in project overlay, global catalog, or base widgets`);
+}
+
+export function formatWidgetResolutionProblems(problems: readonly PifWidgetResolutionProblem[]): string {
+	return problems.map((problem, index) => {
+		const prefix = problem.index !== undefined ? `required widget[${problem.index}]` : `required widget`;
+		const suffix = problem.previousIndex !== undefined ? ` (first seen at [${problem.previousIndex}])` : "";
+		return `${index + 1}. ${prefix} '${problem.id}'${suffix}: ${problem.message}`;
+	}).join("\n");
+}
+
+/** Validate and resolve the widget ids declared in an app manifest. The
+ * dependency list is widget ids only; Dart package dependencies stay on the
+ * widget manifests and are handled separately. */
+export function resolveRequiredWidgetSet(requiredIds: readonly string[], roots: PifWidgetLookupRoots): PifWidgetResolutionResult {
+	const requested: string[] = [];
+	const problems: PifWidgetResolutionProblem[] = [];
+	const resolved: PifResolvedWidgetEntry[] = [];
+	const seen = new Map<string, number>();
+	for (const [index, raw] of requiredIds.entries()) {
+		const id = String(raw ?? "").trim();
+		requested.push(id);
+		const humanIndex = index + 1;
+		if (!id) {
+			problems.push(problemMessage(id, "missing", `required widget entry at position ${humanIndex} is empty` , humanIndex));
+			continue;
+		}
+		if (!isWidgetId(id)) {
+			problems.push(problemMessage(id, "invalid", `required widget '${id}' at position ${humanIndex} must use lowercase snake_case ids`, humanIndex));
+			continue;
+		}
+		const previous = seen.get(id);
+		if (previous !== undefined) {
+			problems.push(problemMessage(id, "duplicate", `required widget '${id}' is duplicated at position ${humanIndex} (first seen at position ${previous + 1})`, humanIndex, previous + 1));
+			continue;
+		}
+		seen.set(id, index);
+		const resolvedEntry = resolveWidgetFromRoots(id, roots);
+		if ("reason" in resolvedEntry) {
+			problems.push({ ...resolvedEntry, index: humanIndex });
+			continue;
+		}
+		resolved.push(resolvedEntry);
+	}
+	resolved.sort((left, right) => left.id.localeCompare(right.id));
+	return { ok: problems.length === 0, requested, resolved, problems };
+}
+
 export function createEnvelope<T>(channel: PifEnvelope["channel"], type: string, payload: T, id = crypto.randomUUID()): PifEnvelope<T> {
 	if (!PIF_CHANNELS.includes(channel.split("/")[0] as PifChannel)) throw new Error(`Unsupported pif channel: ${channel}`);
 	if (!type.trim()) throw new Error("Envelope type is required");
@@ -71,7 +219,7 @@ export function parseWidgetManifest(raw: string): PifWidgetManifest {
 	const required = ["id", "name", "version", "description", "slot", "core"];
 	for (const key of required) if (!values[key]) throw new Error(`widget.yaml missing ${key}`);
 	const id = scalar(values.id);
-	if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("Widget id must be lowercase snake_case");
+	if (!isWidgetId(id)) throw new Error("Widget id must be lowercase snake_case");
 	const slot = scalar(values.slot) as PifWidgetManifest["slot"];
 	if (!["left", "center", "right", "bottom", "status", "page"].includes(slot)) throw new Error(`Invalid widget slot: ${slot}`);
 	const list = (source = "") => {
@@ -256,7 +404,8 @@ function parseYamlStringList(value: string): string[] {
 
 /** Parse + validate `pif_app/app.yaml` (settled schema, task #157): id,
  * name, version, home, pages (ordered), optional template + dependencies.
- * Every rejection is an actionable diagnostic; nothing is guessed. */
+ * `dependencies` is a widget-id list, not Dart package dependencies. Every
+ * rejection is an actionable diagnostic; nothing is guessed. */
 export function parseAppManifest(text: string): { manifest?: PifAppManifest; error?: string } {
   const values = new Map<string, string>();
   const lists = new Map<string, string[]>();
@@ -310,7 +459,7 @@ export function renderAppManifest(manifest: PifAppManifest): string {
 /** Pure manifest updates used by the pif_app_* tools: adding a page keeps
  * order and rejects duplicates; setting home requires a declared page. */
 export function addAppPage(manifest: PifAppManifest, page: string): { manifest?: PifAppManifest; error?: string } {
-  if (!/^[a-z][a-z0-9_]*$/.test(page)) return { error: `Page id must be a lowercase widget identifier (snake_case) — got '${page}'` };
+  if (!isWidgetId(page)) return { error: `Page id must be a lowercase widget identifier (snake_case) — got '${page}'` };
   if (manifest.pages.includes(page)) return { error: `Page '${page}' is already declared` };
   return { manifest: { ...manifest, pages: [...manifest.pages, page] } };
 }

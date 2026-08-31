@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Required widget resolution before export (#209)](./2026-08-31T03-51-07Z-pif-required-widget-resolution-preflight.md) | 2026-08-31T03:51:07Z | pif, widgets, export, preflight | #209 |
 | [pif source precedence and catalog visibility alignment (#207)](./2026-08-31T04-02-39Z-pif-source-precedence-and-catalog-visibility.md) | 2026-08-31T04:02:39Z | pi-extensions, pif, widgets, install-precedence, catalog, rollback, okf | #207 |
 | [Native pif transcript boundaries and tool cards corrected (#215)](./2026-08-31T03-58-19Z-pif-agent-console-transcript-reducer.md) | 2026-08-31T03:58:19Z | pi-extensions, pif, agent-console, transcript, reducer, prompt-echo, turn-finalization, tool-calls, flutter, okf | #215 |
 | [pif bundled inventory authority and writable-path guards (#187)](./2026-08-31T03-38-53Z-pif-bundled-inventory-authority-and-write-guards.md) | 2026-08-31T03:38:53Z | pi-extensions, pif, bundled-mode, registry, inventory, writable-paths, okf | #187 |

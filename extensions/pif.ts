@@ -18,6 +18,8 @@ import {
 	dartFileUri,
 	decodeEnvelope,
 	generateWidgetRegistry,
+	resolveRequiredWidgetSet,
+	formatWidgetResolutionProblems,
 	parseWidgetManifest,
 	pifProbeProof,
 	pifUpgradeAuthorized,
@@ -1256,6 +1258,13 @@ class PifHub {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
 		const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "build-pif-project-app.sh");
 		if (!fs.existsSync(script)) throw new Error(`Export script not found at ${script} — exporting requires the pif dev checkout`);
+		const exportRoot = path.dirname(path.dirname(script));
+		const required = resolveRequiredWidgetSet(this.state.app.dependencies ?? [], {
+			project: path.join(this.workspace, "pif_app", "widgets"),
+			catalog: this.globalCatalogPath,
+			base: [path.join(exportRoot, "pif", "lib", "widgets"), path.join(exportRoot, "pif", "catalog")],
+		});
+		if (!required.ok) throw new Error(`Required widget resolution failed before export:\n${formatWidgetResolutionProblems(required.problems)}`);
 		const name = (String(params?.name ?? this.state.app.name).trim() || this.state.app.name).replace(/[\r\n/]+/g, " ").slice(0, 80);
 		const buildId = crypto.randomUUID();
 		const buildKey = `app-build:${buildId}`;
@@ -1307,7 +1316,7 @@ class PifHub {
 			try {
 				child = spawn(script, [this.state.health.workspace, name], {
 					cwd: this.state.health.workspace,
-					env: { ...process.env, PIF_APP_NAME: name },
+					env: { ...process.env, PIF_APP_NAME: name, PIF_GLOBAL_CATALOG: this.globalCatalogPath },
 					detached: true,
 				});
 			} catch (cause) {

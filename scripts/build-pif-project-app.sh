@@ -27,6 +27,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 PROJECT_DIR="$(cd "$1" && pwd)"
 APP_NAME="${2:-}"
 OUTPUT_DIR="${3:-$PROJECT_DIR/build}"
+GLOBAL_CATALOG_DIR="${PIF_GLOBAL_CATALOG:-$HOME/.pi/pif/catalog}"
 
 MANIFEST="$PROJECT_DIR/pif_app/app.yaml"
 if [ ! -f "$MANIFEST" ]; then
@@ -37,17 +38,67 @@ fi
 echo "=== Exporting pif project app ==="
 
 # Resolve id/name/version from the manifest with the hub's own parser.
-MANIFEST_JSON="$(node --experimental-strip-types -e "
-import { parseAppManifest } from '$REPO_ROOT/extensions/pif-shared.ts';
-import fs from 'node:fs';
-const parsed = parseAppManifest(fs.readFileSync('$MANIFEST', 'utf8'));
-if (parsed.error) { console.error(parsed.error); process.exit(1); }
-console.log(JSON.stringify(parsed.manifest));
-")"
+MANIFEST_JSON="$(
+REPO_ROOT="$REPO_ROOT" MANIFEST="$MANIFEST" node --experimental-strip-types <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const repoRoot = process.env.REPO_ROOT;
+const manifestPath = process.env.MANIFEST;
+if (!repoRoot || !manifestPath) {
+  console.error("ERROR: manifest parse environment missing.");
+  process.exit(1);
+}
+
+const shared = await import(pathToFileURL(path.join(repoRoot, "extensions", "pif-shared.ts")).href);
+const parsed = shared.parseAppManifest(fs.readFileSync(manifestPath, "utf8"));
+if (parsed.error) {
+  console.error(parsed.error);
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify(parsed.manifest));
+NODE
+)"
 if [ -z "$MANIFEST_JSON" ]; then echo "ERROR: manifest parse failed."; exit 1; fi
 APP_ID="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")"
 MANIFEST_NAME="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).name))")"
 APP_NAME="${APP_NAME:-$MANIFEST_NAME}"
+
+# Resolve the widget dependencies before any stage copy. The shared helper
+# validates widget ids, rejects duplicates/missing/unavailable ids, and
+# returns the selected source for each dependency so the export can materialize
+# the pinned set deterministically.
+RESOLVED_WIDGETS_JSON="$(
+REPO_ROOT="$REPO_ROOT" MANIFEST_JSON="$MANIFEST_JSON" PROJECT_WIDGETS_DIR="$PROJECT_DIR/pif_app/widgets" GLOBAL_CATALOG_DIR="$GLOBAL_CATALOG_DIR" node --experimental-strip-types <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const repoRoot = process.env.REPO_ROOT;
+const manifestJson = process.env.MANIFEST_JSON;
+const projectWidgetsDir = process.env.PROJECT_WIDGETS_DIR;
+const globalCatalogDir = process.env.GLOBAL_CATALOG_DIR;
+if (!repoRoot || !manifestJson || !projectWidgetsDir || !globalCatalogDir) {
+  console.error("ERROR: required widget resolution environment missing.");
+  process.exit(1);
+}
+
+const shared = await import(pathToFileURL(path.join(repoRoot, "extensions", "pif-shared.ts")).href);
+const manifest = JSON.parse(manifestJson);
+const resolution = shared.resolveRequiredWidgetSet(manifest.dependencies ?? [], {
+  project: [projectWidgetsDir],
+  catalog: [globalCatalogDir],
+  base: [path.join(repoRoot, "pif", "lib", "widgets"), path.join(repoRoot, "pif", "catalog")],
+});
+if (!resolution.ok) {
+  console.error("ERROR: required widget resolution failed before staging:");
+  console.error(shared.formatWidgetResolutionProblems(resolution.problems));
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify(resolution));
+NODE
+)"
 
 scan_export_bundle_for_secrets() {
   local bundle_root="$1"
@@ -196,22 +247,60 @@ rsync -a \
 echo "2. Pinning project widgets into lib/widgets/ ..."
 cp -R "$PROJECT_DIR/pif_app/widgets/" "$STAGE/lib/widgets/"
 
+# 2b. Materialize the resolved required widgets and persist the pinned set
+#     inside the staged app source before registry generation.
+echo "2b. Materializing resolved required widgets ..."
+RESOLVED_WIDGETS_JSON="$RESOLVED_WIDGETS_JSON" STAGE="$STAGE" node --experimental-strip-types <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+
+const stage = process.env.STAGE;
+const raw = process.env.RESOLVED_WIDGETS_JSON;
+if (!stage || !raw) {
+  console.error("ERROR: required widget materialization environment missing.");
+  process.exit(1);
+}
+
+const resolution = JSON.parse(raw);
+const widgetsRoot = path.join(stage, "lib", "widgets");
+fs.mkdirSync(widgetsRoot, { recursive: true });
+for (const widget of resolution.resolved ?? []) {
+  if (widget.source === "project") continue;
+  const target = path.join(widgetsRoot, widget.id);
+  fs.rmSync(target, { recursive: true, force: true });
+  fs.cpSync(widget.directory, target, { recursive: true });
+}
+const pinnedDir = path.join(stage, "pif_app-manifest");
+fs.mkdirSync(pinnedDir, { recursive: true });
+fs.writeFileSync(path.join(pinnedDir, "required-widgets.json"), JSON.stringify(resolution, null, 2) + "\n");
+console.log(`   pinned ${resolution.resolved?.length ?? 0} required widgets`);
+NODE
+
 # 3. Generate the pinned registry over the staged widget set
 echo "3. Generating the pinned widget registry ..."
-node --experimental-strip-types -e "
-import { parseWidgetManifest, generateWidgetRegistry } from '$REPO_ROOT/extensions/pif-shared.ts';
-import fs from 'node:fs'; import path from 'node:path';
-const root = '$STAGE/lib/widgets';
-const manifests = [];
-for (const entry of fs.readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory())) {
-  const file = path.join(root, entry.name, 'widget.yaml');
-  if (!fs.existsSync(file)) continue;
-  manifests.push({ ...parseWidgetManifest(fs.readFileSync(file, 'utf8')), core: false });
+STAGE_WIDGET_ROOT="$STAGE/lib/widgets" REPO_ROOT="$REPO_ROOT" node --experimental-strip-types <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const repoRoot = process.env.REPO_ROOT;
+const root = process.env.STAGE_WIDGET_ROOT;
+if (!repoRoot || !root) {
+  console.error("ERROR: registry generation environment missing.");
+  process.exit(1);
 }
-manifests.sort((a, b) => a.id.localeCompare(b.id));
-fs.writeFileSync('$STAGE/lib/widget_registry.g.dart', generateWidgetRegistry(manifests));
-console.log('   pinned ' + manifests.length + ' widgets');
-"
+
+const shared = await import(pathToFileURL(path.join(repoRoot, "extensions", "pif-shared.ts")).href);
+const manifests = [];
+for (const entry of fs.readdirSync(root, { withFileTypes: true }).filter((candidate) => candidate.isDirectory())) {
+  const file = path.join(root, entry.name, "widget.yaml");
+  if (!fs.existsSync(file)) continue;
+  manifests.push({ ...shared.parseWidgetManifest(fs.readFileSync(file, "utf8")), core: false });
+}
+manifests.sort((left, right) => left.id.localeCompare(right.id));
+fs.writeFileSync(path.join(root, "..", "widget_registry.g.dart"), shared.generateWidgetRegistry(manifests));
+console.log(`   pinned ${manifests.length} widgets`);
+NODE
 
 # 4. Build the Flutter release binary from the staged source
 echo "4. flutter pub get + build macos --release (staged) ..."
