@@ -28,4 +28,5 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 | [Reviewer model standardization on GPT-5.6 Sol](./2026-07-25-reviewer-model-standardization.md) | 2026-07-25 | agents, reviewers, models, compliance, uat, pi-blueprint | — |
 | [Mercury App Template and pif-app-designer Skill Authored (#178)](./2026-08-29T07-34-46Z-pif-mercury-template-and-app-designer-skill.md) | 2026-08-29T07:34:46Z | pif, templates, mercury, design-system, skills, extract-design | #178 |
 | [Pif stock and export bundles require a portable Node runtime](./2026-08-31T04-51-25Z-pif-portable-node-packaging.md) | 2026-08-31T04:51:25Z | pif, packaging, export, macos, node, remediation | #160, #217 |
+| [Pif queued input preserves the active streaming message](./2026-08-31T05-02-46Z-pif-queued-input-preserves-streaming-message.md) | 2026-08-31T05:02:46Z | pif, agent-console, transcript, steer, regression | #160, #215 |
 <!-- Rows added by session synthesis (agent-written), removed by curation agent -->

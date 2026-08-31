@@ -247,7 +247,9 @@ class _AgentConsoleState extends State<_AgentConsole> {
     final timestamp = _eventTimestamp(event, data);
 
     if (type == 'input') {
-      if (state.sawAssistantContent) {
+      final mode = data['mode'] ?? event['mode'];
+      final queued = mode == 'steer' || mode == 'follow_up';
+      if (!queued && state.sawAssistantContent) {
         _finalizeOpenTurn(
           entries,
           state,
@@ -259,6 +261,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
         state,
         data['content'] ?? event['content'] ?? '',
         timestamp,
+        queued: queued,
       );
       return;
     }
@@ -398,12 +401,17 @@ class _AgentConsoleState extends State<_AgentConsole> {
     List<Map<String, dynamic>> entries,
     _SessionTranscriptState state,
     Object? rawText,
-    String? timestamp,
-  ) {
+    String? timestamp, {
+    bool queued = false,
+  }) {
     final text = rawText?.toString() ?? '';
     if (text.isEmpty) return;
+    final continuingTurn = queued && state.turnStartIndex >= 0;
     _beginTurnIfNeeded(entries, state, timestamp);
     entries.add({'kind': 'user', 'text': text, ..._timestampEntry(timestamp)});
+    // Queued input does not end the native message currently streaming.
+    // Its remaining deltas and final snapshot must update the same entry.
+    if (continuingTurn) return;
     state.turnStartIndex = entries.length - 1;
     state.turnStartTs ??= timestamp;
     state.sawAssistantContent = false;

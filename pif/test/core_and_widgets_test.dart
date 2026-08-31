@@ -819,6 +819,53 @@ void main() {
     }
   });
 
+  testWidgets('queued input preserves a streamed assistant through live and reopened rendering (#215)', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    for (final mode in ['steer', 'follow_up']) {
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({'host': {
+        'id': 'host', 'name': 'Host', 'host': true, 'state': 'running',
+        'model': 'fixture', 'cwd': '/tmp', 'transcript': <dynamic>[],
+      }});
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 950));
+      var sequence = 0;
+      Future<void> deliver(Map<String, dynamic> event, {String state = 'running'}) async {
+        host.sessions.applyEvent({
+          'sessionId': 'host', 'state': state,
+          'event': {...event, 'ts': DateTime.utc(2026, 8, 31, 5, 0, sequence).toIso8601String()},
+        }, envelopeId: 'queued-$mode-${sequence++}');
+        await tester.pump();
+      }
+      await deliver({'type': 'input', 'mode': 'prompt', 'content': 'Count four'});
+      await deliver({'type': 'agent_start'});
+      await deliver({'type': 'message_start'});
+      await deliver({'type': 'message_update', 'delta': '1 2'});
+      await deliver({'type': 'input', 'mode': mode, 'content': 'Then acknowledge'});
+      expect(find.byIcon(Icons.content_copy), findsNothing,
+          reason: 'a queued directive cannot finalize the still-streaming turn');
+      await deliver({'type': 'message_update', 'delta': ' 3 4'});
+      await deliver({'type': 'message', 'role': 'assistant', 'text': '1 2 3 4'});
+      await deliver({'type': 'message_start'});
+      await deliver({'type': 'message_update', 'delta': 'Acknowledged'});
+      await deliver({'type': 'message', 'role': 'assistant', 'text': 'Acknowledged'});
+      await deliver({'type': 'agent_end'}, state: 'idle');
+      for (var reopen = 0; reopen < 2; reopen++) {
+        await tester.pumpAndSettle();
+        expect(tester.widgetList<MarkdownBody>(find.byType(MarkdownBody))
+            .map((widget) => widget.data).toList(), ['1 2 3 4', 'Acknowledged']);
+        expect(find.widgetWithText(SelectableText, 'Then acknowledge'), findsOneWidget);
+        expect(find.byIcon(Icons.content_copy), findsOneWidget);
+        expectNoFlutterErrors(tester);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+        if (reopen == 0) await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 950));
+      }
+      await bus.dispose();
+    }
+  });
+
   testWidgets('model dropdown lists available models and reflects selection', (
     tester,
   ) async {
