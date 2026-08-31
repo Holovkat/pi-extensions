@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Token-only GitHub and central Settings scope](./2026-08-31T09-18-03Z-pif-token-only-central-settings.md) | 2026-08-31T09:18:03Z | pif, settings, github, appearance | #152, #160, #221, #223 |
 | [Installed builder and GitHub project setup required](./2026-08-31T09-06-31Z-pif-installed-builder-github-requirement.md) | 2026-08-31T09:06:31Z | pif, planning, environments, github | #152, #160, #204, #218–#222 |
 | [Final full gate and native recovery workflow proof](./2026-08-31T07-13-51Z-pif-end-to-end-final-candidate.md) | 2026-08-31T07:13:51Z | pif, verification, computer-use | #160, #201, #204, #205, #206, #212, #215 |
 | [Filesystem paths and preserved legacy host history](./2026-08-31T06-58-44Z-pif-filesystem-paths-and-host-history-preservation.md) | 2026-08-31T06:58:44Z | pif, paths, history, migration | #160, #201 |

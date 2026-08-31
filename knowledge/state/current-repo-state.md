@@ -4,7 +4,7 @@ title: Current Repo State
 description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-31T09:06:31Z
+timestamp: 2026-08-31T09:18:03Z
 status: active
 ---
 
@@ -43,7 +43,7 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 
 ### pif App Builder Remediation Snapshot (#160, 31 August 2026)
 - Tested and pushed code candidate: `dc45ff40` on `codex/pif-app-builder-154`. Documentation handoff does not change the built revision.
-- The earlier E2E checkpoint had 27 native remediation children. Following the owner requirement extension below, #160 now has 32: 24 in Review, six To Do, and #206/#212 blocked on independent sample design/appearance approval. Canonical requirements remain #158/#159/#160 with the explicit #152 extension.
+- The earlier E2E checkpoint had 27 native remediation children. Following the owner requirement extension below, #160 now has 33: 24 in Review, seven To Do, and #206/#212 blocked on independent sample design/appearance approval. Canonical requirements remain #158/#159/#160 with the explicit #152 extension.
 - Fresh full gate passes at dc45ff40: 66 Node tests, clean Dart analysis and 81 Flutter tests in one clean-checkout run. Prior failed gates and the earlier bdfe5bb4 pass are preserved in the report.
 - This E2E run additionally fixed native model setup/selection, empty-failure history contamination and URI-encoded filesystem paths. Existing legacy host history is preserved by a verified no-overwrite copy into the canonical path.
 - Stock at `/Applications/pif.app` passed real child/Steer/Abort/tool recovery and widget checks, then reopened at the clean picker as PID 81004. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` passed empty-profile guidance, configured write/read, migration and restart persistence; final PID 80355 normally quit. Both bundles remain unchanged and pass strict signatures.
@@ -52,8 +52,9 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 
 ### Installed Builder and GitHub Setup Requirement (31 August 2026)
 - Owner direction extends existing epic [#152](https://github.com/Holovkat/pi-extensions/issues/152): installed pif must build apps and create local development environments which can create more environments, without this repository checkout. A follow-up adds GitHub repository creation and secure application Settings; the earlier repository-creation deferral is superseded.
-- Native children of #160: #218 bundled builder resources → #219 repeatable development environments → #220 installed export. #221 secure GitHub connection Settings may be prepared independently; #222 repository creation and tracker binding follows #219/#221. These tasks are To Do, not implemented.
+- Native children of #160: #218 bundled builder resources → #219 repeatable development environments → #220 installed export. #223 central Settings/Appearance may be prepared independently; #221 environment-token integration follows #219 identity and #223; #222 repository creation/tracker binding follows #219/#221. These tasks are To Do, not implemented.
 - #204 moves from Blocked to To Do: the owner decision is settled; canonical spec/support-matrix reconciliation remains. #160 stays the sole verification gate and must prove the installed-app and two-generation environment workflow. The previous passing dc45ff40 candidate does not prove added scope.
+- Latest owner simplification: #221 is token-only, stored in macOS Keychain per environment UUID; no browser/device/OAuth flow, global-login fallback or automatic credential sharing. #223 adds one central Settings tab with just Appearance (Light/Dark/System) and GitHub; it borrows Mercury’s grouping without advanced sliders or unrelated sections. Allocate local environment identity before token/GitHub setup.
 - GitHub is the ticket authority; local-only mode remains explicitly disconnected. Secrets stay in secure OS storage and out of projects/exports; created environments do not copy parent runtime state or tickets. Ordinary AOT exports and the deferred RFW lane remain distinct from editable environments. #190 runtime self-management remains related backlog.
 
 ### pif Remediation Wave 2 (#170, In Flight)

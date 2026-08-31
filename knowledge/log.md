@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T09:18:03Z - Narrowed GitHub auth and added central Settings foundation
+
+Updated #221 to environment-scoped secure tokens only and created #223 for Mercury-inspired Appearance/GitHub groups in one central tab. Removed browser-first/shared-account requirements and aligned #152/#153/#160/#204/#219/#222. No application implementation or runtime acceptance is claimed.
+
 ## 2026-08-31T09:06:31Z - Recorded installed builder and GitHub setup requirement
 
 Owner resolved #204 in favor of installed authoring/export and added repeatable local development environments plus secure GitHub Settings/repository creation. Created #218–#222 under existing #160 and extended #152/#153; updated current state while preserving historical test evidence and separate sample design gates. No capability is claimed implemented.
