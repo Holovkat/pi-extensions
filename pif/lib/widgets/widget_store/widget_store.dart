@@ -141,6 +141,12 @@ class _StoreState extends State<_Store> {
     );
   }
 
+  String? _entrySource(Map<String, dynamic> item, {String? fallback}) {
+    final source = item['source'];
+    if (source is String && source.isNotEmpty) return source;
+    return fallback;
+  }
+
   Widget _installed(String id, Map<String, dynamic> item) => Card(
     child: Padding(
       padding: const EdgeInsets.all(8),
@@ -160,10 +166,9 @@ class _StoreState extends State<_Store> {
                         style: const TextStyle(fontWeight: FontWeight.w300),
                       ),
                     ),
-                    if (item['source'] is String &&
-                        (item['source'] as String).isNotEmpty) ...[
+                    if (_entrySource(item) case final source?) ...[
                       const SizedBox(width: 6),
-                      _sourceBadge(item['source'] as String),
+                      _sourceBadge(source),
                     ],
                   ],
                 ),
@@ -216,8 +221,10 @@ class _StoreState extends State<_Store> {
               overflow: TextOverflow.ellipsis,
             ),
           ),
-          const SizedBox(width: 6),
-          _sourceBadge('catalog'),
+          if (_entrySource(item, fallback: 'catalog') case final source?) ...[
+            const SizedBox(width: 6),
+            _sourceBadge(source),
+          ],
         ],
       ),
       subtitle: Text('${item['description'] ?? ''}', maxLines: 2),
