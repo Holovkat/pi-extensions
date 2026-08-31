@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
 	PIF_DEFAULT_PORT,
 	assertSafeWidgetPath,
+	assertWritablePifPath,
 	childEnvironment,
 	createEnvelope,
 	dartFileUri,
@@ -20,6 +21,7 @@ import {
 	parseWidgetManifest,
 	pifProbeProof,
 	pifUpgradeAuthorized,
+	isInsideAppBundle,
 	TrackerSync,
 	addAppPage,
 	parseAppManifest,
@@ -82,13 +84,19 @@ class SessionStore {
 	private pifDir: string;
 	constructor(pifDir: string) { this.pifDir = pifDir; }
 	async init() {
+		this.pifDir = assertWritablePifPath(this.pifDir);
+		const dbPath = assertWritablePifPath(path.join(this.pifDir, "sessions.db"));
+		for (const suffix of ["-wal", "-shm", "-journal"]) assertWritablePifPath(`${dbPath}${suffix}`);
+		const jsonPath = assertWritablePifPath(path.join(this.pifDir, "sessions.json"));
+		assertWritablePifPath(`${jsonPath}.tmp`);
+		this.jsonPath = jsonPath;
 		try {
 			// Feature-detect node:sqlite separately from opening the file so a
 			// corrupt DB file falls back to JSON instead of crashing init.
 			const sqlite = await import("node:sqlite").catch(() => null);
 			if (!sqlite || typeof sqlite.DatabaseSync !== "function") throw new Error("node:sqlite unavailable");
 			const { DatabaseSync } = sqlite;
-			this.db = new DatabaseSync(path.join(this.pifDir, "sessions.db"));
+			this.db = new DatabaseSync(dbPath);
 			// WAL keeps a hard kill mid-write from corrupting the DB (the
 			// default journal_mode=memory does not); busy_timeout lets a
 			// second writer wait instead of throwing SQLITE_BUSY immediately.
@@ -96,7 +104,6 @@ class SessionStore {
 			this.db.exec("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL, model TEXT, thinking TEXT, cwd TEXT, session_file TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
 			this.migrateTranscriptColumn();
 		} catch {
-			this.jsonPath = path.join(this.pifDir, "sessions.json");
 			try { const parsed = JSON.parse(fs.readFileSync(this.jsonPath, "utf8")); if (parsed && Array.isArray(parsed.sessions)) this.json = parsed; } catch { /* absent */ }
 		}
 	}
@@ -149,10 +156,11 @@ class SessionStore {
 		return [...this.json.sessions].sort((a, b) => String(b.updated_at ?? "").localeCompare(String(a.updated_at ?? "")));
 	}
 	private saveJson() {
-		fs.mkdirSync(this.pifDir, { recursive: true });
-		const temp = `${this.jsonPath}.tmp`;
+		const file = assertWritablePifPath(this.jsonPath);
+		const temp = assertWritablePifPath(`${file}.tmp`);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(temp, JSON.stringify(this.json, null, 2) + "\n");
-		fs.renameSync(temp, this.jsonPath);
+		fs.renameSync(temp, file);
 	}
 }
 
@@ -244,6 +252,11 @@ class PifHub {
 	readonly pi: ExtensionAPI; readonly ctx: ExtensionContext; readonly workspace: string; readonly port: number;
 	private controlSecret = "";
 	private appInitializing = false;
+	private readonly appBundled: boolean;
+	private bundledWidgetInventoryCache: Set<string> | null | undefined = undefined;
+	private registryStateLoaded = false;
+	private registryStateExists = false;
+	private registrySeeded = false;
 	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
@@ -262,6 +275,7 @@ class PifHub {
 		// where the app itself runs from.
 		this.globalCatalogPath = process.env.PIF_GLOBAL_CATALOG || path.join(os.homedir(), ".pi", "pif", "catalog");
 		this.pifDir = path.join(workspace, ".pi", "pif");
+		this.appBundled = isInsideAppBundle(this.appDir);
 		this.controlPath = path.join(this.pifDir, "control.sock"); this.layoutPath = path.join(this.pifDir, "layout.json"); this.registryStatePath = path.join(this.pifDir, "registry.json"); this.prefsPath = path.join(this.pifDir, "prefs.json"); this.shellStatePath = path.join(this.pifDir, "storage", "shell.json");
 		this.state = { sessions: {}, widgets: {}, catalog: {}, layout: {}, devMode: false, models: [], modelProviders: {}, tracker: { repo: null, columns: [], cards: [], stale: true, fetchedAt: null, error: null }, app: null, appError: null, health: { hub: "stopped", flutter: "stopped", reload: "idle", workspace, port, origin: process.env.PIF_AUTOSTART === "1" && process.env.PIF_NO_FLUTTER === "1" ? "standalone" : "terminal" } };
 		this.modelsPath = process.env.PIF_MODELS_PATH || path.join(os.homedir(), ".pi", "agent", "models.json");
@@ -274,16 +288,21 @@ class PifHub {
 	}
 	async start(launchFlutter = true) {
 		if (this.httpServer) return;
-		fs.mkdirSync(this.pifDir, { recursive: true }); this.loadLayout(); this.loadShellState();
+		if (launchFlutter && this.appBundled) throw new Error("Bundled widgets are compiled into this app; Flutter launch is unavailable");
+		const pifDir = assertWritablePifPath(this.pifDir);
+		this.pifDir = pifDir;
+		fs.mkdirSync(pifDir, { recursive: true }); this.loadLayout(); this.loadShellState();
 		await this.store.init();
 		await this.tracker.init(); this.tracker.start();
 		// Ephemeral control-socket credential: same-user processes can read
 		// any 0600 file, but requiring a per-launch secret in the handshake
 		// stops accidental/unwitting tool calls from other local processes.
 		this.controlSecret = crypto.randomBytes(32).toString("hex");
-		const tokenPath = path.join(this.pifDir, "token");
-		fs.writeFileSync(`${tokenPath}.tmp`, this.token, { mode: 0o600 }); fs.renameSync(`${tokenPath}.tmp`, tokenPath);
-		try { fs.chmodSync(tokenPath, 0o600); fs.writeFileSync(path.join(this.pifDir, "control.secret"), this.controlSecret, { mode: 0o600 }); } catch { /* perms best-effort */ }
+		const tokenPath = assertWritablePifPath(path.join(pifDir, "token"));
+		const tokenTempPath = assertWritablePifPath(`${tokenPath}.tmp`);
+		const controlSecretPath = assertWritablePifPath(path.join(pifDir, "control.secret"));
+		fs.writeFileSync(tokenTempPath, this.token, { mode: 0o600 }); fs.renameSync(tokenTempPath, tokenPath);
+		try { fs.chmodSync(tokenPath, 0o600); fs.writeFileSync(controlSecretPath, this.controlSecret, { mode: 0o600 }); } catch { /* perms best-effort */ }
 		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig();
 		const hasRegistryState = fs.existsSync(this.registryStatePath); this.loadRegistryState(); this.syncRepoTemplates(); this.scanWidgets();
 		if (!hasRegistryState) { for (const widget of Object.values(this.state.widgets)) { widget.enabled = true; this.enabled.add(widget.id); } this.saveRegistryState(); }
@@ -310,7 +329,7 @@ class PifHub {
 		for (const session of Object.values(this.state.sessions)) if (!session.host) this.store.safe("upsert", () => this.store.upsert(session));
 		this.children.clear(); this.tracker.stop(); await this.supervisor.stop(); for (const peer of this.peers) peer.close(); this.peers.clear();
 		await Promise.all([new Promise<void>((r) => this.httpServer?.close(() => r()) ?? r()), new Promise<void>((r) => this.controlServer?.close(() => r()) ?? r())]);
-		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
+		this.httpServer = null; this.controlServer = null; try { fs.unlinkSync(assertWritablePifPath(this.controlPath)); } catch { /* absent */ }
 		this.state.health.hub = "stopped"; this.setStatus();
 	}
 	private terminateChild(child: ChildProcessWithoutNullStreams) {
@@ -341,7 +360,7 @@ class PifHub {
 	private setStatus() { try { this.ctx.ui.setStatus("pif", this.state.health.hub === "running" ? `pif ● :${this.port}` : undefined); } catch { /* non-interactive */ } }
 	private createHostSession() {
 		const prefs = this.loadPrefs();
-		const sessionFile = process.env.PIF_HOST_SESSION_FILE || undefined;
+		const sessionFile = process.env.PIF_HOST_SESSION_FILE ? assertWritablePifPath(process.env.PIF_HOST_SESSION_FILE) : undefined;
 		const host: PifSession = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [], ...(sessionFile ? { sessionFile } : {}) };
 		this.state.sessions.host = host;
 		if (sessionFile) { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); this.hydrateTranscript(host); }
@@ -357,7 +376,7 @@ class PifHub {
 	 * its session files stop growing forever. */
 	private prunePersistedSessions() {
 		const keep = Number(process.env.PIF_SESSION_RETENTION) || 50;
-		this.store.safe("prune", () => this.store.prune(keep, (file) => { try { fs.rmSync(file, { force: true }); } catch { /* absent */ } }));
+		this.store.safe("prune", () => this.store.prune(keep, (file) => { const transcriptFile = assertWritablePifPath(file); try { fs.rmSync(transcriptFile, { force: true }); } catch { /* absent */ } }));
 	}
 	/** Restored child sessions from the store: read-only history — their
 	 * processes are gone, so they load as ended. Only metadata rows are
@@ -399,8 +418,9 @@ class PifHub {
 	private isUserBoundaryEcho(type: string, payload: any) { return (type === "message_start" || type === "message_end") && payload?.message?.role === "user"; }
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
-		fs.mkdirSync(path.dirname(this.prefsPath), { recursive: true });
-		fs.writeFileSync(this.prefsPath, JSON.stringify({ ...this.loadPrefs(), ...patch }, null, 2) + "\n");
+		const file = assertWritablePifPath(this.prefsPath);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify({ ...this.loadPrefs(), ...patch }, null, 2) + "\n");
 	}
 	private readShellState(strict = false): Record<string, unknown> {
 		try {
@@ -424,10 +444,11 @@ class PifHub {
 	private saveShellState(devMode: boolean) {
 		const current = this.readShellState(true);
 		const next = { ...current, devMode };
-		fs.mkdirSync(path.dirname(this.shellStatePath), { recursive: true });
-		const temp = `${this.shellStatePath}.tmp`;
+		const file = assertWritablePifPath(this.shellStatePath);
+		const temp = assertWritablePifPath(`${file}.tmp`);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(temp, JSON.stringify(next, null, 2) + "\n");
-		fs.renameSync(temp, this.shellStatePath);
+		fs.renameSync(temp, file);
 	}
 	private parseDevModeEnabled(payload: any): boolean {
 		if (payload && typeof payload === "object" && !Array.isArray(payload) && typeof payload.enabled === "boolean") return payload.enabled;
@@ -471,7 +492,8 @@ class PifHub {
 	}
 	private startControl() {
 		return new Promise<void>((resolve, reject) => {
-			try { fs.unlinkSync(this.controlPath); } catch { /* absent */ }
+			const controlPath = assertWritablePifPath(this.controlPath);
+			try { fs.unlinkSync(controlPath); } catch { /* absent */ }
 			const server = net.createServer((socket) => {
 				let input = ""; let authorized = false; socket.on("data", (chunk) => {
 					input += chunk;
@@ -491,7 +513,7 @@ class PifHub {
 					const at = input.indexOf("\n"); if (at < 0) return; const raw = input.slice(0, at); input = input.slice(at + 1); Promise.resolve().then(async () => { const req = JSON.parse(raw); return this.control(req.method, req.params ?? {}); }).then((result) => socket.end(JSON.stringify({ ok: true, result }) + "\n"), (error) => socket.end(JSON.stringify({ ok: false, error: String(error?.message ?? error) }) + "\n"));
 				});
 			});
-			server.once("error", reject); server.listen(this.controlPath, () => { server.off("error", reject); this.controlServer = server; try { fs.chmodSync(this.controlPath, 0o600); } catch { /* perms best-effort */ } resolve(); });
+			server.once("error", reject); server.listen(controlPath, () => { server.off("error", reject); this.controlServer = server; try { fs.chmodSync(controlPath, 0o600); } catch { /* perms best-effort */ } resolve(); });
 		});
 	}
 	private snapshotEnvelope() { return createEnvelope("shell/state", "snapshot", this.snapshot()); }
@@ -599,7 +621,7 @@ class PifHub {
 			this.store.safe("remove", () => this.store.remove(id));
 			// The host transcript belongs to the live parent pi process. Removing
 			// its card must not unlink the file that process is still writing.
-			if (!session.host && session.sessionFile) { try { fs.rmSync(session.sessionFile, { force: true }); } catch { /* absent */ } }
+			if (!session.host && session.sessionFile) { const transcriptFile = assertWritablePifPath(session.sessionFile); try { fs.rmSync(transcriptFile, { force: true }); } catch { /* absent */ } }
 			delete this.state.sessions[id];
 			this.broadcast("session/state", "removed", { sessionId: id });
 			return { ok: true, id };
@@ -632,8 +654,8 @@ class PifHub {
 		child.stdin.write(JSON.stringify({ type: command, message: content }) + "\n");
 	}
 	private spawnSession(payload: any) {
-		const id = `session_${crypto.randomUUID().slice(0, 8)}`; const sessionsDir = path.join(this.pifDir, "sessions"); fs.mkdirSync(sessionsDir, { recursive: true });
-		const sessionFile = path.join(sessionsDir, `${id}.jsonl`); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); const cwd = path.resolve(payload.cwd || this.workspace);
+		const id = `session_${crypto.randomUUID().slice(0, 8)}`; const sessionsDir = assertWritablePifPath(path.join(this.pifDir, "sessions")); fs.mkdirSync(sessionsDir, { recursive: true });
+		const sessionFile = assertWritablePifPath(path.join(sessionsDir, `${id}.jsonl`)); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); const cwd = path.resolve(payload.cwd || this.workspace);
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
 		const pi = resolvePiInvocation(extensionPath);
 		const prefs = this.loadPrefs();
@@ -671,12 +693,14 @@ class PifHub {
 		if (!session) throw new Error(`Unknown session ${id}`);
 		if (session.host) throw new Error("The host session is always live");
 		if (this.children.has(id)) throw new Error("Session is already running");
-		if (!session.sessionFile || !fs.existsSync(session.sessionFile)) throw new Error("Session transcript file is missing — cannot resume");
+		if (!session.sessionFile) throw new Error("Session transcript file is missing — cannot resume");
+		const sessionFile = assertWritablePifPath(session.sessionFile);
+		if (!fs.existsSync(sessionFile)) throw new Error("Session transcript file is missing — cannot resume");
 		const cwd = session.cwd && fs.existsSync(session.cwd) ? session.cwd : this.workspace;
 		const extensionPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "pif.ts");
 		const pi = resolvePiInvocation(extensionPath);
 		const model = session.model !== "default" ? session.model : "";
-		const args = [...pi.args, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", session.sessionFile, "--name", session.name];
+		const args = [...pi.args, "--mode", "rpc", "--no-extensions", "--no-skills", "--no-prompt-templates", "-e", extensionPath, "--session", sessionFile, "--name", session.name];
 		if (model) args.push("--model", model); if (session.thinking && session.thinking !== "none") args.push("--thinking", session.thinking);
 		const child = spawn(pi.command, args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		this.hydrateTranscript(session);
@@ -699,13 +723,41 @@ class PifHub {
 		// same tab on every future launch. Strip it from the copy on disk.
 		const panels = (this.state.layout as any).panels;
 	 const persisted = panels && typeof panels === "object" ? { ...this.state.layout, panels: Object.fromEntries(Object.entries(panels).map(([id, record]) => [id, { ...(record as any), action: undefined }])) } : this.state.layout;
-	 fs.mkdirSync(path.dirname(this.layoutPath), { recursive: true }); fs.writeFileSync(this.layoutPath, JSON.stringify(persisted, null, 2) + "\n");
+	 const file = assertWritablePifPath(this.layoutPath);
+	 fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(persisted, null, 2) + "\n");
 	}
-	private loadRegistryState() { try { const saved = JSON.parse(fs.readFileSync(this.registryStatePath, "utf8")); this.enabled = new Set(Array.isArray(saved.enabled) ? saved.enabled : []); } catch { this.enabled = new Set(); } }
-	private saveRegistryState() { fs.mkdirSync(path.dirname(this.registryStatePath), { recursive: true }); fs.writeFileSync(this.registryStatePath, JSON.stringify({ enabled: [...this.enabled].sort() }, null, 2) + "\n"); }
+	private loadRegistryState() {
+		this.registryStateLoaded = true;
+		this.registryStateExists = fs.existsSync(this.registryStatePath);
+		try { const saved = JSON.parse(fs.readFileSync(this.registryStatePath, "utf8")); this.enabled = new Set(Array.isArray(saved.enabled) ? saved.enabled : []); } catch { this.enabled = new Set(); }
+	}
+	private saveRegistryState() {
+		const file = assertWritablePifPath(this.registryStatePath);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, JSON.stringify({ enabled: [...this.enabled].sort() }, null, 2) + "\n");
+		this.registryStateExists = true;
+	}
+	private assertBundledMutationAllowed(action: string) {
+		if (this.appBundled) throw new Error(`Widgets are compiled into this app; ${action} is unavailable until you rebuild the app`);
+	}
+	private bundledWidgetInventory(): Set<string> {
+		if (!this.appBundled) return new Set();
+		if (this.bundledWidgetInventoryCache) return this.bundledWidgetInventoryCache;
+		const raw = process.env.PIF_COMPILED_WIDGET_IDS;
+		if (!raw) throw new Error("Bundled app requires PIF_COMPILED_WIDGET_IDS compiled inventory");
+		let parsed: unknown;
+		try { parsed = JSON.parse(raw); } catch (error) { throw new Error(`Invalid compiled inventory in PIF_COMPILED_WIDGET_IDS: ${(error as Error).message}`); }
+		if (!Array.isArray(parsed)) throw new Error("PIF_COMPILED_WIDGET_IDS must be a JSON array of widget ids");
+		const ids = parsed.map((value) => {
+			if (typeof value !== "string" || !value.trim()) throw new Error("PIF_COMPILED_WIDGET_IDS must be a JSON array of widget ids");
+			return value;
+		});
+		this.bundledWidgetInventoryCache = new Set(ids);
+		return this.bundledWidgetInventoryCache;
+	}
 	private widgetScaffoldPath(id: string) {
 		const widgetsRoot = path.join(this.state.health.workspace, "pif_app", "widgets");
-		return assertSafeWidgetPath(widgetsRoot, path.join(widgetsRoot, id));
+		return assertWritablePifPath(assertSafeWidgetPath(widgetsRoot, path.join(widgetsRoot, id)));
 	}
 	private assertWidgetScaffoldClear(id: string) {
 		if (this.state.widgets[id]) throw new Error(`Widget id '${id}' is already installed`);
@@ -715,7 +767,7 @@ class PifHub {
 	}
 	private async layoutAction(type: string, payload: any) {
 		const presetsDir = path.join(this.pifDir, "presets");
-		if (type === "save") { if (!payload.preset) throw new Error("preset is required to save a layout"); fs.mkdirSync(presetsDir, { recursive: true }); fs.writeFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), JSON.stringify(this.state.layout, null, 2) + "\n"); }
+		if (type === "save") { if (!payload.preset) throw new Error("preset is required to save a layout"); const file = assertWritablePifPath(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`)); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(this.state.layout, null, 2) + "\n"); }
 		else if (type === "load") { if (!payload.preset) throw new Error("preset is required to load a layout"); this.state.layout = JSON.parse(fs.readFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), "utf8")); }
 		else if (type === "reset") this.state.layout = { panels: {} };
 		else if (type === "pin") { if (!payload.widgetId) throw new Error("widgetId is required to pin"); const panels = (this.state.layout.panels ??= {}) as Record<string, any>; panels[payload.widgetId] = { ...(panels[payload.widgetId] ?? {}), widgetId: payload.widgetId, pinned: payload.pinned !== false }; }
@@ -740,33 +792,41 @@ class PifHub {
 	}
 	private scanDirectory(root: string, installed: boolean, source: PifWidgetSource) {
 		const records: Record<string, WidgetRecord> = {}; if (!fs.existsSync(root)) return records;
-		for (const entry of fs.readdirSync(root, { withFileTypes: true })) { if (!entry.isDirectory()) continue; const manifestPath = path.join(root, entry.name, "widget.yaml"); if (!fs.existsSync(manifestPath)) continue; try { const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8")); records[manifest.id] = { ...manifest, source, installed, enabled: installed && (this.enabled.has(manifest.id) || manifest.core) }; } catch { /* invalid catalog entries surface during install */ } }
+		for (const entry of fs.readdirSync(root, { withFileTypes: true })) { if (!entry.isDirectory()) continue; const manifestPath = path.join(root, entry.name, "widget.yaml"); if (!fs.existsSync(manifestPath)) continue; try { const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8")); records[manifest.id] = { ...manifest, source, installed, enabled: installed && this.enabled.has(manifest.id) }; } catch { /* invalid catalog entries surface during install */ } }
 		return records;
 	}
 	scanWidgets() {
-		const roots = this.widgetRoots(); const oldEnabled = new Set(Object.values(this.state.widgets).filter((w) => w.enabled).map((w) => w.id)); this.enabled = new Set([...this.enabled, ...oldEnabled]);
-		// Layered resolution: a later layer shadows an earlier id wholesale —
-		// the project definition wins over a global-catalog entry, which wins
-		// over the base app. Scan, widget.list, and the registry codegen all
-		// consume this one resolved set.
+		if (!this.registryStateLoaded) this.loadRegistryState();
+		const roots = this.widgetRoots();
 		const base = this.scanDirectory(roots.widgets, true, "base");
-		const project = this.scanDirectory(roots.project, true, "project");
-		this.state.widgets = { ...base, ...project };
+		const project = this.appBundled ? {} : this.scanDirectory(roots.project, true, "project");
 		const appCatalog = this.scanDirectory(roots.catalog, false, "base");
 		const globalCatalog = this.scanDirectory(roots.globalCatalog, false, "catalog");
+		let widgets: Record<string, WidgetRecord> = this.appBundled ? base : { ...base, ...project };
+		if (this.appBundled) {
+			const compiled = this.bundledWidgetInventory();
+			const compiledIds = new Set(compiled);
+			const missing = [...compiledIds].filter((id) => !base[id]);
+			if (missing.length) throw new Error(`Bundled compiled inventory is missing widget metadata: ${missing.join(", ")}`);
+			widgets = Object.fromEntries(Object.entries(base).filter(([id]) => compiledIds.has(id)));
+		}
+		this.state.widgets = widgets;
 		this.state.catalog = { ...appCatalog, ...globalCatalog };
-		this.installed = new Set(Object.keys(this.state.widgets));
-		for (const id of Object.keys(this.state.widgets)) delete this.state.catalog[id];
-		for (const record of Object.values(this.state.widgets)) if (record.core || this.enabled.has(record.id)) { record.enabled = true; this.enabled.add(record.id); }
+		this.installed = new Set(Object.keys(widgets));
+		for (const id of Object.keys(widgets)) delete this.state.catalog[id];
+		const freshRegistry = !this.registryStateExists && !this.registrySeeded;
+		if (freshRegistry) { this.enabled = new Set(Object.keys(widgets)); this.registrySeeded = true; }
+		for (const record of Object.values(widgets)) record.enabled = this.enabled.has(record.id);
 		this.loadAppManifest();
 	}
 	private generateRegistry() {
+		if (this.appBundled) throw new Error("Widgets are compiled into this app; registry code generation is unavailable until you rebuild the app");
 		const roots = this.widgetRoots();
 		const manifests = Object.values(this.state.widgets).filter((record) => record.enabled).map((record) => ({
 			...record,
 			...(record.source === "project" ? { importPath: dartFileUri(path.join(roots.project, record.id, `${record.id}.dart`)) } : {}),
 		}));
-		fs.writeFileSync(roots.registry, generateWidgetRegistry(manifests));
+		fs.writeFileSync(assertWritablePifPath(roots.registry), generateWidgetRegistry(manifests));
 	}
 	private readModelsConfig(): Record<string, any> { try { return JSON.parse(fs.readFileSync(this.modelsPath, "utf8")).providers ?? {}; } catch { return {}; } }
 	private readModelsList(): string[] {
@@ -789,7 +849,8 @@ class PifHub {
 			let existing: Record<string, unknown> = {};
 			try { const parsed = JSON.parse(fs.readFileSync(this.modelsPath, "utf8")); if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) existing = parsed; } catch { /* absent or unreadable */ }
 			if (fs.existsSync(this.modelsPath)) this.backupModelsFile();
-			fs.writeFileSync(this.modelsPath, JSON.stringify({ ...existing, providers }, null, 2) + "\n");
+			const file = assertWritablePifPath(this.modelsPath);
+			fs.writeFileSync(file, JSON.stringify({ ...existing, providers }, null, 2) + "\n");
 			this.refreshModels(); return { ok: true, models: this.state.models };
 		}
 		if (type === "refresh") { this.refreshModels(); return { models: this.state.models }; }
@@ -804,22 +865,27 @@ class PifHub {
 		return providers as Record<string, any>;
 	}
 	private backupModelsFile() {
-		const backup = `${this.modelsPath}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-		fs.copyFileSync(this.modelsPath, backup);
-		const backups = fs.readdirSync(path.dirname(this.modelsPath)).filter((name) => name.startsWith(`${path.basename(this.modelsPath)}.bak-`)).sort();
-		for (const stale of backups.slice(0, Math.max(0, backups.length - 4))) fs.rmSync(path.join(path.dirname(this.modelsPath), stale), { force: true });
+		const file = assertWritablePifPath(this.modelsPath);
+		const backup = assertWritablePifPath(`${file}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+		fs.copyFileSync(file, backup);
+		const backups = fs.readdirSync(path.dirname(file)).filter((name) => name.startsWith(`${path.basename(file)}.bak-`)).sort();
+		for (const stale of backups.slice(0, Math.max(0, backups.length - 4))) fs.rmSync(assertWritablePifPath(path.join(path.dirname(file), stale)), { force: true });
 	}
 	createWidget(params: any) {
+		this.assertBundledMutationAllowed("createWidget");
 		const id = String(params.id ?? ""); if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("id must be lowercase snake_case");
-		const root = this.widgetRoots().widgets; const dir = assertSafeWidgetPath(root, path.join(root, id)); if (fs.existsSync(dir)) throw new Error(`Widget already exists: ${id}`); fs.mkdirSync(dir, { recursive: false });
+		const root = this.widgetRoots().widgets; const dir = assertWritablePifPath(assertSafeWidgetPath(root, path.join(root, id))); if (fs.existsSync(dir)) throw new Error(`Widget already exists: ${id}`); fs.mkdirSync(dir, { recursive: false });
 		const name = String(params.name || id); const slot = String(params.slot || "center");
-		fs.writeFileSync(path.join(dir, "widget.yaml"), `id: ${id}\nname: ${JSON.stringify(name)}\nversion: 0.1.0\ndescription: ${JSON.stringify(String(params.spec || "A pif widget"))}\nslot: ${slot}\ncore: false\ntags: [generated]\ndart_dependencies: []\n`);
-		fs.writeFileSync(path.join(dir, `${id}.dart`), `import 'package:flutter/material.dart';\nimport '../../core/plugin.dart';\n\nclass ${widgetClassName(id)} implements PifWidgetPlugin {\n  @override\n  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: ${JSON.stringify(name)}, slot: PifSlot.${slot});\n\n  @override\n  Widget build(BuildContext context, PifHost host) => const Center(child: Text(${JSON.stringify(String(params.spec || name))}));\n}\n`);
-		return { id, directory: dir, manifest: path.join(dir, "widget.yaml"), source: path.join(dir, `${id}.dart`) };
+		const manifest = assertWritablePifPath(path.join(dir, "widget.yaml"));
+		const source = assertWritablePifPath(path.join(dir, `${id}.dart`));
+		fs.writeFileSync(manifest, `id: ${id}\nname: ${JSON.stringify(name)}\nversion: 0.1.0\ndescription: ${JSON.stringify(String(params.spec || "A pif widget"))}\nslot: ${slot}\ncore: false\ntags: [generated]\ndart_dependencies: []\n`);
+		fs.writeFileSync(source, `import 'package:flutter/material.dart';\nimport '../../core/plugin.dart';\n\nclass ${widgetClassName(id)} implements PifWidgetPlugin {\n  @override\n  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: ${JSON.stringify(name)}, slot: PifSlot.${slot});\n\n  @override\n  Widget build(BuildContext context, PifHost host) => const Center(child: Text(${JSON.stringify(String(params.spec || name))}));\n}\n`);
+		return { id, directory: dir, manifest, source };
 	}
 	private analyzeWidget(dir: string) { const result = spawnSync("dart", ["analyze", dir], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); return { ok: result.status === 0, diagnostics: `${result.stdout || ""}${result.stderr || ""}`.trim() }; }
 	private restoreFile(file: string, previous: Buffer | null) { if (previous) fs.writeFileSync(file, previous); else fs.rmSync(file, { force: true }); }
 	async installWidget(params: any) {
+		this.assertBundledMutationAllowed("installWidget");
 		const id = String(params.id ?? "");
 		if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error("Widget id must be lowercase snake_case");
 		const roots = this.widgetRoots();
@@ -829,13 +895,13 @@ class PifHub {
 		// then the app-local archive (copied into the base app), then the
 		// global catalog (copied into the project overlay).
 		let dir = "", source: PifWidgetSource, copied = false;
-		const projectDir = assertSafeWidgetPath(roots.project, path.join(roots.project, id));
-		const baseDir = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id));
+		const projectDir = assertWritablePifPath(assertSafeWidgetPath(roots.project, path.join(roots.project, id)));
+		const baseDir = assertWritablePifPath(assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)));
 		if (fs.existsSync(projectDir)) { dir = projectDir; source = "project"; }
 		else if (fs.existsSync(baseDir)) { dir = baseDir; source = "base"; }
 		else {
-			const appArchive = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id));
-			const globalEntry = assertSafeWidgetPath(roots.globalCatalog, path.join(roots.globalCatalog, id));
+			const appArchive = assertWritablePifPath(assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)));
+			const globalEntry = assertWritablePifPath(assertSafeWidgetPath(roots.globalCatalog, path.join(roots.globalCatalog, id)));
 			if (fs.existsSync(appArchive)) { fs.cpSync(appArchive, baseDir, { recursive: true, errorOnExist: true }); dir = baseDir; source = "base"; copied = true; }
 			else if (fs.existsSync(globalEntry)) { fs.mkdirSync(roots.project, { recursive: true }); fs.cpSync(globalEntry, projectDir, { recursive: true, errorOnExist: true }); dir = projectDir; source = "project"; copied = true; }
 			else throw new Error(`Widget not found in widgets or catalog: ${id}`);
@@ -854,16 +920,23 @@ class PifHub {
 			if (pubGet.status !== 0) return rejectInstall("pub_get", `${pubGet.stdout}${pubGet.stderr}`);
 		}
 		const analysis = this.analyzeWidget(dir); if (!analysis.ok) return rejectInstall("analyze", analysis.diagnostics);
-		const enabledBefore = new Set(this.enabled), registryBefore = fs.existsSync(roots.registry) ? fs.readFileSync(roots.registry) : null;
+		const registryFile = assertWritablePifPath(roots.registry);
+		const enabledBefore = new Set(this.enabled), registryBefore = fs.existsSync(registryFile) ? fs.readFileSync(registryFile) : null;
 		this.enabled.add(id); this.scanWidgets(); this.state.widgets[id].enabled = true; this.generateRegistry();
-		const projectAnalysis = this.analyzeWidget(roots.registry);
-		if (!projectAnalysis.ok) { this.enabled = enabledBefore; this.restoreFile(roots.registry, registryBefore); this.scanWidgets(); return rejectInstall("registry_analyze", projectAnalysis.diagnostics); }
+		const projectAnalysis = this.analyzeWidget(registryFile);
+		if (!projectAnalysis.ok) { this.enabled = enabledBefore; this.restoreFile(registryFile, registryBefore); this.scanWidgets(); return rejectInstall("registry_analyze", projectAnalysis.diagnostics); }
 		this.saveRegistryState();
 		let reload: any = "shell-not-running"; if (this.supervisor.process) { this.state.health.reload = "running"; try { reload = await this.supervisor.reload(Boolean(manifest.dart_dependencies.length)); } catch (first) { try { reload = await this.supervisor.reload(true); } catch (second) { reload = { error: String(second), first: String(first) }; } } this.state.health.reload = reload?.error ? "failed" : "idle"; }
 		this.scanWidgets(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); this.broadcast("store/catalog", "catalog_state", { catalog: this.state.catalog }); const result = { ok: !reload?.error, id, phase: "reload", diagnostics: analysis.diagnostics, reload, source }; this.broadcast("widget/reload", "reload_result", result); return result;
 	}
-	async toggleWidget(params: any) { const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); widget.enabled = params.enabled ?? !widget.enabled; widget.enabled ? this.enabled.add(id) : this.enabled.delete(id); this.saveRegistryState(); this.generateRegistry(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); if (this.supervisor.process) await this.supervisor.reload(); return widget; }
+	async toggleWidget(params: any) {
+		const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`);
+		widget.enabled = params.enabled ?? !widget.enabled; widget.enabled ? this.enabled.add(id) : this.enabled.delete(id); this.saveRegistryState();
+		if (this.appBundled) { this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); return widget; }
+		this.generateRegistry(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); if (this.supervisor.process) await this.supervisor.reload(); return widget;
+	}
 	async uninstallWidget(params: any) {
+		this.assertBundledMutationAllowed("uninstallWidget");
 		const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); if (widget.core) throw new Error(`Core widget ${id} cannot be uninstalled`);
 		const roots = this.widgetRoots();
 		if (widget.source === "project") {
@@ -877,7 +950,7 @@ class PifHub {
 			return { ok: true, id, source: "project", deregistered: true };
 		}
 		// Base widgets archive back into the app-local catalog (source is never destroyed).
-		const source = assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)); const target = assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target);
+		const source = assertWritablePifPath(assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id))); const target = assertWritablePifPath(assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id))); if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true }); fs.renameSync(source, target);
 		this.enabled.delete(id); this.saveRegistryState(); this.scanWidgets(); this.generateRegistry(); this.broadcastSnapshot(); if (this.supervisor.process) await this.supervisor.reload(); return { ok: true, id, source: "base", archived: target };
 	}
 	// --- App model (#157): pif_app/app.yaml + pif_app_* tools ---
@@ -903,7 +976,7 @@ class PifHub {
 		for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
 			const from = path.join(source, entry.name);
-			const to = path.join(this.globalCatalogPath, "templates", entry.name);
+			const to = assertWritablePifPath(path.join(this.globalCatalogPath, "templates", entry.name));
 			fs.mkdirSync(path.dirname(to), { recursive: true });
 			fs.rmSync(to, { recursive: true, force: true });
 			fs.cpSync(from, to, { recursive: true });
@@ -920,7 +993,7 @@ class PifHub {
 	}
 
 	private writeAppManifest(manifest: PifAppManifest) {
-		const file = this.appManifestPath();
+		const file = assertWritablePifPath(this.appManifestPath());
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, renderAppManifest(manifest));
 		this.state.app = manifest;
@@ -932,13 +1005,13 @@ class PifHub {
 	/// config for project widgets. Scaffolded once; pub get runs here so the
 	/// install gate sees resolved packages.
 	private scaffoldAppPackage() {
-		const root = path.join(this.state.health.workspace, "pif_app");
-		const pubspec = path.join(root, "pubspec.yaml");
+		const pubspec = assertWritablePifPath(path.join(this.state.health.workspace, "pif_app", "pubspec.yaml"));
+		const root = path.dirname(pubspec);
 		if (!fs.existsSync(pubspec)) {
 			const appRef = path.relative(root, this.appDir).split(path.sep).join("/");
 			fs.writeFileSync(pubspec, `name: pif_app\npublish_to: none\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  flutter:\n    sdk: flutter\n  pif:\n    path: ${appRef}\n`);
 		}
-		const pubGet = spawnSync("flutter", ["pub", "get"], { cwd: root, encoding: "utf8", timeout: 180_000 });
+		const pubGet = spawnSync("flutter", ["pub", "get"], { cwd: path.dirname(pubspec), encoding: "utf8", timeout: 180_000 });
 		if (pubGet.status !== 0) throw new Error(`flutter pub get failed in pif_app: ${pubGet.stdout}${pubGet.stderr}`);
 	}
 
@@ -995,6 +1068,7 @@ class PifHub {
 	}
 
 	async appInit(params: any) {
+		this.assertBundledMutationAllowed("appInit");
 		this.assertNoApp();
 		const name = (String(params.name ?? "My App").trim() || "My App").replace(/[\r\n]+/g, " ").slice(0, 120);
 		const template = params.template ? String(params.template) : undefined;
@@ -1004,7 +1078,7 @@ class PifHub {
 		if (template) {
 			const source = this.appTemplateSource(template);
 			if (!source) throw new Error(`Template '${template}' not found (searched project pinned copy, ${this.globalCatalogPath}/templates, and the app's bundled templates)`);
-			const to = path.join(this.state.health.workspace, "pif_app", "template");
+			const to = assertWritablePifPath(path.join(this.state.health.workspace, "pif_app", "template"));
 			fs.mkdirSync(path.dirname(to), { recursive: true });
 			const sameTemplateDir = fs.existsSync(to) ? fs.realpathSync(source) === fs.realpathSync(to) : path.resolve(source) === path.resolve(to);
 			if (!sameTemplateDir) {
@@ -1012,7 +1086,7 @@ class PifHub {
 				fs.cpSync(source, to, { recursive: true });
 			}
 		}
-		fs.mkdirSync(path.dirname(this.appManifestPath()), { recursive: true });
+		fs.mkdirSync(path.dirname(assertWritablePifPath(this.appManifestPath())), { recursive: true });
 		this.appInitializing = true;
 		let homeDir = "";
 		let homeCreated = false;
@@ -1028,7 +1102,7 @@ class PifHub {
 			// Roll back the attempt so a retry is possible: the manifest and
 			// the scaffolded page go; the pinned template and design.md stay.
 			if (homeCreated) fs.rmSync(homeDir, { recursive: true, force: true });
-			fs.rmSync(this.appManifestPath(), { force: true });
+			fs.rmSync(assertWritablePifPath(this.appManifestPath()), { force: true });
 			this.scanWidgets();
 			throw error;
 		} finally {
@@ -1040,6 +1114,7 @@ class PifHub {
 	}
 
 	async appPageAdd(params: any) {
+		this.assertBundledMutationAllowed("appPageAdd");
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
 		const name = String(params.name ?? "").trim().replace(/[\r\n]+/g, " ").slice(0, 120);
 		if (!name) throw new Error("Page name is required");
@@ -1064,6 +1139,7 @@ class PifHub {
 	}
 
 	async appWidgetAdd(params: any) {
+		this.assertBundledMutationAllowed("appWidgetAdd");
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
 		const name = String(params.name ?? "").trim().replace(/[\r\n]+/g, " ").slice(0, 120);
 		if (!name) throw new Error("Widget name is required");
@@ -1104,6 +1180,7 @@ class PifHub {
 			widgets: manifest.pages.map((page) => ({ page, installed: !!this.state.widgets[page], enabled: !!this.state.widgets[page]?.enabled })),
 		};
 	}
+	relaunchShell() { if (this.appBundled) throw new Error("Widgets are compiled into this app; Flutter relaunch is unavailable"); this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
 
 	/** Async export: the acknowledgement and app/build build_result share a
 	 * buildId. Results retain ok/name/code/output, plus error/signal on failure. */
@@ -1193,7 +1270,6 @@ class PifHub {
 
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
 	private async storeAction(type: string, payload: any) { if (type === "install") return this.installWidget(payload); if (type === "refresh") { this.scanWidgets(); this.broadcastSnapshot(); } }
-	relaunchShell() { this.supervisor.relaunch({ ...process.env, PIF_PORT: String(this.port), PIF_WORKSPACE: this.workspace, PIF_TOKEN: this.token }); }
 	async reload(restart = false) { this.state.health.reload = "running"; this.broadcast("shell/health", "health", this.state.health); try { const result = await this.supervisor.reload(restart); this.state.health.reload = "idle"; return result; } catch (error) { this.state.health.reload = "failed"; throw error; } finally { this.broadcast("shell/health", "health", this.state.health); } }
 	/** Stop the hub and exit the pi process — used by app clients adopting a
 	 * standalone hub and by the shell.shutdown control method. */

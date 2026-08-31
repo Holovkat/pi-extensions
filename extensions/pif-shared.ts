@@ -125,6 +125,83 @@ export function dartFileUri(filePath: string): string {
 	return uri;
 }
 
+function hasAppContentsMarker(candidate: string): boolean {
+	const parts = candidate.split(path.sep).filter(Boolean);
+	for (let index = 0; index < parts.length - 1; index++) {
+		if (parts[index].endsWith('.app') && parts[index + 1] === 'Contents') return true;
+	}
+	return false;
+}
+
+function resolveCanonicalPifPath(candidate: string): string {
+	const raw = candidate.split(path.sep).filter((part) => part.length > 0);
+	const absolute = path.isAbsolute(candidate);
+	let current = absolute ? path.parse(candidate).root : fs.realpathSync(process.cwd());
+
+	for (let index = 0; index < raw.length; index++) {
+		const part = raw[index];
+		if (part === '.') continue;
+		if (part === '..') {
+			const parent = path.dirname(current);
+			current = parent === current ? current : parent;
+			continue;
+		}
+
+		const next = path.join(current, part);
+		let stat: fs.Stats;
+		try {
+			stat = fs.lstatSync(next);
+		} catch (error: any) {
+			if (error?.code !== 'ENOENT') throw error;
+			current = next;
+			continue;
+		}
+
+		if (stat.isSymbolicLink()) {
+			let resolved: string;
+			try {
+				resolved = fs.realpathSync(next);
+			} catch (error: any) {
+				throw new Error(`Unable to resolve symlink for writable path ${candidate}: ${error.message}`);
+			}
+			let resolvedStat: fs.Stats;
+			try {
+				resolvedStat = fs.statSync(resolved);
+			} catch (error: any) {
+				throw new Error(`Unable to stat symlink target for writable path ${candidate}: ${error.message}`);
+			}
+			if (index < raw.length - 1 && !resolvedStat.isDirectory()) throw new Error(`Path component is not a directory: ${next}`);
+			current = resolved;
+			continue;
+		}
+
+		if (index < raw.length - 1 && !stat.isDirectory()) throw new Error(`Path component is not a directory: ${next}`);
+		current = next;
+	}
+
+	return current;
+}
+
+/** Best-effort predicate for whether a path is inside an app bundle. Throws
+ * on dangling or unresolvable links so callers can fail closed. */
+export function isInsideAppBundle(candidate: string): boolean {
+	const lexical = path.resolve(candidate);
+	const canonical = resolveCanonicalPifPath(candidate);
+	return hasAppContentsMarker(lexical) || hasAppContentsMarker(canonical);
+}
+
+/** Resolve a writable path and reject any lexical or effective location that
+ * enters an .app/Contents bundle. Returns the effective canonical path for
+ * safe filesystem writes. */
+export function assertWritablePifPath(candidate: string): string {
+	const lexical = path.resolve(candidate);
+	const canonical = resolveCanonicalPifPath(candidate);
+	if (hasAppContentsMarker(lexical) || hasAppContentsMarker(canonical)) {
+		throw new Error(`Destination is inside a signed app bundle and cannot be written: ${candidate}`);
+	}
+	return canonical;
+}
+
 export function assertSafeWidgetPath(root: string, candidate: string): string {
 	const resolvedRoot = path.resolve(root);
 	const resolved = path.resolve(candidate);
@@ -374,16 +451,18 @@ export class TrackerSync {
 		this.workspace = workspace; this.changed = changed; this.runner = runner; this.preferJsonCache = preferJsonCache;
 	}
 	async init() {
-		const cacheDir = path.join(this.workspace, ".pi", "pif", "cache");
+		const cacheDir = assertWritablePifPath(path.join(this.workspace, ".pi", "pif", "cache"));
+		const dbPath = assertWritablePifPath(path.join(cacheDir, "tracker.db"));
+		for (const suffix of ["-wal", "-shm", "-journal"]) assertWritablePifPath(`${dbPath}${suffix}`);
+		this.jsonPath = assertWritablePifPath(path.join(cacheDir, "tracker-cache.json"));
 		if (!this.preferJsonCache) {
 			try {
 				const { DatabaseSync } = await import("node:sqlite");
 				fs.mkdirSync(cacheDir, { recursive: true });
-				this.db = new DatabaseSync(path.join(cacheDir, "tracker.db"));
+				this.db = new DatabaseSync(dbPath);
 				this.db.exec("CREATE TABLE IF NOT EXISTS tracker (id INTEGER PRIMARY KEY, repo TEXT, fetched_at TEXT, cards TEXT)");
 			} catch { this.db = null; }
 		}
-		this.jsonPath = path.join(cacheDir, "tracker-cache.json");
 		this.loadCache();
 	}
 	start() { const kick = setTimeout(() => this.refresh(), 250); kick.unref?.(); this.timer = setInterval(() => this.refresh(), 300_000); this.timer.unref?.(); }
@@ -520,7 +599,8 @@ export class TrackerSync {
 	}
 	private writeCache() {
 		if (this.db) { this.db.prepare("INSERT INTO tracker (id, repo, fetched_at, cards) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET repo = excluded.repo, fetched_at = excluded.fetched_at, cards = excluded.cards").run(this.state.repo, this.state.fetchedAt, JSON.stringify(this.state.cards)); return; }
-		fs.mkdirSync(path.dirname(this.jsonPath), { recursive: true }); fs.writeFileSync(this.jsonPath, JSON.stringify({ repo: this.state.repo, fetchedAt: this.state.fetchedAt, cards: this.state.cards }, null, 2) + "\n");
+		const file = assertWritablePifPath(this.jsonPath);
+		fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify({ repo: this.state.repo, fetchedAt: this.state.fetchedAt, cards: this.state.cards }, null, 2) + "\n");
 	}
 }
 

@@ -287,7 +287,7 @@ cat > "$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs" <<'NODE'
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseAppManifest } from '../pi/extensions/pif-shared.ts';
+import { assertWritablePifPath, parseAppManifest } from '../pi/extensions/pif-shared.ts';
 
 function fail(message) {
   console.error(`ERROR: ${message}`);
@@ -299,14 +299,14 @@ const sourceArg = process.argv[3];
 const appId = process.argv[4];
 if (!workspaceArg || !sourceArg || !appId) fail('usage: bootstrap-manifest.mjs <workspace> <source> <app-id>');
 
-const workspace = path.resolve(workspaceArg);
+const workspace = assertWritablePifPath(workspaceArg);
 const source = path.resolve(sourceArg);
-const manifestDir = path.join(workspace, 'pif_app');
-const target = path.join(manifestDir, 'app.yaml');
+const manifestDir = assertWritablePifPath(path.join(workspace, 'pif_app'));
+const target = assertWritablePifPath(path.join(manifestDir, 'app.yaml'));
 const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-const staging = path.join(manifestDir, `.app.yaml.stage-${process.pid}-${stamp}`);
-const backup = path.join(manifestDir, `app.yaml.export-backup-${stamp}-${process.pid}`);
-const backupStage = `${backup}.stage-${process.pid}`;
+const staging = assertWritablePifPath(path.join(manifestDir, `.app.yaml.stage-${process.pid}-${stamp}`));
+const backup = assertWritablePifPath(path.join(manifestDir, `app.yaml.export-backup-${stamp}-${process.pid}`));
+const backupStage = assertWritablePifPath(`${backup}.stage-${process.pid}`);
 
 let sourceRaw;
 try {
@@ -320,20 +320,20 @@ if (parsed.manifest?.id !== appId) {
   fail(`exported app manifest id '${parsed.manifest?.id ?? '(missing)'}' does not match exported app id '${appId}'`);
 }
 
-fs.mkdirSync(manifestDir, { recursive: true });
+fs.mkdirSync(assertWritablePifPath(manifestDir), { recursive: true });
 
 function cleanup(file) {
-  try { fs.rmSync(file, { force: true }); } catch (_) { /* best-effort cleanup */ }
+  try { fs.rmSync(assertWritablePifPath(file), { force: true }); } catch (_) { /* best-effort cleanup */ }
 }
 
 try {
   if (!fs.existsSync(target)) {
-    fs.writeFileSync(staging, sourceRaw);
-    fs.renameSync(staging, target);
+    fs.writeFileSync(assertWritablePifPath(staging), sourceRaw);
+    fs.renameSync(assertWritablePifPath(staging), assertWritablePifPath(target));
     process.exit(0);
   }
 
-  const currentRaw = fs.readFileSync(target);
+  const currentRaw = fs.readFileSync(assertWritablePifPath(target));
   if (currentRaw.equals(sourceRaw)) process.exit(0);
 
   const currentParsed = parseAppManifest(currentRaw.toString('utf8'));
@@ -341,10 +341,10 @@ try {
     fail(`workspace manifest id '${currentParsed.manifest?.id ?? '(missing)'}' does not match exported app id '${appId}'`);
   }
 
-  fs.copyFileSync(target, backupStage);
-  fs.renameSync(backupStage, backup);
-  fs.writeFileSync(staging, sourceRaw);
-  fs.renameSync(staging, target);
+  fs.copyFileSync(assertWritablePifPath(target), assertWritablePifPath(backupStage));
+  fs.renameSync(assertWritablePifPath(backupStage), assertWritablePifPath(backup));
+  fs.writeFileSync(assertWritablePifPath(staging), sourceRaw);
+  fs.renameSync(assertWritablePifPath(staging), assertWritablePifPath(target));
 } catch (error) {
   cleanup(staging);
   cleanup(backupStage);

@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import '../widget_registry.g.dart';
+
 /// Probe verdicts for a listener on the hub port.
 enum HubProbe {
   /// Nothing answered — port is free or the listener is not an HTTP hub.
@@ -112,6 +114,112 @@ class PiLauncher {
     return 'pif';
   }
 
+  static String _normalizeAbsolutePath(String path) =>
+      Uri.file(Directory(path).absolute.path).normalizePath().path;
+
+  static String _absolutePath(String path) => Directory(path).absolute.path;
+
+  static bool _isInsideAppContents(String path) =>
+      RegExp(r'(^|/)[^/]+\.app/Contents(/|$)').hasMatch(
+        _normalizeAbsolutePath(path).replaceAll('\\', '/'),
+      );
+
+  static String? _resolveCanonicalPath(String path) {
+    final initial = _resolveCanonicalPathOnce(_absolutePath(path));
+    if (initial == null) return null;
+    var resolved = initial;
+    final seen = <String>{resolved};
+    while (true) {
+      final replay = _resolveCanonicalPathOnce(resolved);
+      if (replay == null) return null;
+      if (replay == resolved) return resolved;
+      if (!seen.add(replay)) return null;
+      resolved = replay;
+    }
+  }
+
+  static String? _resolveCanonicalPathOnce(String absolute) {
+    var candidate = absolute;
+    while (true) {
+      final type = FileSystemEntity.typeSync(candidate, followLinks: false);
+      if (type != FileSystemEntityType.notFound) {
+        try {
+          final resolvedAncestor = Directory(candidate).resolveSymbolicLinksSync();
+          final suffix = absolute.substring(candidate.length);
+          if (suffix.isEmpty) return resolvedAncestor;
+          final relativeSuffix = suffix.replaceFirst(RegExp(r'^/+'), '');
+          return Uri.directory(resolvedAncestor).resolve(relativeSuffix).path;
+        } catch (_) {
+          return null;
+        }
+      }
+      final parent = Directory(candidate).parent.path;
+      if (parent == candidate) return null;
+      candidate = parent;
+    }
+  }
+
+  static String _ensureWritableDestination(String path, {required String role}) {
+    final normalized = _normalizeAbsolutePath(path);
+    if (_isInsideAppContents(normalized)) {
+      throw ArgumentError.value(
+        path,
+        role,
+        'Workspace destinations inside .app/Contents are not writable; '
+        'choose a path outside the signed app bundle.',
+      );
+    }
+    final canonical = _resolveCanonicalPath(path);
+    if (canonical == null) {
+      throw ArgumentError.value(
+        path,
+        role,
+        'Unable to verify a writable path because an existing ancestor '
+        'could not be resolved safely; choose a path outside the signed '
+        'app bundle.',
+      );
+    }
+    if (_isInsideAppContents(canonical)) {
+      throw ArgumentError.value(
+        path,
+        role,
+        'Workspace destinations inside .app/Contents are not writable; '
+        'choose a path outside the signed app bundle.',
+      );
+    }
+    return canonical;
+  }
+
+  static String _compiledWidgetIdsJson() {
+    final ids = pifWidgetFactories().keys.toList()..sort();
+    return jsonEncode(ids);
+  }
+
+  static String? _compiledWidgetIdsForAppDir(String appDir) {
+    final normalized = _normalizeAbsolutePath(appDir);
+    final canonical = _resolveCanonicalPath(appDir);
+    if (_isInsideAppContents(normalized) ||
+        (canonical != null && _isInsideAppContents(canonical))) {
+      return _compiledWidgetIdsJson();
+    }
+    return null;
+  }
+
+  // Diagnostic hooks for the #187 handoff. Keep them thin wrappers over the
+  // real helpers so verification can exercise the same code paths.
+  static void debugEnsureWritableDestination(
+    String path, {
+    required String role,
+  }) {
+    _ensureWritableDestination(path, role: role);
+  }
+
+  static String? debugResolveCanonicalPath(String path) =>
+      _resolveCanonicalPath(path);
+
+  static String? debugCompiledWidgetIdsForAppDir(String appDir) =>
+      _compiledWidgetIdsForAppDir(appDir);
+
   /// Whether an actual pif hub is answering on the given port, and if so
   /// whether it can prove it is *ours*. The hub answers GET /probe by
   /// HMAC-ing our nonce under the shared hub token; a port squatter that
@@ -191,6 +299,7 @@ class PiLauncher {
 
   /// Spawn pi with the pif extension in standalone mode.
   Future<void> start({required String workspace}) async {
+    workspace = _ensureWritableDestination(workspace, role: 'workspace');
     _workspace = workspace;
     _token = _generateToken();
     // Claim the requested port if free; otherwise fall back to a random
@@ -202,7 +311,11 @@ class PiLauncher {
     final piCli = _findPiCli();
     final extension = _findExtension();
     final appDir = _findAppDir();
-    final hostSessionFile = '$workspace/.pi/pif/sessions/host.jsonl';
+    final compiledWidgetIds = _compiledWidgetIdsForAppDir(appDir);
+    final hostSessionFile = _ensureWritableDestination(
+      '$workspace/.pi/pif/sessions/host.jsonl',
+      role: 'host session file',
+    );
     final hostSession = File(hostSessionFile);
     hostSession.parent.createSync(recursive: true);
     hostSession.writeAsStringSync('', mode: FileMode.append);
@@ -227,6 +340,9 @@ class PiLauncher {
       'PIF_APP_DIR': appDir,
       'PIF_TOKEN': _token!,
       'PIF_HOST_SESSION_FILE': hostSessionFile,
+      // ignore: use_null_aware_elements
+      if (compiledWidgetIds != null)
+        'PIF_COMPILED_WIDGET_IDS': compiledWidgetIds,
     };
 
     _process = await Process.start(
