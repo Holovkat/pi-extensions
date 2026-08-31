@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [PIF New Project accepts a typed parent folder](./2026-09-01-pif-typed-parent-folder.md) | 2026-08-31T22:06:16Z | pif, onboarding, new-project, filesystem, testing | #160, #224 |
 | [Team Pulse design approved for the sample build](./2026-09-01-team-pulse-design-approval.md) | 2026-08-31T21:48:09Z | pif, team-pulse, design, mercury, approval | #158, #160, #206, #212 |
 | [PIF app-builder development checkpoint and ticket closeout](./2026-08-31-pif-development-checkpoint.md) | 2026-08-31T12:48:20Z | pif, checkpoint, development, verification | #152, #153, #158–#160, #187, #191–#212, #214–#223 |
 | [GitHub Settings uses one validation action](./2026-08-31-pif-github-settings-workflow.md) | 2026-08-31T12:26:00Z | pif, settings, github, workflow | #160, #221, #223 |

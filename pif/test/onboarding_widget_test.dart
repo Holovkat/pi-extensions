@@ -259,12 +259,16 @@ void main() {
     await open(tester);
     await tester.enterText(field('Project name'), 'Fresh project');
     selectedFolder = null;
-    await tester.tap(find.text('Choose project location'));
+    await tester.tap(find.text('Browse'));
     await tester.pumpAndSettle();
     expect(tester.widget<FilledButton>(primary('Continue')).onPressed, isNull);
     selectedFolder = temporary.resolveSymbolicLinksSync();
-    await tester.tap(find.text('Choose project location'));
+    await tester.tap(find.text('Browse'));
     await tester.pumpAndSettle();
+    expect(
+      tester.widget<TextField>(field('Parent folder')).controller!.text,
+      selectedFolder,
+    );
     // Await the button's complete filesystem + platform action, rather than
     // advancing the fake animation clock while real work is still pending.
     final continueAction =
@@ -284,6 +288,64 @@ void main() {
     expect(ProjectRepositoryService(github).pending(identity), isNull);
     await close(tester);
   });
+
+  testWidgets('typed parent folder enables allocation without browsing', (
+    tester,
+  ) async {
+    await open(tester);
+    await tester.enterText(field('Project name'), 'Typed project');
+    await tester.enterText(
+      field('Parent folder'),
+      temporary.resolveSymbolicLinksSync(),
+    );
+    await tester.pump();
+    expect(
+      tester.widget<FilledButton>(primary('Continue')).onPressed,
+      isNotNull,
+    );
+
+    final continueAction =
+        tester.widget<FilledButton>(primary('Continue')).onPressed!
+            as Future<void> Function();
+    await tester.runAsync(continueAction);
+    await tester.pumpAndSettle();
+
+    expect(
+      environments.created.single.workspacePath,
+      endsWith('/Typed project'),
+    );
+    await close(tester);
+  });
+
+  testWidgets(
+    'invalid parent folder paths show specific errors and create nothing',
+    (tester) async {
+      await open(tester);
+      await tester.enterText(field('Project name'), 'Must not exist');
+
+      final file = File('${temporary.path}/not-a-folder')
+        ..writeAsStringSync('fixture');
+      for (final invalid in <(String, String)>[
+        ('relative/folder', 'Enter the full folder path beginning with /.'),
+        ('${temporary.path}/missing', 'This folder does not exist.'),
+        (file.path, 'This path is not a folder.'),
+        ('', 'Enter the parent folder for the new project.'),
+      ]) {
+        await tester.enterText(field('Parent folder'), invalid.$1);
+        await tester.pump();
+        expect(find.text(invalid.$2), findsOneWidget);
+        expect(
+          tester.widget<FilledButton>(primary('Continue')).onPressed,
+          isNull,
+        );
+        expect(environments.created, isEmpty);
+      }
+
+      expect(temporary.listSync().map((entry) => entry.path), [file.path]);
+      expect(file.readAsStringSync(), 'fixture');
+      await close(tester);
+    },
+  );
 
   testWidgets('GitHub details appear after validation and survive Settings', (
     tester,

@@ -53,12 +53,13 @@ class _ProjectOnboarding extends StatefulWidget {
 
 class _ProjectOnboardingState extends State<_ProjectOnboarding> {
   final _name = TextEditingController();
+  final _location = TextEditingController();
   final _owner = TextEditingController();
   final _repo = TextEditingController();
   late final _repositories = ProjectRepositoryService(widget.github);
   EnvironmentIdentity? _identity;
   String _mode = 'create';
-  String? _location;
+  bool _locationEdited = false;
   String? _error;
   String? _notice;
   bool _private = true;
@@ -84,6 +85,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
   void dispose() {
     widget.github.removeListener(_connectionChanged);
     _name.dispose();
+    _location.dispose();
     _owner.dispose();
     _repo.dispose();
     super.dispose();
@@ -184,13 +186,32 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
   Future<void> _selectLocation() => _run(() async {
     final path = await _folder('Choose the parent folder for the new project');
     if (path == null || path.isEmpty || !mounted) return;
-    setState(() => _location = path);
+    setState(() {
+      _location.text = path;
+      _locationEdited = true;
+    });
   });
+
+  String? get _locationError {
+    final path = _location.text.trim();
+    if (path.isEmpty) return 'Enter the parent folder for the new project.';
+    if (!path.startsWith('/'))
+      return 'Enter the full folder path beginning with /.';
+    return switch (FileSystemEntity.typeSync(path, followLinks: true)) {
+      FileSystemEntityType.directory => null,
+      FileSystemEntityType.notFound => 'This folder does not exist.',
+      _ => 'This path is not a folder.',
+    };
+  }
+
   Future<void> _allocate() => _run(() async {
-    if (_location == null)
-      throw StateError('Choose the local project location first.');
+    final locationError = _locationError;
+    if (locationError != null) {
+      setState(() => _locationEdited = true);
+      return;
+    }
     final identity = await widget.environments.create(
-      parentPath: _location!,
+      parentPath: _location.text.trim(),
       name: _name.text.trim(),
     );
     await _activate(identity);
@@ -290,7 +311,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
             _ => 'Create on GitHub',
           };
     final canContinue =
-        selected || (_location != null && _name.text.trim().isNotEmpty);
+        selected || (_locationError == null && _name.text.trim().isNotEmpty);
     return PopScope(
       canPop: !_busy,
       child: AlertDialog(
@@ -363,10 +384,22 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
                     onChanged: (_) => setState(() {}),
                   ),
                   const SizedBox(height: 12),
-                  OutlinedButton.icon(
-                    onPressed: _busy ? null : _selectLocation,
-                    icon: const Icon(Icons.folder_open),
-                    label: Text(_location ?? 'Choose project location'),
+                  TextField(
+                    controller: _location,
+                    enabled: !_busy,
+                    decoration: InputDecoration(
+                      labelText: 'Parent folder',
+                      hintText: '/Users/you/workspace',
+                      errorText: _locationEdited ? _locationError : null,
+                      suffixIcon: TextButton(
+                        onPressed: _busy ? null : _selectLocation,
+                        child: const Text('Browse'),
+                      ),
+                    ),
+                    onChanged: (_) => setState(() {
+                      _locationEdited = true;
+                      _error = null;
+                    }),
                   ),
                   const SizedBox(height: 8),
                   const Text(

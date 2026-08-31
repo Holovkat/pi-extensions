@@ -65,6 +65,7 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 
 ### New Project workflow correction (31 August 2026)
 - Owner follow-up simplifies setup to the relevant next step. Saved projects automatically finish local preparation; saved repository decisions and credentials are not recreated. Settings stays in the header. Routine SDK selection/retry/preview-bypass choices are removed; actual failures expose specific recovery.
+- Follow-up #224 makes the parent folder an editable full-path field with optional Browse, so the fresh-project path can be entered and validated without depending on the native macOS panel. Empty, relative, missing and non-directory inputs create nothing. Source gates pass with clean analysis, 153 Flutter tests and 15 Node integration tests; the rebuilt installed walkthrough remains pending.
 - That workflow candidate was signed and installed as **PID69833**, builder `eba148290911035dff9d53479eb5abf0ccd0ae37b858ab71027bc5467fde84d2`. It is superseded by the Settings candidate below. Clean analysis, **142 Flutter tests** and **15 Node integration tests** passed.
 - Native saved-project setup/open passed for `pif-test-app-1` with unchanged identity/repository decision. New Project first-step/Settings return was observed; the separate native folder chooser was confirmed by the owner but is not addressable by Computer Use. Fresh-project GUI completion and wider #160 acceptance remain distinct from these results.
 

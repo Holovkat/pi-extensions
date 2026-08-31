@@ -3,6 +3,13 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T22:06:16Z - Added a typed New Project parent folder
+
+Replaced the chooser-only location step with one editable Parent folder field
+and optional Browse action. Invalid empty, relative, missing and file paths are
+rejected inline before creation. Clean analysis, 153 Flutter tests and 15 Node
+integration tests pass; installed proof remains with #224/#160.
+
 ## 2026-08-31T21:48:09Z - Approved the corrected Team Pulse design
 
 Replaced the routing-only Home proposal with a useful weekly dashboard, made
