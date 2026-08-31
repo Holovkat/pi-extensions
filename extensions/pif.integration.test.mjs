@@ -1,14 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
-import os from 'node:os';
 import path from 'node:path';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const extension = path.join(repo, 'extensions', 'pif.ts');
+const syntheticAllowedOrigins = 'https://fixture.pif.local';
+const sharedPubCache = fs.mkdtempSync(path.join('/tmp', 'pif-pub-cache-'));
+const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function writeJsonIfMissing(file, value) {
+  if (fs.existsSync(file)) return;
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function prepareAgentDir(workspace) {
+  const agentDir = path.join(workspace, '.pi', 'agent');
+  fs.mkdirSync(path.join(agentDir, 'agents'), {recursive: true});
+  fs.mkdirSync(path.join(agentDir, 'extensions'), {recursive: true});
+  fs.mkdirSync(path.join(agentDir, 'state'), {recursive: true});
+  writeJsonIfMissing(path.join(agentDir, 'models.json'), {providers: {}});
+  writeJsonIfMissing(path.join(agentDir, 'settings.json'), {});
+  writeJsonIfMissing(path.join(agentDir, 'pipeline-config.json'), {});
+  return agentDir;
+}
 
 async function waitFor(check, message, timeout = 15_000) {
   const started = Date.now();
@@ -61,11 +80,82 @@ function nextMessage(socket, predicate, timeout = 10_000) {
 
 function send(socket, channel, type, payload) { socket.send(JSON.stringify({v: 1, id: `${Date.now()}`, ts: new Date().toISOString(), channel, type, payload})); }
 
+function fixtureEnvironment(root, extra = {}) {
+  const env = {
+    PATH: process.env.PATH || '/usr/bin:/bin:/usr/sbin:/sbin',
+    TMPDIR: path.join(root, '.tmp'),
+    PUB_CACHE: sharedPubCache,
+    XDG_CACHE_HOME: path.join(root, '.xdg-cache'),
+    XDG_CONFIG_HOME: path.join(root, '.xdg-config'),
+    ...extra,
+  };
+  if (process.env.HOME) env.HOME = process.env.HOME;
+  if (process.env.LANG) env.LANG = process.env.LANG;
+  if (process.env.LC_ALL) env.LC_ALL = process.env.LC_ALL;
+  if (process.env.USER) env.USER = process.env.USER;
+  if (process.env.LOGNAME) env.LOGNAME = process.env.LOGNAME;
+  for (const key of ['TMPDIR', 'PUB_CACHE', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME']) fs.mkdirSync(env[key], {recursive: true});
+  return env;
+}
+
+function runFlutterPubGet(cwd, root) {
+  const result = spawnSync('flutter', ['pub', 'get'], {cwd, env: fixtureEnvironment(root), encoding: 'utf8', timeout: 120_000, killSignal: 'SIGTERM'});
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(`flutter pub get failed for ${cwd}: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+}
+
+async function reservePort() {
+  return await new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      if (!port) {
+        server.close(() => reject(new Error('Failed to reserve a port')));
+        return;
+      }
+      server.close((error) => error ? reject(error) : resolve(port));
+    });
+  });
+}
+
+async function closeWebSocket(socket, timeout = 5_000) {
+  if (!socket) return;
+  if (socket.readyState === 3) return;
+  if (socket.readyState === 2) {
+    try { await waitFor(() => socket.readyState === 3, 'WebSocket close', timeout); } catch {}
+    return;
+  }
+  socket.close();
+  try { await waitFor(() => socket.readyState === 3, 'WebSocket close', timeout); } catch {}
+}
+
+async function shutdownChild(child, timeout = 5_000) {
+  if (!child || child.exitCode != null || child.signalCode != null) return;
+  try {
+    await rpc(child, {type: 'prompt', message: '/pif-stop'}, Math.min(timeout, 5_000));
+  } catch {}
+  try {
+    await waitFor(() => child.exitCode != null || child.signalCode != null, 'child exit', timeout);
+  } catch {
+    try { child.kill('SIGTERM'); } catch {}
+    try { await waitFor(() => child.exitCode != null || child.signalCode != null, 'child hard exit', timeout); } catch {
+      try { child.kill('SIGKILL'); } catch {}
+      try { await waitFor(() => child.exitCode != null || child.signalCode != null, 'child hard exit', timeout); } catch {}
+    }
+  }
+}
+
 function copyFixture(workspace, removeDiffViewer = true) {
   const target = path.join(workspace, 'pif'); fs.mkdirSync(target, {recursive: true});
-  for (const name of ['lib', 'catalog', '.dart_tool', 'macos']) fs.cpSync(path.join(repo, 'pif', name), path.join(target, name), {recursive: true});
-  if (removeDiffViewer) fs.rmSync(path.join(target, 'lib', 'widgets', 'diff_viewer'), {recursive: true, force: true});
+  for (const name of ['lib', 'catalog', 'templates', 'macos']) fs.cpSync(path.join(repo, 'pif', name), path.join(target, name), {recursive: true});
   for (const name of ['pubspec.yaml', 'pubspec.lock', 'analysis_options.yaml', '.metadata']) fs.copyFileSync(path.join(repo, 'pif', name), path.join(target, name));
+  fs.rmSync(path.join(target, '.dart_tool'), {recursive: true, force: true});
+  fs.rmSync(path.join(target, 'macos', 'Flutter', 'ephemeral'), {recursive: true, force: true});
+  if (removeDiffViewer) fs.rmSync(path.join(target, 'lib', 'widgets', 'diff_viewer'), {recursive: true, force: true});
+  runFlutterPubGet(target, workspace);
+  return target;
 }
 
 /** Layered widget sources (#155): a project overlay package (`pif_app/` with a
@@ -103,6 +193,7 @@ function seedProjectOverlay(workspace) {
     '}',
     '',
   ].join('\n'));
+  runFlutterPubGet(overlay, workspace);
   return {overlay, globalCatalog};
 }
 
@@ -111,12 +202,17 @@ function fakePi(workspace) {
   // Mirrors real pi: events stream over stdout AND append to the
   // `--session <file>.jsonl` log, which the hub treats as the source of
   // truth for display history.
-  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nconst at = process.argv.indexOf('--session');\nconst sessionFile = at >= 0 ? process.argv[at + 1] : null;\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);if(q.type==='prompt'||q.type==='steer'){const user={role:'user',content:[{type:'text',text:q.message||''}]};process.stdout.write(JSON.stringify({type:'message_start',message:user})+'\\n');process.stdout.write(JSON.stringify({type:'message_end',message:user})+'\\n');}const ev={type:'message_update',delta:q.message||'',command:q.type};if(sessionFile)fs.appendFileSync(sessionFile, JSON.stringify(ev)+'\\n');process.stdout.write(JSON.stringify(ev)+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
+  fs.writeFileSync(file, `#!/usr/bin/env node\nimport fs from 'node:fs';\nconst at = process.argv.indexOf('--session');\nconst sessionFile = at >= 0 ? process.argv[at + 1] : null;\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify({autostart: process.env.PIF_AUTOSTART ?? null, noFlutter: process.env.PIF_NO_FLUTTER ?? null, port: process.env.PIF_PORT ?? null, sentinel: process.env.PIF_SYNTHETIC_SENTINEL ?? null, token: process.env.PIF_TOKEN ?? null, allowedOrigins: process.env.PIF_ALLOWED_ORIGINS ?? null, agentDir: process.env.PI_CODING_AGENT_DIR ?? null}));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);if(q.type==='prompt'||q.type==='steer'){const user={role:'user',content:[{type:'text',text:q.message||''}]};process.stdout.write(JSON.stringify({type:'message_start',message:user})+'\\n');process.stdout.write(JSON.stringify({type:'message_end',message:user})+'\\n');}const ev={type:'message_update',delta:q.message||'',command:q.type};if(sessionFile)fs.appendFileSync(sessionFile, JSON.stringify(ev)+'\\n');process.stdout.write(JSON.stringify(ev)+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`);
   fs.chmodSync(file, 0o755); return file;
 }
 
-async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = null, hostSessionFile = null, globalCatalog = null, token = 'integration-token', appDir = null}) {
-  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: {...process.env, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, ...(modelsPath ? {PIF_MODELS_PATH: modelsPath} : {}), ...(hostSessionFile ? {PIF_HOST_SESSION_FILE: hostSessionFile} : {}), ...(globalCatalog ? {PIF_GLOBAL_CATALOG: globalCatalog} : {}), ...(appDir ? {PIF_APP_DIR: appDir} : {})}, stdio: ['pipe', 'pipe', 'pipe']});
+async function startPi({workspace, port, piBin, launchFlutter = false, modelsPath = path.join(workspace, '.pi', 'agent', 'models.json'), hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl'), globalCatalog = path.join(workspace, '.pi', 'pif', 'catalog'), token = 'integration-token', appDir = path.join(workspace, 'pif'), allowedOrigins = syntheticAllowedOrigins, extraEnv = {}}) {
+  const agentDir = prepareAgentDir(workspace);
+  fs.mkdirSync(path.dirname(modelsPath), {recursive: true});
+  writeJsonIfMissing(modelsPath, {providers: {}});
+  fs.mkdirSync(path.dirname(hostSessionFile), {recursive: true});
+  fs.mkdirSync(globalCatalog, {recursive: true});
+  const child = spawn('pi', ['--mode', 'rpc', '--offline', '--no-session', '-ne', '-e', extension], {cwd: workspace, env: fixtureEnvironment(workspace, {PIF_WORKSPACE: workspace, PIF_AUTOSTART: '1', PIF_TOKEN: token, ...(launchFlutter ? {} : {PIF_NO_FLUTTER: '1'}), PIF_PORT: String(port), PIF_PI_BIN: piBin, PIF_MODELS_PATH: modelsPath, PIF_HOST_SESSION_FILE: hostSessionFile, PIF_GLOBAL_CATALOG: globalCatalog, PIF_APP_DIR: appDir, PIF_ALLOWED_ORIGINS: allowedOrigins, PI_CODING_AGENT_DIR: agentDir, ...extraEnv}), stdio: ['pipe', 'pipe', 'pipe']});
   let stdout = '', stderr = '';
   child.stdout.on('data', (chunk) => stdout += chunk);
   child.stderr.on('data', (chunk) => stderr += chunk);
@@ -126,7 +222,7 @@ async function startPi({workspace, port, piBin, launchFlutter = false, modelsPat
     await waitFor(() => fetch(`http://127.0.0.1:${port}`).then((response) => response.ok), `hub start: ${stderr || stdout}`);
     return child;
   } catch (error) {
-    child.kill('SIGKILL');
+    await shutdownChild(child);
     throw error;
   }
 }
@@ -134,10 +230,24 @@ async function startPi({workspace, port, piBin, launchFlutter = false, modelsPat
 test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, and shutdown', {timeout: 120_000}, async (t) => {
   const checkpoint = (name) => console.error(`[pif-smoke] ${name}`);
   checkpoint('setup');
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-smoke-')); copyFixture(workspace); const piBin = fakePi(workspace); const port = 32000 + Math.floor(Math.random() * 1000);
+  const workspace = tempDir('pif-smoke-');
+  let pi;
+  let socket;
+  let pi2;
+  let socket2;
+  t.after(async () => {
+    await closeWebSocket(socket2);
+    await shutdownChild(pi2);
+    await closeWebSocket(socket);
+    await shutdownChild(pi);
+    fs.rmSync(workspace, {recursive: true, force: true});
+  });
+  const appDir = copyFixture(workspace);
+  const piBin = fakePi(workspace);
+  const port = await reservePort();
   checkpoint('seeding project overlay + global catalog');
-  const {overlay, globalCatalog} = seedProjectOverlay(workspace);
-  const overlayPubGet = spawn('flutter', ['pub', 'get'], {cwd: overlay, stdio: 'ignore'}); await new Promise((resolve) => overlayPubGet.on('exit', resolve)); checkpoint('pif_app pub get done');
+  const {globalCatalog} = seedProjectOverlay(workspace);
+  checkpoint('pif_app pub get done');
   const hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl'); fs.mkdirSync(path.dirname(hostSessionFile), {recursive: true});
   fs.writeFileSync(hostSessionFile, [
     {type: 'session', version: 3, id: 'host-fixture', timestamp: new Date().toISOString(), cwd: workspace},
@@ -145,7 +255,8 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
     {type: 'message', message: {role: 'assistant', content: [{type: 'text', text: 'restored host reply'}]}},
   ].map((value) => JSON.stringify(value)).join('\n') + '\n');
   const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
-  const pi = await startPi({workspace, port, piBin: fakePi(workspace), modelsPath, hostSessionFile, globalCatalog}); checkpoint('hub started'); t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  pi = await startPi({workspace, port, piBin, modelsPath, hostSessionFile, globalCatalog, appDir, extraEnv: {PIF_SYNTHETIC_SENTINEL: 'fixture-sentinel'}});
+  checkpoint('hub started');
   const tokenFile = path.join(workspace, '.pi', 'pif', 'token');
   assert.equal(fs.readFileSync(tokenFile, 'utf8'), 'integration-token');
   const openFail = (url) => new Promise((resolve, reject) => { const socket = new WebSocket(url); socket.addEventListener('open', () => { socket.close(); resolve(); }, {once: true}); socket.addEventListener('error', () => reject(new Error('connection rejected')), {once: true}); });
@@ -165,7 +276,7 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(proof, probe.proof, 'hub proves token possession');
   const squatter = await (await fetch(`http://127.0.0.1:${port}/probe?nonce=x`)).json();
   assert.notEqual(proof, squatter.proof, 'proof is bound to the caller nonce');
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
+  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`); await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {}); const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   checkpoint('snapshot received');
   assert.equal(snapshot.payload.health.hub, 'running'); assert.equal(snapshot.payload.widgets.agent_console.core, true); assert.equal(snapshot.payload.widgets.diff_viewer, undefined);
@@ -183,14 +294,13 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   const created = await createdPromise;
   const sessionId = created.payload.id; assert.match(sessionId, /^session_/);
   assert.ok(fs.existsSync(path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`)), 'new sessions reserve a transcript file before first input');
-  const childEnv = JSON.parse(await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.env.json')) ? fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8') : false, 'child env dump'));
-  assert.equal(childEnv.autostart, null); assert.equal(childEnv.noFlutter, null); assert.equal(childEnv.port, null);
+  const childProbe = JSON.parse(await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.env.json')) ? fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8') : false, 'child env dump'));
+  assert.equal(childProbe.autostart, null); assert.equal(childProbe.noFlutter, null); assert.equal(childProbe.port, null);
+  assert.equal(childProbe.sentinel, 'fixture-sentinel');
+  assert.equal(childProbe.token, null, 'children must not inherit the hub token');
+  assert.equal(childProbe.agentDir, path.join(workspace, '.pi', 'agent'));
+  assert.equal(childProbe.allowedOrigins, null);
   checkpoint('child env scrubbed of lifecycle vars');
-  // Full env dump: no credentials may reach the child either (#176).
-  fs.writeFileSync(path.join(workspace, 'fake-pi.mjs'), `#!/usr/bin/env node\nimport fs from 'node:fs';\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.pid'))}, String(process.pid));\nfs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.env.json'))}, JSON.stringify(process.env));\nlet b=''; process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);process.stdout.write(JSON.stringify({type:'message_update',delta:q.message||'',command:q.type})+'\\n');if(q.type==='abort')process.stdout.write(JSON.stringify({type:'agent_end',aborted:true})+'\\n');else process.stdout.write(JSON.stringify({type:'agent_end'})+'\\n');}});\nprocess.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(path.join(workspace, 'fake-child.stopped'))},'yes');process.exit(0)});\n`, {flag: 'w'});
-  const fullEnv = JSON.parse(await waitFor(() => { try { return fs.readFileSync(path.join(workspace, 'fake-child.env.json'), 'utf8'); } catch { return false; } }, 'full child env dump'));
-  assert.equal(fullEnv.PIF_TOKEN, undefined, 'PIF_TOKEN must not reach children');
-  assert.equal(fullEnv.PIF_ALLOWED_ORIGINS, undefined, 'PIF_ALLOWED_ORIGINS must not reach children');
   checkpoint('child env contains no pif credentials');
 
   // Slim snapshots (#174): payload carries rail metadata, no transcripts.
@@ -353,9 +463,9 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(prefs.model, 'fixture/fast'); assert.equal(prefs.thinking, 'low'); assert.equal(prefs.name, 'My Workspace');
   const sessionFile = path.join(workspace, '.pi', 'pif', 'sessions', `${sessionId}.jsonl`);
   fs.appendFileSync(sessionFile, JSON.stringify({type: 'message', message: {role: 'user', content: [{type: 'text', text: 'restored input'}]}}) + '\n');
-  const port2 = 34000 + Math.floor(Math.random() * 500);
-  const pi2 = await startPi({workspace, port: port2, piBin});
-  const socket2 = new WebSocket(`ws://127.0.0.1:${port2}/pif?token=integration-token`);
+  const port2 = await reservePort();
+  pi2 = await startPi({workspace, port: port2, piBin, appDir, globalCatalog, modelsPath, hostSessionFile});
+  socket2 = new WebSocket(`ws://127.0.0.1:${port2}/pif?token=integration-token`);
   await new Promise((resolve, reject) => { socket2.addEventListener('open', resolve, {once: true}); socket2.addEventListener('error', reject, {once: true}); });
   send(socket2, 'shell/state', 'snapshot_request', {});
   const restarted = await nextMessage(socket2, (value) => value.type === 'snapshot');
@@ -401,21 +511,33 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.match(hostError.payload.error, /Host session has been deleted/);
   checkpoint('sessions persist, restore, and delete');
   send(socket2, 'shell/state', 'shutdown_request', {});
-  await waitFor(() => pi2.exitCode != null ? true : false, 'pi2 shutdown via shutdown_request', 15_000);
-  socket2.close();
+  await waitFor(() => pi2.exitCode != null || pi2.signalCode != null, 'pi2 shutdown via shutdown_request', 15_000);
+  await closeWebSocket(socket2);
+  await shutdownChild(pi2);
   checkpoint('adopted standalone hub shuts down over the bus');
 
   await rpc(pi, {type: 'prompt', message: '/pif-stop'});
   await waitFor(() => fs.existsSync(path.join(workspace, 'fake-child.stopped')), 'child termination');
-  socket.close(); pi.kill('SIGTERM'); checkpoint('waiting pi exit'); await new Promise((resolve) => pi.once('exit', resolve)); checkpoint('pi exited');
+  await closeWebSocket(socket);
+  await shutdownChild(pi);
+  checkpoint('pi exited');
 });
 
 test('real Flutter supervisor boots the macOS shell and performs a machine-protocol reload', {timeout: 180_000}, async (t) => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-flutter-smoke-'));
-  copyFixture(workspace, false);
-  const port = 33000 + Math.floor(Math.random() * 1000);
-  const pi = await startPi({workspace, port, piBin: fakePi(workspace), launchFlutter: true});
-  t.after(() => { if (pi.exitCode == null) pi.kill('SIGKILL'); fs.rmSync(workspace, {recursive: true, force: true}); });
+  const workspace = tempDir('pif-flutter-smoke-');
+  let pi;
+  let socket;
+  t.after(async () => {
+    await closeWebSocket(socket);
+    await shutdownChild(pi);
+    fs.rmSync(workspace, {recursive: true, force: true});
+  });
+  const appDir = copyFixture(workspace, false);
+  const globalCatalog = path.join(workspace, '.pi', 'pif', 'catalog');
+  const modelsPath = path.join(workspace, '.pi', 'agent', 'models.json');
+  const hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl');
+  const port = await reservePort();
+  pi = await startPi({workspace, port, piBin: fakePi(workspace), launchFlutter: true, appDir, globalCatalog, modelsPath, hostSessionFile});
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
   const status = await waitFor(async () => {
     const value = await control(controlPath, 'shell.status');
@@ -425,37 +547,35 @@ test('real Flutter supervisor boots the macOS shell and performs a machine-proto
   assert.equal(status.health.flutter, 'running');
   const reload = await control(controlPath, 'shell.reload', {restart: false});
   assert.equal(reload.error, undefined);
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
+  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {});
   const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
   assert.equal(snapshot.payload.widgets.diff_viewer.enabled, true);
   await rpc(pi, {type: 'prompt', message: '/pif-stop'});
-  socket.close();
-  pi.kill('SIGTERM');
-  await new Promise((resolve) => pi.once('exit', resolve));
+  await closeWebSocket(socket);
+  await shutdownChild(pi);
 });
 
 test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (#157)', {timeout: 180_000}, async (t) => {
   const checkpoint = (name) => console.error(`[pif-app-init] ${name}`);
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-app-init-')); copyFixture(workspace); const port = 34000 + Math.floor(Math.random() * 1000);
-  const globalCatalog = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-app-catalog-'));
-  // PIF_APP_DIR points at the repo's app source so template resolution and
-  // the analyzer have a real package — which means the hub's registry
-  // writes land in the repo. Snapshot and restore them (the test cleans
-  // up after itself; the gate depends on a pristine registry).
-  const registryPath = path.join(repo, 'pif', 'lib', 'widget_registry.g.dart');
-  const registryStatePath = path.join(repo, 'pif', '.pi', 'pif', 'registry.json');
-  const registryBefore = fs.existsSync(registryPath) ? fs.readFileSync(registryPath) : null;
-  const stateBefore = fs.existsSync(registryStatePath) ? fs.readFileSync(registryStatePath) : null;
-  const pi = await startPi({workspace, port, piBin: fakePi(workspace), globalCatalog, appDir: path.join(repo, 'pif')});
-  checkpoint('hub started'); t.after(() => {
-    if (pi.exitCode == null) pi.kill('SIGKILL');
+  const workspace = tempDir('pif-app-init-');
+  const appRoot = tempDir('pif-app-init-app-');
+  let pi;
+  let socket;
+  t.after(async () => {
+    await closeWebSocket(socket);
+    await shutdownChild(pi);
     fs.rmSync(workspace, {recursive: true, force: true});
-    fs.rmSync(globalCatalog, {recursive: true, force: true});
-    if (registryBefore) fs.writeFileSync(registryPath, registryBefore); else fs.rmSync(registryPath, {force: true});
-    if (stateBefore) fs.writeFileSync(registryStatePath, stateBefore); else fs.rmSync(registryStatePath, {force: true});
+    fs.rmSync(appRoot, {recursive: true, force: true});
   });
+  const appDir = copyFixture(appRoot);
+  const port = await reservePort();
+  const globalCatalog = path.join(workspace, '.pi', 'pif', 'catalog');
+  const modelsPath = path.join(workspace, '.pi', 'agent', 'models.json');
+  const hostSessionFile = path.join(workspace, '.pi', 'pif', 'sessions', 'host.jsonl');
+  pi = await startPi({workspace, port, piBin: fakePi(workspace), globalCatalog, appDir, modelsPath, hostSessionFile});
+  checkpoint('hub started');
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
   await waitFor(() => fs.existsSync(controlPath), 'control socket appears');
   const init = await control(controlPath, 'pif_app.init', {name: 'Notes Trial', template: 'mercury'});
@@ -476,7 +596,7 @@ test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (
   assert.equal(list.manifest.pages.join(','), 'home,editor_page');
   assert.equal(list.widgets[0].installed, true, 'home page installed');
   // The shell contract: the snapshot carries the manifest, so app mode boots.
-  const socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
+  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
   await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
   send(socket, 'shell/state', 'snapshot_request', {});
   const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');

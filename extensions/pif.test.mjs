@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
@@ -9,6 +8,7 @@ import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, 
 import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
+const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
 
 test('pif envelope codec accepts all protocol channels and rejects malformed data', () => {
   for (const channel of ['session/state', 'widget/registry', 'store/catalog', 'models/save', 'tracker/state', 'shell/state']) {
@@ -33,7 +33,7 @@ test('registry codegen matches deterministic golden', () => {
 });
 
 test('widget path guard line-stops traversal outside managed roots', () => {
-  const root = path.join(os.tmpdir(), 'pif', 'lib', 'widgets');
+  const root = path.join('/tmp', 'pif', 'lib', 'widgets');
   assert.equal(assertSafeWidgetPath(root, path.join(root, 'safe')), path.join(root, 'safe'));
   assert.throws(() => assertSafeWidgetPath(root, path.join(root, '..', '..', 'main.dart')), /escapes/);
 });
@@ -174,7 +174,7 @@ function onlineRunner() {
 }
 
 test('tracker sync refreshes via gh, caches offline, and reloads the cache', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   const boards = [];
   const tracker = new TrackerSync(workspace, (state) => boards.push(state), onlineRunner(), true);
   await tracker.init();
@@ -205,7 +205,7 @@ test('tracker sync refreshes via gh, caches offline, and reloads the cache', asy
 });
 
 test('tracker move writes back through gh and reverts nothing on failure', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
   fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\n\ncolumn doing:\n  name: Doing\n  label: status:doing\n\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
   const runner = onlineRunner();
@@ -249,7 +249,7 @@ test('tracker move writes back through gh and reverts nothing on failure', async
 });
 
 test('tracker create writes through gh, falls back without labels, and prepends the card', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
   fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column todo:\n  name: To Do\n  label: status:todo\ncolumn doing:\n  name: Doing\n  label: status:doing\ncolumn shipped:\n  name: Shipped\n  state: closed\n');
   const runner = stubRunner([
@@ -283,7 +283,7 @@ test('tracker create writes through gh, falls back without labels, and prepends 
 });
 
 test('tracker update edits title and body through gh and patches locally', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   const runner = onlineRunner();
   const tracker = new TrackerSync(workspace, () => {}, runner, true);
   await tracker.init();
@@ -306,7 +306,7 @@ test('tracker update edits title and body through gh and patches locally', async
 });
 
 test('tracker delete removes the card through gh and keeps state on failure', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   const failing = stubRunner([
     {match: (command) => command === 'git', stdout: 'https://github.com/acme/widgets.git\n'},
     {match: (command, args) => command === 'gh' && args[1] === 'list', stdout: JSON.stringify(ghIssuesFixture)},
@@ -333,7 +333,7 @@ test('tracker delete removes the card through gh and keeps state on failure', as
 });
 
 test('tracker surfaces invalid board config and missing github remote as errors', async () => {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-'));
+  const workspace = tempDir('pif-tracker-');
   fs.mkdirSync(path.join(workspace, '.pif'), {recursive: true});
   fs.writeFileSync(path.join(workspace, '.pif', 'board.yaml'), 'column broken:\n  state: sideways\n');
   const invalid = new TrackerSync(workspace, () => {}, onlineRunner(), true);
@@ -342,7 +342,7 @@ test('tracker surfaces invalid board config and missing github remote as errors'
   assert.equal(result.ok, false);
   assert.match(invalid.state.error, /Invalid board\.yaml/);
 
-  const remoteless = new TrackerSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pif-tracker-')), () => {}, stubRunner([
+  const remoteless = new TrackerSync(tempDir('pif-tracker-'), () => {}, stubRunner([
     {match: (command) => command === 'git', status: 1, stderr: 'fatal: no such remote'},
   ]), true);
   await remoteless.init();
@@ -369,16 +369,18 @@ function writeWidgetFixture(root, id, overrides = {}) {
  * through env overrides (this is the #130 "install once, use in any project"
  * shape: the app never has to live inside the workspace). */
 function layeredFixture(t) {
-  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-ws-'));
-  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-app-'));
-  const globalCatalog = fs.mkdtempSync(path.join(os.tmpdir(), 'pif-layered-global-'));
+  const workspace = tempDir('pif-layered-ws-');
+  const appDir = tempDir('pif-layered-app-');
+  const globalCatalog = tempDir('pif-layered-global-');
   fs.mkdirSync(path.join(appDir, 'lib', 'widgets'), {recursive: true});
   fs.mkdirSync(path.join(appDir, 'catalog'), {recursive: true});
+  const previousAppDir = process.env.PIF_APP_DIR;
+  const previousGlobalCatalog = process.env.PIF_GLOBAL_CATALOG;
   process.env.PIF_APP_DIR = appDir;
   process.env.PIF_GLOBAL_CATALOG = globalCatalog;
   t.after(() => {
-    delete process.env.PIF_APP_DIR;
-    delete process.env.PIF_GLOBAL_CATALOG;
+    if (previousAppDir === undefined) delete process.env.PIF_APP_DIR; else process.env.PIF_APP_DIR = previousAppDir;
+    if (previousGlobalCatalog === undefined) delete process.env.PIF_GLOBAL_CATALOG; else process.env.PIF_GLOBAL_CATALOG = previousGlobalCatalog;
     for (const dir of [workspace, appDir, globalCatalog]) fs.rmSync(dir, {recursive: true, force: true});
   });
   return {workspace, appDir, globalCatalog};
