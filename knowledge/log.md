@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T12:48:20Z - Checkpointed development and closed implemented PIF tickets
+
+Recorded the owner-authorized development checkpoint: 32 implementation tickets closed with evidence, while #158/#206/#212 remain unfinished and #160 retains final live acceptance. Epic #152 and sprint #153 remain open; no Supabase dependency or unrelated notes-app closure is implied. Product source remains fd0b8149; only tracker/documentation state changed.
+
 ## 2026-08-31T12:26:00Z - Simplified GitHub Settings and verified saved-token access
 
 Indexed the one-action GitHub Settings workflow, updated canonical requirements and recorded 151 Flutter/15 Node integration passes. Signed installed PID83021 displays the simplified card and completed one live saved-token validation with a successful repository refresh and unchanged project identity/link. Preserved the separate native accessibility diagnostic and wider #160 acceptance gates.

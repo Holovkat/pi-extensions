@@ -198,3 +198,104 @@ are in `/tmp/pif-settings-workflow/`. PIF is left open on Settings with a valida
 connection. #160 remains the acceptance owner; the accessibility diagnostic,
 fresh-project chooser completion, broader credential lifecycle and independent
 #206/#212 sample acceptance remain outside this completed Settings correction.
+
+
+## Development checkpoint — owner-authorized closeout
+
+On 31 August 2026 the owner authorized a **development-complete checkpoint**:
+commit the completed work and close functionally implemented tickets, while
+leaving genuine unfinished work and live-scenario acceptance open. This is the
+current ticket disposition; earlier Review/open snapshots above are historical.
+
+The product source checkpoint is **`fd0b8149`** on
+`codex/pif-app-builder-154`, already pushed. Installed `/Applications/pif.app`
+is still PID83021 and its strict deep signature passes. This closeout changes
+tracker state and documentation only; it does not rebuild, merge to master,
+deploy hosted services or claim a new full test run. Existing evidence remains
+151 Flutter tests, clean analysis and 15 Node integration tests at the latest
+candidate, with older full-suite/export proofs identified by their own revisions.
+Two independent read-only closure audits found no additional implementation
+blocker in the items closed below.
+
+### Closed as development complete
+
+**32 tickets closed:** 31 of #160's 33 native remediation children, plus the
+original export implementation #159. Each has a scoped closure comment linking
+its implementation/evidence and preserving final acceptance under #160. GitHub
+issue state is the board's Done authority; obsolete status labels were removed.
+
+| Ticket | Completed implementation |
+|---|---|
+| [#159](https://github.com/Holovkat/pi-extensions/issues/159) | Standalone agentic export pipeline |
+| [#187](https://github.com/Holovkat/pi-extensions/issues/187) | Writable registry roots and signed-bundle protection |
+| [#191](https://github.com/Holovkat/pi-extensions/issues/191) | First-edit label preservation |
+| [#192](https://github.com/Holovkat/pi-extensions/issues/192) | Correlated asynchronous export results and cleanup |
+| [#193](https://github.com/Holovkat/pi-extensions/issues/193) | Manifest page-ID round trips |
+| [#194](https://github.com/Holovkat/pi-extensions/issues/194) | Live app-manifest publication |
+| [#195](https://github.com/Holovkat/pi-extensions/issues/195) | Pinned-template retry preservation |
+| [#196](https://github.com/Holovkat/pi-extensions/issues/196) | Safe page collision rejection |
+| [#197](https://github.com/Holovkat/pi-extensions/issues/197) | Tracker tag/image save completion |
+| [#198](https://github.com/Holovkat/pi-extensions/issues/198) | Single-page narrow-window application layout |
+| [#199](https://github.com/Holovkat/pi-extensions/issues/199) | Documented credential scanning |
+| [#200](https://github.com/Holovkat/pi-extensions/issues/200) | Executable agent build runbook |
+| [#201](https://github.com/Holovkat/pi-extensions/issues/201) | Native runtime provisioning, model readiness and path/history recovery |
+| [#202](https://github.com/Holovkat/pi-extensions/issues/202) | Atomic re-export manifest upgrade |
+| [#203](https://github.com/Holovkat/pi-extensions/issues/203) | Portable sample dependency |
+| [#204](https://github.com/Holovkat/pi-extensions/issues/204) | Requirement/support-boundary reconciliation |
+| [#205](https://github.com/Holovkat/pi-extensions/issues/205) | Current knowledge and candidate evidence links |
+| [#207](https://github.com/Holovkat/pi-extensions/issues/207) | Catalog/base/project source precedence |
+| [#208](https://github.com/Holovkat/pi-extensions/issues/208) | Synchronized dev-mode control |
+| [#209](https://github.com/Holovkat/pi-extensions/issues/209) | Required-widget export validation |
+| [#210](https://github.com/Holovkat/pi-extensions/issues/210) | Accurate archived-widget provenance |
+| [#211](https://github.com/Holovkat/pi-extensions/issues/211) | Pinned release entrypoint and composition |
+| [#214](https://github.com/Holovkat/pi-extensions/issues/214) | Compact composer layout |
+| [#215](https://github.com/Holovkat/pi-extensions/issues/215) | Consistent streaming/Steer/Abort/reopened transcripts |
+| [#216](https://github.com/Holovkat/pi-extensions/issues/216) | Ticket request correlation and dialog ownership |
+| [#217](https://github.com/Holovkat/pi-extensions/issues/217) | Portable bundled Node runtime |
+| [#218](https://github.com/Holovkat/pi-extensions/issues/218) | Immutable installed builder resources |
+| [#219](https://github.com/Holovkat/pi-extensions/issues/219) | Reopenable independent development environments |
+| [#220](https://github.com/Holovkat/pi-extensions/issues/220) | Installed-resource public export path |
+| [#221](https://github.com/Holovkat/pi-extensions/issues/221) | Secure environment-token handling |
+| [#222](https://github.com/Holovkat/pi-extensions/issues/222) | GitHub repository setup and tracker connection |
+| [#223](https://github.com/Holovkat/pi-extensions/issues/223) | Central Appearance/GitHub Settings and simplified token workflow |
+
+The #221/#223 requirements were aligned with the owner's latest direction:
+no visible environment UUID, fixed masked placeholder, one Validate action and
+inline Remove. This does not change environment-scoped Keychain isolation or
+assert that GitHub itself restricts the token to a single repository.
+
+### Deliberately left open
+
+| Ticket | Actual outstanding work |
+|---|---|
+| #158 | The required designed sample/child workflow is not complete; runbook implementation alone does not satisfy it. Depends on #212/#206. |
+| #206 | Approve and implement the existing Team Pulse design: actual Home/Metrics composition, shared demo data and a real widget extension through scoped child work with diagnostic correction evidence. Existing pages are scaffold placeholders. |
+| #212 | Approve the sample appearance and implement the pinned-template binding at the application-mode boundary. PIF's own Light/Dark/System Settings does not deliver this separate requirement. |
+| #160 | Final integrated native/live acceptance and current-candidate clean-checkout gate, detailed below. |
+| #153 / #152 | Sprint and epic remain open because the sample and acceptance work above is unfinished. |
+
+#160 retains the final installed New/Open/folder-selection → preview/edit → child
+environment → public export → independent app/agent response/restart journey;
+real Keychain save/replacement/removal/denial/revocation and two-environment
+isolation; authorized disposable GitHub creation/recovery and epic/native-child
+CRUD/reopen; appearance/OS/restart checks; and the remaining sample proof.
+The recorded AXTree/Computer Use errors remain to investigate or resolve for
+native accessibility acceptance. Native exported naming/identity remains a
+concrete check: the filename is project-specific, while CFBundleName/bundle ID
+retain PIF defaults. Do not infer either passing native branding or a new binding
+branding requirement without the actual behavior check.
+
+**No Supabase blocker applies to this scope.** Team Pulse explicitly uses demo
+data and has no backend. The separate notes-app epic #179/sprint #180/tasks
+#181–#186 and runtime self-management backlog #190 were not closed or absorbed.
+Historical completed approvals were left unchanged.
+
+The next implementation is #212 then #206 under #158, after the existing Team
+Pulse design/appearance receives its required approval. Then #160 completes the
+combined real-use trial and acceptance. This checkpoint does not start a new
+application, reinterpret general approval as sample-design approval, or close
+remaining work merely because the platform is development complete.
+
+Tracker readback and per-ticket closure URLs are retained in
+`/tmp/pif-dev-checkpoint/`. No product tests were rerun for this documentation
+and tracker-only closeout.

@@ -5,5 +5,5 @@ Current state of play: what works, what's in progress, what's blocked. Updated b
 | Title | Description | Tags | Status |
 |-------|-------------|------|--------|
 | [Comms Delivery State](./comms-delivery-state.md) | All four comms hardening sprints complete, production-deployed, and production-approved | pi-extensions, comms, council, github, issues | active |
-| [Current Repo State](./current-repo-state.md) | Current repo state — installed-builder candidate, simplified project/GitHub Settings workflows and remaining native acceptance gates (31 August 2026) | pi-extensions, state, current, repo, roadmap | active |
+| [Current Repo State](./current-repo-state.md) | Current repo state — development checkpoint, closed implemented tickets and remaining sample/native acceptance work (31 August 2026) | pi-extensions, state, current, repo, roadmap | active |
 <!-- Rows added by curation agent -->
