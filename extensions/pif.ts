@@ -234,6 +234,7 @@ class PifHub {
 	readonly token: string;
 	readonly pi: ExtensionAPI; readonly ctx: ExtensionContext; readonly workspace: string; readonly port: number;
 	private controlSecret = "";
+	private appInitializing = false;
 	private readonly allowedOrigins: string[];
 	private httpServer: http.Server | null = null; private controlServer: net.Server | null = null;
 	private peers = new Set<WsPeer>(); private children = new Map<string, ChildProcessWithoutNullStreams>();
@@ -845,6 +846,7 @@ class PifHub {
 	}
 
 	private assertNoApp() {
+		if (this.appInitializing) throw new Error("App initialization is already in progress — wait for it to finish before retrying");
 		if (fs.existsSync(this.appManifestPath())) throw new Error("This project already has pif_app/app.yaml — use the pif_app_* tools to change it");
 	}
 
@@ -903,11 +905,15 @@ class PifHub {
 			fs.rmSync(to, { recursive: true, force: true });
 			fs.cpSync(source, to, { recursive: true });
 		}
-		this.writeAppManifest(manifest);
+		fs.mkdirSync(path.dirname(this.appManifestPath()), { recursive: true });
+		this.appInitializing = true;
 		try {
 			this.scaffoldAppPackage();
 			await this.scaffoldWidget("home", "Home", "page");
 			await this.installOrFail("home", "Home page");
+			// Install rescans app.yaml; keep it absent until the gate succeeds
+			// so unrelated snapshots cannot expose a pending app manifest.
+			this.writeAppManifest(manifest);
 		} catch (error) {
 			// Roll back the attempt so a retry is possible: the manifest and
 			// the scaffolded page go; the pinned template and design.md stay.
@@ -915,6 +921,8 @@ class PifHub {
 			fs.rmSync(this.appManifestPath(), { force: true });
 			this.loadAppManifest();
 			throw error;
+		} finally {
+			this.appInitializing = false;
 		}
 		this.loadAppManifest();
 		this.broadcastSnapshot();
