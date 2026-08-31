@@ -15,6 +15,7 @@ Map<String, Object?> _result({
   String code = 'missing_token',
   bool needsAuthorization = false,
 }) => {
+  'ok': true,
   'saved': saved,
   'validated': validated,
   'account': account,
@@ -117,6 +118,101 @@ void main() {
       expect(calls[1].arguments['token'], 'fixture-only-token');
     },
   );
+
+  test(
+    'each successful credential check refreshes access even for the same account',
+    () async {
+      var rejectReplacement = false;
+      native((call) async {
+        if (call.method == 'remove') return _result();
+        final connected = _result(
+          saved: true,
+          validated: true,
+          account: 'same-account',
+          code: 'connected',
+        );
+        return rejectReplacement
+            ? {...connected, 'ok': false, 'code': 'invalid_token'}
+            : connected;
+      });
+      expect(service.validationRevision, 0);
+      await selectA();
+      expect(
+        service.validationRevision,
+        0,
+        reason: 'Reading stored metadata is not a new access check.',
+      );
+      final completedChecks = <int>[];
+      service.addListener(() {
+        if (!service.busy) completedChecks.add(service.validationRevision);
+      });
+
+      await service.validate();
+      expect(service.validationRevision, 1);
+      await service.validate();
+      expect(service.validationRevision, 2);
+      await service.saveAndValidate('replacement-fixture');
+      expect(service.validationRevision, 3);
+      expect(service.state.account, 'same-account');
+
+      rejectReplacement = true;
+      await service.saveAndValidate('rejected-fixture');
+      expect(
+        service.state.validated,
+        isTrue,
+        reason: 'Native may preserve the previous working token metadata.',
+      );
+      expect(service.state.code, 'invalid_token');
+      expect(
+        service.validationRevision,
+        3,
+        reason:
+            'A failed replacement must not trigger a successful-access refresh.',
+      );
+      await service.remove();
+      expect(service.validationRevision, 3);
+      expect(completedChecks, [1, 2, 3, 3, 3]);
+    },
+  );
+
+  for (final method in ['validate', 'saveAndValidate']) {
+    test(
+      'late $method success cannot refresh the newly selected project',
+      () async {
+        final pending = Completer<Object?>();
+        final entered = Completer<void>();
+        native((call) {
+          if (call.method == method) {
+            entered.complete();
+            return pending.future;
+          }
+          return Future.value(_result());
+        });
+        await selectA();
+        final checking = method == 'validate'
+            ? service.validate()
+            : service.saveAndValidate('old-environment-fixture');
+        await entered.future;
+        await service.selectEnvironment(
+          environmentId: _environmentB,
+          workspace: '/isolated/environment-b',
+        );
+        pending.complete(
+          _result(
+            saved: true,
+            validated: true,
+            account: 'old-account',
+            code: 'connected',
+          ),
+        );
+        await checking;
+        expect(service.environmentId, _environmentB);
+        expect(service.validationRevision, 0);
+        expect(service.state.account, isNull);
+        expect(service.state.saved, isFalse);
+      },
+    );
+  }
 
   test(
     'a rejected removal preserves reported saved state and can be retried',

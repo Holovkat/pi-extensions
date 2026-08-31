@@ -453,7 +453,8 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     final state = _github.state;
     final key =
         '${_github.environmentId}:${state.saved}:${state.validated}:'
-        '${state.code}:${state.account}:${state.creationCapability}';
+        '${state.code}:${state.account}:${state.creationCapability}:'
+        '${_github.validationRevision}';
     if (_githubStateKey == key) return;
     _githubStateKey = key;
     _bus?.send('tracker/control', 'refresh', const {});

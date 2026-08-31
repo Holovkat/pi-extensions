@@ -4,6 +4,7 @@ import 'dart:math';
 import 'package:markdown/markdown.dart' as md;
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import '../../core/github_connection.dart';
 import '../../core/plugin.dart';
 
 class TrackerBoardPlugin implements PifWidgetPlugin {
@@ -161,6 +162,9 @@ class _BoardState extends State<_Board> {
   @override
   Widget build(BuildContext context) {
     final theme = PifTheme(brightness: Theme.of(context).brightness);
+    final connectRepository = repo.isEmpty
+        ? GithubConnectionScope.connectRepositoryOf(context)
+        : null;
     return Container(
       color: theme.panel,
       child: Column(
@@ -178,13 +182,19 @@ class _BoardState extends State<_Board> {
                     connectionMessage ?? 'Connect GitHub to use the tracker.',
                     style: TextStyle(color: theme.textMuted, fontSize: 12),
                   ),
-                  TextButton(
-                    onPressed: () => widget.host.layout.open(
-                      'pif_settings',
-                      slot: PifSlot.center,
+                  if (connectRepository != null)
+                    TextButton(
+                      onPressed: connectRepository,
+                      child: const Text('Connect repository'),
+                    )
+                  else
+                    TextButton(
+                      onPressed: () => widget.host.layout.open(
+                        'pif_settings',
+                        slot: PifSlot.center,
+                      ),
+                      child: const Text('Open Settings'),
                     ),
-                    child: const Text('Open Settings'),
-                  ),
                 ],
               ),
             ),

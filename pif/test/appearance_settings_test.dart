@@ -18,6 +18,8 @@ const _environmentA = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const _environmentB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const _channel = MethodChannel('pif/test/settings_github');
 const _tokenKey = Key('pif_github_token');
+const _validateKey = Key('pif_github_validate');
+const _removeKey = Key('pif_github_remove');
 const _composerKey = Key('agent_console_composer');
 
 /// A transport fixture only: no sockets, credential files, processes or native
@@ -154,6 +156,7 @@ class _ProductSettingsPlugin implements PifWidgetPlugin {
 Widget _app(
   PifAppearanceService appearance, {
   GithubConnectionService? github,
+  Future<void> Function()? connectRepository,
   Widget child = const PifSettingsPage(),
 }) {
   final themed = PifAppearanceScope(
@@ -170,7 +173,11 @@ Widget _app(
   );
   return github == null
       ? themed
-      : GithubConnectionScope(service: github, child: themed);
+      : GithubConnectionScope(
+          service: github,
+          onConnectRepository: connectRepository,
+          child: themed,
+        );
 }
 
 void main() {
@@ -352,54 +359,152 @@ void main() {
   );
 
   testWidgets(
-    'Settings has only the two groups and disabled credentials without an environment',
+    'Settings keeps two groups and hides credential actions without a project',
     (tester) async {
       await tester.pumpWidget(_app(appearance, github: github));
       expect(find.text('Settings'), findsOneWidget);
       expect(find.text('Appearance'), findsOneWidget);
       expect(find.text('GitHub'), findsOneWidget);
-      expect(
-        find.textContaining('Select/create an environment'),
-        findsOneWidget,
-      );
       expect(tester.widget<TextField>(find.byKey(_tokenKey)).enabled, isFalse);
-      expect(
-        tester
-            .widget<FilledButton>(
-              find.widgetWithText(FilledButton, 'Save and validate'),
-            )
-            .onPressed,
-        isNull,
-      );
-      expect(
-        tester
-            .widget<OutlinedButton>(
-              find.widgetWithText(OutlinedButton, 'Validate'),
-            )
-            .onPressed,
-        isNull,
-      );
-      expect(
-        tester
-            .widget<TextButton>(find.widgetWithText(TextButton, 'Remove'))
-            .onPressed,
-        isNull,
-      );
+      expect(find.byKey(_validateKey), findsNothing);
+      expect(find.byKey(_removeKey), findsNothing);
+      expect(find.text('Connect repository'), findsNothing);
       expect(calls, isEmpty);
       await tester.pumpWidget(const SizedBox());
     },
   );
 
   testWidgets(
-    'token is masked and cleared on save and environment switch without resetting appearance',
+    'empty token shows guidance and typing reveals only right-aligned Validate',
+    (tester) async {
+      await select(_environmentA);
+      await tester.pumpWidget(_app(appearance, github: github));
+      final field = find.byKey(_tokenKey);
+      expect(
+        find.text(
+          'Token access for repositories is stored securely in macOS Keychain.',
+        ),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Environment:'), findsNothing);
+      expect(find.textContaining(_environmentA), findsNothing);
+      expect(find.textContaining('/isolated/alpha'), findsNothing);
+      expect(
+        tester.widget<TextField>(field).decoration!.hintText,
+        'Enter a GitHub token',
+      );
+      expect(tester.widget<TextField>(field).obscureText, isTrue);
+      expect(
+        find.text('Enter a GitHub token to save it securely in Keychain.'),
+        findsOneWidget,
+      );
+      expect(find.byKey(_validateKey), findsNothing);
+      expect(find.byKey(_removeKey), findsNothing);
+
+      await tester.enterText(field, '   ');
+      await tester.pumpAndSettle();
+      expect(find.byKey(_validateKey), findsNothing);
+      await tester.enterText(field, 'fixture-token');
+      await tester.pumpAndSettle();
+      final validate = find.byKey(_validateKey);
+      expect(find.widgetWithText(FilledButton, 'Validate'), findsOneWidget);
+      expect(tester.widget<FilledButton>(validate).onPressed, isNotNull);
+      expect(find.byKey(_removeKey), findsNothing);
+      expect(
+        tester.getRect(validate).right,
+        closeTo(tester.getRect(field).right, 0.1),
+      );
+      expect(
+        tester.getRect(validate).top,
+        greaterThan(tester.getRect(field).bottom),
+      );
+      expect(
+        tester
+            .widget<InputDecorator>(
+              find.descendant(of: field, matching: find.byType(InputDecorator)),
+            )
+            .isEmpty,
+        isFalse,
+        reason: 'A typed value replaces the empty-input watermark.',
+      );
+
+      await tester.enterText(field, '');
+      await tester.pumpAndSettle();
+      expect(find.byKey(_validateKey), findsNothing);
+      expect(find.byKey(_removeKey), findsNothing);
+      expect(calls.map((call) => call.method), ['selectEnvironment']);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'saved token is only a watermark and Validate uses Keychain without onboarding',
+    (tester) async {
+      var repositoryConnections = 0;
+      native(
+        (call) async => call.method == 'selectEnvironment'
+            ? {
+                'saved': true,
+                'code': 'saved',
+                'message': 'Native saved metadata.',
+              }
+            : {
+                'ok': true,
+                'saved': true,
+                'validated': true,
+                'account': 'fixture-account',
+                'code': 'connected',
+                'message': 'Native validated metadata.',
+              },
+      );
+      await select(_environmentA);
+      await tester.pumpWidget(
+        _app(
+          appearance,
+          github: github,
+          connectRepository: () async {
+            repositoryConnections++;
+          },
+        ),
+      );
+      final field = find.byKey(_tokenKey);
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
+      expect(
+        tester.widget<TextField>(field).decoration!.hintText,
+        '••••••••••••••••',
+      );
+      expect(
+        find.text('Token saved securely. Validate to check GitHub access.'),
+        findsOneWidget,
+      );
+      expect(find.text('Replacement token'), findsNothing);
+      expect(find.text('Replace and validate'), findsNothing);
+      expect(find.text('Save and validate'), findsNothing);
+      expect(find.text('Connect repository'), findsNothing);
+      expect(find.byKey(_removeKey), findsOneWidget);
+      await tester.tap(find.byKey(_validateKey));
+      await tester.pumpAndSettle();
+      expect(calls.last.method, 'validate');
+      expect((calls.last.arguments as Map).containsKey('token'), isFalse);
+      expect(calls.last.arguments['environmentId'], _environmentA);
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
+      expect(
+        find.text('Connected to GitHub as fixture-account.'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Account:'), findsNothing);
+      expect(repositoryConnections, 0);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'Enter saves a typed token once and clears transient text before native completion',
     (tester) async {
       final saved = Completer<Object?>();
-      final selectedB = Completer<Object?>();
       native(
         (call) => call.method == 'saveAndValidate'
             ? saved.future
-            : call.arguments['environmentId'] == _environmentB
-            ? selectedB.future
             : Future.value({
                 'saved': false,
                 'code': 'missing_token',
@@ -408,41 +513,211 @@ void main() {
       );
       await select(_environmentA);
       await tester.pumpWidget(_app(appearance, github: github));
+      final field = find.byKey(_tokenKey);
+      expect(tester.widget<TextField>(field).obscureText, isTrue);
+      await tester.enterText(field, '  fixture-only-token  ');
+      await tester.pump();
+      final submit = tester.widget<TextField>(field).onSubmitted!;
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pump();
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
+      expect(tester.widget<TextField>(field).enabled, isFalse);
+      expect(find.byType(LinearProgressIndicator), findsOneWidget);
+      submit('fixture-only-token');
+      await tester.pump();
+      expect(
+        calls.where((call) => call.method == 'saveAndValidate'),
+        hasLength(1),
+      );
+      expect(calls.last.arguments['token'], 'fixture-only-token');
+      saved.complete({
+        'ok': true,
+        'saved': true,
+        'validated': true,
+        'account': 'fixture-account',
+        'code': 'connected',
+        'message': 'Token validated.',
+      });
+      await tester.pumpAndSettle();
+      expect(
+        find.text('Connected to GitHub as fixture-account.'),
+        findsOneWidget,
+      );
+      expect(tester.widget<TextField>(field).enabled, isTrue);
+      expect(find.byKey(_removeKey), findsOneWidget);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'replacement failure preserves saved-token actions and reports the safe failure',
+    (tester) async {
+      native(
+        (call) async => switch (call.method) {
+          'selectEnvironment' => {
+            'saved': true,
+            'code': 'saved',
+            'message': 'Saved.',
+          },
+          'saveAndValidate' => {
+            'ok': false,
+            'saved': true,
+            'validated': true,
+            'account': 'previous-account',
+            'code': 'invalid_token',
+            'message': 'GitHub rejected this token. Check its access.',
+          },
+          'validate' => {
+            'ok': true,
+            'saved': true,
+            'validated': true,
+            'account': 'fixture-account',
+            'code': 'connected',
+          },
+          _ => throw StateError('Unexpected native method: ${call.method}'),
+        },
+      );
+      await select(_environmentA);
+      await tester.pumpWidget(_app(appearance, github: github));
+      final field = find.byKey(_tokenKey);
+      await tester.enterText(field, 'replacement-fixture');
+      await tester.pump();
+      await tester.tap(find.byKey(_validateKey));
+      await tester.pumpAndSettle();
+      expect(calls.last.method, 'saveAndValidate');
+      expect(calls.last.arguments['token'], 'replacement-fixture');
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
+      expect(
+        find.text('GitHub rejected this token. Check its access.'),
+        findsOneWidget,
+      );
+      expect(
+        find.text('Connected to GitHub as previous-account.'),
+        findsNothing,
+      );
+      expect(find.byKey(_removeKey), findsOneWidget);
+      expect(
+        tester.widget<FilledButton>(find.byKey(_validateKey)).onPressed,
+        isNotNull,
+      );
+      await tester.tap(find.byKey(_validateKey));
+      await tester.pumpAndSettle();
+      expect(calls.last.method, 'validate');
+      expect((calls.last.arguments as Map).containsKey('token'), isFalse);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'inline Remove clears draft and disables actions until Keychain confirms removal',
+    (tester) async {
+      final removed = Completer<Object?>();
+      native(
+        (call) => call.method == 'remove'
+            ? removed.future
+            : Future.value({
+                'saved': true,
+                'code': 'saved',
+                'message': 'Saved.',
+              }),
+      );
+      await select(_environmentA);
+      await tester.pumpWidget(_app(appearance, github: github));
+      final field = find.byKey(_tokenKey);
+      final remove = find.byKey(_removeKey);
+      expect(find.byTooltip('Remove saved token'), findsOneWidget);
+      expect(tester.getRect(field).contains(tester.getCenter(remove)), isTrue);
+      expect(
+        tester.getCenter(remove).dx,
+        greaterThan(tester.getCenter(field).dx),
+      );
+      final removeWidget = tester.widget<IconButton>(remove);
+      expect((removeWidget.icon as Icon).icon, Icons.close);
+      expect(
+        removeWidget.color ?? (removeWidget.icon as Icon).color,
+        Theme.of(tester.element(remove)).colorScheme.error,
+      );
+      await tester.enterText(field, 'discard-this-draft');
+      await tester.pump();
+      await tester.tap(remove);
+      await tester.pump();
+      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
+      expect(tester.widget<TextField>(field).enabled, isFalse);
+      expect(tester.widget<IconButton>(remove).onPressed, isNull);
+      expect(
+        tester.widget<FilledButton>(find.byKey(_validateKey)).onPressed,
+        isNull,
+      );
+      removeWidget.onPressed!();
+      await tester.pump();
+      expect(calls.where((call) => call.method == 'remove'), hasLength(1));
+      removed.complete({
+        'saved': false,
+        'code': 'missing_token',
+        'message': 'Removed.',
+      });
+      await tester.pumpAndSettle();
+      expect(tester.widget<TextField>(field).enabled, isTrue);
+      expect(find.byKey(_removeKey), findsNothing);
+      expect(find.byKey(_validateKey), findsNothing);
+      expect(
+        find.text('Enter a GitHub token to save it securely in Keychain.'),
+        findsOneWidget,
+      );
+      expect(calls.map((call) => call.method), ['selectEnvironment', 'remove']);
+      await tester.pumpWidget(const SizedBox());
+    },
+  );
+
+  testWidgets(
+    'switching projects clears unsaved tokens and account status without resetting appearance',
+    (tester) async {
+      final selectedB = Completer<Object?>();
+      native(
+        (call) => call.arguments['environmentId'] == _environmentB
+            ? selectedB.future
+            : Future.value({
+                'saved': true,
+                'validated': true,
+                'account': 'fixture-account',
+                'code': 'connected',
+              }),
+      );
+      await select(_environmentA);
+      await tester.pumpWidget(_app(appearance, github: github));
       final appearanceElement = tester.element(
         find.byKey(const Key('pif_appearance_mode')),
       );
       final field = find.byKey(_tokenKey);
-      expect(tester.widget<TextField>(field).obscureText, isTrue);
-      await tester.enterText(field, 'fixture-only-token');
-      await tester.pump();
-      await tester.ensureVisible(find.text('Save and validate'));
-      await tester.tap(find.text('Save and validate'));
-      await tester.pump();
-      expect(tester.widget<TextField>(field).controller!.text, isEmpty);
-      expect(tester.widget<TextField>(field).enabled, isFalse);
-      expect(find.text('Account: fixture-account'), findsNothing);
-      expect(calls.last.arguments['token'], 'fixture-only-token');
-      saved.complete({
-        'saved': true,
-        'validated': true,
-        'account': 'fixture-account',
-        'message': 'Token validated.',
-      });
-      await tester.pumpAndSettle();
-      expect(find.text('Account: fixture-account'), findsOneWidget);
+      expect(
+        find.text('Connected to GitHub as fixture-account.'),
+        findsOneWidget,
+      );
 
       await tester.enterText(field, 'unsaved-replacement');
       final switching = select(_environmentB);
       await tester.pump();
       expect(tester.widget<TextField>(field).controller!.text, isEmpty);
       expect(tester.widget<TextField>(field).enabled, isFalse);
-      expect(find.text('Account: fixture-account'), findsNothing);
-      selectedB.complete({'saved': false, 'message': 'No token saved.'});
+      expect(
+        find.text('Connected to GitHub as fixture-account.'),
+        findsNothing,
+      );
+      selectedB.complete({
+        'saved': false,
+        'code': 'missing_token',
+        'message': 'No token saved.',
+      });
       await switching;
       await tester.pumpAndSettle();
       expect(tester.widget<TextField>(field).controller!.text, isEmpty);
-      expect(find.text('Account: fixture-account'), findsNothing);
-      expect(find.textContaining(_environmentB), findsOneWidget);
+      expect(
+        find.text('Connected to GitHub as fixture-account.'),
+        findsNothing,
+      );
+      expect(find.textContaining(_environmentB), findsNothing);
+      expect(find.byKey(_validateKey), findsNothing);
+      expect(find.byKey(_removeKey), findsNothing);
       expect(
         tester.element(find.byKey(const Key('pif_appearance_mode'))),
         same(appearanceElement),
@@ -453,7 +728,7 @@ void main() {
   );
 
   testWidgets(
-    'locked secure storage offers explicit Validate and Remove without claiming a saved token',
+    'locked Keychain allows explicit Validate without claiming a saved removable token',
     (tester) async {
       native(
         (_) async => {
@@ -466,33 +741,27 @@ void main() {
       );
       await select(_environmentA);
       await tester.pumpWidget(_app(appearance, github: github));
-      expect(find.text('Personal access token'), findsOneWidget);
+      expect(
+        tester.widget<TextField>(find.byKey(_tokenKey)).decoration!.hintText,
+        'Enter a GitHub token',
+      );
       expect(
         find.text('Authorize Keychain access to continue.'),
         findsOneWidget,
       );
       expect(
-        tester
-            .widget<OutlinedButton>(
-              find.widgetWithText(OutlinedButton, 'Validate'),
-            )
-            .onPressed,
+        tester.widget<FilledButton>(find.byKey(_validateKey)).onPressed,
         isNotNull,
       );
-      expect(
-        tester
-            .widget<TextButton>(find.widgetWithText(TextButton, 'Remove'))
-            .onPressed,
-        isNotNull,
-      );
+      expect(find.byKey(_removeKey), findsNothing);
+      expect(find.text('••••••••••••••••'), findsNothing);
       expect(find.textContaining('Account:'), findsNothing);
       await tester.ensureVisible(find.text('Validate'));
       await tester.tap(find.text('Validate'));
       await tester.pumpAndSettle();
       expect(calls.last.method, 'validate');
-      await tester.tap(find.text('Remove'));
-      await tester.pumpAndSettle();
-      expect(calls.last.method, 'remove');
+      expect((calls.last.arguments as Map).containsKey('token'), isFalse);
+      expect(find.byKey(_removeKey), findsNothing);
       await tester.pumpWidget(const SizedBox());
     },
   );

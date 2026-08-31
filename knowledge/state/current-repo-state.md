@@ -63,8 +63,14 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 
 ### New Project workflow correction (31 August 2026)
 - Owner follow-up simplifies setup to the relevant next step. Saved projects automatically finish local preparation; saved repository decisions and credentials are not recreated. Settings stays in the header. Routine SDK selection/retry/preview-bypass choices are removed; actual failures expose specific recovery.
-- Current installed `/Applications/pif.app` is signed and running as **PID69833**, builder `eba148290911035dff9d53479eb5abf0ccd0ae37b858ab71027bc5467fde84d2`. This supersedes the installed candidate above. Clean analysis, **142 Flutter tests** and **15 Node integration tests** pass.
+- That workflow candidate was signed and installed as **PID69833**, builder `eba148290911035dff9d53479eb5abf0ccd0ae37b858ab71027bc5467fde84d2`. It is superseded by the Settings candidate below. Clean analysis, **142 Flutter tests** and **15 Node integration tests** passed.
 - Native saved-project setup/open passed for `pif-test-app-1` with unchanged identity/repository decision. New Project first-step/Settings return was observed; the separate native folder chooser was confirmed by the owner but is not addressable by Computer Use. Fresh-project GUI completion and wider #160 acceptance remain distinct from these results.
+
+### GitHub Settings workflow correction (31 August 2026)
+
+- Current installed `/Applications/pif.app` is signed and running as **PID83021**, builder `51b92859504060b1ffb80475d8ecf9447446a0ff72a45c6e16cb2e2787f47ba1` (10,333 files). **151 Flutter tests**, **15 Node integration tests** and clean analysis pass; changed product sources match the installation.
+- GitHub Settings now has a masked placeholder, inline Remove only when saved, one right-aligned Validate and plain status guidance. Empty actions are hidden; locked/unknown Keychain retains explicit validation. Same-account validation refreshes tracker access, while repository setup remains only in the unlinked Tracker state.
+- The owner's saved token validated successfully in the installed UI and the repository fetch timestamp advanced. No token was extracted, changed or removed; project identity/link hashes are unchanged. Flutter AXTree/Computer Use errors limited repeat native clicking, so this is not error-free automation or full #160 credential/chooser/sample acceptance. See the canonical verification report.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.

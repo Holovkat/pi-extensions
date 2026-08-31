@@ -140,3 +140,61 @@ preservation checks, installed/build/test logs and native screenshots. The
 previous app is retained at `previous-pif.app` in that directory. PIF is left
 open on the owner's project. This scoped workflow repair does not close #160,
 replace live credential lifecycle verification or approve #206/#212.
+
+## Owner follow-up: GitHub Settings has one validation action
+
+The GitHub card now uses plain repository-access wording, without an environment
+UUID or a claim that the token grants access to only one repository. Saved
+credentials appear as a fixed masked placeholder; the actual token is never
+returned to the UI. Typing replaces the placeholder. Remove is an inline close
+icon shown only for a confirmed saved token. The sole button, **Validate**, sits
+below the field on the right. When neither a saved nor entered token exists,
+both actions are hidden and entry guidance remains.
+
+Validate uses the entered candidate, or the existing Keychain token when the
+field is blank. Native validation-before-replacement and environment isolation
+are unchanged. A failed replacement preserves the saved credential and shows
+the actual safe error. Locked/unknown Keychain status keeps explicit Validate
+available without falsely claiming a saved token or offering removal.
+
+Every successful validation now refreshes repository/tracker access, including
+repeat checks and replacements for the same account. This reuses the existing
+read-only repository checks; it never creates a repository or changes origin.
+The separate repository setup action was removed from Settings and retained in
+the Tracker only for local-only projects with no linked repository.
+
+Evidence for this follow-up:
+
+- Flutter analysis is clean; **151/151 Flutter tests** and **15/15 Node
+  integration tests** pass. Token/UI regressions cover empty, typed, stored,
+  failed replacement, removal, busy, keyboard, locked Keychain and environment
+  switching. Service tests cover repeated same-account validation and stale
+  results. Tracker coverage preserves the local-only setup route. Independent
+  production diff review found no remaining actionable findings.
+- Stock build, strict deep signature and installation passed. Installed at
+  `/Applications/pif.app`, running as **PID 83021**. All four changed Dart
+  product files match installed resources. Builder version is
+  `51b92859504060b1ffb80475d8ecf9447446a0ff72a45c6e16cb2e2787f47ba1`
+  with **10,333 files**. The prior installation is retained at
+  `/tmp/pif-settings-workflow/previous-pif.app`.
+- Computer Use visually confirmed the simplified Settings card on the owner's
+  `pif-test-app-1`. Clicking Validate with the field blank completed successfully
+  and showed **Connected to GitHub as Holovkat.** The tracker cache's successful
+  fetch timestamp advanced from `2026-08-31T12:24:24.479Z` to
+  `2026-08-31T12:25:07.931Z`, proving the existing repository access path refreshed.
+  Project identity and repository-decision SHA-256 values are unchanged. No
+  token was extracted, re-entered, replaced or removed by the agent.
+- Native automation has a separate limitation: Flutter emitted AXTree update
+  diagnostics and Computer Use returned intermittent `AXError.failure` while
+  its accessibility tree lagged the visible screen. Visual inspection and one
+  live validation succeeded, but the attempted second native click did not
+  establish another refresh. Repeated validation, replacement and removal are
+  covered by synthetic regressions, not claimed as live credential-lifecycle
+  proof. This run is not described as warning/error-free. The macOS build also
+  retained the non-fatal attached-iPhone passcode diagnostic.
+
+Logs, installed-source checks, screenshots and timestamp/preservation evidence
+are in `/tmp/pif-settings-workflow/`. PIF is left open on Settings with a validated
+connection. #160 remains the acceptance owner; the accessibility diagnostic,
+fresh-project chooser completion, broader credential lifecycle and independent
+#206/#212 sample acceptance remain outside this completed Settings correction.

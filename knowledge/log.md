@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T12:26:00Z - Simplified GitHub Settings and verified saved-token access
+
+Indexed the one-action GitHub Settings workflow, updated canonical requirements and recorded 151 Flutter/15 Node integration passes. Signed installed PID83021 displays the simplified card and completed one live saved-token validation with a successful repository refresh and unchanged project identity/link. Preserved the separate native accessibility diagnostic and wider #160 acceptance gates.
+
 ## 2026-08-31T12:03:49Z - Simplified New Project and verified automatic saved-project preparation
 
 Indexed the New Project workflow synthesis and updated canonical requirements, support guidance, report and state. Recorded 142 Flutter/15 Node integration passes, final signed PID69833 and native saved-project open with preserved UUID/repository choice. Preserved the separate system-chooser automation limit and wider #160/sample acceptance gates.

@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:pif/core/bus.dart';
+import 'package:pif/core/github_connection.dart';
 import 'package:pif/core/plugin.dart';
 import 'package:pif/widgets/tracker_board/tracker_board.dart';
 
@@ -145,6 +146,48 @@ void main() {
     if (_workspace.existsSync()) {
       _workspace.deleteSync(recursive: true);
     }
+  });
+
+  testWidgets('repository setup is offered only for an unlinked tracker', (
+    tester,
+  ) async {
+    final bus = FakeBus();
+    final github = GithubConnectionService();
+    final host = PifHost(bus: bus)
+      ..workspace = _workspace.path
+      ..snapshot = {
+        'tracker': {'repo': '', 'writable': false},
+      };
+    var connections = 0;
+    await tester.pumpWidget(
+      GithubConnectionScope(
+        service: github,
+        onConnectRepository: () async {
+          connections++;
+        },
+        child: _panel(TrackerBoardPlugin(), host),
+      ),
+    );
+    expect(find.text('Connect repository'), findsOneWidget);
+    expect(find.text('Open Settings'), findsNothing);
+    await tester.tap(find.text('Connect repository'));
+    expect(connections, 1);
+
+    bus.emit('tracker/state', 'state', {
+      'repo': 'acme/widgets',
+      'writable': false,
+      'message': 'Validate GitHub access in Settings.',
+    });
+    await tester.pumpAndSettle();
+    expect(find.text('Connect repository'), findsNothing);
+    await tester.tap(find.text('Open Settings'));
+    expect(connections, 1);
+    expect(bus.sent.last['channel'], 'shell/layout');
+    expect((bus.sent.last['payload'] as Map)['widgetId'], 'pif_settings');
+
+    await tester.pumpWidget(const SizedBox());
+    github.dispose();
+    await bus.dispose();
   });
 
   testWidgets('All work view stays the default and shows every card', (

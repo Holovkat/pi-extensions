@@ -205,6 +205,7 @@ class _GithubSectionState extends State<_GithubSection> {
     super.initState();
     _environmentId = widget.service?.environmentId;
     widget.service?.addListener(_connectionChanged);
+    _token.addListener(_draftChanged);
   }
 
   @override
@@ -225,6 +226,10 @@ class _GithubSectionState extends State<_GithubSection> {
     if (mounted) setState(() {});
   }
 
+  void _draftChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
     widget.service?.removeListener(_connectionChanged);
@@ -232,12 +237,39 @@ class _GithubSectionState extends State<_GithubSection> {
     super.dispose();
   }
 
-  Future<void> _save() async {
+  Future<void> _validate() async {
     final service = widget.service;
-    if (service == null || service.busy || _token.text.trim().isEmpty) return;
+    if (service == null || service.busy) return;
     final token = _token.text.trim();
+    if (token.isNotEmpty) {
+      _token.clear();
+      await service.saveAndValidate(token);
+    } else if (service.state.saved || service.state.needsAuthorization) {
+      await service.validate();
+    }
+  }
+
+  Future<void> _remove() async {
+    final service = widget.service;
+    if (service == null || service.busy || !service.state.saved) return;
     _token.clear();
-    await service.saveAndValidate(token);
+    await service.remove();
+  }
+
+  String _status(GithubConnectionState? state, bool hasEnvironment) {
+    if (!hasEnvironment) {
+      return 'Open or create a project to add a GitHub token.';
+    }
+    return switch (state?.code) {
+      'missing_token' =>
+        'Enter a GitHub token to save it securely in Keychain.',
+      'saved' => 'Token saved securely. Validate to check GitHub access.',
+      'connected' =>
+        state?.account == null
+            ? 'Connected to GitHub.'
+            : 'Connected to GitHub as ${state!.account}.',
+      _ => state?.message ?? 'GitHub connection status is unavailable.',
+    };
   }
 
   @override
@@ -247,95 +279,59 @@ class _GithubSectionState extends State<_GithubSection> {
     final busy = service?.busy == true;
     final state = service?.state;
     final theme = PifTheme(brightness: Theme.of(context).brightness);
-    final workspace = service?.workspace;
-    final connectRepository = GithubConnectionScope.connectRepositoryOf(
-      context,
-    );
-    final name = workspace == null || workspace.isEmpty
-        ? 'Local environment'
-        : workspace.split('/').where((part) => part.isNotEmpty).lastOrNull ??
-              'Local environment';
+    final canValidate =
+        hasEnvironment &&
+        (_token.text.trim().isNotEmpty ||
+            state?.saved == true ||
+            state?.needsAuthorization == true);
     return _SettingsGroup(
       icon: Icons.code,
       title: 'GitHub',
-      help: hasEnvironment
-          ? 'Token access for $name only. Stored securely in macOS Keychain.'
-          : 'Select/create an environment before adding a GitHub token.',
+      help:
+          'Token access for repositories is stored securely in macOS Keychain.',
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (hasEnvironment) ...[
-            Text(
-              'Environment: ${service!.environmentId}',
-              style: TextStyle(fontSize: 11, color: theme.textMuted),
+          Semantics(
+            label: 'GitHub token',
+            child: TextField(
+              key: const Key('pif_github_token'),
+              controller: _token,
+              enabled: hasEnvironment && !busy,
+              obscureText: true,
+              autocorrect: false,
+              enableSuggestions: false,
+              enableIMEPersonalizedLearning: false,
+              decoration: InputDecoration(
+                // This is a placeholder, never any part of the saved secret.
+                hintText: state?.saved == true
+                    ? '••••••••••••••••'
+                    : 'Enter a GitHub token',
+                border: const OutlineInputBorder(),
+                suffixIcon: hasEnvironment && state?.saved == true
+                    ? IconButton(
+                        key: const Key('pif_github_remove'),
+                        tooltip: 'Remove saved token',
+                        color: Theme.of(context).colorScheme.error,
+                        onPressed: busy ? null : _remove,
+                        icon: const Icon(Icons.close, size: 18),
+                      )
+                    : null,
+              ),
+              onSubmitted: (_) => unawaited(_validate()),
             ),
-            const SizedBox(height: 14),
+          ),
+          if (canValidate) ...[
+            const SizedBox(height: 12),
+            Align(
+              alignment: Alignment.centerRight,
+              child: FilledButton(
+                key: const Key('pif_github_validate'),
+                onPressed: busy ? null : _validate,
+                child: const Text('Validate'),
+              ),
+            ),
           ],
-          TextField(
-            key: const Key('pif_github_token'),
-            controller: _token,
-            enabled: hasEnvironment && !busy,
-            obscureText: true,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: InputDecoration(
-              labelText: state?.saved == true
-                  ? 'Replacement token'
-                  : 'Personal access token',
-              hintText: 'Enter a GitHub token',
-              border: const OutlineInputBorder(),
-            ),
-            onSubmitted: (_) => unawaited(_save()),
-          ),
-          const SizedBox(height: 12),
-          ListenableBuilder(
-            listenable: _token,
-            builder: (context, child) => Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                FilledButton(
-                  onPressed:
-                      hasEnvironment && !busy && _token.text.trim().isNotEmpty
-                      ? _save
-                      : null,
-                  child: Text(
-                    state?.saved == true
-                        ? 'Replace and validate'
-                        : 'Save and validate',
-                  ),
-                ),
-                OutlinedButton(
-                  onPressed:
-                      hasEnvironment &&
-                          !busy &&
-                          (state?.saved == true ||
-                              state?.needsAuthorization == true)
-                      ? service!.validate
-                      : null,
-                  child: const Text('Validate'),
-                ),
-                TextButton(
-                  onPressed:
-                      hasEnvironment &&
-                          !busy &&
-                          (state?.saved == true ||
-                              state?.needsAuthorization == true)
-                      ? service!.remove
-                      : null,
-                  child: const Text('Remove'),
-                ),
-                if (connectRepository != null)
-                  OutlinedButton.icon(
-                    onPressed: hasEnvironment && !busy
-                        ? connectRepository
-                        : null,
-                    icon: const Icon(Icons.link),
-                    label: const Text('Connect repository'),
-                  ),
-              ],
-            ),
-          ),
           const SizedBox(height: 12),
           if (busy) ...[
             const LinearProgressIndicator(minHeight: 2),
@@ -344,22 +340,12 @@ class _GithubSectionState extends State<_GithubSection> {
           Semantics(
             liveRegion: true,
             child: Text(
-              !hasEnvironment
-                  ? 'GitHub is disconnected. No environment selected.'
-                  : state?.message ??
-                        'GitHub connection status is unavailable.',
+              busy
+                  ? 'Updating GitHub connection…'
+                  : _status(state, hasEnvironment),
               style: TextStyle(fontSize: 12, color: theme.textMuted),
             ),
           ),
-          if (hasEnvironment &&
-              state?.validated == true &&
-              state?.account != null) ...[
-            const SizedBox(height: 4),
-            Text(
-              'Account: ${state!.account}',
-              style: const TextStyle(fontSize: 12),
-            ),
-          ],
         ],
       ),
     );

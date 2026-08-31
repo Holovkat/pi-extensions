@@ -977,6 +977,13 @@ require Flutter to run or load newly edited Dart widgets dynamically.
 
 The central **Settings** tab contains only **Appearance** (Light, Dark,
 System) and **GitHub**. Appearance is a non-secret device preference.
+The GitHub card has one **Validate** button: enter a new token to validate
+and save it, or leave the field blank to validate the saved token. A masked
+placeholder indicates a saved token, with an inline remove control. Empty
+connections show only the entry guidance until a token is entered. Successful
+validation also refreshes the current repository's tracker access; it never
+changes the repository link or opens repository setup.
+Local-only projects can connect their repository from the Tracker when needed.
 GitHub uses a token saved to macOS Keychain for the selected environment
 UUID and requires GitHub CLI (`gh`) in a standard macOS install location.
 Missing tooling is reported; local-only work remains available.

@@ -63,6 +63,7 @@ class GithubConnectionService extends ChangeNotifier {
   bool _busy = false;
   bool _disposed = false;
   int _revision = 0;
+  int _validationRevision = 0;
   HttpServer? _bridge;
   String? _socketPath;
 
@@ -70,6 +71,10 @@ class GithubConnectionService extends ChangeNotifier {
   String? get workspace => _workspace;
   GithubConnectionState get state => _state;
   bool get busy => _busy;
+
+  /// Revalidation can change repository access without changing the account.
+  /// Consumers must refresh access after every successful credential check.
+  int get validationRevision => _validationRevision;
 
   Future<void> selectEnvironment({
     required String environmentId,
@@ -107,6 +112,11 @@ class GithubConnectionService extends ChangeNotifier {
     final result = await _invoke(method, arguments);
     if (_disposed || revision != _revision) return;
     _state = GithubConnectionState.fromMap(result);
+    if ((method == 'validate' || method == 'saveAndValidate') &&
+        result['ok'] == true &&
+        _state.validated) {
+      _validationRevision++;
+    }
     _busy = false;
     _notify();
   }

@@ -310,6 +310,21 @@ in exports. Machine-wide gh profiles and GH_TOKEN are not authentication
 fallbacks. A small central Settings tab exposes connection validation,
 replacement and removal beside Light/Dark/System appearance, borrowing
 Mercury's section grouping without importing its product-specific settings.
+The GitHub card uses plain repository-access wording without exposing the
+environment UUID or implying that GitHub limits the token to one repository.
+It has one right-aligned Validate action below the token field. Entered text
+is validated before replacing a saved token; blank input validates the saved
+token. Successful validation refreshes current repository access even when
+the account has not changed, without opening repository onboarding or changing
+the origin. A fixed masked placeholder represents saved credentials and
+disappears while typing; the actual token is never returned to the UI. Remove
+is an inline field control only when a saved token is confirmed. With neither
+saved nor entered token, actions are hidden and entry guidance remains.
+Unknown/locked Keychain status may retain Validate for explicit authorization,
+but must not claim that a token exists or offer removal until confirmed.
+An existing local-only project retains repository setup through the Tracker's
+unlinked state; an already linked repository with credential problems directs
+the user to Settings instead.
 
 #160 owns integration, security, installed two-generation authoring/export
 verification and remaining acceptance. The independent #206/#212 sample
