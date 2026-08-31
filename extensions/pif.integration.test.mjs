@@ -299,8 +299,13 @@ test('page collision rejection preserves installed widgets and existing director
   assert.equal(fs.existsSync(path.join(widgets, 'rejected_new')), false);
   assert.deepEqual(fs.readFileSync(manifestPath), committed);
   const originalWrite = fs.writeFileSync;
+  const rejectedWritePath = path.join(fs.realpathSync(widgets), 'rejected_write', 'rejected_write.dart');
+  let writeRejected = false;
   fs.writeFileSync = (file, ...arguments_) => {
-    if (String(file) === path.join(widgets, 'rejected_write', 'rejected_write.dart')) throw new Error('controlled source write failure');
+    if (String(file) === rejectedWritePath) {
+      writeRejected = true;
+      throw new Error('controlled source write failure');
+    }
     return originalWrite(file, ...arguments_);
   };
   syncBuiltinESMExports();
@@ -310,6 +315,7 @@ test('page collision rejection preserves installed widgets and existing director
     fs.writeFileSync = originalWrite;
     syncBuiltinESMExports();
   }
+  assert.equal(writeRejected, true, 'the actual canonical source-write boundary was exercised');
   assert.equal(fs.existsSync(path.join(widgets, 'rejected_write')), false, 'partial scaffold write removes only its newly claimed directory');
   assert.deepEqual(fs.readFileSync(manifestPath), committed);
   const uninitialized = contractHub(t);
@@ -772,7 +778,7 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   assert.equal(listed.installed.hello_page.source, 'project');
   assert.equal(listed.installed.workspace_clock.source, 'base');
   assert.equal(listed.catalog.global_only.source, 'catalog');
-  assert.equal(listed.catalog.workspace_clock, undefined, 'installed widgets shadow catalog entries');
+  assert.equal(listed.catalog.workspace_clock, undefined, 'installed base widgets hide their lower-priority app-local archive copy');
   const helloSource = path.join(workspace, 'pif_app', 'widgets', 'hello_page', 'hello_page.dart');
   const helloBefore = fs.readFileSync(helloSource, 'utf8');
   const projectInstall = await control(controlPath, 'widget.install', {id: 'hello_page'}); checkpoint('project widget installed');

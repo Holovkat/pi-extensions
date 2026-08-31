@@ -26,3 +26,7 @@ These counts overlap. The complete npm run test:pif gate, final public-tool expo
 ## Decisions and Lessons
 
 Keep a single combined acceptance gate under #160. A fake spawn proves protocol behavior, not a compiled export or provider answer. Native errors and aborts must remain visible rather than being suppressed to make a test appear clean. A final release claim requires the named installed artifact and its actual workflow evidence.
+
+## First Combined Gate and Fixture Corrections
+
+The first full gate at d1ee4e7a failed at the Node stage: 61/63 passed; Flutter was not reached. The native text event control metadata regression was fixed in 087cbcf5. The source-write rejection fixture now compares the canonical destination and asserts that injection occurred, preserving the original rollback assertions. The transcript-only child test avoids an uninitialized SessionStore, and the native profile test restores its model-path environment override. Two confirmed synthetic temporary session files were removed; no user data was changed. The subsequent focused collision, real-hub and source-precedence cases pass 3/3, including the archive correction in c1da132c. Full gate failures remain 1; no final acceptance is claimed.

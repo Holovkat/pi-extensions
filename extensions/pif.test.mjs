@@ -1116,6 +1116,8 @@ test('native empty failures and cancellation reasons survive normalization (#215
 test('new child initial prompt is visible once before native user echoes (#215)', async (t) => {
   const f = layeredFixture(t);
   const hub = layeredHub(f.workspace);
+  // This case exercises transcript routing, not persistence; the hub is not started.
+  hub.store.upsert = () => {};
   const {harness, restore} = patchBuildSpawn([{kind: 'child'}]);
   t.after(restore);
   const events = [];
@@ -1134,7 +1136,11 @@ test('new child initial prompt is visible once before native user echoes (#215)'
 test('hub model files follow the native profile with legacy override preserved (#201)', (t) => {
   const f = layeredFixture(t);
   const previous = process.env.PI_CODING_AGENT_DIR;
-  t.after(() => { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; });
+  const previousModels = process.env.PIF_MODELS_PATH;
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous;
+    if (previousModels === undefined) delete process.env.PIF_MODELS_PATH; else process.env.PIF_MODELS_PATH = previousModels;
+  });
   const profile = path.join(f.workspace, 'native profile');
   fs.mkdirSync(profile);
   fs.writeFileSync(path.join(profile, 'models.json'), JSON.stringify({providers: {fixture: {models: [{id: 'profile-model'}]}}}));
