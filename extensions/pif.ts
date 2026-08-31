@@ -400,7 +400,9 @@ class PifHub {
 			const lines = fs.readFileSync(session.sessionFile, "utf8").split("\n").filter(Boolean);
 			for (const line of lines) {
 				let value: any; try { value = JSON.parse(line); } catch { continue; }
-				session.transcript.push({ ...this.normalizeEntry(String(value.type ?? "event"), value), ts: this.eventTimestamp(value) });
+				const type = String(value.type ?? "event");
+				if (this.isUserBoundaryEcho(type, value)) continue;
+				session.transcript.push({ ...this.normalizeEntry(type, value), ts: this.eventTimestamp(value) });
 			}
 		} catch { /* absent or unreadable — keep empty */ }
 	}
@@ -415,7 +417,34 @@ class PifHub {
 		}
 		return new Date().toISOString();
 	}
-	private isUserBoundaryEcho(type: string, payload: any) { return (type === "message_start" || type === "message_end") && payload?.message?.role === "user"; }
+	private isUserBoundaryEcho(type: string, payload: any) {
+		if (type !== "message_start" && type !== "message_end") return false;
+		const message = payload?.message ?? {};
+		return message?.role === "user" || message?.customType === "pif-input";
+	}
+	private serializeDetail(value: unknown, limit = 4_000): string {
+		if (value == null) return "";
+		if (typeof value === "string") return value.slice(0, limit);
+		try { return (JSON.stringify(value) ?? "").slice(0, limit); } catch { return String(value).slice(0, limit); }
+	}
+	private messageContentText(message: any): string {
+		const content = message?.content;
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) return content.filter((item: any) => item?.type === "text").map((item: any) => String(item?.text ?? "")).join("");
+		return typeof message?.text === "string" ? message.text : "";
+	}
+	private toolEventDetails(payload: any) {
+		const result = payload.result ?? payload.partialResult ?? (payload.role === "toolResult" ? { content: payload.content } : undefined);
+		return {
+			toolName: String(payload.toolName ?? payload.name ?? "tool"),
+			...(payload.toolCallId != null ? { toolCallId: String(payload.toolCallId) } : {}),
+			...(payload.args !== undefined ? { args: this.serializeDetail(payload.args) } : {}),
+			...(result !== undefined ? { result: this.serializeDetail(result) } : {}),
+			...(payload.isError !== undefined ? { isError: Boolean(payload.isError) } : {}),
+			...(payload.aborted !== undefined ? { aborted: Boolean(payload.aborted) } : {}),
+			...(payload.error !== undefined ? { error: this.serializeDetail(payload.error) } : {}),
+		};
+	}
 	private loadPrefs(): { model?: string; thinking?: string; name?: string } { try { const prefs = JSON.parse(fs.readFileSync(this.prefsPath, "utf8")); return prefs && typeof prefs === "object" ? prefs : {}; } catch { return {}; } }
 	private savePrefs(patch: { model?: string; thinking?: string; name?: string }) {
 		const file = assertWritablePifPath(this.prefsPath);
@@ -565,31 +594,46 @@ class PifHub {
 	}
 	private normalizeEntry(type: string, payload: any): Record<string, unknown> {
 		const p = payload ?? {};
+		const message = p.message ?? p;
+		const role = String(message.role ?? "");
 		if (type === "input") return { type: "input", content: String(p.content ?? p.prompt ?? "") };
-		if (type === "custom_message" && p.customType === "pif-input") return { type: "input", content: String(p.content ?? "") };
-		if (type === "message_update" || type === "message_start" || type === "message" || type === "message_end") {
-			const delta = p.assistantMessageEvent?.delta ?? p.delta;
-			if (delta) return { type: "message_update", delta: String(delta), ...(p.command !== undefined ? { command: String(p.command) } : {}) };
-			const content = p.message?.content;
-			const messageText = Array.isArray(content) ? content.filter((c: any) => c?.type === "text").map((c: any) => c?.text ?? "").join("") : typeof content === "string" ? content : "";
-			if (messageText) return p.message?.role === "user" ? { type: "input", content: messageText } : { type: "message", text: messageText };
-			return { type: "message_update", delta: "" };
+		if (type === "custom_message" && p.customType === "pif-input") return { type: "input", content: this.messageContentText(p) };
+		if (type === "message" && role === "user") return { type: "input", content: this.messageContentText(message) };
+		if (type === "message_start" || type === "message_update") {
+			// Start is a message boundary, not an assistant snapshot to render.
+			if (type === "message_start" && role === "assistant") return { type, role };
+			const update = p.assistantMessageEvent;
+			const delta = update ? (update.type === "text_delta" ? update.delta : undefined) : p.delta;
+			if (typeof delta === "string" && delta) return { type: "message_update", delta };
+			// Native thinking/tool-call deltas and text_end snapshots are not
+			// answer text; tool execution has its own correlated events.
+			return { type };
 		}
-		if (type.includes("tool")) return { type, toolName: String(p.toolName ?? p.name ?? "tool"), toolCallId: String(p.toolCallId ?? p.id ?? ""), args: p.args ? JSON.stringify(p.args).slice(0, 300) : undefined, result: p.result ? String(p.result).slice(0, 300) : undefined };
-		if (type === "agent_start" || type === "agent_end") {
-			// Surface the model id and cumulative token usage pi already
-			// reports so the shell status bar shows real data.
-			const usage = p.usage?.totalTokens ?? p.message?.usage?.totalTokens;
+		if ((type === "message" || type === "message_end") && role === "toolResult") {
+			return { type: "tool_execution_end", ...this.toolEventDetails(message) };
+		}
+		if ((type === "message" || type === "message_end") && (role === "assistant" || (!role && typeof p.text === "string"))) {
 			return {
-				type,
-				state: type === "agent_start" ? "running" : "idle",
-				...(p.aborted !== undefined ? { aborted: Boolean(p.aborted) } : {}),
+				type: "message", role: "assistant", text: this.messageContentText(message),
+				...(message.stopReason ? { stopReason: String(message.stopReason) } : {}),
+				...(message.errorMessage ? { errorMessage: this.serializeDetail(message.errorMessage) } : {}),
+				...(message.stopReason === "aborted" ? { aborted: true } : {}),
+			};
+		}
+		if (type.includes("tool")) return { type, ...this.toolEventDetails(p) };
+		if (type === "agent_start" || type === "agent_end") {
+			const usage = p.usage?.totalTokens ?? p.message?.usage?.totalTokens;
+			const last = Array.isArray(p.messages) ? p.messages.at(-1) : undefined;
+			return {
+				type, state: type === "agent_start" ? "running" : "idle",
+				...(p.aborted === true || last?.stopReason === "aborted" ? { aborted: true } : {}),
 				...(this.ctxModelId() ? { model: this.ctxModelId() } : {}),
 				...(usage != null ? { usage: { totalTokens: Number(usage) } } : {}),
 			};
 		}
-		if (type === "stderr" || type === "output") return { type, data: String(p.data ?? p).slice(0, 500) };
-		return { type, data: JSON.stringify(p).slice(0, 500) };
+		if (type === "response" && p.success === false) return { type: "stderr", data: this.serializeDetail(p.error ?? "Pi request failed") };
+		if (type === "stderr" || type === "output") return { type, data: this.serializeDetail(p.data ?? p) };
+		return { type, data: this.serializeDetail(p, 500) };
 	}
 	private ctxModelId(): string | undefined {
 		const model = (this.ctx as any)?.model;
@@ -665,7 +709,14 @@ class PifHub {
 		const child = spawn(pi.command, args, { cwd, env: childEnvironment(process.env), stdio: ["pipe", "pipe", "pipe"] });
 		const session: PifSession = { id, name: payload.name || "Agent", host: false, state: "idle", model: model || "default", thinking, cwd, transcript: [], sessionFile }; this.state.sessions[id] = session; this.children.set(id, child); this.store.safe("upsert", () => this.store.upsert(session));
 		this.wireChild(session, child);
-		this.broadcast("session/state", "created", this.sessionPatch(session)); if (payload.prompt) { session.state = "running"; child.stdin.write(JSON.stringify({ type: "prompt", message: String(payload.prompt) }) + "\n"); }
+		this.broadcast("session/state", "created", this.sessionPatch(session));
+		if (payload.prompt) {
+			session.state = "running";
+			const event = { type: "input", content: String(payload.prompt), mode: "prompt", ts: new Date().toISOString() };
+			session.transcript.push(event);
+			this.broadcast("session/event", "input", { sessionId: id, state: session.state, event });
+			child.stdin.write(JSON.stringify({ type: "prompt", message: event.content }) + "\n");
+		}
 		return session;
 	}
 	/** (Re)attach event wiring for a live child process. */

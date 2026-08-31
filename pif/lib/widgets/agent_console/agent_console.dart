@@ -24,6 +24,30 @@ class _AgentConsole extends StatefulWidget {
   State<_AgentConsole> createState() => _AgentConsoleState();
 }
 
+class _SessionTranscriptState {
+  int turnStartIndex = -1;
+  String? turnStartTs;
+  bool sawAssistantContent = false;
+  int activeAssistantIndex = -1;
+  final Map<String, int> toolIndexByCallId = {};
+  String? firstSignature;
+  String? lastSignature;
+
+  void resetTurn() {
+    turnStartIndex = -1;
+    turnStartTs = null;
+    sawAssistantContent = false;
+    activeAssistantIndex = -1;
+  }
+
+  void resetAll() {
+    resetTurn();
+    toolIndexByCallId.clear();
+    firstSignature = null;
+    lastSignature = null;
+  }
+}
+
 class _AgentConsoleState extends State<_AgentConsole> {
   static const _conversationMaxWidth = 760.0;
   final controller = TextEditingController();
@@ -42,6 +66,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
   final entriesBySession = <String, List<Map<String, dynamic>>>{};
   final runningBySession = <String, bool>{};
   final processedEvents = <String, int>{};
+  final transcriptStates = <String, _SessionTranscriptState>{};
   Timer? _coalesce;
   List<Map<String, dynamic>> get entries => entriesBySession.putIfAbsent(
     widget.host.activeSessionId,
@@ -86,12 +111,34 @@ class _AgentConsoleState extends State<_AgentConsole> {
   void _consume(List<PifSession> sessions) {
     for (final session in sessions) {
       runningBySession[session.id] = session.state == 'running';
+      final state = transcriptStates.putIfAbsent(
+        session.id,
+        _SessionTranscriptState.new,
+      );
       final seen = processedEvents[session.id] ?? 0;
       final transcript = session.transcript;
-      if (seen > transcript.length) {
-        // History was replaced (snapshot) — rebuild this session.
+      final firstSignature = transcript.isEmpty
+          ? null
+          : _entrySignature(transcript.first);
+      final lastSignature = transcript.isEmpty
+          ? null
+          : _entrySignature(transcript.last);
+      final needsRebuild =
+          seen > transcript.length ||
+          (seen == transcript.length &&
+              (state.firstSignature != firstSignature ||
+                  state.lastSignature != lastSignature));
+      if (needsRebuild) {
+        // History was replaced (snapshot/trim) — rebuild this session.
+        state.resetAll();
         processedEvents[session.id] = transcript.length;
-        entriesBySession[session.id] = _buildEntries(transcript);
+        entriesBySession[session.id] = _buildEntries(
+          transcript,
+          state: state,
+          finalizeOpenTurn: session.state != 'running',
+        );
+        state.firstSignature = firstSignature;
+        state.lastSignature = lastSignature;
         continue;
       }
       if (transcript.length == seen) continue;
@@ -99,8 +146,10 @@ class _AgentConsoleState extends State<_AgentConsole> {
         session.id,
         () => <Map<String, dynamic>>[],
       );
-      _appendEntries(transcript.sublist(seen), target);
+      _appendEntries(transcript.sublist(seen), target, state);
       processedEvents[session.id] = transcript.length;
+      state.firstSignature ??= firstSignature;
+      state.lastSignature = lastSignature;
     }
     entriesBySession.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
@@ -111,161 +160,478 @@ class _AgentConsoleState extends State<_AgentConsole> {
     processedEvents.removeWhere(
       (id, _) => sessions.every((session) => session.id != id),
     );
+    transcriptStates.removeWhere(
+      (id, _) => sessions.every((session) => session.id != id),
+    );
   }
 
   void _rebuildAll(List<PifSession> sessions) {
     for (final session in sessions) {
       runningBySession[session.id] = session.state == 'running';
+      final state = transcriptStates.putIfAbsent(
+        session.id,
+        _SessionTranscriptState.new,
+      );
+      state.resetAll();
       processedEvents[session.id] = session.transcript.length;
-      entriesBySession[session.id] = _buildEntries(session.transcript);
+      entriesBySession[session.id] = _buildEntries(
+        session.transcript,
+        state: state,
+        finalizeOpenTurn: session.state != 'running',
+      );
+      state.firstSignature = session.transcript.isEmpty
+          ? null
+          : _entrySignature(session.transcript.first);
+      state.lastSignature = session.transcript.isEmpty
+          ? null
+          : _entrySignature(session.transcript.last);
     }
   }
 
   /// Extend already-built entries with new raw transcript items.
-  void _appendEntries(List<dynamic> rawItems, List<Map<String, dynamic>> into) {
-    final fresh = _buildEntries(rawItems, finalizeOpenTurn: false);
-    // Streaming deltas continue the current assistant card. A final
-    // message/message_end is authoritative and replaces the streamed text
-    // instead of duplicating it.
-    for (final entry in fresh) {
-      if (entry['kind'] == 'assistant' &&
-          into.isNotEmpty &&
-          into.last['kind'] == 'assistant') {
-        if (entry['replace'] == true) {
-          into.last['text'] = entry['text'];
-        } else {
-          into.last['text'] = '${into.last['text']}${entry['text']}';
-        }
-        if (entry['ts'] != null) into.last['ts'] = entry['ts'];
-      } else {
-        into.add(entry);
-      }
+  void _appendEntries(
+    List<dynamic> rawItems,
+    List<Map<String, dynamic>> into,
+    _SessionTranscriptState state,
+  ) {
+    for (final raw in rawItems) {
+      if (raw is! Map) continue;
+      _ingestTranscriptEvent(
+        Map<String, dynamic>.from(raw),
+        into,
+        state,
+        finalizeOpenTurn: false,
+      );
     }
-    if (fresh.any(
-          (entry) => entry['kind'] == 'assistant' && entry['replace'] == true,
-        ) &&
-        !fresh.any((entry) => entry['kind'] == 'turn_end')) {
-      _finalizeOpenTurn(into);
-    }
-  }
-
-  void _finalizeOpenTurn(List<Map<String, dynamic>> entries) {
-    final assistantIndex = _lastAssistantIndex(entries);
-    if (assistantIndex < 0 || assistantIndex != entries.length - 1) return;
-    final userIndex = entries
-        .sublist(0, assistantIndex)
-        .lastIndexWhere((entry) => entry['kind'] == 'user');
-    if (userIndex < 0) return;
-    _appendTurnEnd(
-      entries,
-      startIndex: userIndex,
-      startTs: entries[userIndex]['ts'] as String?,
-      endTs: entries[assistantIndex]['ts'] as String?,
-    );
   }
 
   List<Map<String, dynamic>> _buildEntries(
     List<dynamic> transcript, {
+    required _SessionTranscriptState state,
     bool finalizeOpenTurn = true,
   }) {
     final entries = <Map<String, dynamic>>[];
-    var turnStartIndex = -1;
-    String? turnStartTs;
     for (final raw in transcript) {
       if (raw is! Map) continue;
-      final event = Map<String, dynamic>.from(raw);
-      final type = event['type'] as String? ?? 'event';
-      final data = event['payload'] is Map
-          ? event['payload'] as Map<String, dynamic>
-          : event;
-
-      if (type == 'input') {
-        if (turnStartTs != null && _lastAssistantIndex(entries) >= 0) {
-          _appendTurnEnd(
-            entries,
-            startIndex: turnStartIndex,
-            startTs: turnStartTs,
-            endTs: _lastAssistantTimestamp(entries),
-          );
-        }
-        final timestamp = _eventTimestamp(event, data);
-        turnStartTs = timestamp;
-        turnStartIndex = entries.length;
-        entries.add({
-          'kind': 'user',
-          'text': data['content'] ?? event['content'] ?? '',
-          ..._timestampEntry(timestamp),
-        });
-      } else if (type == 'message_update' || type == 'message_start') {
-        final delta = _extractDelta(data);
-        final timestamp = _eventTimestamp(event, data);
-        if (delta != null && delta.isNotEmpty) {
-          if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
-            entries.last['text'] = '${entries.last['text']}$delta';
-            if (timestamp != null) entries.last['ts'] = timestamp;
-          } else {
-            entries.add({
-              'kind': 'assistant',
-              'text': delta,
-              'replace': false,
-              ..._timestampEntry(timestamp),
-            });
-          }
-        }
-      } else if (type == 'message_end' || type == 'message') {
-        final text = _extractFullText(data);
-        final timestamp = _eventTimestamp(event, data);
-        if (text != null && text.isNotEmpty) {
-          if (entries.isNotEmpty && entries.last['kind'] == 'assistant') {
-            entries.last['text'] = text;
-            entries.last['replace'] = true;
-            if (timestamp != null) entries.last['ts'] = timestamp;
-          } else {
-            entries.add({
-              'kind': 'assistant',
-              'text': text,
-              'replace': true,
-              ..._timestampEntry(timestamp),
-            });
-          }
-        }
-      } else if (type.contains('tool')) {
-        entries.add({
-          'kind': 'tool',
-          'name': data['toolName'] ?? data['name'] ?? type,
-          'status': type.contains('end') ? 'done' : 'running',
-          'detail': data['args'] ?? data['result'] ?? '',
-        });
-      } else if (type == 'agent_start') {
-        turnStartTs = _eventTimestamp(event, data) ?? turnStartTs;
-        turnStartIndex = entries.length;
-        entries.add({'kind': 'status', 'text': 'Agent started'});
-      } else if (type == 'agent_end') {
-        _appendTurnEnd(
-          entries,
-          startIndex: turnStartIndex,
-          startTs: turnStartTs,
-          endTs: _eventTimestamp(event, data),
-          aborted: event['aborted'] == true || data['aborted'] == true,
-        );
-        turnStartIndex = -1;
-        turnStartTs = null;
-      } else if (type == 'stderr' || type == 'output') {
-        final text = data['data']?.toString() ?? '';
-        if (text.trim().isNotEmpty) {
-          entries.add({'kind': 'raw', 'text': text.trim()});
-        }
-      }
-    }
-    if (finalizeOpenTurn && turnStartTs != null) {
-      _appendTurnEnd(
+      _ingestTranscriptEvent(
+        Map<String, dynamic>.from(raw),
         entries,
-        startIndex: turnStartIndex,
-        startTs: turnStartTs,
+        state,
+        finalizeOpenTurn: false,
+      );
+    }
+    if (finalizeOpenTurn) {
+      _finalizeOpenTurn(
+        entries,
+        state,
         endTs: _lastAssistantTimestamp(entries),
       );
     }
     return entries;
+  }
+
+  void _ingestTranscriptEvent(
+    Map<String, dynamic> event,
+    List<Map<String, dynamic>> entries,
+    _SessionTranscriptState state, {
+    required bool finalizeOpenTurn,
+  }) {
+    final type = event['type'] as String? ?? 'event';
+    final data = event['payload'] is Map
+        ? Map<String, dynamic>.from(event['payload'] as Map)
+        : event;
+    final timestamp = _eventTimestamp(event, data);
+
+    if (type == 'input') {
+      if (state.sawAssistantContent) {
+        _finalizeOpenTurn(
+          entries,
+          state,
+          endTs: _lastAssistantTimestamp(entries),
+        );
+      }
+      _appendPromptLikeEntry(
+        entries,
+        state,
+        data['content'] ?? event['content'] ?? '',
+        timestamp,
+      );
+      return;
+    }
+
+    if (type == 'message_update' || type == 'message_start') {
+      if (type == 'message_start') state.activeAssistantIndex = -1;
+      final delta = _extractDelta(data);
+      if (delta == null || delta.isEmpty) return;
+      _beginTurnIfNeeded(entries, state, timestamp);
+      final assistantIndex = state.activeAssistantIndex;
+      if (assistantIndex >= 0) {
+        final entry = entries[assistantIndex];
+        entry['text'] = '${entry['text'] as String? ?? ''}$delta';
+        entry['replace'] = false;
+        if (timestamp != null) entry['ts'] = timestamp;
+      } else {
+        state.activeAssistantIndex = entries.length;
+        entries.add({
+          'kind': 'assistant',
+          'text': delta,
+          'replace': false,
+          ..._timestampEntry(timestamp),
+        });
+      }
+      state.sawAssistantContent = true;
+      return;
+    }
+
+    if (type == 'message_end' || type == 'message') {
+      final text = _extractFullText(data);
+      final failure = _turnFailure(data);
+      if (failure != null &&
+          (failure.status == 'failed' || text == null || text.isEmpty)) {
+        _appendFailureEntry(entries, failure, timestamp);
+      }
+      if (text == null || text.isEmpty) {
+        state.activeAssistantIndex = -1;
+        return;
+      }
+      _beginTurnIfNeeded(entries, state, timestamp);
+      final assistantIndex = state.activeAssistantIndex;
+      if (assistantIndex >= 0) {
+        final entry = entries[assistantIndex];
+        entry['text'] = text;
+        entry['replace'] = true;
+        if (timestamp != null) entry['ts'] = timestamp;
+      } else {
+        state.activeAssistantIndex = entries.length;
+        entries.add({
+          'kind': 'assistant',
+          'text': text,
+          'replace': true,
+          ..._timestampEntry(timestamp),
+        });
+      }
+      state.sawAssistantContent = true;
+      state.activeAssistantIndex = -1;
+      return;
+    }
+
+    if (type.contains('tool')) {
+      _beginTurnIfNeeded(entries, state, timestamp);
+      _upsertToolEntry(entries, state, type, data, timestamp);
+      state.sawAssistantContent = true;
+      return;
+    }
+
+    if (type == 'agent_start') {
+      _beginTurnIfNeeded(entries, state, timestamp);
+      if (_hasVisibleStatus(entries, 'Agent started')) {
+        if (timestamp != null) entries.last['ts'] = timestamp;
+      } else {
+        entries.add({
+          'kind': 'status',
+          'text': 'Agent started',
+          ..._timestampEntry(timestamp),
+        });
+      }
+      return;
+    }
+
+    if (type == 'agent_end') {
+      _finalizeOpenTurn(
+        entries,
+        state,
+        endTs: timestamp,
+        aborted: event['aborted'] == true || data['aborted'] == true,
+      );
+      return;
+    }
+
+    if (type == 'turn_end') {
+      final failure = _turnFailure(data);
+      if (failure != null) {
+        _appendFailureEntry(entries, failure, timestamp);
+        state.resetTurn();
+        return;
+      }
+      if (finalizeOpenTurn) {
+        _finalizeOpenTurn(entries, state, endTs: timestamp);
+      }
+      return;
+    }
+
+    if (type == 'stderr' || type == 'output') {
+      final text = data['data']?.toString() ?? '';
+      if (text.trim().isNotEmpty) {
+        entries.add({'kind': 'raw', 'text': text.trim()});
+      }
+      return;
+    }
+
+    if (finalizeOpenTurn) {
+      _finalizeOpenTurn(entries, state, endTs: timestamp);
+    }
+  }
+
+  void _beginTurnIfNeeded(
+    List<Map<String, dynamic>> entries,
+    _SessionTranscriptState state,
+    String? timestamp,
+  ) {
+    if (state.turnStartIndex < 0) {
+      state.turnStartIndex = entries.length;
+      state.turnStartTs = timestamp;
+      state.sawAssistantContent = false;
+      return;
+    }
+    state.turnStartTs ??= timestamp;
+  }
+
+  void _appendPromptLikeEntry(
+    List<Map<String, dynamic>> entries,
+    _SessionTranscriptState state,
+    Object? rawText,
+    String? timestamp,
+  ) {
+    final text = rawText?.toString() ?? '';
+    if (text.isEmpty) return;
+    _beginTurnIfNeeded(entries, state, timestamp);
+    entries.add({'kind': 'user', 'text': text, ..._timestampEntry(timestamp)});
+    state.turnStartIndex = entries.length - 1;
+    state.turnStartTs ??= timestamp;
+    state.sawAssistantContent = false;
+    state.activeAssistantIndex = -1;
+  }
+
+  void _finalizeOpenTurn(
+    List<Map<String, dynamic>> entries,
+    _SessionTranscriptState state, {
+    required String? endTs,
+    bool aborted = false,
+  }) {
+    if (state.turnStartIndex < 0) return;
+    _appendTurnEnd(
+      entries,
+      startIndex: state.turnStartIndex,
+      startTs: state.turnStartTs,
+      endTs: endTs,
+      aborted: aborted,
+    );
+    state.resetTurn();
+  }
+
+  void _upsertToolEntry(
+    List<Map<String, dynamic>> entries,
+    _SessionTranscriptState state,
+    String type,
+    Map<String, dynamic> data,
+    String? timestamp,
+  ) {
+    final callId = _toolCallId(data);
+    final name = _toolName(type, data);
+    final status = _toolStatus(type, data);
+    final detail = _toolDetail(type, data);
+    if (callId.isNotEmpty) {
+      final existingIndex = state.toolIndexByCallId[callId];
+      if (existingIndex != null && existingIndex < entries.length) {
+        final entry = entries[existingIndex];
+        if (name.isNotEmpty) entry['name'] = name;
+        entry['status'] = _mergeToolStatus(
+          entry['status'] as String? ?? 'running',
+          status,
+        );
+        if (detail.isNotEmpty) {
+          entry['detail'] = detail;
+        }
+        if (timestamp != null) entry['ts'] = timestamp;
+        entry['callId'] = callId;
+        return;
+      }
+    }
+    entries.add({
+      'kind': 'tool',
+      'name': name,
+      'status': status,
+      'detail': detail,
+      if (callId.isNotEmpty) 'callId': callId,
+      ..._timestampEntry(timestamp),
+    });
+    if (callId.isNotEmpty) {
+      state.toolIndexByCallId[callId] = entries.length - 1;
+    }
+  }
+
+  void _appendFailureEntry(
+    List<Map<String, dynamic>> entries,
+    ({String status, String title, String detail}) failure,
+    String? timestamp,
+  ) {
+    if (entries.isNotEmpty &&
+        entries.last['kind'] == 'error' &&
+        entries.last['status'] == failure.status &&
+        entries.last['detail'] == failure.detail) {
+      if (timestamp != null) entries.last['ts'] = timestamp;
+      return;
+    }
+    entries.add({
+      'kind': 'error',
+      'status': failure.status,
+      'title': failure.title,
+      'detail': failure.detail,
+      ..._timestampEntry(timestamp),
+    });
+  }
+
+  bool _hasVisibleStatus(List<Map<String, dynamic>> entries, String text) {
+    return entries.isNotEmpty &&
+        entries.last['kind'] == 'status' &&
+        entries.last['text'] == text;
+  }
+
+  String _toolCallId(Map<String, dynamic> data) =>
+      data['toolCallId']?.toString() ?? data['id']?.toString() ?? '';
+
+  String _toolName(String type, Map<String, dynamic> data) {
+    final name = data['toolName'] ?? data['name'];
+    if (name is String && name.isNotEmpty) return name;
+    return type;
+  }
+
+  String _toolStatus(String type, Map<String, dynamic> data) {
+    final lowered = type.toLowerCase();
+    if (lowered.contains('cancel') ||
+        lowered.contains('abort') ||
+        data['aborted'] == true) {
+      return 'canceled';
+    }
+    if (lowered.contains('fail') ||
+        lowered.contains('error') ||
+        data['error'] != null ||
+        data['isError'] == true) {
+      return 'failed';
+    }
+    if (lowered.contains('end')) return 'done';
+    return 'running';
+  }
+
+  String _toolDetail(String type, Map<String, dynamic> data) {
+    final lowered = type.toLowerCase();
+    final failure = data['error'] ?? data['result'] ?? data['args'];
+    if (lowered.contains('cancel') ||
+        lowered.contains('abort') ||
+        lowered.contains('fail') ||
+        lowered.contains('error') ||
+        data['isError'] == true) {
+      return failure?.toString() ?? '';
+    }
+    if (lowered.contains('end') && data['result'] != null) {
+      return data['result'].toString();
+    }
+    if (data['args'] != null && data['args'].toString().isNotEmpty) {
+      return data['args'].toString();
+    }
+    if (data['result'] != null && data['result'].toString().isNotEmpty) {
+      return data['result'].toString();
+    }
+    if (data['error'] != null && data['error'].toString().isNotEmpty) {
+      return data['error'].toString();
+    }
+    return '';
+  }
+
+  String _mergeToolStatus(String current, String next) {
+    const priority = {'running': 0, 'done': 1, 'canceled': 2, 'failed': 3};
+    final currentPriority = priority[current.toLowerCase()] ?? 0;
+    final nextPriority = priority[next.toLowerCase()] ?? 0;
+    return nextPriority >= currentPriority ? next : current;
+  }
+
+  ({String status, String title, String detail})? _turnFailure(
+    dynamic rawData,
+  ) {
+    final data = rawData is Map
+        ? Map<String, dynamic>.from(rawData)
+        : <String, dynamic>{'data': rawData?.toString() ?? ''};
+    final raw =
+        data['data']?.toString() ??
+        data['message']?.toString() ??
+        data['errorMessage']?.toString() ??
+        '';
+    final stopReason = _jsonStringField(data, raw, 'stopReason');
+    final rawStopReason = _jsonStringField(data, raw, 'rawStopReason');
+    final errorMessage = _jsonStringField(data, raw, 'errorMessage');
+    final stoppedByAbort =
+        data['aborted'] == true ||
+        (stopReason?.toLowerCase().contains('abort') ?? false) ||
+        (rawStopReason?.toLowerCase().contains('abort') ?? false) ||
+        raw.contains('"aborted":true');
+    final stoppedByError =
+        (stopReason?.toLowerCase().contains('error') ?? false) ||
+        raw.contains('"stopReason":"error"') ||
+        raw.contains('"errorMessage"') ||
+        data['isError'] == true ||
+        data['error'] != null;
+    if (!stoppedByAbort && !stoppedByError) return null;
+    final detail = errorMessage?.trim().isNotEmpty == true
+        ? errorMessage!.trim()
+        : rawStopReason?.trim().isNotEmpty == true
+        ? rawStopReason!.trim()
+        : stopReason?.trim().isNotEmpty == true
+        ? stopReason!.trim()
+        : stoppedByAbort
+        ? 'Request was aborted'
+        : 'Assistant turn failed';
+    return (
+      status: stoppedByAbort ? 'canceled' : 'failed',
+      title: stoppedByAbort ? 'Canceled' : 'Error',
+      detail: detail,
+    );
+  }
+
+  String? _jsonStringField(
+    Map<String, dynamic> data,
+    String raw,
+    String field,
+  ) {
+    final direct = data[field];
+    if (direct is String && direct.isNotEmpty) return direct;
+    final match = RegExp(
+      '"$field"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"',
+    ).firstMatch(raw);
+    if (match == null) return null;
+    return match
+        .group(1)
+        ?.replaceAll(r'\"', '"')
+        .replaceAll(r'\\n', '\n')
+        .replaceAll(r'\\t', '\t')
+        .replaceAll(r'\\\\', '\\');
+  }
+
+  String _entrySignature(dynamic raw) {
+    if (raw is! Map) return raw.toString();
+    final event = Map<String, dynamic>.from(raw);
+    final payload = event['payload'] is Map
+        ? Map<String, dynamic>.from(event['payload'] as Map)
+        : const <String, dynamic>{};
+    final data = payload.isEmpty ? event : payload;
+    final bits = <String>[
+      event['type']?.toString() ?? '',
+      data['id']?.toString() ?? '',
+      data['sessionId']?.toString() ?? '',
+      data['role']?.toString() ?? '',
+      data['customType']?.toString() ?? '',
+      data['toolCallId']?.toString() ?? '',
+      data['toolName']?.toString() ?? '',
+      data['state']?.toString() ?? '',
+      data['text']?.toString() ?? '',
+      data['content']?.toString() ?? '',
+      data['delta']?.toString() ?? '',
+      data['result']?.toString() ?? '',
+      data['args']?.toString() ?? '',
+      data['aborted']?.toString() ?? '',
+      data['ts']?.toString() ?? '',
+      data['timestamp']?.toString() ?? '',
+    ];
+    return bits.join('\u001f');
   }
 
   String? _eventTimestamp(
@@ -302,8 +668,13 @@ class _AgentConsoleState extends State<_AgentConsole> {
     bool aborted = false,
   }) {
     if (entries.isEmpty || entries.last['kind'] == 'turn_end') return;
+    final safeStart = startIndex.clamp(0, entries.length - 1).toInt();
+    final responseStart = entries[safeStart]['kind'] == 'assistant'
+        ? safeStart
+        : safeStart + 1;
+    if (responseStart >= entries.length) return;
     final response = entries
-        .skip(startIndex + 1)
+        .skip(responseStart)
         .where((entry) => entry['kind'] == 'assistant')
         .map((entry) => entry['text'] as String? ?? '')
         .where((text) => text.isNotEmpty)
@@ -571,10 +942,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
                             size: 14,
                             color: Color(0xffcf8d55),
                           ),
-                          SizedBox(
-                            width: 112,
-                            child: _workspaceAccessLabel(),
-                          ),
+                          SizedBox(width: 112, child: _workspaceAccessLabel()),
                           if (selected != null) ...[
                             SizedBox(
                               width: 136,
@@ -681,10 +1049,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
       disabledBackgroundColor: const Color(0xff3b3b3b),
       disabledForegroundColor: const Color(0xff777777),
     ),
-    icon: Icon(
-      running ? Icons.stop_rounded : Icons.arrow_upward,
-      size: 18,
-    ),
+    icon: Icon(running ? Icons.stop_rounded : Icons.arrow_upward, size: 18),
   );
 
   Widget _modelSelector(PifSession selected) {
@@ -762,11 +1127,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
           ),
           DropdownMenuItem(
             value: 'medium',
-            child: Text(
-              'Medium',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
+            child: Text('Medium', maxLines: 1, overflow: TextOverflow.ellipsis),
           ),
           DropdownMenuItem(
             value: 'high',
@@ -874,6 +1235,20 @@ class _EntryCard extends StatelessWidget {
       final name = entry['name'] as String? ?? 'tool';
       final status = entry['status'] as String? ?? 'running';
       final detail = entry['detail'] as String? ?? '';
+      final trailingIcon = status == 'done'
+          ? Icons.check_circle
+          : status == 'failed'
+          ? Icons.error_outline
+          : status == 'canceled'
+          ? Icons.cancel_outlined
+          : null;
+      final trailingColor = status == 'done'
+          ? const Color(0xff78dba9)
+          : status == 'failed'
+          ? const Color(0xfff28b82)
+          : status == 'canceled'
+          ? Colors.amber
+          : Colors.amber;
       return Container(
         margin: const EdgeInsets.only(bottom: 8),
         padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 2),
@@ -882,32 +1257,84 @@ class _EntryCard extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
           border: Border.all(color: const Color(0xff303b34)),
         ),
-        child: ExpansionTile(
-          tilePadding: EdgeInsets.zero,
-          leading: Icon(
-            Icons.build_outlined,
-            size: 18,
-            color: status == 'done' ? const Color(0xff78dba9) : Colors.amber,
+        child: Material(
+          type: MaterialType.transparency,
+          child: ExpansionTile(
+            tilePadding: EdgeInsets.zero,
+            leading: Icon(Icons.build_outlined, size: 18, color: trailingColor),
+            title: Text(
+              name,
+              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w300),
+            ),
+            trailing: trailingIcon != null
+                ? Icon(trailingIcon, size: 16, color: trailingColor)
+                : const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+            children: [
+              SelectableText(
+                detail,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+              ),
+            ],
           ),
-          title: Text(
-            name,
-            style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w300),
-          ),
-          trailing: status == 'done'
-              ? const Icon(
-                  Icons.check_circle,
-                  size: 16,
-                  color: Color(0xff78dba9),
-                )
-              : const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
+        ),
+      );
+    }
+
+    if (kind == 'error') {
+      final title = entry['title'] as String? ?? 'Error';
+      final detail = entry['detail'] as String? ?? '';
+      final status = entry['status'] as String? ?? 'failed';
+      final color = status == 'canceled'
+          ? Colors.amber
+          : const Color(0xfff28b82);
+      return Container(
+        margin: const EdgeInsets.only(bottom: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xff26191b),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: const Color(0xff5d2c31)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            SelectableText(
-              detail,
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            Icon(
+              status == 'canceled'
+                  ? Icons.cancel_outlined
+                  : Icons.error_outline,
+              size: 18,
+              color: color,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w300,
+                      color: Color(0xfff28b82),
+                    ),
+                  ),
+                  if (detail.isNotEmpty) ...[
+                    const SizedBox(height: 4),
+                    SelectableText(
+                      detail,
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 11,
+                        color: Color(0xfff2c7c9),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ],
         ),
