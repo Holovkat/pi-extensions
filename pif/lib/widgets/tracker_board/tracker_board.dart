@@ -550,6 +550,10 @@ class _TicketSheetState extends State<_TicketSheet> {
   bool _editing = false;
   bool _busy = false;
   bool _closeAfterSave = false;
+  // Track the in-flight tracker op so save acknowledgements still land
+  // when the sheet is closed over a view-mode change.
+  String? _pendingOp;
+  int? _pendingNumber;
   _Pane _pane = _Pane.body;
   String? _error;
   late final TextEditingController _title;
@@ -713,19 +717,20 @@ class _TicketSheetState extends State<_TicketSheet> {
     if (!mounted || payload is! Map) return;
     final op = '${payload['op'] ?? ''}';
     final ok = payload['ok'] == true;
+    if (!_matchesPendingOp(op, payload)) return;
     if (op == 'create' && _creating) {
       if (ok) return Navigator.of(context).pop();
       setState(() {
-        _busy = false;
+        _resetPendingOp();
         _closeAfterSave = false;
         _error = '${payload['error'] ?? 'create failed'}';
       });
-    } else if (op == 'update' && _editing && !_creating) {
+    } else if (op == 'update' && !_creating) {
       if (ok) {
         setState(() {
           _card!['title'] = _title.text.trim();
           _card['body'] = _body.text;
-          _busy = false;
+          _resetPendingOp();
           _originalTitle = _title.text;
           _originalBody = _body.text;
           _originalTags = List.of(_tags);
@@ -738,7 +743,7 @@ class _TicketSheetState extends State<_TicketSheet> {
         });
       } else {
         setState(() {
-          _busy = false;
+          _resetPendingOp();
           _closeAfterSave = false;
           _error = '${payload['error'] ?? 'update failed'}';
         });
@@ -746,10 +751,25 @@ class _TicketSheetState extends State<_TicketSheet> {
     } else if (op == 'delete' && !_creating) {
       if (ok) return Navigator.of(context).pop();
       setState(() {
-        _busy = false;
+        _resetPendingOp();
         _error = '${payload['error'] ?? 'delete failed'}';
       });
     }
+  }
+
+  bool _matchesPendingOp(String op, Map payload) {
+    if (_pendingOp != op) return false;
+    if (_pendingNumber == null) return true;
+    final payloadNumber = payload['number'];
+    if (payloadNumber is num) return payloadNumber.toInt() == _pendingNumber;
+    if (payloadNumber is String) return int.tryParse(payloadNumber) == _pendingNumber;
+    return true;
+  }
+
+  void _resetPendingOp() {
+    _busy = false;
+    _pendingOp = null;
+    _pendingNumber = null;
   }
 
   void _onMoveResult(Object? payload) {
@@ -779,6 +799,9 @@ class _TicketSheetState extends State<_TicketSheet> {
     setState(() {
       _busy = true;
       _error = null;
+      _pendingOp = op;
+      final number = payload['number'];
+      _pendingNumber = number is num ? number.toInt() : int.tryParse('$number');
     });
     widget.host.bus.send('tracker/control', op, payload);
   }
