@@ -11,9 +11,10 @@
 #   [app-name]     display name override (default: manifest name)
 #   [output-dir]   default: <project-dir>/build
 #
-# Secrets policy: the bundle ships without dev models.json or API keys —
-# models are provisioned on the target machine at first run. A scan step
-# below fails the export if key-shaped material is found.
+# Secrets policy: the bundle ships without dev models.json, settings.json,
+# .env files, or API keys — models are provisioned on the target machine at
+# first run. The scan below fails the export if credential-shaped material is
+# found and only reports file paths plus credential classes, never raw values.
 #
 # AOT limitation: the widget set is frozen at export time (compiled into the
 # binary). Runtime widget installs do not apply to exported apps; rebuild to
@@ -47,6 +48,136 @@ if [ -z "$MANIFEST_JSON" ]; then echo "ERROR: manifest parse failed."; exit 1; f
 APP_ID="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).id))")"
 MANIFEST_NAME="$(printf '%s' "$MANIFEST_JSON" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>console.log(JSON.parse(d).name))")"
 APP_NAME="${APP_NAME:-$MANIFEST_NAME}"
+
+scan_export_bundle_for_secrets() {
+  local bundle_root="$1"
+  ROOT="$bundle_root" node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+
+const root = process.env.ROOT;
+if (!root) {
+  console.error('ERROR: secret scan root missing.');
+  process.exit(1);
+}
+
+const fileNameRules = [
+  { label: 'models.json', test: (name) => name === 'models.json' },
+  { label: 'settings.json', test: (name) => name === 'settings.json' },
+  { label: '.env', test: (name) => name === '.env' },
+];
+
+const textRules = [
+  { label: 'generic-sk-token', regex: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
+  { label: 'github-token', regex: /\b(?:github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{36,})\b/ },
+  { label: 'aws-access-key', regex: /\b(?:AKIA|ASIA|AIDA|AROA|ANPA|ANVA|AGPA|ACCA|ABIA|A3T)[A-Z0-9]{16}\b/ },
+  { label: 'google-api-key', regex: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { label: 'google-oauth-token', regex: /\bya29\.[0-9A-Za-z_-]+\b/ },
+];
+
+const hits = [];
+const seen = new Set();
+const visitedDirs = new Set();
+const visitedFiles = new Set();
+const rootReal = fs.realpathSync(root);
+const rootPrefix = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`;
+
+function ensureUnderRoot(targetPath, sourcePath) {
+  let resolvedTarget;
+  try {
+    resolvedTarget = fs.realpathSync(targetPath);
+  } catch (error) {
+    console.error(`ERROR: secret scan could not resolve symlink target ${sourcePath}: ${error.message}`);
+    process.exit(1);
+  }
+  if (resolvedTarget !== rootReal && !resolvedTarget.startsWith(rootPrefix)) {
+    console.error(`ERROR: secret scan refuses symlink target outside the export bundle: ${sourcePath} -> ${resolvedTarget}`);
+    process.exit(1);
+  }
+  return resolvedTarget;
+}
+
+function record(label, file) {
+  const key = `${label}\u0000${file}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+  hits.push({ label, file });
+}
+
+function scanFile(file, logicalPath = file) {
+  const base = path.basename(logicalPath);
+  for (const rule of fileNameRules) {
+    if (rule.test(base)) record(rule.label, logicalPath);
+  }
+
+  const canonical = ensureUnderRoot(file, logicalPath);
+  if (visitedFiles.has(canonical)) return;
+  visitedFiles.add(canonical);
+
+  let buffer;
+  try {
+    buffer = fs.readFileSync(canonical);
+  } catch (error) {
+    console.error(`ERROR: secret scan could not read ${canonical}: ${error.message}`);
+    process.exit(1);
+  }
+
+  if (buffer.includes(0)) return;
+
+  const text = buffer.toString('utf8');
+  for (const rule of textRules) {
+    if (rule.regex.test(text)) record(rule.label, canonical);
+  }
+}
+
+function walk(dir) {
+  const canonical = ensureUnderRoot(dir, dir);
+  if (visitedDirs.has(canonical)) return;
+  visitedDirs.add(canonical);
+
+  let entries;
+  try {
+    entries = fs.readdirSync(canonical, { withFileTypes: true });
+  } catch (error) {
+    console.error(`ERROR: secret scan could not read ${canonical}: ${error.message}`);
+    process.exit(1);
+  }
+
+  for (const entry of entries) {
+    const file = path.join(canonical, entry.name);
+    if (entry.isSymbolicLink()) {
+      const target = ensureUnderRoot(file, file);
+      const stat = fs.statSync(target);
+      if (stat.isDirectory()) {
+        walk(target);
+      } else if (stat.isFile()) {
+        scanFile(target, file);
+      }
+    } else if (entry.isDirectory()) {
+      walk(file);
+    } else if (entry.isFile()) {
+      scanFile(file);
+    }
+  }
+}
+
+walk(root);
+hits.sort((left, right) => left.file.localeCompare(right.file) || left.label.localeCompare(right.label));
+
+if (hits.length) {
+  console.error('ERROR: credential-shaped material found in the export bundle:');
+  for (const { label, file } of hits) {
+    console.error(`  - ${label}: ${file}`);
+  }
+  console.error('Coverage: exact file names (models.json, settings.json, .env) plus GitHub/AWS/Google/token-shaped text scans.');
+  console.error('False positives: redacted fixtures or docs that intentionally contain these shapes may trip the scan.');
+  console.error('Unsupported: encrypted blobs, compressed archives, and binary-only secret payloads are not inspected.');
+  process.exit(1);
+}
+
+console.log('    clean.');
+NODE
+}
 
 STAGE="$OUTPUT_DIR/$APP_ID-stage"
 rm -rf "$STAGE"
@@ -96,7 +227,7 @@ APP="$OUTPUT_DIR/$APP_NAME.app"
 rm -rf "$APP"
 cp -R "$APP_BUNDLE" "$APP"
 RESOURCES="$APP/Contents/Resources"
-mkdir -p "$RESOURCES/pi/extensions" "$RESOURCES/app" "$RESOURCES/pif_app-manifest"
+mkdir -p "$RESOURCES/pi/cli" "$RESOURCES/pi/extensions" "$RESOURCES/app" "$RESOURCES/pif_app-manifest"
 echo "5. Assembled $APP"
 
 # 6. Bundle Node.js
@@ -119,7 +250,13 @@ if [ -z "$PI_PKG_DIR" ]; then
 fi
 if [ ! -f "$PI_PKG_DIR/dist/cli.js" ]; then echo "ERROR: could not locate the pi package directory."; exit 1; fi
 echo "7. Bundling pi CLI from $PI_PKG_DIR ..."
-cp -R "$PI_PKG_DIR" "$RESOURCES/pi/cli"
+# Keep runtime JS/assets, but skip TypeScript declaration files: historical
+# packages carry example-shaped text in non-runtime *.d.ts files that should
+# not enter the exported bundle.
+rsync -a \
+  --exclude='*.d.ts' \
+  "$PI_PKG_DIR/" \
+  "$RESOURCES/pi/cli/"
 
 # 8. Bundle pif extensions (hub runtime)
 echo "8. Bundling pif extensions ..."
@@ -173,15 +310,15 @@ fi
 rm -f "$ENTITLEMENTS"
 if ! codesign --verify --deep --strict "$APP"; then echo "ERROR: codesign verification failed for $APP"; exit 1; fi
 
-# 13. Secrets scan: the bundle must ship without dev credentials
+# 13. Secrets scan: fail closed on bundled credential-shaped material.
+#    Coverage: exact file names (models.json, settings.json, .env) plus
+#    GitHub/AWS/Google/token-shaped text scans.
+#    False positives: redacted fixtures or docs that intentionally contain
+#    these shapes may trip the scan.
+#    Unsupported: encrypted blobs, compressed archives, and binary-only
+#    secret payloads are not inspected.
 echo "13. Secrets scan ..."
-if find "$RESOURCES" -name 'models.json' -o -name '.env' | grep -q .; then
-  echo "ERROR: credential-shaped files found in the bundle:"; find "$RESOURCES" -name 'models.json' -o -name '.env'; exit 1
-fi
-if grep -RIlE 'sk-[A-Za-z0-9]{20,}' "$RESOURCES" 2>/dev/null | grep -q .; then
-  echo "ERROR: key-shaped material found in:"; grep -RIlE 'sk-[A-Za-z0-9]{20,}' "$RESOURCES" | head -5; exit 1
-fi
-echo "    clean."
+scan_export_bundle_for_secrets "$RESOURCES"
 
 # 14. Summary
 echo ""
