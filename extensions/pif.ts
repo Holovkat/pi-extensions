@@ -790,6 +790,16 @@ class PifHub {
 			registry: path.join(this.appDir, "lib", "widget_registry.g.dart"),
 		};
 	}
+	private readWidgetManifestAt(root: string, id: string): PifWidgetManifest | null {
+		const manifestPath = path.join(root, id, "widget.yaml");
+		if (!fs.existsSync(manifestPath)) return null;
+		try {
+			const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8"));
+			return manifest.id === id ? manifest : null;
+		} catch {
+			return null;
+		}
+	}
 	private scanDirectory(root: string, installed: boolean, source: PifWidgetSource) {
 		const records: Record<string, WidgetRecord> = {}; if (!fs.existsSync(root)) return records;
 		for (const entry of fs.readdirSync(root, { withFileTypes: true })) { if (!entry.isDirectory()) continue; const manifestPath = path.join(root, entry.name, "widget.yaml"); if (!fs.existsSync(manifestPath)) continue; try { const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, "utf8")); records[manifest.id] = { ...manifest, source, installed, enabled: installed && this.enabled.has(manifest.id) }; } catch { /* invalid catalog entries surface during install */ } }
@@ -813,7 +823,7 @@ class PifHub {
 		this.state.widgets = widgets;
 		this.state.catalog = { ...appCatalog, ...globalCatalog };
 		this.installed = new Set(Object.keys(widgets));
-		for (const id of Object.keys(widgets)) delete this.state.catalog[id];
+		for (const [id, record] of Object.entries(widgets)) if (record.source === "project") delete this.state.catalog[id];
 		const freshRegistry = !this.registryStateExists && !this.registrySeeded;
 		if (freshRegistry) { this.enabled = new Set(Object.keys(widgets)); this.registrySeeded = true; }
 		for (const record of Object.values(widgets)) record.enabled = this.enabled.has(record.id);
@@ -891,27 +901,34 @@ class PifHub {
 		const roots = this.widgetRoots();
 		// Layered install resolution mirrors scanWidgets so install can never
 		// register a definition other than the one a scan would surface:
-		// project overlay first (registered in place), then base app widgets,
-		// then the app-local archive (copied into the base app), then the
-		// global catalog (copied into the project overlay).
+		// project overlay first (registered in place), then the global catalog
+		// (copied into the project overlay), then base widgets, then the
+		// app-local archive (copied into the base app).
 		let dir = "", source: PifWidgetSource, copied = false;
 		const projectDir = assertWritablePifPath(assertSafeWidgetPath(roots.project, path.join(roots.project, id)));
+		const globalEntry = assertWritablePifPath(assertSafeWidgetPath(roots.globalCatalog, path.join(roots.globalCatalog, id)));
 		const baseDir = assertWritablePifPath(assertSafeWidgetPath(roots.widgets, path.join(roots.widgets, id)));
+		const appArchive = assertWritablePifPath(assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)));
 		if (fs.existsSync(projectDir)) { dir = projectDir; source = "project"; }
+		else if (fs.existsSync(globalEntry)) { fs.mkdirSync(roots.project, { recursive: true }); fs.cpSync(globalEntry, projectDir, { recursive: true, errorOnExist: true }); dir = projectDir; source = "project"; copied = true; }
 		else if (fs.existsSync(baseDir)) { dir = baseDir; source = "base"; }
-		else {
-			const appArchive = assertWritablePifPath(assertSafeWidgetPath(roots.catalog, path.join(roots.catalog, id)));
-			const globalEntry = assertWritablePifPath(assertSafeWidgetPath(roots.globalCatalog, path.join(roots.globalCatalog, id)));
-			if (fs.existsSync(appArchive)) { fs.cpSync(appArchive, baseDir, { recursive: true, errorOnExist: true }); dir = baseDir; source = "base"; copied = true; }
-			else if (fs.existsSync(globalEntry)) { fs.mkdirSync(roots.project, { recursive: true }); fs.cpSync(globalEntry, projectDir, { recursive: true, errorOnExist: true }); dir = projectDir; source = "project"; copied = true; }
-			else throw new Error(`Widget not found in widgets or catalog: ${id}`);
-		}
+		else if (fs.existsSync(appArchive)) { fs.cpSync(appArchive, baseDir, { recursive: true, errorOnExist: true }); dir = baseDir; source = "base"; copied = true; }
+		else throw new Error(`Widget not found in widgets or catalog: ${id}`);
 		const manifest = parseWidgetManifest(fs.readFileSync(path.join(dir, "widget.yaml"), "utf8")); if (manifest.id !== id) throw new Error("Manifest id does not match folder");
+		const registryFile = assertWritablePifPath(roots.registry);
+		const enabledBefore = new Set(this.enabled), registryBefore = fs.existsSync(registryFile) ? fs.readFileSync(registryFile) : null;
+		const registryStateExistsBefore = this.registryStateExists;
 		const pubspecPath = path.join(this.appDir, "pubspec.yaml"), lockPath = path.join(this.appDir, "pubspec.lock");
 		const pubspecBefore = fs.existsSync(pubspecPath) ? fs.readFileSync(pubspecPath) : null, lockBefore = fs.existsSync(lockPath) ? fs.readFileSync(lockPath) : null;
 		const rejectInstall = (phase: string, diagnostics: string) => {
 			if (manifest.dart_dependencies.length) { this.restoreFile(pubspecPath, pubspecBefore); this.restoreFile(lockPath, lockBefore); spawnSync("flutter", ["pub", "get"], { cwd: this.appDir, encoding: "utf8", timeout: 120_000 }); }
 			if (copied) fs.rmSync(dir, { recursive: true, force: true });
+			this.enabled = enabledBefore;
+			this.restoreFile(registryFile, registryBefore);
+			this.registryStateExists = registryStateExistsBefore;
+			this.scanWidgets();
+			this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets });
+			this.broadcast("store/catalog", "catalog_state", { catalog: this.state.catalog });
 			const result = { ok: false, id, phase, diagnostics, source }; this.broadcast("widget/reload", "reload_result", result); return result;
 		};
 		if (manifest.dart_dependencies.length) {
@@ -920,11 +937,9 @@ class PifHub {
 			if (pubGet.status !== 0) return rejectInstall("pub_get", `${pubGet.stdout}${pubGet.stderr}`);
 		}
 		const analysis = this.analyzeWidget(dir); if (!analysis.ok) return rejectInstall("analyze", analysis.diagnostics);
-		const registryFile = assertWritablePifPath(roots.registry);
-		const enabledBefore = new Set(this.enabled), registryBefore = fs.existsSync(registryFile) ? fs.readFileSync(registryFile) : null;
 		this.enabled.add(id); this.scanWidgets(); this.state.widgets[id].enabled = true; this.generateRegistry();
 		const projectAnalysis = this.analyzeWidget(registryFile);
-		if (!projectAnalysis.ok) { this.enabled = enabledBefore; this.restoreFile(registryFile, registryBefore); this.scanWidgets(); return rejectInstall("registry_analyze", projectAnalysis.diagnostics); }
+		if (!projectAnalysis.ok) return rejectInstall("registry_analyze", projectAnalysis.diagnostics);
 		this.saveRegistryState();
 		let reload: any = "shell-not-running"; if (this.supervisor.process) { this.state.health.reload = "running"; try { reload = await this.supervisor.reload(Boolean(manifest.dart_dependencies.length)); } catch (first) { try { reload = await this.supervisor.reload(true); } catch (second) { reload = { error: String(second), first: String(first) }; } } this.state.health.reload = reload?.error ? "failed" : "idle"; }
 		this.scanWidgets(); this.broadcast("widget/registry", "registry_state", { widgets: this.state.widgets }); this.broadcast("store/catalog", "catalog_state", { catalog: this.state.catalog }); const result = { ok: !reload?.error, id, phase: "reload", diagnostics: analysis.diagnostics, reload, source }; this.broadcast("widget/reload", "reload_result", result); return result;
@@ -937,8 +952,10 @@ class PifHub {
 	}
 	async uninstallWidget(params: any) {
 		this.assertBundledMutationAllowed("uninstallWidget");
-		const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`); if (widget.core) throw new Error(`Core widget ${id} cannot be uninstalled`);
+		const id = String(params.id); const widget = this.state.widgets[id]; if (!widget) throw new Error(`Unknown installed widget: ${id}`);
 		const roots = this.widgetRoots();
+		const baseManifest = this.readWidgetManifestAt(roots.widgets, id);
+		if (widget.core || baseManifest?.core) throw new Error(`Core widget ${id} cannot be uninstalled`);
 		if (widget.source === "project") {
 			// Project widgets are versioned inside the project overlay: uninstall
 			// deregisters only — the source never moves or disappears, and it

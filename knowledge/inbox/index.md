@@ -4,6 +4,8 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [pif source precedence and catalog visibility alignment (#207)](./2026-08-31T04-02-39Z-pif-source-precedence-and-catalog-visibility.md) | 2026-08-31T04:02:39Z | pi-extensions, pif, widgets, install-precedence, catalog, rollback, okf | #207 |
+| [Native pif transcript boundaries and tool cards corrected (#215)](./2026-08-31T03-58-19Z-pif-agent-console-transcript-reducer.md) | 2026-08-31T03:58:19Z | pi-extensions, pif, agent-console, transcript, reducer, prompt-echo, turn-finalization, tool-calls, flutter, okf | #215 |
 | [pif bundled inventory authority and writable-path guards (#187)](./2026-08-31T03-38-53Z-pif-bundled-inventory-authority-and-write-guards.md) | 2026-08-31T03:38:53Z | pi-extensions, pif, bundled-mode, registry, inventory, writable-paths, okf | #187 |
 | [pif handoff state and candidate links corrected for live review rows](./2026-08-31T03-38-50Z-pif-handoff-state-candidate-links-corrective.md) | 2026-08-31T03:38:50Z | pi-extensions, pif, okf, state, inbox, handoff, verification, review | #158, #159, #160, #187, #201, #204, #205, #206, #207, #209, #211, #212, #214, #215 |
 | [pif handoff state and candidate links now reflect the live review slice](./2026-08-31T03-32-02Z-pif-handoff-state-and-candidate-links.md) | 2026-08-31T03:32:02Z | pi-extensions, pif, okf, state, inbox, handoff, verification | #205, #160, #187, #201, #204, #206, #207, #209, #211, #212, #214 |
