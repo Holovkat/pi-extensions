@@ -917,6 +917,7 @@ class PifHub {
 			throw error;
 		}
 		this.loadAppManifest();
+		this.broadcastSnapshot();
 		return { ok: true, id: manifest.id, name: manifest.name, template: template ?? null, pages: manifest.pages, note: template ? "template layers pinned to pif_app/template/" : "minimal unstyled app" };
 	}
 
@@ -936,6 +937,7 @@ class PifHub {
 			throw error;
 		}
 		this.writeAppManifest(parsed.manifest!);
+		this.broadcastSnapshot();
 		return { ok: true, page: id, pages: this.state.app!.pages };
 	}
 
@@ -958,6 +960,7 @@ class PifHub {
 		const parsed = setAppHome(this.state.app, String(params.id ?? ""));
 		if (parsed.error) throw new Error(parsed.error);
 		this.writeAppManifest(parsed.manifest!);
+		this.broadcastSnapshot();
 		return { ok: true, home: this.state.app!.home, pages: this.state.app!.pages };
 	}
 
