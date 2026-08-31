@@ -5,5 +5,7 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
+  # Keep this fixture portable from a clean checkout: resolve the repo's pif
+  # package directly instead of copying it into the sample tree.
   pif:
-    path: ../../../../../Users/tonyholovka/workspace/pi-extensions/pif
+    path: ../../../pif
