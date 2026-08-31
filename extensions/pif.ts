@@ -660,6 +660,16 @@ class PifHub {
 	}
 	private loadRegistryState() { try { const saved = JSON.parse(fs.readFileSync(this.registryStatePath, "utf8")); this.enabled = new Set(Array.isArray(saved.enabled) ? saved.enabled : []); } catch { this.enabled = new Set(); } }
 	private saveRegistryState() { fs.mkdirSync(path.dirname(this.registryStatePath), { recursive: true }); fs.writeFileSync(this.registryStatePath, JSON.stringify({ enabled: [...this.enabled].sort() }, null, 2) + "\n"); }
+	private widgetScaffoldPath(id: string) {
+		const widgetsRoot = path.join(this.state.health.workspace, "pif_app", "widgets");
+		return assertSafeWidgetPath(widgetsRoot, path.join(widgetsRoot, id));
+	}
+	private assertWidgetScaffoldClear(id: string) {
+		if (this.state.widgets[id]) throw new Error(`Widget id '${id}' is already installed`);
+		const dir = this.widgetScaffoldPath(id);
+		try { fs.lstatSync(dir); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return dir; throw error; }
+		throw new Error(`Widget source already exists: ${id}`);
+	}
 	private async layoutAction(type: string, payload: any) {
 		const presetsDir = path.join(this.pifDir, "presets");
 		if (type === "save") { if (!payload.preset) throw new Error("preset is required to save a layout"); fs.mkdirSync(presetsDir, { recursive: true }); fs.writeFileSync(path.join(presetsDir, `${String(payload.preset).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`), JSON.stringify(this.state.layout, null, 2) + "\n"); }
@@ -897,33 +907,39 @@ class PifHub {
 	/// Scaffold a widget inside the project overlay (pif_app/widgets): the
 	/// only allowed write root for app scaffolding per the #157 contract.
 	private async scaffoldWidget(id: string, name: string, slot: string) {
-		const widgetsRoot = path.join(this.state.health.workspace, "pif_app", "widgets");
-		const dir = assertSafeWidgetPath(widgetsRoot, path.join(widgetsRoot, id));
-		fs.mkdirSync(dir, { recursive: true });
+		const dir = this.assertWidgetScaffoldClear(id);
+		fs.mkdirSync(path.dirname(dir), { recursive: true });
+		fs.mkdirSync(dir);
 		const safeName = name.replace(/'/g, "\\'");
-		fs.writeFileSync(path.join(dir, "widget.yaml"), `id: ${id}\nname: ${safeName}\nslot: ${slot}\nversion: 0.1.0\ncore: false\ndescription: ${slot === "page" ? "Page" : "Widget"} ${safeName} for the project app\n`);
-		fs.writeFileSync(
-			path.join(dir, `${id}.dart`),
-			"import 'package:flutter/material.dart';\nimport 'package:pif/core/plugin.dart';\n\n" +
-			`class ${widgetClassName(id)} implements PifWidgetPlugin {\n` +
-			`  const ${widgetClassName(id)}();\n` +
-			"  @override\n" +
-			`  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: '${safeName}', slot: PifSlot.${slot});\n` +
-			"  @override\n" +
-			"  Widget build(BuildContext context, PifHost host) => Scaffold(\n" +
-			"    body: Center(\n" +
-			"      child: Column(\n" +
-			"        mainAxisAlignment: MainAxisAlignment.center,\n" +
-			"        children: [\n" +
-			`          Text('${safeName}', style: Theme.of(context).textTheme.headlineSmall),\n` +
-			"          const SizedBox(height: 8),\n" +
-			"          Text('Scaffolded by pif_app_init — ready for its content.', style: Theme.of(context).textTheme.bodySmall),\n" +
-			"        ],\n" +
-			"      ),\n" +
-			"    ),\n" +
-			"  );\n" +
-			"}\n",
-		);
+		try {
+			fs.writeFileSync(path.join(dir, "widget.yaml"), `id: ${id}\nname: ${safeName}\nslot: ${slot}\nversion: 0.1.0\ncore: false\ndescription: ${slot === "page" ? "Page" : "Widget"} ${safeName} for the project app\n`);
+			fs.writeFileSync(
+				path.join(dir, `${id}.dart`),
+				"import 'package:flutter/material.dart';\nimport 'package:pif/core/plugin.dart';\n\n" +
+				`class ${widgetClassName(id)} implements PifWidgetPlugin {\n` +
+				`  const ${widgetClassName(id)}();\n` +
+				"  @override\n" +
+				`  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: '${safeName}', slot: PifSlot.${slot});\n` +
+				"  @override\n" +
+				"  Widget build(BuildContext context, PifHost host) => Scaffold(\n" +
+				"    body: Center(\n" +
+				"      child: Column(\n" +
+				"        mainAxisAlignment: MainAxisAlignment.center,\n" +
+				"        children: [\n" +
+				`          Text('${safeName}', style: Theme.of(context).textTheme.headlineSmall),\n` +
+				"          const SizedBox(height: 8),\n" +
+				"          Text('Scaffolded by pif_app_init — ready for its content.', style: Theme.of(context).textTheme.bodySmall),\n" +
+				"        ],\n" +
+				"      ),\n" +
+				"    ),\n" +
+				"  );\n" +
+				"}\n",
+			);
+		} catch (error) {
+			fs.rmSync(dir, { recursive: true, force: true });
+			throw error;
+		}
+		return dir;
 	}
 
 	private async installOrFail(id: string, what: string) {
@@ -941,6 +957,7 @@ class PifHub {
 		const template = params.template ? String(params.template) : undefined;
 		if (template && !/^[a-z0-9][a-z0-9-]*$/.test(template)) throw new Error(`Template id must be a kebab identifier — got '${template}'`);
 		const manifest: PifAppManifest = { id: slugifyAppId(name), name, version: "0.1.0", home: "home", pages: ["home"], template, dependencies: [] };
+		this.assertWidgetScaffoldClear("home");
 		if (template) {
 			const source = this.appTemplateSource(template);
 			if (!source) throw new Error(`Template '${template}' not found (searched project pinned copy, ${this.globalCatalogPath}/templates, and the app's bundled templates)`);
@@ -954,9 +971,12 @@ class PifHub {
 		}
 		fs.mkdirSync(path.dirname(this.appManifestPath()), { recursive: true });
 		this.appInitializing = true;
+		let homeDir = "";
+		let homeCreated = false;
 		try {
 			this.scaffoldAppPackage();
-			await this.scaffoldWidget("home", "Home", "page");
+			homeDir = await this.scaffoldWidget("home", "Home", "page");
+			homeCreated = true;
 			await this.installOrFail("home", "Home page");
 			// Install rescans app.yaml; keep it absent until the gate succeeds
 			// so unrelated snapshots cannot expose a pending app manifest.
@@ -964,9 +984,9 @@ class PifHub {
 		} catch (error) {
 			// Roll back the attempt so a retry is possible: the manifest and
 			// the scaffolded page go; the pinned template and design.md stay.
-			fs.rmSync(path.join(this.state.health.workspace, "pif_app", "widgets", "home"), { recursive: true, force: true });
+			if (homeCreated) fs.rmSync(homeDir, { recursive: true, force: true });
 			fs.rmSync(this.appManifestPath(), { force: true });
-			this.loadAppManifest();
+			this.scanWidgets();
 			throw error;
 		} finally {
 			this.appInitializing = false;
@@ -981,13 +1001,17 @@ class PifHub {
 		const name = String(params.name ?? "").trim().replace(/[\r\n]+/g, " ").slice(0, 120);
 		if (!name) throw new Error("Page name is required");
 		const id = params.id ? String(params.id) : slugifyAppId(name).replace(/-/g, "_");
+		this.assertWidgetScaffoldClear(id);
 		const parsed = addAppPage(this.state.app, id);
 		if (parsed.error) throw new Error(parsed.error);
+		let pageDir = "";
+		let pageCreated = false;
 		try {
-			await this.scaffoldWidget(id, name, "page");
+			pageDir = await this.scaffoldWidget(id, name, "page");
+			pageCreated = true;
 			await this.installOrFail(id, "Page");
 		} catch (error) {
-			fs.rmSync(path.join(this.state.health.workspace, "pif_app", "widgets", id), { recursive: true, force: true });
+			if (pageCreated) fs.rmSync(pageDir, { recursive: true, force: true });
 			this.scanWidgets();
 			throw error;
 		}
@@ -1004,9 +1028,18 @@ class PifHub {
 		if (!/^[a-z][a-z0-9_]*$/.test(id)) throw new Error(`Widget id must be a lowercase identifier (snake_case) — got '${id}'`);
 		const slot = String(params.slot ?? "center");
 		if (!["left", "center", "right", "bottom", "status"].includes(slot)) throw new Error(`Slot must be one of left|center|right|bottom|status — got '${slot}'`);
-		if (this.state.widgets[id]) throw new Error(`Widget id '${id}' is already installed`);
-		await this.scaffoldWidget(id, name, slot);
-		await this.installOrFail(id, "Widget");
+		this.assertWidgetScaffoldClear(id);
+		let widgetDir = "";
+		let widgetCreated = false;
+		try {
+			widgetDir = await this.scaffoldWidget(id, name, slot);
+			widgetCreated = true;
+			await this.installOrFail(id, "Widget");
+		} catch (error) {
+			if (widgetCreated) fs.rmSync(widgetDir, { recursive: true, force: true });
+			this.scanWidgets();
+			throw error;
+		}
 		return { ok: true, widget: id, slot };
 	}
 
