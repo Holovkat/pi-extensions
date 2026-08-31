@@ -29,6 +29,8 @@ class _SessionTranscriptState {
   String? turnStartTs;
   bool sawAssistantContent = false;
   int activeAssistantIndex = -1;
+  bool turnAborted = false;
+  bool turnFailed = false;
   final Map<String, int> toolIndexByCallId = {};
   String? firstSignature;
   String? lastSignature;
@@ -38,11 +40,13 @@ class _SessionTranscriptState {
     turnStartTs = null;
     sawAssistantContent = false;
     activeAssistantIndex = -1;
+    turnAborted = false;
+    turnFailed = false;
+    toolIndexByCallId.clear();
   }
 
   void resetAll() {
     resetTurn();
-    toolIndexByCallId.clear();
     firstSignature = null;
     lastSignature = null;
   }
@@ -286,6 +290,10 @@ class _AgentConsoleState extends State<_AgentConsole> {
     if (type == 'message_end' || type == 'message') {
       final text = _extractFullText(data);
       final failure = _turnFailure(data);
+      if (failure != null) {
+        state.turnAborted = failure.status == 'canceled';
+        state.turnFailed = failure.status == 'failed';
+      }
       if (failure != null &&
           (failure.status == 'failed' || text == null || text.isEmpty)) {
         _appendFailureEntry(entries, failure, timestamp);
@@ -414,7 +422,8 @@ class _AgentConsoleState extends State<_AgentConsole> {
       startIndex: state.turnStartIndex,
       startTs: state.turnStartTs,
       endTs: endTs,
-      aborted: aborted,
+      aborted: aborted || state.turnAborted,
+      failed: state.turnFailed,
     );
     state.resetTurn();
   }
@@ -666,6 +675,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
     required String? startTs,
     required String? endTs,
     bool aborted = false,
+    bool failed = false,
   }) {
     if (entries.isEmpty || entries.last['kind'] == 'turn_end') return;
     final safeStart = startIndex.clamp(0, entries.length - 1).toInt();
@@ -688,6 +698,7 @@ class _AgentConsoleState extends State<_AgentConsole> {
       ..._durationEntry(duration),
       'response': response,
       'aborted': aborted,
+      'failed': failed,
     });
   }
 
@@ -1400,6 +1411,7 @@ class _TurnEndCardState extends State<_TurnEndCard> {
     final duration = entry['duration'] as Duration?;
     final response = entry['response'] as String? ?? '';
     final aborted = entry['aborted'] == true;
+    final failed = entry['failed'] == true;
     final codeBlocks = _codeBlocks(response);
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
@@ -1415,9 +1427,17 @@ class _TurnEndCardState extends State<_TurnEndCard> {
               child: Row(
                 children: [
                   Icon(
-                    aborted ? Icons.stop_outlined : Icons.check_circle,
+                    aborted
+                        ? Icons.stop_outlined
+                        : failed
+                        ? Icons.error_outline
+                        : Icons.check_circle,
                     size: 13,
-                    color: aborted ? Colors.amber : const Color(0xff78dba9),
+                    color: aborted
+                        ? Colors.amber
+                        : failed
+                        ? const Color(0xfff28b82)
+                        : const Color(0xff78dba9),
                   ),
                   const SizedBox(width: 7),
                   const Text(
@@ -1434,11 +1454,14 @@ class _TurnEndCardState extends State<_TurnEndCard> {
                       ),
                     ),
                   ],
-                  if (aborted) ...[
+                  if (aborted || failed) ...[
                     const SizedBox(width: 6),
-                    const Text(
-                      'aborted',
-                      style: TextStyle(fontSize: 11, color: Colors.amber),
+                    Text(
+                      aborted ? 'aborted' : 'failed',
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: aborted ? Colors.amber : const Color(0xfff28b82),
+                      ),
                     ),
                   ],
                   Icon(
@@ -1471,6 +1494,8 @@ class _TurnEndCardState extends State<_TurnEndCard> {
               child: Text(
                 aborted
                     ? 'The agent was stopped before the turn completed.'
+                    : failed
+                    ? 'The agent failed before the turn completed.'
                     : 'Turn complete. Tap the response actions to copy output.',
                 style: const TextStyle(fontSize: 11, color: Color(0xff737373)),
               ),

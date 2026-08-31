@@ -757,6 +757,68 @@ void main() {
     }
   });
 
+  testWidgets('reused native tool IDs stay scoped to their own turns (#215)', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    final bus = FakeBus();
+    final host = _host(bus);
+    host.sessions.applySnapshot({'host': {
+      'id': 'host', 'name': 'Host', 'host': true, 'state': 'ended',
+      'model': 'fixture', 'cwd': '/tmp', 'transcript': [
+        for (final turn in ['First', 'Second']) ...[
+          {'type': 'input', 'content': '$turn request'},
+          {'type': 'tool_execution_end', 'toolCallId': 'call_0', 'toolName': 'fixture_read', 'result': '$turn tool result'},
+          {'type': 'message', 'role': 'assistant', 'text': '$turn answer'},
+          {'type': 'agent_end'},
+        ],
+      ],
+    }});
+    await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 950));
+    await tester.pumpAndSettle();
+    expect(find.byType(ExpansionTile), findsNWidgets(2));
+    await tester.tap(find.byType(ExpansionTile).first);
+    await tester.pumpAndSettle();
+    expect(find.text('First tool result'), findsOneWidget);
+    await tester.tap(find.byType(ExpansionTile).last);
+    await tester.pumpAndSettle();
+    expect(find.text('Second tool result'), findsOneWidget);
+    expectNoFlutterErrors(tester);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    await bus.dispose();
+  });
+
+  testWidgets('reopened partial terminal answers never receive a success footer (#215)', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 1000));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    for (final reason in ['error', 'aborted']) {
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({'host': {
+        'id': 'host', 'name': 'Host', 'host': true, 'state': 'ended',
+        'model': 'fixture', 'cwd': '/tmp', 'transcript': [
+          {'type': 'input', 'content': 'Run fixture'},
+          {'type': 'message', 'role': 'assistant', 'text': 'Partial answer',
+           'stopReason': reason, 'errorMessage': 'Fixture $reason'},
+        ],
+      }});
+      for (var reopen = 0; reopen < 2; reopen++) {
+        await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 950));
+        await tester.pumpAndSettle();
+        expect(tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data, 'Partial answer');
+        expect(find.byIcon(Icons.check_circle), findsNothing);
+        expect(find.text(reason == 'error' ? 'failed' : 'aborted'), findsOneWidget);
+        await tester.tap(find.byKey(const Key('agent_console_turn_summary')));
+        await tester.pumpAndSettle();
+        expect(find.textContaining('Turn complete.'), findsNothing);
+        expectNoFlutterErrors(tester);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pumpAndSettle();
+      }
+      await bus.dispose();
+    }
+  });
+
   testWidgets('model dropdown lists available models and reflects selection', (
     tester,
   ) async {
