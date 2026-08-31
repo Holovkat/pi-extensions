@@ -15,6 +15,7 @@ class MockHubBus extends PifBus {
   final connectionController = StreamController<bool>.broadcast();
   final sent = <String>[];
   bool online = false;
+  String get workspacePath => _workspace.path;
   @override
   Stream<PifEnvelope> get events => eventController.stream;
   @override
@@ -60,7 +61,7 @@ class MockHubBus extends PifBus {
             'host': true,
             'state': 'idle',
             'model': 'mock',
-            'cwd': '/tmp',
+            'cwd': workspacePath,
           },
         },
         'widgets':
@@ -73,7 +74,7 @@ class MockHubBus extends PifBus {
             },
         'catalog': {},
         'layout': layout ?? {'panels': {}},
-        'health': {'workspace': '/tmp'},
+        'health': {'workspace': workspacePath},
       },
     ),
   );
@@ -102,6 +103,12 @@ class MockHubBus extends PifBus {
     await connectionController.close();
   }
 }
+
+late Directory _workspace;
+
+Widget _shell(MockHubBus bus) => MaterialApp(
+  home: DockingShell(bus: bus, workspace: bus.workspacePath),
+);
 
 /// Minimal hub-like WebSocket server used by the reconnect test.
 /// dart:io's server.close(force) does not terminate upgraded sockets, so
@@ -154,6 +161,16 @@ Future<HubLikeServer> startHubLikeServer(int port, List<String> received) async 
 }
 
 void main() {
+  setUp(() {
+    _workspace = Directory.systemTemp.createTempSync('pif_integration_smoke_test');
+  });
+
+  tearDown(() {
+    if (_workspace.existsSync()) {
+      _workspace.deleteSync(recursive: true);
+    }
+  });
+
   testWidgets('shell renders at tiny surface sizes without clamping exceptions', (
     tester,
   ) async {
@@ -171,7 +188,7 @@ void main() {
     };
     try {
       final bus = MockHubBus();
-      await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+      await tester.pumpWidget(_shell(bus));
       bus.emitSnapshot();
       await tester.pump();
       await tester.pump();
@@ -275,7 +292,7 @@ void main() {
   testWidgets('tabbed panels drag into collapsed dock edges', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     bus.emitSnapshot(
       widgets: {
         'agent_console': {'enabled': true},
@@ -316,7 +333,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     final widgets = {
       'agent_console': {'enabled': true},
       'terminal': {'enabled': true},
@@ -357,7 +374,7 @@ void main() {
     // re-request after subscribing instead of missing it forever.
     await bus.connect();
     bus.emitSnapshot();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     expect(
       bus.sent.where((event) => event == 'shell/state:snapshot_request').length,
       greaterThanOrEqualTo(2),
@@ -375,7 +392,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     // No center widgets (agent console off): terminal takes the stage.
     bus.emitSnapshot(
       widgets: {
@@ -403,7 +420,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     final widgets = {
       'agent_console': {'enabled': true},
       'status_bar': {'enabled': true},
@@ -433,7 +450,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     bus.emitSnapshot(
       widgets: {
         'agent_console': {'enabled': true},
@@ -462,7 +479,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     bus.emitSnapshot(
       widgets: {
         'agent_console': {'enabled': true},
@@ -495,7 +512,7 @@ void main() {
   testWidgets('dividers resize docks and persist the sizes', (tester) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     final widgets = {
       'agent_console': {'enabled': true},
       'session_rail': {'enabled': true},
@@ -541,7 +558,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     final widgets = {
       'agent_console': {'enabled': true},
       'session_rail': {'enabled': true},
@@ -599,7 +616,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     bus.emitSnapshot(
       widgets: {
         'agent_console': {'enabled': true},
@@ -638,7 +655,7 @@ void main() {
   ) async {
     await tester.binding.setSurfaceSize(const Size(1400, 900));
     final bus = MockHubBus();
-    await tester.pumpWidget(MaterialApp(home: DockingShell(bus: bus)));
+    await tester.pumpWidget(_shell(bus));
     bus.emitSnapshot();
     await tester.pump();
     expect(find.text('Mock Host'), findsWidgets);

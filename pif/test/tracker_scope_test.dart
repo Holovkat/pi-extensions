@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -113,14 +114,28 @@ Widget _panel(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
 
 Future<(FakeBus, PifHost)> _pump(WidgetTester tester) async {
   final bus = FakeBus();
-  final host = PifHost(bus: bus);
+  final host = PifHost(bus: bus)
+    ..workspace = _workspace.path
+    ..storage.workspace = _workspace.path;
   host.snapshot = {'tracker': _fixture()};
   await tester.pumpWidget(_panel(TrackerBoardPlugin(), host));
   await tester.pump();
   return (bus, host);
 }
 
+late Directory _workspace;
+
 void main() {
+  setUp(() {
+    _workspace = Directory.systemTemp.createTempSync('pif_tracker_scope_test');
+  });
+
+  tearDown(() {
+    if (_workspace.existsSync()) {
+      _workspace.deleteSync(recursive: true);
+    }
+  });
+
   testWidgets('All work view stays the default and shows every card', (
     tester,
   ) async {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -13,6 +14,8 @@ import 'package:pif/widgets/status_bar/status_bar.dart';
 import 'package:pif/widgets/terminal/terminal.dart';
 import 'package:pif/widgets/tracker_board/tracker_board.dart';
 import 'package:pif/widgets/widget_store/widget_store.dart';
+
+late Directory _workspace;
 
 class FakeBus extends PifBus {
   FakeBus() : super(uri: Uri.parse('ws://127.0.0.1:1/pif'));
@@ -67,7 +70,24 @@ Widget panel(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
   ),
 );
 
+PifHost _host(FakeBus bus, {String? workspace}) {
+  final host = PifHost(bus: bus);
+  host.workspace = workspace ?? _workspace.path;
+  host.storage.workspace = _workspace.path;
+  return host;
+}
+
 void main() {
+  setUp(() {
+    _workspace = Directory.systemTemp.createTempSync('pif_core_and_widgets_test');
+  });
+
+  tearDown(() {
+    if (_workspace.existsSync()) {
+      _workspace.deleteSync(recursive: true);
+    }
+  });
+
   test('envelope validates and round-trips JSON', () {
     final value = PifEnvelope.fromJson({
       'v': 1,
@@ -82,7 +102,7 @@ void main() {
   });
   test('contract host applies authoritative sessions snapshot', () {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'child': {
         'id': 'child',
@@ -108,7 +128,7 @@ void main() {
   });
   test('host follows a created session and falls back after deletion', () {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -150,7 +170,7 @@ void main() {
   });
   testWidgets('Agent Console renders streams and emits input', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -173,7 +193,7 @@ void main() {
   });
   testWidgets('Agent Console renders authoritative turns once', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -221,7 +241,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -247,7 +267,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus)
+    final host = _host(bus)
       ..models = ['openai-codex/gpt-5.6-sol', 'fixture/fast'];
     host.sessions.applySnapshot({
       'host': {
@@ -274,7 +294,7 @@ void main() {
 
   testWidgets('console title renames inline on double-click', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -311,7 +331,7 @@ void main() {
 
   testWidgets('session cards context menu renames and deletes', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus)..workspace = '/tmp';
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -392,7 +412,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus)
+    final host = _host(bus)
       ..models = ['openai-codex/gpt-5.6-sol', 'fixture/fast'];
     host.sessions.applySnapshot({
       'host': {
@@ -416,7 +436,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -459,7 +479,7 @@ void main() {
     'Agent Console shows one start tag and a duration footer with copy actions',
     (tester) async {
       final bus = FakeBus();
-      final host = PifHost(bus: bus);
+      final host = _host(bus);
       host.sessions.applySnapshot({
         'host': {
           'id': 'host',
@@ -493,7 +513,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -561,7 +581,7 @@ void main() {
   });
   testWidgets('Session Rail pins host and exposes New Session', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.sessions.applySnapshot({
       'host': {
         'id': 'host',
@@ -579,7 +599,7 @@ void main() {
   });
   testWidgets('Status Bar reflects connection and workspace', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus)..workspace = '/workspace';
+    final host = _host(bus, workspace: '/workspace');
     await tester.pumpWidget(panel(StatusBarPlugin(), host));
     expect(find.text('Hub connected'), findsOneWidget);
     expect(find.text('/workspace'), findsOneWidget);
@@ -589,7 +609,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     await tester.pumpWidget(panel(StatusBarPlugin(), host));
     await tester.tap(find.byIcon(Icons.restore));
     await tester.pumpAndSettle();
@@ -613,7 +633,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {
       'widgets': {
         'agent_console': {
@@ -635,7 +655,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     await tester.pumpWidget(panel(DiffViewerPlugin(), host));
     expect(find.text('Phase 1 real-use trial'), findsOneWidget);
     expect(find.byType(TextField), findsNWidgets(2));
@@ -656,7 +676,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture(stale: true)};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -674,7 +694,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -693,7 +713,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -724,7 +744,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -745,7 +765,7 @@ void main() {
 
   testWidgets('ticket sheet creates a ticket through the hub', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -771,7 +791,7 @@ void main() {
 
   testWidgets('ticket sheet surfaces create failures and stays open', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -789,7 +809,7 @@ void main() {
 
   testWidgets('ticket sheet edits a card and returns to view mode on success', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -818,7 +838,7 @@ void main() {
 
   testWidgets('ticket sheet moves a card via the lane dropdown', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -843,7 +863,7 @@ void main() {
 
   testWidgets('ticket sheet deletes a card after confirmation', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -869,7 +889,7 @@ void main() {
 
   testWidgets('ticket sheet resizes from the corner handle', (tester) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
     await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
     await tester.pump();
@@ -887,7 +907,7 @@ void main() {
     tester,
   ) async {
     final bus = FakeBus();
-    final host = PifHost(bus: bus);
+    final host = _host(bus);
     await tester.pumpWidget(
       MaterialApp(
         home: PanelErrorBoundary(plugin: _ThrowingPlugin(), host: host),

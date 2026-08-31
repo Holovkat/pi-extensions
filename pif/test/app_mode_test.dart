@@ -47,6 +47,8 @@ class FakeBus extends PifBus {
 /// ({id, name, home, pages}). Lane A's layered-sources work (#155) is
 /// faked here with widget `source` provenance fields.
 class FakeHubBus extends FakeBus {
+  String workspacePath = '/tmp';
+
   void emitSnapshot({
     Map<String, dynamic>? app,
     Map<String, dynamic>? layout,
@@ -58,7 +60,7 @@ class FakeHubBus extends FakeBus {
         'host': true,
         'state': 'idle',
         'model': 'fake',
-        'cwd': '/tmp',
+        'cwd': workspacePath,
       },
     },
     'widgets': const {
@@ -68,7 +70,7 @@ class FakeHubBus extends FakeBus {
     },
     'catalog': const {},
     'layout': layout ?? const {'panels': {}},
-    'health': {'workspace': '/tmp'},
+    'health': {'workspace': workspacePath},
     'app': ?app,
   });
 }
@@ -139,6 +141,7 @@ Future<Directory> _pumpShell(
   // leaks between tests (or into the repo checkout). Sync I/O only:
   // awaited real-async I/O never completes inside the FakeAsync zone.
   final workspace = Directory.systemTemp.createTempSync('pif_app_mode_test');
+  bus.workspacePath = workspace.path;
   await tester.pumpWidget(
     MaterialApp(
       home: DockingShell(
