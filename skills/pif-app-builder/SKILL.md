@@ -5,9 +5,10 @@ description: >
   all the way to a working application inside the pif shell — design pass
   (pif-app-designer), owner approval, pif_app_init (optionally --template
   mercury), then page/widget scaffolding through the analyzer gate, with
-  compiler diagnostics round-tripping to the owner. Zero manual file
-  editing at any point. Use when the owner gives a brief for a new pif app,
-  or asks to build/extend an app declared by pif_app/app.yaml.
+  agent-authored Dart writes round-tripping compiler diagnostics to the
+  owner. Zero manual owner editing at any point. Use when the owner gives a
+  brief for a new pif app, or asks to build/extend an app declared by
+  pif_app/app.yaml.
 ---
 
 # pif App Builder (agentic build flow)
@@ -20,11 +21,13 @@ never improvise layout inside the build loop.
 
 ## Guardrails
 
-1. **Zero manual file editing.** Every artifact is created by a pif tool
-   (`pif_app_init`, `pif_app_page_add`, `pif_app_widget_add`,
-   `pif_app_home_set`) or by the analyzer-gated install pipeline. If you
-   find yourself wanting to hand-edit a generated file, stop and re-plan
-   the piece instead.
+1. **No manual owner editing.** Every artifact is still created by a pif
+   tool (`pif_app_init`, `pif_app_page_add`, `pif_app_widget_add`,
+   `pif_app_home_set`) or by the analyzer-gated install pipeline, but the
+   agent may write the scoped Dart for an approved piece inside
+   `pif_app/widgets/` or the approved foundation files before install. The
+   owner never patches generated files by hand. If a piece would need a
+   bypass around the gate, stop and re-plan it instead.
 2. **Complexity gate: ≤ 5 per piece.** One page or one widget per
    scaffolding call. A piece that needs "and" is two pieces. Add
    sophistication by composing more small pieces, not by growing one.
@@ -54,9 +57,10 @@ never improvise layout inside the build loop.
    `pif_app_widget_add` with `{ name, id, slot }`. Then flesh out each
    piece: re-enter the piece with the owner (or a child session with a
    scoped brief: the page's job, its components from the template kit, its
-   token bindings) and iterate on the generated `.dart` through
-   `pif_widget_create` / `pif_widget_install` — small pieces, gate every
-   round, diagnostics round-trip visibly.
+   token bindings). The app loop starts from the `pif_app_*` scaffold
+   once, then you write or revise the scoped Dart for that existing piece
+   and rerun `pif_widget_install` for every correction — small pieces, gate
+   every round, diagnostics round-trip visibly.
 5. **Confirm the home page.** `pif_app_home_set` if the plan's home differs
    from the scaffold; otherwise confirm `pif_app_list` shows every plan
    page installed and enabled.
@@ -72,8 +76,9 @@ never improvise layout inside the build loop.
 
 For pieces worth parallel attention, dispatch a child session with a
 scoped brief: one piece, its plan section, the template kit, and the exact
-tools it may call. The child never edits files directly — it closes its
-piece through the same gated tools and reports diagnostics.
+tools it may call. The child writes only the scoped Dart it owns, then
+closes its piece through `pif_widget_install` for any follow-up
+corrections and reports diagnostics.
 
 ## Output
 
