@@ -946,8 +946,11 @@ class PifHub {
 			if (!source) throw new Error(`Template '${template}' not found (searched project pinned copy, ${this.globalCatalogPath}/templates, and the app's bundled templates)`);
 			const to = path.join(this.state.health.workspace, "pif_app", "template");
 			fs.mkdirSync(path.dirname(to), { recursive: true });
-			fs.rmSync(to, { recursive: true, force: true });
-			fs.cpSync(source, to, { recursive: true });
+			const sameTemplateDir = fs.existsSync(to) ? fs.realpathSync(source) === fs.realpathSync(to) : path.resolve(source) === path.resolve(to);
+			if (!sameTemplateDir) {
+				fs.rmSync(to, { recursive: true, force: true });
+				fs.cpSync(source, to, { recursive: true });
+			}
 		}
 		fs.mkdirSync(path.dirname(this.appManifestPath()), { recursive: true });
 		this.appInitializing = true;
