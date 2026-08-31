@@ -42,13 +42,13 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 - Tracker precursor sprint #163–#166 (repo-synced Kanban tracker panel v0.1: sprint, hub sync layer, board widget, verification) is historical shipped context and no longer the active planning surface for this snapshot.
 
 ### pif App Builder Remediation Snapshot (#160, 31 August 2026)
-- Tested code candidate: `3bc8e1fc` on `codex/pif-app-builder-154`; the final documentation handoff does not change that built code revision.
-- Canonical requirements remain GitHub #158/#159/#160. There are 27 native remediation children: 24 implementation tasks in Review and owner-gated #204/#206/#212 blocked. #215 and #217 have final rebuilt UI evidence.
-- Both actual artifacts launch and obtain real answers using the existing native Pi profile. Installed stock passed valid New Session, Send, Steer, Abort/recovery, replay and widget toggles. Export passed Settings-home restart, a tool response, and widget toggles. Both signed bundles remained byte-for-byte unchanged after the checks.
-- Stock is installed at `/Applications/pif.app`, left at the clean project picker as PID 52706. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` was normally quit after testing. This technical fixture does not establish Mercury sample acceptance or clean-machine authentication provisioning.
-- Two combined gate attempts failed. Separate Node 63/63, clean analysis and Flutter 77/77 evidence exists on `4972a603`; final `3bc8e1fc` has eight passing focused transcript cases and live UI proof. No combined full gate has passed at tip.
-- #160 remains blocked on the export support-boundary decision, approved Mercury sample/appearance work and final combined acceptance. Historical seven-task owner approvals (#154/#155/#156/#157/#178/#188/#189) are preserved.
-- [Current report](../../docs/reviews/2026-08-31-remediation-verification.md) distinguishes final UI proof, earlier checks, operational incidents and remaining acceptance gaps. The dated baseline review is retained separately.
+- Tested and pushed code candidate: `dc45ff40` on `codex/pif-app-builder-154`. Documentation handoff does not change the built revision.
+- Live #160 readback confirms 27 native remediation children: 24 implementation tasks in Review; owner-gated #204/#206/#212 blocked. Canonical requirements remain #158/#159/#160.
+- Fresh full gate passes at dc45ff40: 66 Node tests, clean Dart analysis and 81 Flutter tests in one clean-checkout run. Prior failed gates and the earlier bdfe5bb4 pass are preserved in the report.
+- This E2E run additionally fixed native model setup/selection, empty-failure history contamination and URI-encoded filesystem paths. Existing legacy host history is preserved by a verified no-overwrite copy into the canonical path.
+- Stock at `/Applications/pif.app` passed real child/Steer/Abort/tool recovery and widget checks, then reopened at the clean picker as PID 81004. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` passed empty-profile guidance, configured write/read, migration and restart persistence; final PID 80355 normally quit. Both bundles remain unchanged and pass strict signatures.
+- #160 remains open for the export support-boundary decision, approved Mercury sample/appearance implementation and owner acceptance. Native folder chooser completion and new OAuth/denied-permission provisioning are not proven. The technical scaffold export is not Mercury sample acceptance.
+- [Current report](../../docs/reviews/2026-08-31-remediation-verification.md) links final evidence and remaining gates. Historical owner approvals #154/#155/#156/#157/#178/#188/#189 and the original review remain unchanged.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.

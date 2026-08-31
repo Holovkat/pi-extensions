@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T07:13:51Z - Recorded final full gate and native end-to-end results
+
+Updated the current report/state with dc45ff40, 66 Node and 81 Flutter passing tests, real missing-auth/recovery/restart proof and unchanged signed bundles. Preserved the three remaining owner gates and native chooser limitation; no epic acceptance or release was claimed.
+
 ## 2026-08-31T06:58:44Z - Recorded filesystem path correction and history preservation
 
 Indexed the #201 URI/filesystem boundary fix and safe copy of matching legacy host history into a missing canonical destination. Focused checks reproduce the old path failure and verify preservation; native launch proof remains pending.

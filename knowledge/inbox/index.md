@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Final full gate and native recovery workflow proof](./2026-08-31T07-13-51Z-pif-end-to-end-final-candidate.md) | 2026-08-31T07:13:51Z | pif, verification, computer-use | #160, #201, #204, #205, #206, #212, #215 |
 | [Filesystem paths and preserved legacy host history](./2026-08-31T06-58-44Z-pif-filesystem-paths-and-host-history-preservation.md) | 2026-08-31T06:58:44Z | pif, paths, history, migration | #160, #201 |
 | [Empty failure no longer contaminates a later history turn](./2026-08-31T06-53-12Z-pif-empty-failure-history-turn-boundary.md) | 2026-08-31T06:53:12Z | pif, transcript, history | #160, #215 |
 | [Native profile setup and real host model selection](./2026-08-31T06-52-34Z-pif-native-profile-first-run-guidance.md) | 2026-08-31T06:52:34Z | pif, models, authentication | #160, #201 |
