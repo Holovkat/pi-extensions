@@ -1154,8 +1154,9 @@ class PifHub {
 
 	/// pif_app is a package per the layered-sources convention (#155): its
 	/// pubspec (flutter + a path dep on the app) gives the analyzer a package
-	/// config for project widgets. Scaffolded once; pub get runs here so the
-	/// install gate sees resolved packages.
+	/// config for project widgets. Resolve the writable host package first:
+	/// fresh installed environments cannot depend on a concurrently starting
+	/// Flutter preview to create its package identity before the analyzer gate.
 	private scaffoldAppPackage() {
 		const pubspec = assertWritablePifPath(path.join(this.state.health.workspace, "pif_app", "pubspec.yaml"));
 		const root = path.dirname(pubspec);
@@ -1163,8 +1164,10 @@ class PifHub {
 			const appRef = path.relative(root, this.appDir).split(path.sep).join("/");
 			fs.writeFileSync(pubspec, `name: pif_app\npublish_to: none\nenvironment:\n  sdk: ^3.5.0\ndependencies:\n  flutter:\n    sdk: flutter\n  pif:\n    path: ${appRef}\n`);
 		}
-		const pubGet = spawnSync(process.env.PIF_FLUTTER_BIN || "flutter", ["pub", "get"], { cwd: path.dirname(pubspec), encoding: "utf8", timeout: 180_000 });
-		if (pubGet.status !== 0) throw new Error(`flutter pub get failed in pif_app: ${pubGet.stdout}${pubGet.stderr}`);
+		for (const directory of [assertWritablePifPath(this.appDir), root]) {
+			const pubGet = spawnSync(process.env.PIF_FLUTTER_BIN || "flutter", ["pub", "get"], { cwd: directory, encoding: "utf8", timeout: 180_000 });
+			if (pubGet.status !== 0) throw new Error(`flutter pub get failed in ${path.basename(directory)}: ${pubGet.stdout}${pubGet.stderr}`);
+		}
 	}
 
 	private assertNoApp() {

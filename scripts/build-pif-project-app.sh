@@ -310,10 +310,10 @@ done
 echo "9. Bundling app source ..."
 PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-runtime-source "$STAGE" "$RESOURCES/app" > /dev/null
 
-# 9b. Retain the complete builder for future editable environments. Only the
-# known source inputs are copied; no stage outputs, profiles or parent bundles.
+# 9b. Retain canonical builder inputs for future editable environments,
+# independently of this export's mutable app source and pinned widget set.
 echo "9b. Bundling the versioned builder kit ..."
-PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" create "$REPO_ROOT" "$RESOURCES/builder" "$PIF_BUNDLE_NODE" "$PI_PKG_DIR" "$PIF_APP_TEMPLATE_DIR" > /dev/null
+pif_bundle_builder_kit "$RESOURCES/builder" > /dev/null
 
 # 10. Ship the app manifest for first-run workspace bootstrap
 echo "10. Bundling the app manifest ..."

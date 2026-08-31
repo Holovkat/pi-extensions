@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 export const BUILDER_SCHEMA_VERSION = 1;
 export const BUILDER_LAYOUT = Object.freeze({
@@ -162,7 +162,26 @@ export function sealBuilderKit(root) {
   return manifest;
 }
 
-export function createBuilderKit(sourceRoot, destination, nodeBinary, piRoot, appTemplate = path.join(sourceRoot, 'pif')) {
+async function generateBaseRegistry(root) {
+  // Reuse canonical parsing/codegen, but derive entries solely from the files
+  // included in this template. A live checkout registry may contain overlays.
+  const { parseWidgetManifest, generateWidgetRegistry } = await import(pathToFileURL(path.join(root, 'extensions/pif-shared.ts')).href);
+  const widgets = path.join(root, 'pif/lib/widgets');
+  const manifests = [];
+  for (const entry of fs.readdirSync(widgets, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const manifestPath = path.join(widgets, entry.name, 'widget.yaml');
+    if (!fs.existsSync(manifestPath)) continue;
+    const manifest = parseWidgetManifest(fs.readFileSync(manifestPath, 'utf8'));
+    if (manifest.id !== entry.name || !fs.statSync(path.join(widgets, entry.name, `${manifest.id}.dart`), { throwIfNoEntry: false })?.isFile()) {
+      fail(`Incomplete base widget source: ${entry.name}`);
+    }
+    manifests.push({ ...manifest, source: 'base' });
+  }
+  fs.writeFileSync(path.join(root, 'pif/lib/widget_registry.g.dart'), generateWidgetRegistry(manifests));
+}
+
+export async function createBuilderKit(sourceRoot, destination, nodeBinary, piRoot) {
   // Source-checkout output normally lives under its own build/. Only these
   // explicit inputs are copied, so that output can never recurse into itself.
   const target = process.env.PIF_BUILDER_ASSEMBLY === '1' ? existingPath(destination) : assertWritableBuilderPath(destination);
@@ -173,7 +192,8 @@ export function createBuilderKit(sourceRoot, destination, nodeBinary, piRoot, ap
   for (const name of fs.readdirSync(path.join(sourceRoot, 'extensions')).sort()) {
     if (/^pif(?:[.-].*)?\.(?:ts|mjs)$/.test(name) && !/\.test\./.test(name)) copyTree(path.join(sourceRoot, 'extensions', name), path.join(target, 'extensions', name));
   }
-  copyAppSource(appTemplate, path.join(target, 'pif'), { allowBundle: true });
+  copyAppSource(path.join(sourceRoot, 'pif'), path.join(target, 'pif'), { allowBundle: true });
+  await generateBaseRegistry(target);
   for (const name of ['pif-app-builder', 'pif-app-designer']) {
     const source = path.join(sourceRoot, 'skills', name);
     copyTree(source, path.join(target, 'skills', name), source, new Set(), omitSourceEntry);
@@ -189,6 +209,21 @@ export function copyBuilderKit(source, destination) {
   copyTree(source, target); // An existing kit is copied exactly, without source filters.
   validateBuilderKit(target, { expectedVersion: manifest.builderVersion });
   freezeKit(target);
+  return { root: target, manifest };
+}
+
+export function copyBuilderKitForAssembly(source, destination) {
+  if (process.env.PIF_BUILDER_ASSEMBLY !== '1') fail('Builder kit packaging requires an explicit assembly context.');
+  const manifest = validateBuilderKit(source);
+  const target = destinationFor(source, destination, true);
+  const app = path.dirname(path.dirname(path.dirname(target)));
+  assemblyDirectory(path.dirname(app), source);
+  if (!app.endsWith('.app') || target !== path.join(app, 'Contents/Resources/builder') || !fs.lstatSync(app).isDirectory()) {
+    fail('Builder kit packaging requires an owned staged app Resources/builder directory.');
+  }
+  copyTree(source, target);
+  validateBuilderKit(target, { expectedVersion: manifest.builderVersion });
+  // Keep only the assembly copy writable for deep signing, then seal/freeze it.
   return { root: target, manifest };
 }
 
@@ -314,6 +349,7 @@ const commands = {
   'discard-assembly': ([directory, kit]) => discardBuilderAssembly(directory, kit),
   validate: ([root, version]) => validateBuilderKit(root, { expectedVersion: version }),
   'copy-kit': ([source, destination]) => copyBuilderKit(source, destination),
+  'copy-kit-for-assembly': ([source, destination]) => copyBuilderKitForAssembly(source, destination),
   'copy-template': ([source, destination]) => copyAppTemplate(source, destination),
   'copy-source': ([source, destination]) => ({ appTemplateDir: copyAppSource(source, destination) }),
   'copy-runtime-source': ([source, destination]) => {
@@ -322,7 +358,7 @@ const commands = {
     fs.rmSync(path.join(appTemplateDir, 'macos'), { recursive: true });
     return { appTemplateDir };
   },
-  create: ([source, destination, node, pi, template]) => createBuilderKit(source, destination, node, pi, template),
+  create: ([source, destination, node, pi]) => createBuilderKit(source, destination, node, pi),
   seal: ([root]) => { const manifest = sealBuilderKit(root); freezeKit(root); return manifest; },
   scan: ([root]) => { scanBuilderSecrets(root); return { clean: true }; },
   writable: ([target, kitRoot]) => {
@@ -335,7 +371,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(proces
   try {
     const [command, ...args] = process.argv.slice(2);
     if (!commands[command]) fail(`Usage: pif-builder-kit.mjs <${Object.keys(commands).join('|')}> <paths...>`);
-    const result = commands[command](args);
+    const result = await commands[command](args);
     process.stdout.write(typeof result === 'string' ? `${result}\n` : `${JSON.stringify(result)}\n`);
   } catch (error) { console.error(`ERROR: ${error.message}`); process.exitCode = 1; }
 }

@@ -156,6 +156,16 @@ pif_select_build_resources() {
   export PIF_BUILDER_ROOT PIF_SOURCE_ROOT PIF_APP_TEMPLATE_DIR
 }
 
+# Runtime compilation may use the writable project app. Future environments
+# always start from the canonical kit, never that app's generated overlays.
+pif_bundle_builder_kit() {
+  if [ -n "${PIF_BUILDER_ROOT:-}" ]; then
+    PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-kit-for-assembly "$PIF_BUILDER_ROOT" "$1"
+  else
+    PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" create "$PIF_SOURCE_ROOT" "$1" "$PIF_BUNDLE_NODE" "$PI_PKG_DIR"
+  fi
+}
+
 # Start the copied dependency tree before publishing either app. A valid Node
 # binary alone cannot detect missing package build/dist modules.
 pif_validate_pi_runtime() {

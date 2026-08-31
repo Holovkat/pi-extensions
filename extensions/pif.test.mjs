@@ -9,7 +9,7 @@ const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, assertWritablePifPath, isInsideAppBundle, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
 import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange, parseAppManifest, renderAppManifest, addAppPage, setAppHome, slugifyAppId } from './pif-shared.ts';
 import { __test as __pif } from './pif.ts';
-import { sealBuilderKit, createBuilderKit, copyBuilderKit, validateBuilderKit, publishBuiltApp, discardBuilderAssembly } from '../scripts/pif-builder-kit.mjs';
+import { sealBuilderKit, createBuilderKit, copyBuilderKit, copyBuilderKitForAssembly, validateBuilderKit, publishBuiltApp, discardBuilderAssembly } from '../scripts/pif-builder-kit.mjs';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
@@ -1560,7 +1560,7 @@ function builderKitFixture(root, destination) {
     'pif/pubspec.yaml': 'name: pif\nversion: 1.0.0+1\n', 'pif/pubspec.lock': '# fixture',
     'pif/lib/main.dart': '// main', 'pif/lib/export_main.dart': '// export',
     'pif/lib/widget_registry.g.dart': '// registry', 'pif/lib/core/plugin.dart': '// core',
-    'pif/lib/widgets/fixture/widget.yaml': 'id: fixture\nname: Fixture\nslot: center\n',
+    'pif/lib/widgets/fixture/widget.yaml': 'id: fixture\nname: Fixture\nversion: 1.0.0\ndescription: Fixture widget\nslot: center\ncore: true\n',
     'pif/lib/widgets/fixture/fixture.dart': '// widget',
     'pif/macos/Runner.xcodeproj/project.pbxproj': '// project', 'pif/macos/Podfile': '# Podfile',
     'skills/pif-app-builder/SKILL.md': '# Builder', 'skills/pif-app-designer/SKILL.md': '# Designer',
@@ -1697,7 +1697,7 @@ test('builder publication keeps previous output on validation or rename failure 
   discardBuilderAssembly(candidate.assembly);
 });
 
-test('builder runtime copying preserves dependency build code and copies existing kit inventory exactly', (t) => {
+test('builder runtime copying preserves dependency build code and copies existing kit inventory exactly', async (t) => {
   const root = tempDir('pif-runtime-copy-');
   const assembly = fs.mkdtempSync(path.join(root, '.pif-assembly.'));
   t.after(() => { discardBuilderAssembly(assembly); fs.rmSync(root, {recursive:true,force:true}); });
@@ -1717,7 +1717,7 @@ test('builder runtime copying preserves dependency build code and copies existin
   write('pif/macos/Flutter/ephemeral/generated.xcconfig', 'NATIVE_BUILD_CACHE');
   write('pif/macos/Pods/generated', 'PODS_CACHE');
   const generated = path.join(assembly, 'generated');
-  createBuilderKit(source, generated, path.join(source,'runtime/node'), path.join(source,'runtime/pi'));
+  await createBuilderKit(source, generated, path.join(source,'runtime/node'), path.join(source,'runtime/pi'));
   for (const file of runtimeFiles) assert.equal(fs.readFileSync(path.join(generated,file),'utf8'),fs.readFileSync(path.join(source,file),'utf8'),file);
   for (const file of ['pif/build','pif/macos/Flutter/ephemeral','pif/macos/Pods','runtime/pi/node_modules/fixture/types.d.ts']) assert.equal(fs.existsSync(path.join(generated,file)),false,file);
   // A validated existing kit may have additional inventoried input types.
@@ -1728,6 +1728,63 @@ test('builder runtime copying preserves dependency build code and copies existin
   const copied = path.join(assembly, 'child'); copyBuilderKit(generated,copied);
   assert.deepEqual(validateBuilderKit(copied).files,manifest.files);
   assert.equal(fs.readFileSync(path.join(copied,'runtime/pi/node_modules/fixture/inventoried.d.ts'),'utf8'),'// intentionally inventoried declaration');
+});
+
+test('builder packaging retains canonical kit inputs and regenerates only portable source-template registries', (t) => {
+  const root = tempDir('pif-kit-portability-');
+  const assembly = fs.mkdtempSync(path.join(root, '.pif-assembly.'));
+  const inputArea = fs.mkdtempSync(path.join(root, '.pif-assembly.'));
+  t.after(() => { discardBuilderAssembly(assembly); discardBuilderAssembly(inputArea); fs.rmSync(root, {recursive:true,force:true}); });
+  const source = path.join(assembly, 'source'); builderKitFixture(assembly, source);
+  const main = 'pif/lib/main.dart';
+  const registry = 'pif/lib/widget_registry.g.dart';
+  fs.writeFileSync(path.join(source, main), '// canonical base app');
+  fs.writeFileSync(path.join(source, registry), "import 'file:///private/tmp/creator/pif_app/widgets/home/home.dart';\n");
+  const extra = path.join(source, 'pif/lib/widgets/extra'); fs.mkdirSync(extra);
+  fs.writeFileSync(path.join(extra, 'widget.yaml'), 'id: extra\nname: Extra\nversion: 1.0.0\ndescription: Included widget\nslot: center\ncore: false\n');
+  fs.writeFileSync(path.join(extra, 'extra.dart'), '// included base widget');
+  const mutable = path.join(assembly, 'project/pif'); fs.cpSync(path.join(source, 'pif'), mutable, {recursive:true});
+  fs.writeFileSync(path.join(mutable, 'lib/main.dart'), '// parent project edits');
+  const destination = (name) => {
+    const app = path.join(assembly, `${name}.app`); fs.mkdirSync(app);
+    return path.join(app, 'Contents/Resources/builder');
+  };
+  const packageKit = (target, kit = '') => childProcess.spawnSync('/bin/bash', ['-c', 'source "$1"; pif_bundle_builder_kit "$2"',
+    'fixture', path.join(repo, 'scripts/pif-node-runtime.sh'), target], {
+    encoding:'utf8', timeout:20_000,
+    env:{...process.env, PIF_BUILDER_ROOT:kit, PIF_SOURCE_ROOT:kit || source, PIF_APP_TEMPLATE_DIR:mutable,
+      PIF_BUNDLE_NODE:process.execPath, PIF_BUILDER_HELPER:path.join(repo, 'scripts/pif-builder-kit.mjs'), PI_PKG_DIR:path.join(source, 'runtime/pi')},
+  });
+  const generated = destination('Source');
+  const creation = packageKit(generated); assert.ifError(creation.error); assert.equal(creation.status, 0, creation.stderr);
+  assert.equal(fs.readFileSync(path.join(generated, main), 'utf8'), '// canonical base app');
+  const generatedRegistry = fs.readFileSync(path.join(generated, registry), 'utf8');
+  assert.doesNotMatch(generatedRegistry, /file:|creator|home|parent project/);
+  assert.match(generatedRegistry, /widgets\/fixture\/fixture\.dart/);
+  assert.match(generatedRegistry, /widgets\/extra\/extra\.dart/);
+  for (const [, uri] of generatedRegistry.matchAll(/import '([^']+)';/g)) {
+    assert.ok(!path.isAbsolute(uri) && !uri.includes('..') && !uri.includes(':'), uri);
+    assert.ok(fs.statSync(path.join(generated, 'pif/lib', uri)).isFile(), `${uri} exists inside the template`);
+  }
+  assert.match(fs.readFileSync(path.join(source, registry), 'utf8'), /file:\/\/\/private\/tmp\/creator/, 'source checkout is not rewritten');
+  const installed = path.join(inputArea, 'input-kit'); copyBuilderKit(generated, installed);
+  const original = validateBuilderKit(installed);
+  const retained = destination('Export');
+  const copying = packageKit(retained, installed); assert.ifError(copying.error); assert.equal(copying.status, 0, copying.stderr);
+  assert.deepEqual(validateBuilderKit(retained), original, 'retained inventory/version match the canonical input before signing');
+  assert.equal(fs.statSync(installed).mode & 0o222, 0, 'input kit remains immutable');
+  assert.notEqual(fs.statSync(retained).mode & 0o200, 0, 'assembly is writable until signing/seal');
+  assert.notEqual(fs.statSync(path.join(retained, 'runtime/node')).mode & 0o200, 0, 'nested runtime can be signed');
+  assert.deepEqual(validateBuilderKit(installed), original, 'packaging never modifies the input kit');
+  preserveEnvironment(t, ['PIF_BUILDER_ASSEMBLY']); delete process.env.PIF_BUILDER_ASSEMBLY;
+  assert.throws(() => copyBuilderKitForAssembly(installed, destination('Unauthorized')), /explicit assembly context/);
+  process.env.PIF_BUILDER_ASSEMBLY = '1';
+  assert.throws(() => copyBuilderKitForAssembly(installed, path.join(root, 'outside.app/Contents/Resources/builder')), /owned builder assembly|ENOENT/);
+  for (const name of ['build-pif-app.sh', 'build-pif-project-app.sh']) {
+    const script = fs.readFileSync(path.join(repo, 'scripts', name), 'utf8');
+    assert.match(script, /pif_bundle_builder_kit "\$RESOURCES\/builder"/, `${name} uses canonical kit selection`);
+    assert.doesNotMatch(script, /"\$PIF_BUILDER_HELPER" create/);
+  }
 });
 
 test('canonical copied-Pi smoke catches missing dependency modules with a clean disposable profile', (t) => {

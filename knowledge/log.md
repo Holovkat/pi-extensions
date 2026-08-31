@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T10:36:58Z - Recorded installed portability and fresh bootstrap repairs
+
+Updated the existing integration synthesis/report and state indexes with the copied-runtime startup, fresh host package restoration and canonical retained-kit fixes. Final signed stock is PID53246 with builder b0b9f4ff and 10,333 verified files. Fresh installed-resource provisioning/reopen, two-page export and a further independent environment from its exact retained kit pass without manual setup; native UI and live GitHub remain open gates under #160. Historical failed attempts and sample approval boundaries remain explicit.
+
 ## 2026-08-31T10:18:00Z - Recorded installed builder and secure Settings integration
 
 Indexed six implementation/integration syntheses and updated current state for #204/#218–#223. Recorded 79 Node tests, 129 Flutter tests, clean analysis, repaired repeat builds and installed signed candidate PID48193. Preserved prior baseline evidence and the remaining Computer Use, live token/GitHub and sample-approval boundaries. Added the six-contract disposition matrix; no release acceptance is claimed.

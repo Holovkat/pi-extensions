@@ -1215,6 +1215,10 @@ test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (
     fs.rmSync(appRoot, {recursive: true, force: true});
   });
   const appDir = copyFixture(appRoot);
+  const appPackageConfig = path.join(appDir, '.dart_tool', 'package_config.json');
+  // A newly provisioned source tree has no generated package configuration.
+  // Public init must prepare it even when no Flutter supervisor is running.
+  fs.rmSync(path.join(appDir, '.dart_tool'), {recursive: true, force: true});
   const port = await reservePort();
   const globalCatalog = path.join(workspace, '.pi', 'pif', 'catalog');
   const modelsPath = path.join(workspace, '.pi', 'agent', 'models.json');
@@ -1227,11 +1231,14 @@ test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (
   const initialSnapshot = nextMessage(socket, (value) => value.type === 'snapshot');
   const [, initial] = await Promise.all([new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); }), initialSnapshot]);
   assert.equal(initial.payload.app, null);
+  assert.equal(fs.existsSync(appPackageConfig), false, 'headless startup leaves the fresh app unprepared');
   const initializedSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.app?.id === 'notes-trial', 150_000);
   const [init, committedInit] = await Promise.all([control(controlPath, 'pif_app.init', {name: 'Notes Trial', template: 'mercury'}), initializedSnapshot]);
   assert.equal(init.ok, true);
   assert.equal(init.id, 'notes-trial');
   assert.equal(init.template, 'mercury');
+  const appPackages = JSON.parse(fs.readFileSync(appPackageConfig, 'utf8'));
+  assert.ok(appPackages.packages.some((entry) => entry.name === 'pif'), 'public init prepares the app package before the analyzer gate');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'app.yaml')), 'manifest written');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'template', 'template.yaml')), 'mercury layers pinned into the project');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'widgets', 'home', 'home.dart')), 'home page scaffolded');

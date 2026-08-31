@@ -970,7 +970,9 @@ require Flutter to run or load newly edited Dart widgets dynamically.
 The central **Settings** tab contains only **Appearance** (Light, Dark,
 System) and **GitHub**. Appearance is a non-secret device preference.
 GitHub uses a token saved to macOS Keychain for the selected environment
-UUID. There is no browser login or fallback to a global `gh` login or
+UUID and requires GitHub CLI (`gh`) in a standard macOS install location.
+Missing tooling is reported; local-only work remains available.
+There is no browser login or fallback to a global `gh` login or
 `GH_TOKEN`. New environments start disconnected; tokens are never copied
 into children, Git repositories or exported apps. A connection requires a
 short enough local path for the Unix socket (under 104 UTF-8 bytes including

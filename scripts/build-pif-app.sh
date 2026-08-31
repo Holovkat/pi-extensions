@@ -81,7 +81,7 @@ PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" copy-runtime-sou
 
 # 6b. Complete, version-matched inputs for installed authoring and export.
 echo "6b. Bundling the versioned builder kit ..."
-PIF_BUILDER_ASSEMBLY=1 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" create "$REPO_ROOT" "$RESOURCES/builder" "$PIF_BUNDLE_NODE" "$PI_PKG_DIR" "$PIF_APP_TEMPLATE_DIR" > /dev/null
+pif_bundle_builder_kit "$RESOURCES/builder" > /dev/null
 "$PIF_BUNDLE_NODE" "$PIF_BUILDER_HELPER" scan "$RESOURCES" > /dev/null
 
 # 7. Re-sign the bundle: inserting resources invalidated the release
