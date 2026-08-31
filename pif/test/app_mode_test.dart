@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -6,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:pif/core/bus.dart';
 import 'package:pif/core/docking_shell.dart';
 import 'package:pif/core/plugin.dart';
+import 'package:pif/core/pi_launcher.dart';
 import 'package:pif/widgets/widget_store/widget_store.dart';
 
 /// Fake bus: never touches a socket; the shell's connect() is a no-op so
@@ -168,6 +170,50 @@ Future<void> _teardown(WidgetTester tester, Directory workspace) async {
 }
 
 void main() {
+  test('launcher keeps literal filesystem names and rejects bundle aliases (#201)', () {
+    final root = Directory.systemTemp.createTempSync('pif-literal-path-');
+    addTearDown(() => root.deleteSync(recursive: true));
+    final canonicalRoot = root.resolveSymbolicLinksSync();
+    final path = '$canonicalRoot/Application Support/100% # café/session.jsonl';
+    expect(PiLauncher.debugResolveCanonicalPath(path), path);
+    Directory('$canonicalRoot/Application Support').createSync();
+    expect(PiLauncher.debugResolveCanonicalPath(path), path);
+    final bundle = Directory('$canonicalRoot/Test App.app/Contents')..createSync(recursive: true);
+    final link = Link('$canonicalRoot/bundle alias')..createSync(bundle.path);
+    expect(() => PiLauncher.debugEnsureWritableDestination('${link.path}/new file', role: 'fixture'), throwsArgumentError);
+    expect(File('${bundle.path}/new file').existsSync(), isFalse);
+  });
+
+  test('legacy host history migration preserves both sources and existing destinations (#201)', () async {
+    final root = Directory.systemTemp.createTempSync('pif-history-migration-');
+    addTearDown(() => root.deleteSync(recursive: true));
+    final canonicalRoot = root.resolveSymbolicLinksSync();
+    final workspace = Directory('$canonicalRoot/Application Support/Test Workspace')..createSync(recursive: true);
+    final target = File('${workspace.path}/.pi/pif/sessions/host.jsonl');
+    final legacy = File(Uri.file(target.path).path);
+    legacy.parent.createSync(recursive: true);
+    final transcript = '${jsonEncode({'type': 'session', 'version': 3, 'cwd': workspace.path})}\n'
+        '${jsonEncode({'type': 'message', 'message': {'role': 'assistant', 'content': 'KEEP_HISTORY'}})}\n';
+    legacy.writeAsStringSync(transcript);
+    expect(await PiLauncher.debugMigrateLegacyHostSession(workspace: workspace.path, sessionFile: target.path), isTrue);
+    expect(target.readAsStringSync(), transcript);
+    expect(legacy.readAsStringSync(), transcript);
+    target.writeAsStringSync('NEW_CANONICAL_HISTORY');
+    expect(await PiLauncher.debugMigrateLegacyHostSession(workspace: workspace.path, sessionFile: target.path), isFalse);
+    expect(target.readAsStringSync(), 'NEW_CANONICAL_HISTORY');
+    expect(legacy.readAsStringSync(), transcript);
+    expect(target.parent.listSync().map((entry) => entry.path), [target.path]);
+
+    final foreignWorkspace = Directory('$canonicalRoot/Other Workspace')..createSync();
+    final foreignTarget = File('${foreignWorkspace.path}/.pi/pif/sessions/host.jsonl');
+    final foreignLegacy = File(Uri.file(foreignTarget.path).path);
+    foreignLegacy.parent.createSync(recursive: true);
+    foreignLegacy.writeAsStringSync(transcript); // Header belongs to the first workspace.
+    expect(await PiLauncher.debugMigrateLegacyHostSession(workspace: foreignWorkspace.path, sessionFile: foreignTarget.path), isFalse);
+    expect(foreignTarget.existsSync(), isFalse);
+    expect(foreignLegacy.readAsStringSync(), transcript);
+  });
+
   testWidgets(
     'app manifest boots into the page stage on the declared home page',
     (tester) async {

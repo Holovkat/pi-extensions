@@ -126,7 +126,7 @@ class PiLauncher {
   }
 
   static String _normalizeAbsolutePath(String path) =>
-      Uri.file(Directory(path).absolute.path).normalizePath().path;
+      Uri.file(Directory(path).absolute.path).normalizePath().toFilePath();
 
   static String _absolutePath(String path) => Directory(path).absolute.path;
 
@@ -159,7 +159,9 @@ class PiLauncher {
           final suffix = absolute.substring(candidate.length);
           if (suffix.isEmpty) return resolvedAncestor;
           final relativeSuffix = suffix.replaceFirst(RegExp(r'^/+'), '');
-          return Uri.directory(resolvedAncestor).resolve(relativeSuffix).path;
+          return Uri.directory(resolvedAncestor)
+              .resolveUri(Uri.file(relativeSuffix))
+              .toFilePath();
         } catch (_) {
           return null;
         }
@@ -234,8 +236,98 @@ class PiLauncher {
         : _expandTildePath(candidate.trim());
     final absolute = resolved.startsWith('/')
         ? resolved
-        : Uri.directory(Directory(workspace).absolute.path).resolve(resolved).path;
+        : Uri.directory(Directory(workspace).absolute.path)
+              .resolveUri(Uri.file(resolved))
+              .toFilePath();
     return _ensureWritableDestination(absolute, role: 'native profile');
+  }
+
+  /// Older launchers treated an encoded URI path as a filesystem path.
+  /// Preserve their host history when the corrected destination is new.
+  /// Only this workspace's verified session is eligible; profile credentials
+  /// and unrelated encoded directories are never moved or copied.
+  static Future<bool> _migrateLegacyHostSession(
+    String workspace,
+    String sessionFile,
+  ) async {
+    final canonical = File(
+      _ensureWritableDestination(sessionFile, role: 'host session file'),
+    );
+    if (FileSystemEntity.typeSync(canonical.path, followLinks: false) !=
+        FileSystemEntityType.notFound) {
+      return false;
+    }
+    final legacyPath = Uri.file(canonical.path).path;
+    if (legacyPath == canonical.path ||
+        FileSystemEntity.typeSync(legacyPath, followLinks: false) !=
+            FileSystemEntityType.file) {
+      return false;
+    }
+    final legacy = File(
+      _ensureWritableDestination(legacyPath, role: 'legacy host session file'),
+    );
+    if (await legacy.length() == 0) return false;
+    final firstLine = await legacy
+        .openRead()
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .first;
+    final Object? header;
+    try {
+      header = jsonDecode(firstLine);
+    } on FormatException {
+      throw FileSystemException(
+        'Cannot verify legacy host history; the original is preserved. '
+        'Inspect its session header before retrying.',
+        legacy.path,
+      );
+    }
+    final canonicalWorkspace = _resolveCanonicalPath(workspace);
+    if (canonicalWorkspace == null ||
+        header is! Map ||
+        header['type'] != 'session' ||
+        header['cwd'] is! String ||
+        !(header['cwd'] as String).startsWith('/') ||
+        _resolveCanonicalPath(header['cwd'] as String) !=
+            canonicalWorkspace) {
+      return false;
+    }
+
+    await canonical.parent.create(recursive: true);
+    final stage = await canonical.parent.createTemp('.host-migration-');
+    try {
+      final before = await legacy.stat();
+      final stagedFile = await legacy.copy('${stage.path}/host.jsonl');
+      final after = await legacy.stat();
+      if (before.size != after.size || before.modified != after.modified) {
+        throw FileSystemException(
+          'Legacy host history changed during migration. Close the earlier '
+          'app instance and retry; the original is preserved.',
+          legacy.path,
+        );
+      }
+      // macOS link publishes one complete file atomically and fails if the
+      // destination exists. Unlike ln, it never treats a directory target as
+      // an instruction to create a file inside that directory.
+      final linked = await Process.run('/bin/link', [
+        stagedFile.path,
+        canonical.path,
+      ]);
+      if (linked.exitCode != 0) {
+        if (FileSystemEntity.typeSync(canonical.path, followLinks: false) !=
+            FileSystemEntityType.notFound) {
+          return false;
+        }
+        throw FileSystemException(
+          'Could not publish migrated host history; the original is '
+          'preserved. ${linked.stderr}',
+          canonical.path,
+        );
+      }
+      return true;
+    } finally {
+      await stage.delete(recursive: true);
+    }
   }
 
   static String? _compiledWidgetIdsForAppDir(String appDir) {
@@ -259,6 +351,11 @@ class PiLauncher {
 
   static String? debugResolveCanonicalPath(String path) =>
       _resolveCanonicalPath(path);
+
+  static Future<bool> debugMigrateLegacyHostSession({
+    required String workspace,
+    required String sessionFile,
+  }) => _migrateLegacyHostSession(workspace, sessionFile);
 
   static String? debugCompiledWidgetIdsForAppDir(String appDir) =>
       _compiledWidgetIdsForAppDir(appDir);
@@ -361,6 +458,7 @@ class PiLauncher {
       '$workspace/.pi/pif/sessions/host.jsonl',
       role: 'host session file',
     );
+    await _migrateLegacyHostSession(workspace, hostSessionFile);
     final hostSession = File(hostSessionFile);
     hostSession.parent.createSync(recursive: true);
     hostSession.writeAsStringSync('', mode: FileMode.append);

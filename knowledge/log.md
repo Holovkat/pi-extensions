@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T06:58:44Z - Recorded filesystem path correction and history preservation
+
+Indexed the #201 URI/filesystem boundary fix and safe copy of matching legacy host history into a missing canonical destination. Focused checks reproduce the old path failure and verify preservation; native launch proof remains pending.
+
 ## 2026-08-31T06:53:12Z - Recorded empty-failure history boundary correction
 
 Indexed the #215 native restart finding, minimal ordinary-turn reset and failing-baseline/passing-fix evidence. Kept the earlier error visible while preventing it from marking a subsequent successful reply as failed.
