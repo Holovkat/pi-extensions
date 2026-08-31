@@ -982,28 +982,52 @@ class PifHub {
 		};
 	}
 
-	appBuild(params: any) {
+	/** Async export: the acknowledgement and app/build build_result share a
+	 * buildId. Results retain ok/name/code/output, plus error/signal on failure. */
+	async appBuild(params: any) {
 		if (!this.state.app) throw new Error("No app manifest — run pif_app_init first");
 		const script = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "build-pif-project-app.sh");
 		if (!fs.existsSync(script)) throw new Error(`Export script not found at ${script} — exporting requires the pif dev checkout`);
 		const name = (String(params?.name ?? this.state.app.name).trim() || this.state.app.name).replace(/[\r\n/]+/g, " ").slice(0, 80);
-		const child = spawn(script, [this.state.health.workspace, name], {
-			cwd: this.state.health.workspace,
-			env: { ...process.env, PIF_APP_NAME: name },
-			encoding: "utf8",
-			timeout: 30 * 60_000,
-		});
+		const buildId = crypto.randomUUID();
+		const buildKey = `app-build:${buildId}`;
 		let output = "";
-		child.stdout?.on("data", (chunk) => { output += String(chunk); });
-		child.stderr?.on("data", (chunk) => { output += String(chunk); });
-		void new Promise<void>((resolve) => {
-			child.on("exit", (code) => {
-				const result = { ok: code === 0, name, code: code ?? -1, output: output.slice(-4000) };
-				this.broadcast("app/build", "build_result", result);
-				resolve();
+		let error: string | undefined;
+		let published = false;
+		const appendOutput = (chunk: unknown) => {
+			output = `${output}${String(chunk)}`.slice(-4000);
+		};
+		const publishResult = (code: number | null, signal: NodeJS.Signals | null = null) => {
+			if (published) return;
+			published = true;
+			this.children.delete(buildKey);
+			this.broadcast("app/build", "build_result", { ok: code === 0 && !error, buildId, name, code: code ?? -1, output, ...(error ? { error } : {}), ...(signal ? { signal } : {}) });
+		};
+		const started = await new Promise<boolean>((resolve) => {
+			let child: ChildProcessWithoutNullStreams;
+			try {
+				child = spawn(script, [this.state.health.workspace, name], {
+					cwd: this.state.health.workspace,
+					env: { ...process.env, PIF_APP_NAME: name },
+					timeout: 30 * 60_000,
+				});
+			} catch (cause) {
+				error = cause instanceof Error ? cause.message : String(cause);
+				publishResult(null); resolve(false); return;
+			}
+			this.children.set(buildKey, child);
+			child.once("spawn", () => resolve(true));
+			child.on("error", (cause) => {
+				error = cause instanceof Error ? cause.message : String(cause);
+				publishResult(null);
+				resolve(false);
 			});
+			// close follows error/exit and waits for stdout/stderr to drain.
+			child.once("close", publishResult);
+			child.stdout.on("data", appendOutput);
+			child.stderr.on("data", appendOutput);
 		});
-		return { ok: true, started: true, name, note: "Export runs asynchronously; the result arrives on the app/build channel." };
+		return { ok: started, started, buildId, name, ...(error ? { error } : {}), note: "Export result arrives as app/build build_result with the same buildId." };
 	}
 
 	private async widgetAction(type: string, payload: any) { if (type === "toggle") return this.toggleWidget(payload); if (type === "uninstall") return this.uninstallWidget(payload); if (type === "action") return this.broadcast("widget/event", "widget_event", payload); }
@@ -1052,7 +1076,7 @@ export default function pifExtension(pi: ExtensionAPI) {
 	register("pif_app_widget_add", "pif app widget add", "Add a widget-extension to the project app (dock or status slot).", Type.Object({ name: Type.String(), id: Type.Optional(Type.String()), slot: Type.Optional(Type.String()) }), "pif_app.widget_add");
 	register("pif_app_home_set", "pif app home set", "Set the app's home page (must be a declared page).", Type.Object({ id: Type.String() }), "pif_app.home_set");
 	register("pif_app_list", "pif app list", "List the project app manifest and its pages with install state.", Type.Object({}), "pif_app.list");
-	register("pif_app_build", "pif app build", "Export the project app as a standalone macOS application (builds asynchronously; result on the app/build channel).", Type.Object({ name: Type.Optional(Type.String()) }), "pif_app.build");
+	register("pif_app_build", "pif app build", "Export the project app as a standalone macOS application (builds asynchronously; app/build build_result includes the returned buildId).", Type.Object({ name: Type.Optional(Type.String()) }), "pif_app.build");
 	register("pif_tracker_create", "pif tracker create", "Create a ticket in the workspace repo. type epic|sprint|task|issue maps to labels; column applies the board's column label.", Type.Object({ title: Type.String(), body: Type.Optional(Type.String()), type: Type.Optional(Type.String()), column: Type.Optional(Type.String()) }), "tracker.create");
 	register("pif_tracker_update", "pif tracker update", "Update a ticket's title, body, and/or tags by issue number. Tags sync as GitHub labels (status:* and type labels are preserved).", Type.Object({ number: Type.Number(), title: Type.Optional(Type.String()), body: Type.Optional(Type.String()), labels: Type.Optional(Type.Array(Type.String())) }), "tracker.update");
 	register("pif_tracker_delete", "pif tracker delete", "Delete a ticket from the tracker by issue number. Irreversible on GitHub.", Type.Object({ number: Type.Number() }), "tracker.delete");

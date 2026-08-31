@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 
 export const PIF_PROTOCOL_VERSION = 1 as const;
 export const PIF_DEFAULT_PORT = 31415;
-export const PIF_CHANNELS = ["session", "widget", "store", "models", "tracker", "shell"] as const;
+export const PIF_CHANNELS = ["session", "widget", "store", "models", "tracker", "shell", "app"] as const;
 export type PifChannel = (typeof PIF_CHANNELS)[number];
 
 export interface PifEnvelope<T = unknown> {
