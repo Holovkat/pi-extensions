@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T06:52:34Z - Recorded native profile failure and recovery repair
+
+Indexed the #201 setup/selection synthesis and focused #160 regressions. Empty-profile input now receives safe setup guidance before provider dispatch, and host model selection updates native Pi before preferences. Rebuilt UI and final-candidate acceptance remain pending.
+
 ## 2026-08-31T05:17:19Z - Recorded final native pif verification without closing acceptance gates
 
 Aligned the current state and inbox indexes with tested code 3bc8e1fc, 27 native remediation children, actual stock/export UI evidence and unchanged signed bundles. Preserved both failed combined gates and the three owner decisions. Added the dated verification report and retained the original review. Restored index links for 35 pre-existing inbox files and corrected the inventory to 61 without changing their content or curating them. No product source or acceptance criteria were changed.

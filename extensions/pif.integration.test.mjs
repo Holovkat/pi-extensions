@@ -224,6 +224,78 @@ function fileTree(root) {
   return result;
 }
 
+function nativeHostFixture(t) {
+  const fixture = contractHub(t);
+  const {hub} = fixture;
+  fs.mkdirSync(hub.pifDir, {recursive: true});
+  let selected = {provider: 'unknown', id: 'unknown', api: 'unknown'};
+  let available = [];
+  const sent = [];
+  const activated = [];
+  const refreshes = [];
+  hub.ctx = {
+    get model() { return selected; },
+    modelRegistry: {
+      getAvailable: () => available,
+      refresh: async (options) => { refreshes.push(options); },
+    },
+  };
+  hub.pi = {
+    setModel: async (model) => { activated.push(model); selected = model; return true; },
+    sendMessage: (...args) => sent.push(args),
+  };
+  hub.createHostSession();
+  return {...fixture, sent, activated, refreshes, configure: (models) => { available = models; }};
+}
+
+test('empty native profile gives setup guidance without submitting an unknown model (#201)', async (t) => {
+  const {hub, sent, messages} = nativeHostFixture(t);
+  assert.equal(hub.state.sessions.host.model, '');
+  await assert.rejects(hub.sessionAction('input', {sessionId: 'host', content: 'fixture prompt'}), /credentials are not configured/);
+  assert.equal(sent.length, 0, 'unconfigured input must never reach the provider');
+  assert.equal(hub.state.sessions.host.transcript.some((entry) => entry.type === 'input'), false);
+  const guidance = messages.filter((event) => event.channel === 'session/event' && event.type === 'output').at(-1).payload.event.data;
+  assert.ok(guidance.includes(hub.nativeAgentDir));
+  assert.match(guidance, /PI_CODING_AGENT_DIR=.*\/login.*\/model/s);
+  assert.match(guidance, /do not paste them into this chat/);
+  assert.doesNotMatch(guidance, /Unknown provider: unknown/);
+});
+
+test('native model setup recovers through refresh, actual activation and subsequent Send (#201)', async (t) => {
+  const {hub, sent, activated, refreshes, configure} = nativeHostFixture(t);
+  const model = {provider: 'fixture', id: 'fast', api: 'openai-completions'};
+  configure([model]); // Credentials were provisioned outside the app.
+  await hub.control('models.refresh');
+  assert.deepEqual(hub.state.models, ['fixture/fast']);
+  await hub.sessionAction('setModel', {sessionId: 'host', model: 'fixture/fast'});
+  assert.deepEqual(activated, [model]);
+  assert.equal(hub.ctx.model, model, 'selection must change the native runtime, not only preferences');
+  assert.equal(JSON.parse(fs.readFileSync(hub.prefsPath, 'utf8')).model, 'fixture/fast');
+  await hub.sessionAction('input', {sessionId: 'host', content: 'recovered fixture prompt'});
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0][0].content, 'recovered fixture prompt');
+  assert.ok(refreshes.length >= 2);
+  assert.ok(refreshes.every((options) => options.allowNetwork === false));
+});
+
+test('failed native model activation preserves prior preference and redacts provider errors (#201)', async (t) => {
+  const {hub, configure, sent} = nativeHostFixture(t);
+  const first = {provider: 'fixture', id: 'first', api: 'openai-completions'};
+  const second = {...first, id: 'second'};
+  configure([first, second]);
+  await hub.sessionAction('setModel', {sessionId: 'host', model: 'fixture/first'});
+  const prefs = fs.readFileSync(hub.prefsPath);
+  hub.pi.setModel = async () => { throw new Error('SYNTHETIC_PRIVATE_PROVIDER_DETAIL'); };
+  await assert.rejects(hub.sessionAction('setModel', {sessionId: 'host', model: 'fixture/second'}), (error) => {
+    assert.match(error.message, /could not activate/);
+    assert.ok(!error.message.includes('SYNTHETIC_PRIVATE_PROVIDER_DETAIL'));
+    return true;
+  });
+  assert.deepEqual(fs.readFileSync(hub.prefsPath), prefs);
+  assert.equal(hub.state.sessions.host.model, 'fixture/first');
+  assert.equal(sent.length, 0);
+});
+
 test('app init preserves pinned template and design bytes through failure then retry (#195)', async (t) => {
   const {hub, workspace} = contractHub(t);
   const template = path.join(hub.appDir, 'templates', 'mercury');
@@ -664,6 +736,13 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
     {type: 'message', message: {role: 'assistant', content: [{type: 'text', text: 'restored host reply'}]}},
   ].map((value) => JSON.stringify(value)).join('\n') + '\n');
   const modelsPath = path.join(workspace, 'models-fixture.json'); fs.writeFileSync(modelsPath, JSON.stringify({providers: {fixture: {models: [{id: 'old'}]}}, customKey: 'keep-me'}, null, 2));
+  // Host model selection now validates the real native registry. Keep its
+  // synthetic authenticated model local; this test never submits a prompt.
+  const nativeAgentDir = prepareAgentDir(workspace);
+  fs.writeFileSync(path.join(nativeAgentDir, 'models.json'), JSON.stringify({providers: {
+    fixture: {baseUrl: 'http://127.0.0.1:9', api: 'openai-completions', apiKey: 'synthetic-fixture-no-network',
+      models: [{id: 'fast', name: 'Fixture Fast'}]},
+  }}));
   pi = await startPi({workspace, port, piBin, modelsPath, hostSessionFile, globalCatalog, appDir, extraEnv: {PIF_SYNTHETIC_SENTINEL: 'fixture-sentinel'}});
   checkpoint('hub started');
   const tokenFile = path.join(workspace, '.pi', 'pif', 'token');

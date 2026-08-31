@@ -366,16 +366,66 @@ class PifHub {
 	private createHostSession() {
 		const prefs = this.loadPrefs();
 		const sessionFile = process.env.PIF_HOST_SESSION_FILE ? assertWritablePifPath(process.env.PIF_HOST_SESSION_FILE) : undefined;
-		const host: PifSession = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || (this.ctx as any).model?.id || "host", thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [], ...(sessionFile ? { sessionFile } : {}) };
+		const host: PifSession = { id: "host", name: prefs.name || "Host session", host: true, state: "idle", model: this.canonicalModel(prefs.model) || this.nativeModelId((this.ctx as any).model), thinking: prefs.thinking || (this.ctx as any).thinkingLevel || "medium", cwd: this.workspace, transcript: [], ...(sessionFile ? { sessionFile } : {}) };
 		this.state.sessions.host = host;
 		if (sessionFile) { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, "", { flag: "a", mode: 0o600 }); this.hydrateTranscript(host); }
+		if (!this.availableNativeModels().length) this.appendSetupGuidance(host, this.nativeSetupGuidance("No authenticated model is available."));
 	}
 	/** Session model ids sometimes lack the provider prefix; resolve to the
 	 * full id from the available models when the suffix match is unique. */
 	private canonicalModel(model: string | undefined): string {
+		if (model?.split("/").some((part) => part.toLowerCase() === "unknown")) return "";
 		if (!model || this.state.models.includes(model)) return model ?? "";
 		const matches = this.state.models.filter((candidate) => candidate.endsWith(`/${model}`));
 		return matches.length === 1 ? matches[0] : model;
+	}
+	private nativeModelId(model: any): string {
+		return typeof model?.provider === "string" && model.provider && typeof model?.id === "string" && model.id && model.api !== "unknown"
+			? this.canonicalModel(`${model.provider}/${model.id}`) : "";
+	}
+	private availableNativeModels(): any[] {
+		return ((this.ctx as any).modelRegistry?.getAvailable?.() ?? []).filter((model: any) => this.nativeModelId(model));
+	}
+	private nativeSetupGuidance(reason: string): string {
+		const invocation = resolvePiInvocation(fileURLToPath(import.meta.url));
+		const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+		const command = `PI_CODING_AGENT_DIR=${quote(this.nativeAgentDir)} ${[invocation.command, ...invocation.args, "--no-extensions", "--no-skills", "--no-prompt-templates"].map(quote).join(" ")}`;
+		return `${reason}\nSet up a model in the native Pi profile: ${this.nativeAgentDir}\nIn Terminal run:\n${command}\nUse /login for a built-in provider, then /model to select a model. For a custom provider, configure ${path.join(this.nativeAgentDir, "models.json")}. Restart this app after setup, or refresh models and select a model here, then resend your message. Keep credentials in the native profile; do not paste them into this chat.`;
+	}
+	private appendSetupGuidance(session: PifSession, guidance: string) {
+		const last = session.transcript.at(-1) as any;
+		if (last?.type === "output" && last.data === guidance) return;
+		const event = { type: "output", data: guidance, ts: new Date().toISOString() };
+		session.transcript.push(event);
+		this.broadcast("session/event", "output", { sessionId: session.id, state: session.state, event });
+	}
+	private modelSetupError(reason: string): Error {
+		const guidance = this.nativeSetupGuidance(reason);
+		const session = this.state.sessions.host;
+		if (session) this.appendSetupGuidance(session, guidance);
+		return new Error(guidance);
+	}
+	private resolveNativeModel(requested: string): any {
+		const available = this.availableNativeModels();
+		const canonical = this.canonicalModel(requested);
+		const current = this.nativeModelId((this.ctx as any).model);
+		const target = canonical || (!requested ? current : "");
+		const matches = target ? available.filter((model: any) => this.nativeModelId(model) === target || model.id === target) : [];
+		const model = matches.length === 1 ? matches[0] : undefined;
+		if (!model) throw this.modelSetupError("The selected model is unavailable or its credentials are not configured.");
+		return model;
+	}
+	private async activateHostModel(requested: string) {
+		try { await (this.ctx as any).modelRegistry?.refresh?.({ allowNetwork: false }); }
+		catch { throw this.modelSetupError("Native Pi could not refresh its model configuration."); }
+		const model = this.resolveNativeModel(requested);
+		if (this.nativeModelId((this.ctx as any).model) !== this.nativeModelId(model)) {
+			try {
+				if (!(await this.pi.setModel(model))) throw new Error("Model authentication is not configured");
+			} catch { throw this.modelSetupError("Native Pi could not activate the selected model with its configured credentials."); }
+		}
+		this.state.models = this.readModelsList();
+		return this.nativeModelId(model);
 	}
 	/** Retention: keep the newest sessions per workspace so the store and
 	 * its session files stop growing forever. */
@@ -677,7 +727,9 @@ class PifHub {
 		}
 		if (type === "setModel") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
-			session.model = String(payload.model ?? ""); if (id === "host") this.savePrefs({ model: session.model }); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
+			const model = String(payload.model ?? "").trim();
+			session.model = id === "host" ? await this.activateHostModel(model) : model;
+			if (id === "host") this.savePrefs({ model: session.model }); this.broadcast("session/state", "updated", this.sessionPatch(session)); return session;
 		}
 		if (type === "setThinking") {
 			const session = this.state.sessions[id]; if (!session) throw new Error(`Unknown session ${id}`);
@@ -688,6 +740,15 @@ class PifHub {
 			if (!host) throw new Error("Host session has been deleted — create a new session to continue");
 			if (type === "abort") return (this.ctx as any).abort?.();
 			const content = String(payload.content ?? payload.prompt ?? ""); if (!content) throw new Error("Session content is required");
+			if (host.state === "running") {
+				const current = this.nativeModelId((this.ctx as any).model);
+				if (!current) throw this.modelSetupError("No usable native model is selected.");
+				this.resolveNativeModel(current);
+			}
+			else {
+				host.model = await this.activateHostModel(host.model);
+				this.broadcast("session/state", "updated", this.sessionPatch(host));
+			}
 			const event = { type: "input", content, mode: type, ts: new Date().toISOString() }; host.transcript.push(event); this.broadcast("session/event", "input", { sessionId: "host", state: host.state, event });
 			this.pi.sendMessage({ customType: "pif-input", content, display: true }, { deliverAs: type === "steer" ? "steer" : "followUp", triggerTurn: true }); return;
 		}
@@ -900,9 +961,12 @@ class PifHub {
 		try { for (const m of ((this.ctx as any).modelRegistry?.getAvailable?.() ?? [])) models.add(`${m.provider}/${m.id}`); } catch {}
 		try { const settings = JSON.parse(fs.readFileSync(path.join(this.nativeAgentDir, "settings.json"), "utf8")); for (const m of (settings.enabledModels ?? [])) models.add(m); } catch {}
 		try { const providers = this.readModelsConfig(); for (const [provider, config] of Object.entries(providers)) { for (const m of ((config as any).models ?? [])) models.add(`${provider}/${m.id}`); } } catch {}
-		return [...models].sort();
+		return [...models].filter((model) => typeof model === "string" && model && this.canonicalModel(model)).sort();
 	}
-	private refreshModels() { this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot(); }
+	private async refreshModels() {
+		await (this.ctx as any).modelRegistry?.refresh?.({ allowNetwork: false });
+		this.state.models = this.readModelsList(); this.state.modelProviders = this.readModelsConfig(); this.broadcastSnapshot();
+	}
 	private trackerAction(type: string, payload: any) {
 		if (type === "refresh") return this.tracker.refresh();
 		if (type === "move") { const result = this.tracker.move(payload); this.broadcast("tracker/move", "move_result", result); return result; }
@@ -917,9 +981,9 @@ class PifHub {
 			if (fs.existsSync(this.modelsPath)) this.backupModelsFile();
 			const file = assertWritablePifPath(this.modelsPath);
 			fs.writeFileSync(file, JSON.stringify({ ...existing, providers }, null, 2) + "\n");
-			this.refreshModels(); return { ok: true, models: this.state.models };
+			await this.refreshModels(); return { ok: true, models: this.state.models };
 		}
-		if (type === "refresh") { this.refreshModels(); return { models: this.state.models }; }
+		if (type === "refresh") { await this.refreshModels(); return { models: this.state.models }; }
 		throw new Error(`Unknown models action: ${type}`);
 	}
 	private validateModelProviders(providers: unknown): Record<string, any> {
