@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:async';
 import 'dart:io';
 
@@ -47,13 +48,15 @@ Map<String, dynamic> _card(
   int? parent,
   String excerpt = '',
   bool closed = false,
+  List<String>? labels,
+  String? body,
 }) => {
   'number': number,
   'title': title,
   'type': type,
   'state': closed ? 'closed' : 'open',
-  'labels': [type],
-  'body': 'Body of #$number',
+  'labels': labels ?? [type],
+  'body': body ?? 'Body of #$number',
   'excerpt': excerpt,
   'parent': parent,
   'updatedAt': '2026-08-30T0$number:00:00Z',
@@ -61,7 +64,10 @@ Map<String, dynamic> _card(
   'column': column,
 };
 
-Map<String, dynamic> _fixture() => {
+Map<String, dynamic> _fixture({
+  List<String>? taskLabels,
+  String? taskBody,
+}) => {
   'repo': 'acme/widgets',
   'stale': false,
   'fetchedAt': '2026-08-30T01:00:00Z',
@@ -87,6 +93,8 @@ Map<String, dynamic> _fixture() => {
       'todo',
       parent: 10,
       excerpt: 'Design the notes app against the Mercury template.',
+      labels: taskLabels ?? ['task'],
+      body: taskBody ?? 'Body of #11',
     ),
     _card(14, 'Task: cards page', 'task', 'review', parent: 13),
     _card(12, 'Unrelated thing', 'issue', 'done', closed: true),
@@ -112,12 +120,15 @@ Widget _panel(PifWidgetPlugin plugin, PifHost host) => MaterialApp(
   ),
 );
 
-Future<(FakeBus, PifHost)> _pump(WidgetTester tester) async {
+Future<(FakeBus, PifHost)> _pump(
+  WidgetTester tester, {
+  Map<String, dynamic>? tracker,
+}) async {
   final bus = FakeBus();
   final host = PifHost(bus: bus)
     ..workspace = _workspace.path
     ..storage.workspace = _workspace.path;
-  host.snapshot = {'tracker': _fixture()};
+  host.snapshot = {'tracker': tracker ?? _fixture()};
   await tester.pumpWidget(_panel(TrackerBoardPlugin(), host));
   await tester.pump();
   return (bus, host);
@@ -382,6 +393,190 @@ void main() {
     );
     await bus.dispose();
   });
+
+  testWidgets(
+    'view-mode local image resize saves, closes, and reopens at the same width',
+    (tester) async {
+      final imageFile = File('${_workspace.path}/notes-sketch.png');
+      imageFile.writeAsBytesSync(
+        base64Decode(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO7+q3cAAAAASUVORK5CYII=',
+        ),
+      );
+      final imagePath = imageFile.path;
+      final originalBody = 'Intro\n\n![image|240]($imagePath)\n\nTail';
+      final (bus, _) = await _pump(
+        tester,
+        tracker: _fixture(taskBody: originalBody),
+      );
+      await tester.tap(find.textContaining('Task: design pass'));
+      await tester.pumpAndSettle();
+      final image = find.byWidgetPredicate(
+        (widget) => widget is Image && widget.image is FileImage,
+      );
+      expect(image, findsOneWidget);
+      final handle = find.byKey(const Key('tracker_image_resize'));
+      expect(handle, findsOneWidget);
+      await tester.ensureVisible(handle);
+      await tester.pumpAndSettle();
+      final handleWidget = tester.widget<GestureDetector>(handle);
+      expect(handleWidget.onHorizontalDragUpdate, isNotNull);
+      handleWidget.onHorizontalDragUpdate!(
+        DragUpdateDetails(
+          delta: const Offset(72, 0),
+          globalPosition: tester.getCenter(handle),
+          localPosition: tester.getCenter(handle),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pump();
+      expect(find.text('Save changes?'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('tracker_sheet_save_close')));
+      await tester.pump();
+      final update = bus.sent.singleWhere(
+        (event) =>
+            event['channel'] == 'tracker/control' &&
+            event['type'] == 'update' &&
+            (event['payload'] as Map)['number'] == 11,
+      );
+      final savedBody = update['payload'] as Map;
+      final savedBodyText = savedBody['body'] as String;
+      expect(savedBodyText, contains('![image|'));
+      expect(savedBodyText, contains(imagePath));
+      expect(savedBodyText, isNot(contains('![image|240]($imagePath)')));
+      bus.emit('tracker/op', 'op_result', {
+        'op': 'update',
+        'ok': true,
+        'number': 11,
+      });
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+
+      bus.emit('tracker/state', 'state', _fixture(taskBody: savedBodyText));
+      await tester.pumpAndSettle();
+      await tester.tap(find.textContaining('Task: design pass'));
+      await tester.pumpAndSettle();
+      final reopenedHandle = find.byKey(const Key('tracker_image_resize'));
+      expect(reopenedHandle, findsOneWidget);
+      expect(find.text('Intro'), findsOneWidget);
+      expect(find.text('Tail'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.text('Tail')).dy,
+        greaterThan(tester.getTopLeft(find.text('Intro')).dy),
+      );
+      await bus.dispose();
+    },
+  );
+
+  testWidgets(
+    'view-mode tags remove an existing tag, add one, and retry on failure',
+    (tester) async {
+      final (bus, _) = await _pump(
+        tester,
+        tracker: _fixture(taskLabels: ['task', 'status:todo', 'keep-me']),
+      );
+      await tester.tap(find.textContaining('Task: design pass'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('tracker_pill_attributes')));
+      await tester.pump();
+      final keepMeRow = find.ancestor(
+        of: find.text('keep-me'),
+        matching: find.byType(Row),
+      );
+      await tester.tap(
+        find.descendant(of: keepMeRow, matching: find.byIcon(Icons.close)),
+      );
+      await tester.pump();
+      expect(find.text('keep-me'), findsNothing);
+      await tester.enterText(find.byKey(const Key('tracker_tag_input')), 'design');
+      await tester.testTextInput.receiveAction(TextInputAction.done);
+      await tester.pump();
+      expect(find.text('design'), findsOneWidget);
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pump();
+      expect(find.text('Save changes?'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('tracker_sheet_save_close')));
+      await tester.pump();
+      expect(
+        bus.sent.where(
+          (event) =>
+              event['channel'] == 'tracker/control' &&
+              event['type'] == 'update' &&
+              (event['payload'] as Map)['number'] == 11 &&
+              ((event['payload'] as Map)['labels'] as List).contains('design') &&
+              !((event['payload'] as Map)['labels'] as List).contains('keep-me'),
+        ),
+        isNotEmpty,
+      );
+      bus.emit('tracker/op', 'op_result', {
+        'op': 'create',
+        'ok': true,
+        'number': 99,
+      });
+      await tester.pump();
+      expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+      final closeButtonAfterOtherReply = tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Close'),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(
+        closeButtonAfterOtherReply.onPressed,
+        isNull,
+      );
+      bus.emit('tracker/op', 'op_result', {
+        'op': 'update',
+        'ok': false,
+        'number': 99,
+        'error': 'gh: other ticket failed',
+      });
+      await tester.pump();
+      expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+      final closeButtonAfterWrongTicket = tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Close'),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(
+        closeButtonAfterWrongTicket.onPressed,
+        isNull,
+      );
+      bus.emit('tracker/op', 'op_result', {
+        'op': 'update',
+        'ok': false,
+        'number': 11,
+        'error': 'gh: conflict',
+      });
+      await tester.pumpAndSettle();
+      expect(find.textContaining('gh: conflict'), findsOneWidget);
+      final closeButtonAfterFailure = tester.widget<IconButton>(
+        find.ancestor(
+          of: find.byTooltip('Close'),
+          matching: find.byType(IconButton),
+        ),
+      );
+      expect(
+        closeButtonAfterFailure.onPressed,
+        isNotNull,
+      );
+      await tester.tap(find.byTooltip('Close'));
+      await tester.pump();
+      expect(find.text('Save changes?'), findsOneWidget);
+      await tester.tap(find.byKey(const Key('tracker_sheet_save_close')));
+      await tester.pump();
+      bus.emit('tracker/op', 'op_result', {
+        'op': 'update',
+        'ok': true,
+        'number': 11,
+      });
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+      await bus.dispose();
+    },
+  );
 
   testWidgets('tags added in attributes sync as labels on save', (tester) async {
     final (bus, _) = await _pump(tester);

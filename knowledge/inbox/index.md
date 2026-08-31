@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [pif focused regression coverage for view-mode resize, app-mode breakpoints, and widget provenance](./2026-08-31T02-02-55Z-pif-regression-tests-view-mode-save-ack.md) | 2026-08-31T02:28:27Z | pi-extensions, pif, regression, tracker-board, app-mode, widget-store, okf | #160, #197, #198, #208, #210 |
 | [pif hub protocol and live-state regression coverage under test ticket 160](./2026-08-31T02-10-00Z-pif-hub-protocol-and-live-state-regressions.md) | 2026-08-31T02:10:00Z | pi-extensions, pif, testing, protocol, manifest, dev-mode | #160 |
 | [pif page collision rejection and scaffold rollback preserve existing directories](./2026-08-31T02-24-36Z-pif-page-collision-rejection-and-scaffold-rollback.md) | 2026-08-31T02:24:36Z | pi-extensions, pif, scaffold, collision, rollback, diagnostics, okf | #196 |
 | [pif app init preserves pinned template bytes on failed retry](./2026-08-31T02-04-50Z-pif-app-init-preserves-pinned-template-bytes-on-failed-retry.md) | 2026-08-31T02:04:50Z | pi-extensions, pif, app-init, template, retry, diagnostics, okf | #195 |

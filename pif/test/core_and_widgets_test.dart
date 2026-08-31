@@ -629,7 +629,7 @@ void main() {
     expect(reset['channel'], 'shell/layout');
     await bus.dispose();
   });
-  testWidgets('Widget Store renders installed and catalog records', (
+  testWidgets('Widget Store renders base, catalog, and legacy provenance badges', (
     tester,
   ) async {
     final bus = FakeBus();
@@ -640,15 +640,53 @@ void main() {
           'name': 'Agent Console',
           'enabled': true,
           'core': true,
+          'source': 'base',
+        },
+        'legacy_helper': {
+          'name': 'Legacy Helper',
+          'enabled': true,
         },
       },
       'catalog': {
-        'clock': {'name': 'Clock', 'description': 'Example'},
+        'clock': {
+          'name': 'Clock',
+          'description': 'Example',
+          'source': 'catalog',
+        },
+        'archived_clock': {
+          'name': 'Archived Clock',
+          'description': 'Base archive example',
+          'source': 'base',
+        },
+        'legacy_clock': {
+          'name': 'Legacy Clock',
+          'description': 'Legacy available entry',
+        },
       },
     };
     await tester.pumpWidget(panel(WidgetStorePlugin(), host));
     expect(find.text('Agent Console'), findsOneWidget);
     expect(find.text('Clock'), findsOneWidget);
+    expect(find.text('BASE'), findsNWidgets(2));
+    expect(find.text('CATALOG'), findsNWidgets(2));
+    expect(find.text('LEGACY'), findsNothing);
+    expect(find.text('Legacy Helper'), findsOneWidget);
+    final archiveRow = find.ancestor(
+      of: find.text('Archived Clock'),
+      matching: find.byType(ListTile),
+    );
+    expect(find.descendant(of: archiveRow, matching: find.text('BASE')), findsOneWidget);
+    expect(find.descendant(of: archiveRow, matching: find.text('CATALOG')), findsNothing);
+    final legacyRow = find.ancestor(
+      of: find.text('Legacy Clock'),
+      matching: find.byType(ListTile),
+    );
+    expect(find.descendant(of: legacyRow, matching: find.text('CATALOG')), findsOneWidget);
+    await tester.tap(find.descendant(of: archiveRow, matching: find.text('Install')));
+    expect(bus.sent.last['channel'], 'store/control');
+    expect(bus.sent.last['type'], 'install');
+    expect(bus.sent.last['payload'], {'id': 'archived_clock'});
+    expect(tester.takeException(), isNull);
     await bus.dispose();
   });
   testWidgets('Diff Viewer real-use trial renders and updates a usable comparison', (
@@ -836,6 +874,40 @@ void main() {
     await bus.dispose();
   });
 
+  testWidgets('ticket sheet preserves remote labels on a title-only save', (tester) async {
+    final bus = FakeBus();
+    final host = _host(bus);
+    host.snapshot = {
+      'tracker': _trackerFixture(
+        card11Labels: const ['task', 'status:todo', 'keep-me'],
+      ),
+    };
+    await tester.pumpWidget(panel(TrackerBoardPlugin(), host));
+    await tester.pump();
+    await tester.tap(find.textContaining('Task: build board'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byIcon(Icons.edit_outlined));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Task: renamed');
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    expect(
+      bus.sent.where((sent) {
+        if (sent['channel'] != 'tracker/control' || sent['type'] != 'update') return false;
+        final payload = sent['payload'] as Map;
+        return payload['number'] == 11 &&
+            (payload['labels'] as List).contains('keep-me') &&
+            !(payload['labels'] as List).contains('status:todo');
+      }),
+      isNotEmpty,
+    );
+    bus.emit('tracker/op', 'op_result', {'op': 'update', 'ok': true, 'number': 11});
+    await tester.pumpAndSettle();
+    expect(find.textContaining('Task: renamed'), findsOneWidget);
+    expect(find.byKey(const Key('tracker_sheet_title')), findsNothing);
+    await bus.dispose();
+  });
+
   testWidgets('ticket sheet moves a card via the lane dropdown', (tester) async {
     final bus = FakeBus();
     final host = _host(bus);
@@ -920,7 +992,11 @@ void main() {
   });
 }
 
-Map<String, dynamic> _trackerFixture({bool stale = false, String? error}) => {
+Map<String, dynamic> _trackerFixture({
+  bool stale = false,
+  String? error,
+  List<String>? card11Labels,
+}) => {
   'repo': 'acme/widgets',
   'stale': stale,
   'fetchedAt': '2026-08-23T01:00:00Z',
@@ -947,7 +1023,7 @@ Map<String, dynamic> _trackerFixture({bool stale = false, String? error}) => {
       'title': 'Task: build board',
       'type': 'task',
       'state': 'open',
-      'labels': ['task', 'status:todo'],
+      'labels': card11Labels ?? ['task', 'status:todo'],
       'body': 'Task body',
       'updatedAt': '2026-08-23T02:00:00Z',
       'url': 'https://github.com/acme/widgets/issues/11',

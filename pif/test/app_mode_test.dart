@@ -52,6 +52,7 @@ class FakeHubBus extends FakeBus {
   void emitSnapshot({
     Map<String, dynamic>? app,
     Map<String, dynamic>? layout,
+    bool devMode = false,
   }) => emit('shell/state', 'snapshot', {
     'sessions': {
       'host': {
@@ -71,7 +72,8 @@ class FakeHubBus extends FakeBus {
     'catalog': const {},
     'layout': layout ?? const {'panels': {}},
     'health': {'workspace': workspacePath},
-    'app': ?app,
+    'app': app,
+    'devMode': devMode,
   });
 }
 
@@ -236,6 +238,74 @@ void main() {
     }
   });
 
+  testWidgets(
+    'single-page app mode stays chrome-free at 720, 1023, and 1024 before a second page adds navigation, console, and dev access',
+    (tester) async {
+      final bus = FakeHubBus();
+      final workspace = await _pumpShell(
+        tester,
+        bus,
+        app: {
+          'id': 'demo',
+          'name': 'Demo App',
+          'home': 'page_home',
+          'pages': ['page_home'],
+        },
+      );
+      try {
+        for (final width in [720.0, 1023.0, 1024.0]) {
+          await tester.binding.setSurfaceSize(Size(width, 700));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.text('Home body'), findsOneWidget);
+          expect(find.byType(NavigationBar), findsNothing);
+          expect(find.byType(NavigationRail), findsNothing);
+          expect(find.byKey(const Key('pif_dev_toggle')), findsOneWidget);
+          expect(find.byTooltip('Show Agent Console'), findsOneWidget);
+        }
+
+        bus.emitSnapshot(app: _demoApp, devMode: false);
+        await tester.pumpAndSettle();
+        expect(tester.takeException(), isNull);
+
+        for (final width in [720.0, 1023.0, 1024.0]) {
+          await tester.binding.setSurfaceSize(Size(width, 700));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.text('Home body'), findsOneWidget);
+          expect(find.byKey(const Key('pif_dev_toggle')), findsOneWidget);
+          expect(find.byTooltip('Show Agent Console'), findsOneWidget);
+          if (width >= 1024) {
+            expect(find.byType(NavigationRail), findsOneWidget);
+            expect(find.byType(NavigationBar), findsNothing);
+          } else {
+            expect(find.byType(NavigationBar), findsOneWidget);
+            expect(find.byType(NavigationRail), findsNothing);
+          }
+          await tester.tap(find.text('About'));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.text('About body'), findsOneWidget);
+          await tester.tap(find.text('Home'));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.text('Home body'), findsOneWidget);
+          await tester.tap(find.byTooltip('Show Agent Console'));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.byKey(const Key('pif_app_console')), findsOneWidget);
+          await tester.tap(find.byTooltip('Hide Agent Console'));
+          await tester.pumpAndSettle();
+          expect(tester.takeException(), isNull);
+          expect(find.byKey(const Key('pif_app_console')), findsNothing);
+        }
+      } finally {
+        await _teardown(tester, workspace);
+        await tester.binding.setSurfaceSize(null);
+      }
+    },
+  );
+
   testWidgets('dev toggle exposes the IDE docking and preserves page state', (
     tester,
   ) async {
@@ -253,6 +323,19 @@ void main() {
 
       // Dev toggle: the full IDE docking is reachable again.
       await tester.tap(find.byKey(const Key('pif_dev_toggle')));
+      await tester.pump();
+      expect(
+        bus.sent.where(
+          (event) =>
+              event['channel'] == 'shell/control' &&
+              event['type'] == 'dev_mode_set' &&
+              (event['payload'] as Map)['enabled'] == true,
+        ),
+        isNotEmpty,
+      );
+      expect(find.byKey(const Key('pif_dock_center')), findsNothing);
+      expect(find.text('About body'), findsOneWidget);
+      bus.emitSnapshot(app: _demoApp, devMode: true);
       await tester.pumpAndSettle();
       expect(find.byKey(const Key('pif_dock_center')), findsOneWidget);
       expect(find.text('Dock body'), findsOneWidget);
@@ -267,6 +350,18 @@ void main() {
       // Toggling back restores the page stage on the same page — not the
       // home page — with the page's state intact.
       await tester.tap(find.byKey(const Key('pif_dev_toggle')));
+      await tester.pump();
+      expect(
+        bus.sent.where(
+          (event) =>
+              event['channel'] == 'shell/control' &&
+              event['type'] == 'dev_mode_set' &&
+              (event['payload'] as Map)['enabled'] == false,
+        ),
+        isNotEmpty,
+      );
+      expect(find.byKey(const Key('pif_dock_center')), findsOneWidget);
+      bus.emitSnapshot(app: _demoApp, devMode: false);
       await tester.pumpAndSettle();
       expect(find.text('About body'), findsOneWidget);
       expect(find.text('Home body'), findsNothing);
@@ -407,7 +502,7 @@ void main() {
     expect(find.text('BASE'), findsOneWidget);
     expect(find.text('PROJECT'), findsOneWidget);
     expect(find.text('CATALOG'), findsOneWidget);
-    // Records without a provenance field (today's hub) render no badge.
+    // Legacy available entries retain their catalog fallback badge.
     expect(find.text('Notes'), findsOneWidget);
     await bus.dispose();
   });
