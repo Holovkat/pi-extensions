@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
+import { __test as pif } from './pif.ts';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const extension = path.join(repo, 'extensions', 'pif.ts');
@@ -11,6 +12,97 @@ const syntheticAllowedOrigins = 'https://fixture.pif.local';
 const sharedPubCache = fs.mkdtempSync(path.join('/tmp', 'pif-pub-cache-'));
 const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Exercise real hub dispatch/state without starting Pi, Flutter or GitHub.
+// External compiler/process boundaries are controlled explicitly per case.
+function contractHub(t, workspace = tempDir('pif-contract-')) {
+  const overrides = {
+    PIF_APP_DIR: path.join(workspace, 'app-source'),
+    PIF_GLOBAL_CATALOG: path.join(workspace, 'catalog'),
+    PIF_MODELS_PATH: path.join(workspace, 'agent', 'models.json'),
+    PI_CODING_AGENT_DIR: path.join(workspace, 'agent'),
+  };
+  const previous = Object.fromEntries(Object.keys(overrides).map((key) => [key, process.env[key]]));
+  let hub;
+  try {
+    Object.assign(process.env, overrides);
+    hub = new pif.PifHub({}, {}, workspace, 0);
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+  const messages = [];
+  hub.peers.add({sendRaw: (bytes) => messages.push(JSON.parse(bytes.toString()))});
+  t.after(() => {
+    hub.peers.clear();
+    fs.rmSync(workspace, {recursive: true, force: true});
+  });
+  return {hub, workspace, messages};
+}
+
+test('manifest publication waits for the install gate and rejects speculative state (#194)', async (t) => {
+  const {hub, workspace, messages} = contractHub(t);
+  hub.scaffoldAppPackage = () => {}; // Real scaffold writes; only package resolution is stubbed.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  hub.installOrFail = async () => {
+    hub.scanWidgets();
+    hub.broadcastSnapshot();
+    await gate;
+  };
+  const initializing = hub.control('pif_app.init', {name: 'Live Fixture'});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(path.join(workspace, 'pif_app', 'app.yaml')), false);
+  assert.equal(hub.snapshot().app, null);
+  assert.ok(messages.every((event) => event.payload.app === null));
+  release();
+  await initializing;
+  assert.equal(messages.at(-1).payload.app.id, 'live-fixture');
+  assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'app.yaml')));
+
+  const rejected = contractHub(t);
+  rejected.hub.scaffoldAppPackage = () => {};
+  rejected.hub.installOrFail = async () => {
+    rejected.hub.broadcastSnapshot();
+    throw new Error('controlled analyzer rejection');
+  };
+  await assert.rejects(rejected.hub.control('pif_app.init', {name: 'Rejected'}), /analyzer rejection/);
+  assert.equal(rejected.hub.snapshot().app, null);
+  assert.equal(fs.existsSync(path.join(rejected.workspace, 'pif_app', 'app.yaml')), false);
+  assert.ok(rejected.messages.every((event) => event.payload.app === null));
+});
+
+test('dev mode synchronizes control and client messages with safe persistence (#208)', async (t) => {
+  const {hub, workspace, messages} = contractHub(t);
+  assert.equal(hub.snapshot().devMode, false);
+  assert.equal(fs.existsSync(hub.shellStatePath), false);
+  await hub.control('shell.dev_mode', {enabled: true});
+  assert.equal(messages.at(-1).payload.devMode, true);
+  const preferences = JSON.parse(fs.readFileSync(hub.shellStatePath, 'utf8'));
+  preferences.unrelated = {keep: 'sentinel'};
+  fs.writeFileSync(hub.shellStatePath, JSON.stringify(preferences));
+  await hub.receive(JSON.stringify({v: 1, id: 'dev-mode-client', ts: new Date().toISOString(), channel: 'shell/control', type: 'dev_mode_set', payload: {enabled: false}}), {send: (event) => messages.push(event)});
+  assert.equal(hub.snapshot().devMode, false);
+  assert.equal(messages.at(-1).payload.devMode, false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(hub.shellStatePath, 'utf8')).unrelated, {keep: 'sentinel'});
+  const before = fs.readFileSync(hub.shellStatePath);
+  const eventCount = messages.length;
+  for (const payload of [true, null, 'true', {}, {enabled: 'false'}]) {
+    await assert.rejects(hub.control('shell.dev_mode', payload), /requires/);
+  }
+  assert.deepEqual(fs.readFileSync(hub.shellStatePath), before);
+  assert.equal(messages.length, eventCount);
+  await hub.control('shell.dev_mode', {enabled: true});
+  const {hub: restored} = contractHub(t, workspace);
+  restored.loadShellState();
+  assert.equal(restored.snapshot().devMode, true);
+  const malformed = '{ SYNTHETIC_PRIVATE_PREFERENCE';
+  fs.writeFileSync(hub.shellStatePath, malformed);
+  await assert.rejects(hub.control('shell.dev_mode', {enabled: false}), (error) => error.message.includes('invalid shell JSON') && !error.message.includes('SYNTHETIC_PRIVATE_PREFERENCE'));
+  assert.equal(fs.readFileSync(hub.shellStatePath, 'utf8'), malformed);
+  assert.equal(hub.snapshot().devMode, true);
+});
 
 function writeJsonIfMissing(file, value) {
   if (fs.existsSync(file)) return;
@@ -72,9 +164,24 @@ function rpc(child, command, timeout = 15_000) {
 
 function nextMessage(socket, predicate, timeout = 10_000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { socket.removeEventListener('message', listener); reject(new Error('WebSocket message timeout')); }, timeout);
-    const listener = (event) => { const value = JSON.parse(event.data); if (!predicate(value)) return; clearTimeout(timer); socket.removeEventListener('message', listener); resolve(value); };
+    const finish = (action, value) => {
+      clearTimeout(timer);
+      socket.removeEventListener('message', listener);
+      socket.removeEventListener('close', closed);
+      socket.removeEventListener('error', closed);
+      action(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error('WebSocket message timeout')), timeout);
+    const closed = () => finish(reject, new Error('WebSocket closed before the expected message'));
+    const listener = (event) => {
+      try {
+        const value = JSON.parse(event.data);
+        if (predicate(value)) finish(resolve, value);
+      } catch (error) { finish(reject, error); }
+    };
     socket.addEventListener('message', listener);
+    socket.addEventListener('close', closed);
+    socket.addEventListener('error', closed);
   });
 }
 
@@ -578,31 +685,58 @@ test('pif_app_init scaffolds a runnable app; the manifest reaches the snapshot (
   checkpoint('hub started');
   const controlPath = path.join(workspace, '.pi', 'pif', 'control.sock');
   await waitFor(() => fs.existsSync(controlPath), 'control socket appears');
-  const init = await control(controlPath, 'pif_app.init', {name: 'Notes Trial', template: 'mercury'});
+  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
+  const initialSnapshot = nextMessage(socket, (value) => value.type === 'snapshot');
+  const [, initial] = await Promise.all([new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); }), initialSnapshot]);
+  assert.equal(initial.payload.app, null);
+  const initializedSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.app?.id === 'notes-trial', 150_000);
+  const [init, committedInit] = await Promise.all([control(controlPath, 'pif_app.init', {name: 'Notes Trial', template: 'mercury'}), initializedSnapshot]);
   assert.equal(init.ok, true);
   assert.equal(init.id, 'notes-trial');
   assert.equal(init.template, 'mercury');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'app.yaml')), 'manifest written');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'template', 'template.yaml')), 'mercury layers pinned into the project');
   assert.ok(fs.existsSync(path.join(workspace, 'pif_app', 'widgets', 'home', 'home.dart')), 'home page scaffolded');
+  assert.deepEqual(committedInit.payload.app.pages, ['home']);
   checkpoint('init done (template pinned, home installed through the analyzer gate)');
-  const page = await control(controlPath, 'pif_app.page_add', {name: 'Editor', id: 'editor_page'});
-  assert.deepEqual(page.pages, ['home', 'editor_page']);
-  assert.equal((await control(controlPath, 'pif_app.home_set', {id: 'home'})).home, 'home');
+  const pageSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.app?.pages.includes('settings'), 120_000);
+  const [page, committedPage] = await Promise.all([control(controlPath, 'pif_app.page_add', {name: 'Settings', id: 'settings'}), pageSnapshot]);
+  assert.deepEqual(page.pages, ['home', 'settings']);
+  assert.deepEqual(committedPage.payload.app.pages, ['home', 'settings']);
+  const homeSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.app?.home === 'settings');
+  const [home, snapshot] = await Promise.all([control(controlPath, 'pif_app.home_set', {id: 'settings'}), homeSnapshot]);
+  assert.equal(home.home, 'settings');
   // pif_app.build dispatches a REAL export build (minutes; #159 verified
   // live) — do not call it in tests: the orphaned build locks pub and
   // hangs the smoke suite.
   const list = await control(controlPath, 'pif_app.list', {});
-  assert.equal(list.manifest.pages.join(','), 'home,editor_page');
+  assert.equal(list.manifest.pages.join(','), 'home,settings');
   assert.equal(list.widgets[0].installed, true, 'home page installed');
-  // The shell contract: the snapshot carries the manifest, so app mode boots.
-  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
-  await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); });
-  send(socket, 'shell/state', 'snapshot_request', {});
-  const snapshot = await nextMessage(socket, (value) => value.type === 'snapshot');
+  // This is the original connection: each mutation publishes without a
+  // reconnect or snapshot_request hiding a missing broadcast.
   assert.equal(snapshot.payload.app.id, 'notes-trial');
-  assert.equal(snapshot.payload.app.home, 'home');
-  assert.deepEqual(snapshot.payload.app.pages, ['home', 'editor_page']);
+  assert.equal(snapshot.payload.app.home, 'settings');
+  assert.deepEqual(snapshot.payload.app.pages, ['home', 'settings']);
   assert.equal(snapshot.payload.widgets.home.source, 'project', 'scaffolded page registers from the project overlay');
   checkpoint('manifest live in the snapshot — app mode is armed');
+  const devSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.devMode === true);
+  const [devResult, devEvent] = await Promise.all([control(controlPath, 'shell.dev_mode', {enabled: true}), devSnapshot]);
+  assert.equal(devResult.devMode, true);
+  assert.equal(devEvent.payload.devMode, true);
+  const appSnapshot = nextMessage(socket, (value) => value.type === 'snapshot' && value.payload.devMode === false);
+  send(socket, 'shell/control', 'dev_mode_set', {enabled: false});
+  assert.equal((await appSnapshot).payload.devMode, false);
+  assert.equal((await control(controlPath, 'shell.status')).devMode, false);
+  await assert.rejects(control(controlPath, 'shell.dev_mode', {enabled: 'true'}), /requires/);
+  await control(controlPath, 'shell.dev_mode', {enabled: true});
+  await closeWebSocket(socket);
+  await shutdownChild(pi);
+  pi = await startPi({workspace, port, piBin: fakePi(workspace), globalCatalog, appDir, modelsPath, hostSessionFile});
+  socket = new WebSocket(`ws://127.0.0.1:${port}/pif?token=integration-token`);
+  const restartedSnapshot = nextMessage(socket, (value) => value.type === 'snapshot');
+  const [, restarted] = await Promise.all([new Promise((resolve, reject) => { socket.addEventListener('open', resolve, {once: true}); socket.addEventListener('error', reject, {once: true}); }), restartedSnapshot]);
+  assert.equal(restarted.payload.app.home, 'settings', 's-prefixed home survives a real hub restart');
+  assert.deepEqual(restarted.payload.app.pages, ['home', 'settings']);
+  assert.equal(restarted.payload.devMode, true, 'source dev preference survives restart and reconnect');
+  checkpoint('home and dev mode survived a real hub restart');
 });

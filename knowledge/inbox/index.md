@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [pif hub protocol and live-state regression coverage under test ticket 160](./2026-08-31T02-10-00Z-pif-hub-protocol-and-live-state-regressions.md) | 2026-08-31T02:10:00Z | pi-extensions, pif, testing, protocol, manifest, dev-mode | #160 |
 | [pif app init preserves pinned template bytes on failed retry](./2026-08-31T02-04-50Z-pif-app-init-preserves-pinned-template-bytes-on-failed-retry.md) | 2026-08-31T02:04:50Z | pi-extensions, pif, app-init, template, retry, diagnostics, okf | #195 |
 | [pif export launcher now refreshes workspace manifest atomically](./2026-08-31T02-05-00Z-pif-export-manifest-bootstrap-atomic-upgrade.md) | 2026-08-31T02:05:00Z | pi-extensions, pif, export, bootstrap, manifest, launcher, atomic, backup | #202 |
 | [pif shell dev mode sync, fresh-state persistence, and redacted shell-state failures](./2026-08-31T01-57-06Z-pif-shell-dev-mode-sync-and-redacted-shell-state-failures.md) | 2026-08-31T01:57:06Z | pi-extensions, pif, shell, dev-mode, websocket, diagnostics, okf | #208 |

@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 const repo = path.resolve(import.meta.dirname, '..');
 import { __test as __shared, createEnvelope, decodeEnvelope, dartFileUri, generateWidgetRegistry, parseWidgetManifest, assertSafeWidgetPath, childEnvironment, extractPifToken, pifProbeProof, pifProbeValid, pifUpgradeAuthorized } from './pif-shared.ts';
 import { parseBoardConfig, defaultBoardConfig, columnForCard, normalizeGhIssue, plannedTrackerMove, TrackerSync, trackerParentRef, trackerExcerpt, plannedLabelChange, parseAppManifest, renderAppManifest, addAppPage, setAppHome, slugifyAppId } from './pif-shared.ts';
@@ -9,9 +12,73 @@ import { __test as __pif } from './pif.ts';
 
 const manifest = `id: alpha_widget\nname: "Alpha"\nversion: 0.1.0\ndescription: "Fixture"\nslot: center\ncore: false\ntags: [test, golden]\ndart_dependencies: []\n`;
 const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(check, message, timeout = 5_000) {
+  const started = Date.now();
+  while (Date.now() - started < timeout) {
+    try {
+      const value = await check();
+      if (value) return value;
+    } catch {}
+    await delay(25);
+  }
+  throw new Error(`Timed out: ${message}`);
+}
+
+function makeBuildChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.stdin = { write() {}, end() {} };
+  child.exitCode = null;
+  child.signalCode = null;
+  child.killCalls = [];
+  child.kill = (signal = 'SIGTERM') => {
+    child.killCalls.push(signal);
+    child.signalCode = signal;
+    return true;
+  };
+  child.emitSpawn = () => child.emit('spawn');
+  child.emitClose = (code = 0, signal = null) => {
+    child.exitCode = code;
+    child.signalCode = signal;
+    child.emit('close', code, signal);
+  };
+  child.emitError = (error) => child.emit('error', error instanceof Error ? error : new Error(String(error)));
+  return child;
+}
+
+function patchBuildSpawn(plans) {
+  const originalSpawn = childProcess.spawn;
+  const harness = { calls: [], children: [], plans: plans.map((plan) => ({...plan})) };
+  childProcess.spawn = (command, args) => {
+    harness.calls.push({command, args});
+    const plan = harness.plans.shift();
+    if (!plan) throw new Error(`Unexpected spawn: ${command}`);
+    if (plan.kind === 'throw') throw new Error(plan.message);
+    const child = makeBuildChild();
+    harness.children.push(child);
+    if (plan.kind === 'error') {
+      queueMicrotask(() => {
+        child.emitError(plan.error ?? new Error(plan.message ?? 'spawn failed'));
+        queueMicrotask(() => child.emitClose(plan.code ?? 127, plan.signal ?? null));
+      });
+    }
+    return child;
+  };
+  syncBuiltinESMExports();
+  return {
+    harness,
+    restore() {
+      childProcess.spawn = originalSpawn;
+      syncBuiltinESMExports();
+    },
+  };
+}
 
 test('pif envelope codec accepts all protocol channels and rejects malformed data', () => {
-  for (const channel of ['session/state', 'widget/registry', 'store/catalog', 'models/save', 'tracker/state', 'shell/state']) {
+  for (const channel of ['session/state', 'widget/registry', 'store/catalog', 'models/save', 'tracker/state', 'shell/state', 'app/build']) {
     const env = createEnvelope(channel, 'fixture', {ok: true}, 'fixed');
     assert.deepEqual(decodeEnvelope(JSON.stringify(env)), env);
   }
@@ -567,32 +634,158 @@ test('plannedLabelChange diffs tags while preserving status and type labels', ()
   assert.deepEqual(protect.remove, []);
 });
 
-test('parseAppManifest accepts the settled schema and rejects with actionable diagnostics', () => {
-  const good = parseAppManifest('id: notes\nname: Notes\nversion: 0.1.0\nhome: home\npages:\n  - home\n  - editor\ntemplate: mercury\ndependencies:\n  - diff_viewer\n');
+test('parseAppManifest accepts block and inline list forms with s-prefixed ids', () => {
+  const good = parseAppManifest('id: notes\nname: Notes\nversion: 0.1.0\nhome: settings\npages:\n  - settings\n  - search\n  - ss_panel\ntemplate: mercury\ndependencies:\n  - search_index\n  - ss_catalog\n');
   assert.equal(good.error, undefined);
-  assert.deepEqual(good.manifest, { id: 'notes', name: 'Notes', version: '0.1.0', home: 'home', pages: ['home', 'editor'], template: 'mercury', dependencies: ['diff_viewer'] });
-  const inline = parseAppManifest('id: notes\nname: Notes\nhome: home\npages: [home, editor]\n');
-  assert.deepEqual(inline.manifest.pages, ['home', 'editor']);
-  assert.equal(inline.manifest.version, '0.1.0');
+  assert.deepEqual(good.manifest, { id: 'notes', name: 'Notes', version: '0.1.0', home: 'settings', pages: ['settings', 'search', 'ss_panel'], template: 'mercury', dependencies: ['search_index', 'ss_catalog'] });
+  const inline = parseAppManifest('id: notes\nname: Notes\nhome: settings\npages: [settings, search, ss_panel]\ndependencies: [search_index, ss_catalog]\n');
+  assert.deepEqual(inline.manifest, { id: 'notes', name: 'Notes', version: '0.1.0', home: 'settings', pages: ['settings', 'search', 'ss_panel'], template: undefined, dependencies: ['search_index', 'ss_catalog'] });
+  assert.deepEqual(parseAppManifest(renderAppManifest(good.manifest)).manifest, good.manifest);
+  assert.deepEqual(parseAppManifest(renderAppManifest(inline.manifest)).manifest, { ...inline.manifest, template: undefined });
   assert.match(parseAppManifest('id: Bad Id\nname: X\nhome: a\npages: [a]').error, /kebab identifier/);
   assert.match(parseAppManifest('id: notes\nhome: home\npages: [home]').error, /'name' is required/);
   assert.match(parseAppManifest('id: notes\nname: N\nhome: editor\npages: [home]').error, /'home' must be one of the declared pages/);
-  assert.match(parseAppManifest('id: notes\nname: N\nhome: home\npages: [home, home]').error, /duplicate/);
+  assert.match(parseAppManifest('id: notes\nname: N\nhome: settings\npages: [settings, settings]').error, /duplicate/);
+  assert.match(parseAppManifest('id: notes\nname: N\nhome: settings\npages: [settings]\ntemplate: not valid template!\n').error, /template/);
   assert.match(parseAppManifest('what is this line\n', ).error, /line 1/);
 });
 
 test('app manifest updates validate and render round-trips', () => {
-  const base = parseAppManifest('id: notes\nname: Notes\nhome: home\npages: [home]\n').manifest;
-  const withPage = addAppPage(base, 'editor');
-  assert.deepEqual(withPage.manifest.pages, ['home', 'editor']);
-  assert.match(addAppPage(base, 'home').error, /already declared/);
+  const base = parseAppManifest('id: notes\nname: Notes\nhome: settings\npages: [settings]\ndependencies: [search_index]\n').manifest;
+  const withPage = addAppPage(base, 'search');
+  assert.deepEqual(withPage.manifest.pages, ['settings', 'search']);
+  assert.match(addAppPage(base, 'settings').error, /already declared/);
   assert.match(addAppPage(base, 'Not Kebab').error, /widget identifier/);
-  const newHome = setAppHome(withPage.manifest, 'editor');
-  assert.equal(newHome.manifest.home, 'editor');
+  const newHome = setAppHome(withPage.manifest, 'search');
+  assert.equal(newHome.manifest.home, 'search');
   assert.match(setAppHome(withPage.manifest, 'missing').error, /must be one of the declared pages/);
   assert.equal(slugifyAppId('My Fancy App!'), 'my-fancy-app');
   const rendered = renderAppManifest(newHome.manifest);
   const reparsed = parseAppManifest(rendered);
   assert.equal(reparsed.error, undefined);
   assert.deepEqual(reparsed.manifest, newHome.manifest);
+});
+
+test('pif_app.build publishes correlated build_result envelopes and stays responsive (#192)', async () => {
+  const workspace = tempDir('pif-build-');
+  const appDir = tempDir('pif-build-app-');
+  const globalCatalog = tempDir('pif-build-catalog-');
+  const modelsPath = path.join(workspace, '.pi', 'agent', 'models.json');
+  const agentDir = path.join(workspace, '.pi', 'agent');
+  const previousEnv = {
+    PIF_APP_DIR: process.env.PIF_APP_DIR,
+    PIF_GLOBAL_CATALOG: process.env.PIF_GLOBAL_CATALOG,
+    PIF_MODELS_PATH: process.env.PIF_MODELS_PATH,
+    PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+  };
+  fs.mkdirSync(path.join(agentDir, 'agents'), {recursive: true});
+  fs.mkdirSync(path.join(agentDir, 'extensions'), {recursive: true});
+  fs.mkdirSync(path.join(agentDir, 'state'), {recursive: true});
+  fs.mkdirSync(appDir, {recursive: true});
+  fs.mkdirSync(globalCatalog, {recursive: true});
+  fs.writeFileSync(path.join(appDir, 'pubspec.yaml'), 'name: pif_build_app\n');
+  fs.writeFileSync(modelsPath, JSON.stringify({providers: {}}, null, 2) + '\n');
+  const peerMessages = [];
+  const peer = { sendRaw(payload) { peerMessages.push(JSON.parse(Buffer.from(payload).toString())); }, close() {} };
+  const { harness, restore } = patchBuildSpawn([
+    {kind: 'child'},
+    {kind: 'child'},
+    {kind: 'error', message: 'spawn failed asynchronously', code: 127},
+    {kind: 'throw', message: 'spawn denied by fixture'},
+  ]);
+  let hub;
+  try {
+    process.env.PIF_APP_DIR = appDir;
+    process.env.PIF_GLOBAL_CATALOG = globalCatalog;
+    process.env.PIF_MODELS_PATH = modelsPath;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    hub = new __pif.PifHub({}, { ui: { setStatus() {}, notify() {} }, model: { id: 'fixture-model' }, thinkingLevel: 'low' }, workspace, 0);
+    hub.state.app = parseAppManifest('id: notes\nname: Notes\nhome: home\npages: [home]\ndependencies: []\n').manifest;
+    hub.peers.add(peer);
+    const buildScript = path.join(repo, 'scripts', 'build-pif-project-app.sh');
+    // Fake children only: this checks the app/build contract, not real process cleanup.
+
+    const success = hub.control('pif_app.build', { name: 'Exported App' });
+    const successChild = harness.children[0];
+    assert.equal(path.basename(harness.calls[0].command), path.basename(buildScript));
+    assert.deepEqual(harness.calls[0].args, [workspace, 'Exported App']);
+    successChild.emitSpawn();
+    const successAck = await success;
+    assert.equal(successAck.ok, true);
+    assert.equal(successAck.started, true);
+    assert.equal(successAck.name, 'Exported App');
+    const statusDuringSuccess = await hub.control('shell.status');
+    assert.equal(statusDuringSuccess.app.id, 'notes');
+    const stdoutChunk = 'stdout-'.repeat(400);
+    const stderrChunk = 'stderr-'.repeat(400);
+    successChild.stdout.emit('data', stdoutChunk);
+    successChild.stderr.emit('data', stderrChunk);
+    successChild.emitClose(0);
+    successChild.emitClose(0);
+    await waitFor(() => peerMessages.length === 1, 'first build_result');
+    assert.equal(peerMessages.length, 1);
+    assert.equal(peerMessages[0].channel, 'app/build');
+    assert.equal(peerMessages[0].type, 'build_result');
+    assert.equal(peerMessages[0].payload.buildId, successAck.buildId);
+    assert.equal(peerMessages[0].payload.name, 'Exported App');
+    assert.equal(peerMessages[0].payload.ok, true);
+    assert.equal(peerMessages[0].payload.code, 0);
+    assert.equal(peerMessages[0].payload.output.length, 4000);
+    assert.equal(peerMessages[0].payload.output, `${stdoutChunk}${stderrChunk}`.slice(-4000));
+
+    const nonzero = hub.control('pif_app.build', { name: 'Broken App' });
+    const nonzeroChild = harness.children[1];
+    assert.deepEqual(harness.calls[1].args, [workspace, 'Broken App']);
+    nonzeroChild.emitSpawn();
+    const nonzeroAck = await nonzero;
+    assert.equal(nonzeroAck.ok, true);
+    const statusDuringFailure = await hub.control('shell.status');
+    assert.equal(statusDuringFailure.app.id, 'notes');
+    nonzeroChild.stdout.emit('data', 'warn ');
+    nonzeroChild.emitClose(17);
+    await waitFor(() => peerMessages.length === 2, 'second build_result');
+    assert.equal(peerMessages[1].payload.buildId, nonzeroAck.buildId);
+    assert.equal(peerMessages[1].payload.ok, false);
+    assert.equal(peerMessages[1].payload.code, 17);
+    assert.equal(peerMessages[1].payload.output, 'warn ');
+    assert.equal(peerMessages[1].payload.error, undefined);
+
+    const asyncError = await hub.control('pif_app.build', { name: 'Async Fail App' });
+    assert.equal(harness.calls[2].args[1], 'Async Fail App');
+    assert.equal(asyncError.ok, false);
+    assert.equal(asyncError.started, false);
+    assert.match(asyncError.error, /spawn failed asynchronously/);
+    const statusAfterAsyncError = await hub.control('shell.status');
+    assert.equal(statusAfterAsyncError.app.id, 'notes');
+    await waitFor(() => peerMessages.length === 3, 'async-error build_result');
+    assert.equal(peerMessages[2].payload.buildId, asyncError.buildId);
+    assert.equal(peerMessages[2].payload.ok, false);
+    assert.equal(peerMessages[2].payload.code, -1);
+    assert.match(peerMessages[2].payload.error, /spawn failed asynchronously/);
+    assert.equal(peerMessages[2].payload.output, '');
+
+    const spawnError = await hub.control('pif_app.build', { name: 'Denied App' });
+    assert.equal(harness.calls[3].args[1], 'Denied App');
+    assert.equal(spawnError.ok, false);
+    assert.equal(spawnError.started, false);
+    assert.match(spawnError.error, /spawn denied by fixture/);
+    const statusAfterError = await hub.control('shell.status');
+    assert.equal(statusAfterError.app.id, 'notes');
+    await waitFor(() => peerMessages.length === 4, 'spawn-error build_result');
+    assert.equal(peerMessages[3].payload.buildId, spawnError.buildId);
+    assert.equal(peerMessages[3].payload.ok, false);
+    assert.equal(peerMessages[3].payload.code, -1);
+    assert.match(peerMessages[3].payload.error, /spawn denied by fixture/);
+    assert.equal(peerMessages[3].payload.output, '');
+  } finally {
+    if (hub) await hub.stop();
+    restore();
+    if (previousEnv.PIF_APP_DIR === undefined) delete process.env.PIF_APP_DIR; else process.env.PIF_APP_DIR = previousEnv.PIF_APP_DIR;
+    if (previousEnv.PIF_GLOBAL_CATALOG === undefined) delete process.env.PIF_GLOBAL_CATALOG; else process.env.PIF_GLOBAL_CATALOG = previousEnv.PIF_GLOBAL_CATALOG;
+    if (previousEnv.PIF_MODELS_PATH === undefined) delete process.env.PIF_MODELS_PATH; else process.env.PIF_MODELS_PATH = previousEnv.PIF_MODELS_PATH;
+    if (previousEnv.PI_CODING_AGENT_DIR === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousEnv.PI_CODING_AGENT_DIR;
+    fs.rmSync(workspace, { recursive: true, force: true });
+    fs.rmSync(appDir, { recursive: true, force: true });
+    fs.rmSync(globalCatalog, { recursive: true, force: true });
+  }
 });
