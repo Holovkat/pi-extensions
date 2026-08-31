@@ -427,6 +427,336 @@ void main() {
     },
   );
 
+  testWidgets(
+    'native live turns finalize once and match reopened history (#215)',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final bus = FakeBus();
+      final host = _host(bus);
+      final history = <Map<String, dynamic>>[];
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host',
+          'name': 'Host',
+          'host': true,
+          'state': 'idle',
+          'model': 'fixture',
+          'thinking': 'low',
+          'cwd': '/tmp',
+          'transcript': <dynamic>[],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      Future<void> deliver(
+        Map<String, dynamic> event, {
+        String state = 'running',
+      }) async {
+        history.add(event);
+        host.sessions.applyEvent({
+          'sessionId': 'host',
+          'state': state,
+          'event': event,
+        }, envelopeId: 'native-${history.length}');
+        await tester.pump();
+        expectNoFlutterErrors(tester);
+      }
+
+      await deliver({
+        'type': 'input',
+        'content': 'Hello fixture',
+        'ts': '2026-08-31T03:00:00.000Z',
+      });
+      await deliver({'type': 'agent_start', 'ts': '2026-08-31T03:00:00.000Z'});
+      await deliver({
+        'type': 'message_update',
+        'delta': 'Hel',
+        'ts': '2026-08-31T03:00:00.100Z',
+      });
+      await deliver({
+        'type': 'message_update',
+        'delta': 'lo',
+        'ts': '2026-08-31T03:00:00.200Z',
+      });
+      await deliver({
+        'type': 'message',
+        'text': 'Hello',
+        'ts': '2026-08-31T03:00:01.000Z',
+      });
+      expect(find.byIcon(Icons.content_copy), findsNothing);
+      await deliver({
+        'type': 'agent_end',
+        'ts': '2026-08-31T03:00:02.000Z',
+      }, state: 'idle');
+      await tester.pumpAndSettle();
+      expect(
+        find.widgetWithText(SelectableText, 'Hello fixture'),
+        findsOneWidget,
+      );
+      expect(find.byType(MarkdownBody), findsOneWidget);
+      expect(
+        tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data,
+        'Hello',
+      );
+      expect(find.byIcon(Icons.content_copy), findsOneWidget);
+      expect(find.text('2s'), findsOneWidget);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      await tester.pumpAndSettle();
+      expect(find.byType(MarkdownBody), findsOneWidget);
+      expect(
+        tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data,
+        'Hello',
+      );
+      expect(find.byIcon(Icons.content_copy), findsOneWidget);
+      expect(find.text('2s'), findsOneWidget);
+      expectNoFlutterErrors(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await bus.dispose();
+    },
+  );
+
+  testWidgets(
+    'native tool updates render one execution and keep failure visible (#215)',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host',
+          'name': 'Host',
+          'host': true,
+          'state': 'running',
+          'model': 'fixture',
+          'thinking': 'low',
+          'cwd': '/tmp',
+          'transcript': <dynamic>[],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      final events = <Map<String, dynamic>>[
+        {'type': 'input', 'content': 'Read the fixture'},
+        {'type': 'agent_start'},
+        {
+          'type': 'tool_execution_start',
+          'toolCallId': 'call-one',
+          'toolName': 'fixture_read',
+          'args': '{"path":"fixture.txt"}',
+        },
+        {
+          'type': 'tool_execution_update',
+          'toolCallId': 'call-one',
+          'toolName': 'fixture_read',
+          'result': 'Opening fixture',
+        },
+        {
+          'type': 'tool_execution_end',
+          'toolCallId': 'call-one',
+          'toolName': 'fixture_read',
+          'isError': true,
+          'result': 'Fixture access denied',
+        },
+        {'type': 'agent_end'},
+      ];
+      for (var i = 0; i < events.length; i++) {
+        host.sessions.applyEvent({
+          'sessionId': 'host',
+          'state': i == events.length - 1 ? 'idle' : 'running',
+          'event': events[i],
+        }, envelopeId: 'tool-$i');
+        await tester.pump();
+        if (events[i]['type'] == 'tool_execution_update') {
+          expect(find.byIcon(Icons.check_circle), findsNothing);
+          expect(find.byType(CircularProgressIndicator), findsWidgets);
+        }
+        expectNoFlutterErrors(tester);
+      }
+      await tester.pumpAndSettle();
+      expect(find.text('fixture_read'), findsOneWidget);
+      expect(find.byType(ExpansionTile), findsOneWidget);
+      expect(find.byIcon(Icons.check_circle), findsNothing);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      await tester.tap(find.text('fixture_read'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('Fixture access denied'), findsOneWidget);
+      expectNoFlutterErrors(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await bus.dispose();
+    },
+  );
+
+  testWidgets(
+    'native tool turns retain distinct assistant messages across a running reopen (#215)',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host',
+          'name': 'Host',
+          'host': true,
+          'state': 'running',
+          'model': 'fixture',
+          'cwd': '/tmp',
+          'transcript': <dynamic>[],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 850));
+      var sequence = 0;
+      Future<void> deliver(
+        Map<String, dynamic> event, {
+        String state = 'running',
+      }) async {
+        host.sessions.applyEvent({
+          'sessionId': 'host',
+          'state': state,
+          'event': event,
+        }, envelopeId: 'boundary-${sequence++}');
+        await tester.pump();
+      }
+
+      await deliver({'type': 'input', 'content': 'Check fixture'});
+      await deliver({'type': 'agent_start'});
+      await deliver({'type': 'message_start'});
+      await deliver({'type': 'message_update', 'delta': 'Checking'});
+      await deliver({
+        'type': 'message',
+        'role': 'assistant',
+        'text': 'Checking the fixture.',
+      });
+      await deliver({
+        'type': 'tool_execution_start',
+        'toolCallId': 'read-one',
+        'toolName': 'fixture_read',
+        'args': '{}',
+      });
+      await deliver({
+        'type': 'tool_execution_end',
+        'toolCallId': 'read-one',
+        'toolName': 'fixture_read',
+        'result': 'one record',
+      });
+      expect(find.byIcon(Icons.content_copy), findsNothing);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump();
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host, height: 850));
+      await tester.pump();
+      expect(
+        find.byIcon(Icons.content_copy),
+        findsNothing,
+        reason: 'reopening an active turn does not mark it complete',
+      );
+      await deliver({'type': 'message_start'});
+      await deliver({'type': 'message_update', 'delta': 'One'});
+      await deliver({'type': 'message_update', 'delta': ' record.'});
+      await deliver({
+        'type': 'message',
+        'role': 'assistant',
+        'text': 'One record.',
+      });
+      await deliver({'type': 'agent_end'}, state: 'idle');
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widgetList<MarkdownBody>(find.byType(MarkdownBody))
+            .map((widget) => widget.data)
+            .toList(),
+        ['Checking the fixture.', 'One record.'],
+      );
+      expect(find.byType(ExpansionTile), findsOneWidget);
+      expect(find.byIcon(Icons.content_copy), findsOneWidget);
+      expectNoFlutterErrors(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await bus.dispose();
+    },
+  );
+
+  testWidgets(
+    'stored assistant replies retain their role without live agent boundaries (#215)',
+    (tester) async {
+      await tester.binding.setSurfaceSize(const Size(1440, 960));
+      addTearDown(() => tester.binding.setSurfaceSize(null));
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host',
+          'name': 'Host',
+          'host': true,
+          'state': 'ended',
+          'model': 'fixture',
+          'cwd': '/tmp',
+          'transcript': [
+            {
+              'type': 'input',
+              'content': 'Repeat me',
+              'ts': '2026-08-31T03:00:00Z',
+            },
+            {
+              'type': 'message',
+              'role': 'assistant',
+              'text': 'Repeat me',
+              'ts': '2026-08-31T03:00:01Z',
+            },
+          ],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      await tester.pumpAndSettle();
+      expect(find.byType(MarkdownBody), findsOneWidget);
+      expect(
+        tester.widget<MarkdownBody>(find.byType(MarkdownBody)).data,
+        'Repeat me',
+      );
+      expect(find.widgetWithText(SelectableText, 'Repeat me'), findsOneWidget);
+      expect(find.byIcon(Icons.content_copy), findsOneWidget);
+      expectNoFlutterErrors(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await bus.dispose();
+    },
+  );
+
+  testWidgets('empty native failures and cancellations remain visible (#215)', (tester) async {
+    await tester.binding.setSurfaceSize(const Size(1440, 960));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    for (final reason in ['error', 'aborted']) {
+      final bus = FakeBus();
+      final host = _host(bus);
+      host.sessions.applySnapshot({
+        'host': {
+          'id': 'host', 'name': 'Host', 'host': true, 'state': 'idle',
+          'model': 'fixture', 'cwd': '/tmp',
+          'transcript': [
+            {'type': 'input', 'content': 'Run fixture'},
+            {'type': 'agent_start'},
+            {'type': 'message', 'role': 'assistant', 'text': '',
+             'stopReason': reason, 'errorMessage': reason == 'error' ? 'Fixture provider unavailable' : 'Request was aborted'},
+            {'type': 'agent_end', 'aborted': reason == 'aborted'},
+          ],
+        },
+      });
+      await tester.pumpWidget(panel(AgentConsolePlugin(), host));
+      await tester.pumpAndSettle();
+      expect(find.text(reason == 'error' ? 'Error' : 'Canceled'), findsWidgets);
+      expect(find.textContaining(reason == 'error' ? 'Fixture provider unavailable' : 'Request was aborted'), findsOneWidget);
+      expect(find.byType(MarkdownBody), findsNothing);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      expectNoFlutterErrors(tester);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await bus.dispose();
+    }
+  });
+
   testWidgets('model dropdown lists available models and reflects selection', (
     tester,
   ) async {
@@ -985,13 +1315,13 @@ void main() {
       }),
       isNotEmpty,
     );
-    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': true, 'number': 21});
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],'op': 'create', 'ok': true, 'number': 21});
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
     await bus.dispose();
   });
 
-  testWidgets('ticket sheet surfaces create failures and stays open', (tester) async {
+  testWidgets('ticket sheet isolates create results and retries by request (#216)', (tester) async {
     final bus = FakeBus();
     final host = _host(bus);
     host.snapshot = {'tracker': _trackerFixture()};
@@ -1002,10 +1332,38 @@ void main() {
     await tester.enterText(find.byKey(const Key('tracker_sheet_title')), 'Doomed ticket');
     await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
     await tester.pump();
-    bus.emit('tracker/op', 'op_result', {'op': 'create', 'ok': false, 'error': 'gh: label not found'});
+    final firstRequestId = (bus.sent.last['payload'] as Map)['requestId'];
+    expect(firstRequestId, isA<String>());
+    await tester.tapAt(const Offset(1, 1));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    for (final wrongResult in [
+      {'op': 'create', 'ok': true, 'number': 99, 'requestId': 'other-dialog'},
+      {'op': 'create', 'ok': false, 'error': 'FOREIGN_FAILURE', 'requestId': 'other-dialog'},
+      {'op': 'create', 'ok': false, 'error': 'UNCORRELATED_FAILURE'},
+    ]) {
+      bus.emit('tracker/op', 'op_result', wrongResult);
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+      expect(find.textContaining('FOREIGN_FAILURE'), findsNothing);
+      expect(find.textContaining('UNCORRELATED_FAILURE'), findsNothing);
+      expect(tester.widget<FilledButton>(find.byKey(const Key('tracker_sheet_submit'))).onPressed, isNull);
+    }
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],'op': 'create', 'ok': false, 'error': 'gh: label not found'});
     await tester.pumpAndSettle();
     expect(find.textContaining('gh: label not found'), findsOneWidget);
     expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('tracker_sheet_submit')));
+    await tester.pump();
+    final retryRequestId = (bus.sent.last['payload'] as Map)['requestId'];
+    expect(retryRequestId, isNot(firstRequestId));
+    bus.emit('tracker/op', 'op_result', {'requestId': firstRequestId, 'op': 'create', 'ok': true, 'number': 21});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsOneWidget);
+    bus.emit('tracker/op', 'op_result', {'requestId': retryRequestId, 'op': 'create', 'ok': true, 'number': 22});
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
+    expectNoFlutterErrors(tester);
     await bus.dispose();
   });
 
@@ -1031,7 +1389,7 @@ void main() {
       }),
       isNotEmpty,
     );
-    bus.emit('tracker/op', 'op_result', {'op': 'update', 'ok': true, 'number': 11});
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],'op': 'update', 'ok': true, 'number': 11});
     await tester.pumpAndSettle();
     expect(find.textContaining('Task: renamed'), findsOneWidget);
     expect(find.byKey(const Key('tracker_sheet_title')), findsNothing);
@@ -1065,7 +1423,7 @@ void main() {
       }),
       isNotEmpty,
     );
-    bus.emit('tracker/op', 'op_result', {'op': 'update', 'ok': true, 'number': 11});
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],'op': 'update', 'ok': true, 'number': 11});
     await tester.pumpAndSettle();
     expect(find.textContaining('Task: renamed'), findsOneWidget);
     expect(find.byKey(const Key('tracker_sheet_title')), findsNothing);
@@ -1117,7 +1475,7 @@ void main() {
       }),
       isNotEmpty,
     );
-    bus.emit('tracker/op', 'op_result', {'op': 'delete', 'ok': true, 'number': 12});
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],'op': 'delete', 'ok': true, 'number': 12});
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('tracker_sheet_box')), findsNothing);
     await bus.dispose();

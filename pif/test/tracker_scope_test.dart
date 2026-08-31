@@ -307,7 +307,7 @@ void main() {
       ),
       isNotEmpty,
     );
-    bus.emit('tracker/op', 'op_result', {
+    bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
       'op': 'update',
       'ok': true,
       'number': 11,
@@ -445,7 +445,7 @@ void main() {
       expect(savedBodyText, contains('![image|'));
       expect(savedBodyText, contains(imagePath));
       expect(savedBodyText, isNot(contains('![image|240]($imagePath)')));
-      bus.emit('tracker/op', 'op_result', {
+      bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
         'op': 'update',
         'ok': true,
         'number': 11,
@@ -509,7 +509,7 @@ void main() {
         ),
         isNotEmpty,
       );
-      bus.emit('tracker/op', 'op_result', {
+      bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
         'op': 'create',
         'ok': true,
         'number': 99,
@@ -526,7 +526,7 @@ void main() {
         closeButtonAfterOtherReply.onPressed,
         isNull,
       );
-      bus.emit('tracker/op', 'op_result', {
+      bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
         'op': 'update',
         'ok': false,
         'number': 99,
@@ -544,7 +544,7 @@ void main() {
         closeButtonAfterWrongTicket.onPressed,
         isNull,
       );
-      bus.emit('tracker/op', 'op_result', {
+      bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
         'op': 'update',
         'ok': false,
         'number': 11,
@@ -567,7 +567,7 @@ void main() {
       expect(find.text('Save changes?'), findsOneWidget);
       await tester.tap(find.byKey(const Key('tracker_sheet_save_close')));
       await tester.pump();
-      bus.emit('tracker/op', 'op_result', {
+      bus.emit('tracker/op', 'op_result', {'requestId': (bus.sent.last['payload'] as Map)['requestId'],
         'op': 'update',
         'ok': true,
         'number': 11,

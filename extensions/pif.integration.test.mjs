@@ -1,17 +1,183 @@
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 import { __test as pif } from './pif.ts';
 
 const repo = path.resolve(import.meta.dirname, '..');
 const extension = path.join(repo, 'extensions', 'pif.ts');
 const syntheticAllowedOrigins = 'https://fixture.pif.local';
 const sharedPubCache = fs.mkdtempSync(path.join('/tmp', 'pif-pub-cache-'));
+after(() => fs.rmSync(sharedPubCache, {recursive: true, force: true}));
 const tempDir = (prefix) => fs.mkdtempSync(path.join('/tmp', prefix));
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Execute the helpers emitted by the canonical exporter without invoking an
+// AOT build. This is subprocess boundary coverage, not exported-app acceptance.
+function exportHelperSource(marker) {
+  const script = fs.readFileSync(path.join(repo, 'scripts', 'build-pif-project-app.sh'), 'utf8');
+  const start = script.indexOf(marker);
+  assert.notEqual(start, -1, `canonical export helper marker: ${marker}`);
+  const bodyStart = start + marker.length;
+  const end = script.indexOf('\nNODE\n', bodyStart);
+  assert.notEqual(end, -1, 'canonical helper terminator');
+  return script.slice(bodyStart, end);
+}
+
+test('direct export rejects invalid requirements before staging even with quoted paths (#209)', (t) => {
+  const root = tempDir("pif-required-'quote-");
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const project = path.join(root, 'project with spaces');
+  const manifestDir = path.join(project, 'pif_app');
+  fs.mkdirSync(manifestDir, {recursive: true});
+  const output = path.join(root, 'must-not-exist');
+  const manifestPath = path.join(manifestDir, 'app.yaml');
+  for (const dependencies of ['[missing_widget]', '[../invalid]', '[agent_console, agent_console]']) {
+    const raw = `id: fixture\nname: Fixture\nhome: home\npages: [home]\ndependencies: ${dependencies}\n`;
+    fs.writeFileSync(manifestPath, raw);
+    const result = spawnSync(path.join(repo, 'scripts', 'build-pif-project-app.sh'), [project, 'Fixture', output], {
+      env: fixtureEnvironment(root), encoding: 'utf8', timeout: 10_000,
+    });
+    assert.ifError(result.error);
+    assert.notEqual(result.status, 0, dependencies);
+    assert.match(result.stderr, /required widget/i);
+    assert.ok(!fs.existsSync(output), 'preflight must not publish or stage output');
+    assert.equal(fs.readFileSync(manifestPath, 'utf8'), raw);
+    assert.deepEqual(fs.readdirSync(project), ['pif_app']);
+  }
+});
+
+test('canonical export scanner rejects declared credential classes without revealing values (#199)', (t) => {
+  const root = tempDir('pif-scan-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const runner = path.join(root, 'scan.mjs');
+  fs.writeFileSync(runner, exportHelperSource('ROOT="$bundle_root" node --input-type=module <<\'NODE\'\n'));
+  const scan = (directory) => spawnSync(process.execPath, [runner], {
+    env: fixtureEnvironment(root, {ROOT: directory}), encoding: 'utf8', timeout: 10_000,
+  });
+  const cases = [
+    ['clean', 'sample.txt', 'ordinary sample content', true],
+    ['models-file', 'models.json', '{}', false],
+    ['settings-file', 'settings.json', '{}', false],
+    ['env-file', '.env', 'EXAMPLE=demo', false],
+    ['project-token', 'sample.txt', `sk-proj-${'xY2_'.repeat(12)}`, false],
+    ['service-token', 'sample.txt', `sk-svcacct-${'xY2-'.repeat(12)}`, false],
+    ['github-pat', 'sample.txt', `github_pat_${'A1_'.repeat(20)}`, false],
+    ['github-classic', 'sample.txt', `ghp_${'B'.repeat(36)}`, false],
+    ['aws', 'sample.txt', `AKIA${'C'.repeat(16)}`, false],
+    ['google-api', 'sample.txt', `AIza${'D'.repeat(35)}`, false],
+    ['google-oauth', 'sample.txt', `ya29.${'E2_'.repeat(15)}`, false],
+  ];
+  for (const [name, file, value, clean] of cases) {
+    const directory = path.join(root, name);
+    fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(directory, file), value);
+    const result = scan(directory);
+    assert.ifError(result.error);
+    assert.equal(result.status === 0, clean, name);
+    if (!clean && file === 'sample.txt') assert.ok(!(result.stdout + result.stderr).includes(value), `${name}: synthetic value must be redacted`);
+  }
+  const alias = path.join(root, 'alias');
+  fs.mkdirSync(alias);
+  fs.writeFileSync(path.join(alias, 'plain.txt'), '{}');
+  fs.symlinkSync('plain.txt', path.join(alias, 'settings.json'));
+  fs.symlinkSync('.', path.join(alias, 'cycle'));
+  const aliased = scan(alias);
+  assert.ifError(aliased.error);
+  assert.notEqual(aliased.status, 0);
+  assert.match(aliased.stderr, /settings\.json/);
+  const external = path.join(root, 'external');
+  fs.mkdirSync(external);
+  fs.writeFileSync(path.join(root, 'outside.txt'), 'SYNTHETIC_OUTSIDE_CONTENT');
+  fs.symlinkSync('../outside.txt', path.join(external, 'link'));
+  const refused = scan(external);
+  assert.ifError(refused.error);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /outside the export bundle/);
+  assert.ok(!refused.stderr.includes('SYNTHETIC_OUTSIDE_CONTENT'));
+});
+
+test('canonical manifest bootstrap upgrades atomically and rejects bundle destinations (#202, #187)', (t) => {
+  const root = tempDir('pif-bootstrap-');
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const resources = path.join(root, 'Fixture.app', 'Contents', 'Resources');
+  const helperDir = path.join(resources, 'pif_app-manifest');
+  const extensionDir = path.join(resources, 'pi', 'extensions');
+  fs.mkdirSync(helperDir, {recursive: true});
+  fs.mkdirSync(extensionDir, {recursive: true});
+  fs.copyFileSync(path.join(repo, 'extensions', 'pif-shared.ts'), path.join(extensionDir, 'pif-shared.ts'));
+  const runner = path.join(helperDir, 'bootstrap-manifest.mjs');
+  fs.writeFileSync(runner, exportHelperSource('cat > "$RESOURCES/pif_app-manifest/bootstrap-manifest.mjs" <<\'NODE\'\n'));
+  const source = path.join(helperDir, 'app.yaml');
+  const manifest = (home = 'home', id = 'fixture') => `id: ${id}\nname: Fixture\nversion: 1.0.0\nhome: ${home}\npages: [home, settings]\ndependencies: []\n`;
+  const run = (workspace, preload) => spawnSync(process.execPath, [
+    ...(preload ? ['--import', preload] : []), '--experimental-strip-types', runner, workspace, source, 'fixture',
+  ], {env: fixtureEnvironment(root), encoding: 'utf8', timeout: 10_000});
+  const expectSuccess = (workspace) => {
+    const result = run(workspace); assert.ifError(result.error); assert.equal(result.status, 0, result.stderr);
+  };
+  const workspace = path.join(root, 'profile with spaces');
+  fs.writeFileSync(source, manifest());
+  expectSuccess(workspace);
+  const manifestDir = path.join(workspace, 'pif_app');
+  const target = path.join(manifestDir, 'app.yaml');
+  const backups = () => fs.readdirSync(manifestDir).filter((name) => name.startsWith('app.yaml.export-backup-'));
+  assert.equal(fs.readFileSync(target, 'utf8'), manifest());
+  expectSuccess(workspace);
+  assert.deepEqual(backups(), []);
+  fs.writeFileSync(path.join(workspace, 'user-data.json'), 'USER_DATA');
+  fs.mkdirSync(path.join(workspace, '.pi'));
+  fs.writeFileSync(path.join(workspace, '.pi', 'config.json'), 'USER_CONFIG');
+  const edited = manifest() + '# owner note\n';
+  fs.writeFileSync(target, edited);
+  fs.writeFileSync(source, manifest('settings'));
+  expectSuccess(workspace);
+  assert.equal(fs.readFileSync(target, 'utf8'), manifest('settings'));
+  assert.equal(backups().length, 1);
+  assert.equal(fs.readFileSync(path.join(manifestDir, backups()[0]), 'utf8'), edited);
+  assert.equal(fs.readFileSync(path.join(workspace, 'user-data.json'), 'utf8'), 'USER_DATA');
+  assert.equal(fs.readFileSync(path.join(workspace, '.pi', 'config.json'), 'utf8'), 'USER_CONFIG');
+
+  fs.writeFileSync(target, manifest('home', 'foreign-app'));
+  const foreign = run(workspace);
+  assert.notEqual(foreign.status, 0);
+  assert.match(foreign.stderr, /does not match/);
+  assert.equal(fs.readFileSync(target, 'utf8'), manifest('home', 'foreign-app'));
+  fs.writeFileSync(target, 'malformed previous bytes');
+  expectSuccess(workspace);
+  assert.ok(backups().some((name) => fs.readFileSync(path.join(manifestDir, name), 'utf8') === 'malformed previous bytes'));
+
+  const invalidWorkspace = path.join(root, 'invalid-source-profile');
+  fs.writeFileSync(source, 'invalid export');
+  assert.notEqual(run(invalidWorkspace).status, 0);
+  assert.equal(fs.existsSync(invalidWorkspace), false);
+  fs.writeFileSync(source, manifest('home'));
+  const previous = fs.readFileSync(target);
+  const preload = path.join(root, 'reject-final-rename.mjs');
+  fs.writeFileSync(preload, `import fs from 'node:fs';\nconst rename = fs.renameSync;\nfs.renameSync = (from, to) => { if (String(from).includes('.app.yaml.stage-')) throw new Error('controlled interrupted rename'); return rename(from, to); };\n`);
+  const interrupted = run(workspace, preload);
+  assert.notEqual(interrupted.status, 0);
+  assert.match(interrupted.stderr, /controlled interrupted rename/);
+  assert.deepEqual(fs.readFileSync(target), previous);
+  assert.ok(fs.readdirSync(manifestDir).every((name) => !name.includes('.stage-')));
+
+  // Both lexical and canonical targets are prohibited before mutation.
+  const linked = path.join(root, 'linked-profile');
+  fs.mkdirSync(linked);
+  fs.symlinkSync(resources, path.join(linked, 'link'));
+  const marker = path.join(resources, 'sealed.txt');
+  fs.writeFileSync(marker, 'SEALED_SENTINEL');
+  for (const candidate of [path.join(resources, 'new-profile'), `${linked}/link/../new-profile`]) {
+    const result = run(candidate);
+    assert.ifError(result.error);
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.existsSync(candidate), false);
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'SEALED_SENTINEL');
+  }
+});
 
 // Exercise real hub dispatch/state without starting Pi, Flutter or GitHub.
 // External compiler/process boundaries are controlled explicitly per case.
@@ -40,6 +206,120 @@ function contractHub(t, workspace = tempDir('pif-contract-')) {
   });
   return {hub, workspace, messages};
 }
+
+function fileTree(root) {
+  if (!fs.existsSync(root)) return null;
+  const result = {};
+  const walk = (directory) => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const file = path.join(directory, name);
+      const relative = path.relative(root, file);
+      const stat = fs.lstatSync(file);
+      if (stat.isSymbolicLink()) result[relative] = {link: fs.readlinkSync(file)};
+      else if (stat.isDirectory()) { result[`${relative}/`] = null; walk(file); }
+      else result[relative] = fs.readFileSync(file).toString('base64');
+    }
+  };
+  walk(root);
+  return result;
+}
+
+test('app init preserves pinned template and design bytes through failure then retry (#195)', async (t) => {
+  const {hub, workspace} = contractHub(t);
+  const template = path.join(hub.appDir, 'templates', 'mercury');
+  fs.mkdirSync(template, {recursive: true});
+  fs.writeFileSync(path.join(template, 'template.yaml'), 'id: mercury\nname: Mercury\n');
+  fs.writeFileSync(path.join(template, 'design.md'), 'TEMPLATE DESIGN SENTINEL');
+  const appRoot = path.join(workspace, 'pif_app');
+  fs.mkdirSync(appRoot);
+  fs.writeFileSync(path.join(appRoot, 'design.md'), 'OWNER DESIGN SENTINEL');
+  hub.scaffoldAppPackage = () => {};
+  let attempts = 0;
+  hub.installOrFail = async () => {
+    if (++attempts < 3) throw new Error('controlled analyzer rejection');
+  };
+  const parameters = {name: 'Retry Fixture', template: 'mercury'};
+  await assert.rejects(hub.control('pif_app.init', parameters), /analyzer rejection/);
+  const pinned = path.join(appRoot, 'template');
+  const expected = fileTree(template);
+  assert.deepEqual(fileTree(pinned), expected);
+  fs.rmSync(template, {recursive: true}); // Retry can only use the pinned copy.
+  await assert.rejects(hub.control('pif_app.init', parameters), /analyzer rejection/);
+  assert.deepEqual(fileTree(pinned), expected);
+  assert.equal(fs.existsSync(path.join(appRoot, 'app.yaml')), false);
+  assert.equal(fs.existsSync(path.join(appRoot, 'widgets', 'home')), false);
+  assert.equal(fs.readFileSync(path.join(appRoot, 'design.md'), 'utf8'), 'OWNER DESIGN SENTINEL');
+  const success = await hub.control('pif_app.init', parameters);
+  assert.equal(success.ok, true);
+  assert.equal(attempts, 3);
+  assert.deepEqual(fileTree(pinned), expected);
+  assert.equal(fs.readFileSync(path.join(appRoot, 'design.md'), 'utf8'), 'OWNER DESIGN SENTINEL');
+  assert.equal(hub.snapshot().app.home, 'home');
+  assert.ok(fs.existsSync(path.join(appRoot, 'widgets', 'home', 'home.dart')));
+});
+
+test('page collision rejection preserves installed widgets and existing directories (#196)', async (t) => {
+  const {hub, workspace} = contractHub(t);
+  hub.scaffoldAppPackage = () => {};
+  let installs = 0;
+  hub.installOrFail = async () => { installs++; };
+  await hub.control('pif_app.init', {name: 'Collision Fixture'});
+  const widgets = path.join(workspace, 'pif_app', 'widgets');
+  const manifestPath = path.join(workspace, 'pif_app', 'app.yaml');
+  const beforeManifest = fs.readFileSync(manifestPath);
+  const outside = path.join(workspace, 'owned-external-widget');
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, 'sentinel.txt'), 'KEEP_EXTERNAL');
+  fs.mkdirSync(path.join(widgets, 'empty_existing'));
+  fs.mkdirSync(path.join(widgets, 'custom_widget'));
+  fs.writeFileSync(path.join(widgets, 'custom_widget', 'widget.yaml'), 'id: custom_widget\nname: Custom\nslot: bottom\nversion: 1.0.0\ndescription: Custom fixture\ncore: false\n');
+  fs.writeFileSync(path.join(widgets, 'custom_widget', 'custom_widget.dart'), 'KEEP_CUSTOM_SOURCE');
+  fs.symlinkSync(outside, path.join(widgets, 'linked_widget'));
+  const baseWidget = path.join(hub.appDir, 'lib', 'widgets', 'installed_only');
+  fs.mkdirSync(baseWidget, {recursive: true});
+  fs.writeFileSync(path.join(baseWidget, 'widget.yaml'), 'id: installed_only\nname: Installed\nslot: bottom\nversion: 1.0.0\ndescription: Installed fixture\ncore: false\n');
+  fs.writeFileSync(path.join(baseWidget, 'installed_only.dart'), 'KEEP_BASE_SOURCE');
+  hub.scanWidgets();
+  assert.equal(hub.state.widgets.installed_only.source, 'base');
+  const beforeTree = fileTree(widgets);
+  for (const id of ['custom_widget', 'empty_existing', 'linked_widget', 'installed_only']) {
+    await assert.rejects(hub.control('pif_app.page_add', {id, name: id}), /already|exist|collision/i);
+    assert.deepEqual(fileTree(widgets), beforeTree, `${id}: preserve source tree`);
+    assert.deepEqual(fs.readFileSync(manifestPath), beforeManifest, `${id}: preserve manifest`);
+    assert.equal(fs.readFileSync(path.join(outside, 'sentinel.txt'), 'utf8'), 'KEEP_EXTERNAL');
+    assert.equal(installs, 1, 'collisions must not enter install/analyzer gate');
+    assert.equal(fs.readFileSync(path.join(baseWidget, 'installed_only.dart'), 'utf8'), 'KEEP_BASE_SOURCE');
+  }
+  const added = await hub.control('pif_app.page_add', {id: 'settings', name: 'Settings'});
+  assert.equal(added.ok, true);
+  assert.deepEqual(added.pages, ['home', 'settings']);
+  const committed = fs.readFileSync(manifestPath);
+  hub.installOrFail = async () => { throw new Error('controlled analyzer rejection'); };
+  await assert.rejects(hub.control('pif_app.page_add', {id: 'rejected_new', name: 'Rejected'}), /analyzer rejection/);
+  assert.equal(fs.existsSync(path.join(widgets, 'rejected_new')), false);
+  assert.deepEqual(fs.readFileSync(manifestPath), committed);
+  const originalWrite = fs.writeFileSync;
+  fs.writeFileSync = (file, ...arguments_) => {
+    if (String(file) === path.join(widgets, 'rejected_write', 'rejected_write.dart')) throw new Error('controlled source write failure');
+    return originalWrite(file, ...arguments_);
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(hub.control('pif_app.page_add', {id: 'rejected_write', name: 'Rejected write'}), /source write failure/);
+  } finally {
+    fs.writeFileSync = originalWrite;
+    syncBuiltinESMExports();
+  }
+  assert.equal(fs.existsSync(path.join(widgets, 'rejected_write')), false, 'partial scaffold write removes only its newly claimed directory');
+  assert.deepEqual(fs.readFileSync(manifestPath), committed);
+  const uninitialized = contractHub(t);
+  const oldHome = path.join(uninitialized.workspace, 'pif_app', 'widgets', 'home');
+  fs.mkdirSync(oldHome, {recursive: true});
+  fs.writeFileSync(path.join(oldHome, 'home.dart'), 'PRE_EXISTING_HOME');
+  uninitialized.hub.scaffoldAppPackage = () => { throw new Error('package work must not start'); };
+  await assert.rejects(uninitialized.hub.control('pif_app.init', {name: 'Collision'}), /already|exist|collision/i);
+  assert.equal(fs.readFileSync(path.join(oldHome, 'home.dart'), 'utf8'), 'PRE_EXISTING_HOME');
+});
 
 test('manifest publication waits for the install gate and rejects speculative state (#194)', async (t) => {
   const {hub, workspace, messages} = contractHub(t);
@@ -102,6 +382,22 @@ test('dev mode synchronizes control and client messages with safe persistence (#
   await assert.rejects(hub.control('shell.dev_mode', {enabled: false}), (error) => error.message.includes('invalid shell JSON') && !error.message.includes('SYNTHETIC_PRIVATE_PREFERENCE'));
   assert.equal(fs.readFileSync(hub.shellStatePath, 'utf8'), malformed);
   assert.equal(hub.snapshot().devMode, true);
+});
+
+test('dev mode reports unreadable owned preferences without overwriting them (#208)', {
+  skip: typeof process.getuid !== 'function' || process.getuid() === 0,
+}, async (t) => {
+  const {hub} = contractHub(t);
+  await hub.control('shell.dev_mode', {enabled: true});
+  const before = fs.readFileSync(hub.shellStatePath);
+  fs.chmodSync(hub.shellStatePath, 0o000);
+  try {
+    await assert.rejects(hub.control('shell.dev_mode', {enabled: false}), /Unable to read existing shell state.*EACCES/);
+    assert.equal(hub.snapshot().devMode, true);
+  } finally {
+    fs.chmodSync(hub.shellStatePath, 0o600);
+  }
+  assert.deepEqual(fs.readFileSync(hub.shellStatePath), before);
 });
 
 function writeJsonIfMissing(file, value) {
@@ -628,6 +924,154 @@ test('real hub smoke covers snapshot, RPC child, analyze gate, catalog, layout, 
   await closeWebSocket(socket);
   await shutdownChild(pi);
   checkpoint('pi exited');
+});
+
+test('layered widget sources resolve project over catalog over base and clean up registry rollbacks (#207)', {timeout: 180_000}, async (t) => {
+  const checkpoint = (name) => console.error(`[pif-207] ${name}`);
+  const classNameFor = (id) => id.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join('') + 'Plugin';
+  const writeWidgetFixture = (root, id, {name, description, slot = 'right', broken = false}) => {
+    const dir = path.join(root, id);
+    fs.mkdirSync(dir, {recursive: true});
+    fs.writeFileSync(path.join(dir, 'widget.yaml'), [
+      `id: ${id}`,
+      `name: ${JSON.stringify(name)}`,
+      'version: 0.1.0',
+      `description: ${JSON.stringify(description)}`,
+      `slot: ${slot}`,
+      'core: false',
+      `tags: [${id}]`,
+      'dart_dependencies: []',
+      '',
+    ].join('\n'));
+    fs.writeFileSync(path.join(dir, `${id}.dart`), broken ? "void broken( {\n" : [
+      "import 'package:flutter/material.dart';",
+      "import 'package:pif/core/plugin.dart';",
+      '',
+      `class ${classNameFor(id)} implements PifWidgetPlugin {`,
+      '  @override',
+      `  PifWidgetMeta get meta => const PifWidgetMeta(id: '${id}', name: ${JSON.stringify(name)}, slot: PifSlot.${slot});`,
+      '',
+      '  @override',
+      '  Widget build(BuildContext context, PifHost host) => const SizedBox();',
+      '}',
+      '',
+    ].join('\n'));
+    return dir;
+  };
+  const mainWorkspace = tempDir('pif-sources-207-');
+  const rollbackWorkspace = tempDir('pif-sources-207-rollback-');
+  let mainPi;
+  let rollbackPi;
+  t.after(async () => {
+    await shutdownChild(rollbackPi);
+    await shutdownChild(mainPi);
+    fs.rmSync(mainWorkspace, {recursive: true, force: true});
+    fs.rmSync(rollbackWorkspace, {recursive: true, force: true});
+  });
+
+  const mainAppDir = copyFixture(mainWorkspace, false);
+  const {globalCatalog: mainCatalog} = seedProjectOverlay(mainWorkspace);
+  writeWidgetFixture(mainCatalog, 'diff_viewer', {name: 'Diff Viewer (Catalog)', description: 'Catalog precedence fixture', slot: 'center'});
+  const mainPort = await reservePort();
+  mainPi = await startPi({workspace: mainWorkspace, port: mainPort, piBin: fakePi(mainWorkspace), appDir: mainAppDir, globalCatalog: mainCatalog});
+  const mainControlPath = path.join(mainWorkspace, '.pi', 'pif', 'control.sock');
+  const baseDiffViewer = path.join(mainAppDir, 'lib', 'widgets', 'diff_viewer');
+  const projectDiffViewer = path.join(mainWorkspace, 'pif_app', 'widgets', 'diff_viewer');
+  const readWidgetBytes = (dir, id) => ({
+    yaml: fs.readFileSync(path.join(dir, 'widget.yaml'), 'utf8'),
+    dart: fs.readFileSync(path.join(dir, `${id}.dart`), 'utf8'),
+  });
+  const baseDiffViewerBefore = readWidgetBytes(baseDiffViewer, 'diff_viewer');
+  const catalogDiffViewerBefore = readWidgetBytes(path.join(mainCatalog, 'diff_viewer'), 'diff_viewer');
+
+  const initialList = await control(mainControlPath, 'widget.list');
+  assert.equal(initialList.installed.diff_viewer.source, 'base');
+  assert.equal(initialList.catalog.diff_viewer.source, 'catalog');
+  assert.equal(initialList.catalog.diff_viewer.name, 'Diff Viewer (Catalog)');
+  const initialStatus = await control(mainControlPath, 'shell.status');
+  assert.equal(initialStatus.widgets.diff_viewer.source, 'base');
+  assert.equal(initialStatus.catalog.diff_viewer.source, 'catalog');
+  checkpoint('base and catalog collision visible');
+
+  const installed = await control(mainControlPath, 'widget.install', {id: 'diff_viewer'});
+  assert.equal(installed.ok, true, installed.diagnostics || '');
+  assert.equal(installed.phase, 'reload');
+  assert.equal(installed.source, 'project');
+  assert.ok(fs.existsSync(projectDiffViewer), 'catalog install copies into the project overlay');
+  assert.match(fs.readFileSync(path.join(projectDiffViewer, 'widget.yaml'), 'utf8'), /Diff Viewer \(Catalog\)/);
+  assert.deepEqual(readWidgetBytes(baseDiffViewer, 'diff_viewer'), baseDiffViewerBefore);
+  assert.deepEqual(readWidgetBytes(path.join(mainCatalog, 'diff_viewer'), 'diff_viewer'), catalogDiffViewerBefore);
+  assert.deepEqual(readWidgetBytes(projectDiffViewer, 'diff_viewer'), catalogDiffViewerBefore);
+  const installedStatus = await control(mainControlPath, 'shell.status');
+  assert.equal(installedStatus.widgets.diff_viewer.source, 'project');
+  assert.equal(installedStatus.widgets.diff_viewer.name, 'Diff Viewer (Catalog)');
+  assert.equal(installedStatus.catalog.diff_viewer, undefined);
+  const installedList = await control(mainControlPath, 'widget.list');
+  assert.equal(installedList.installed.diff_viewer.source, 'project');
+  assert.equal(installedList.catalog.diff_viewer, undefined);
+  const registry = fs.readFileSync(path.join(mainAppDir, 'lib', 'widget_registry.g.dart'), 'utf8');
+  assert.match(registry, /\/\/ source: project\n    'diff_viewer'/);
+  assert.match(registry, /import 'file:\/\/.+\/pif_app\/widgets\/diff_viewer\/diff_viewer\.dart';/);
+  checkpoint('catalog copy becomes project source');
+
+  const uninstalled = await control(mainControlPath, 'widget.uninstall', {id: 'diff_viewer'});
+  assert.equal(uninstalled.ok, true);
+  assert.equal(uninstalled.source, 'project');
+  assert.equal(uninstalled.deregistered, true);
+  assert.ok(fs.existsSync(projectDiffViewer), 'project uninstall preserves the source files');
+  const postUninstallStatus = await control(mainControlPath, 'shell.status');
+  assert.equal(postUninstallStatus.widgets.diff_viewer.source, 'project');
+  assert.equal(postUninstallStatus.widgets.diff_viewer.enabled, false);
+  assert.equal(postUninstallStatus.catalog.diff_viewer, undefined);
+  const postUninstallList = await control(mainControlPath, 'widget.list');
+  assert.equal(postUninstallList.installed.diff_viewer.source, 'project');
+  assert.equal(postUninstallList.installed.diff_viewer.enabled, false);
+  assert.equal(postUninstallList.catalog.diff_viewer, undefined);
+  assert.deepEqual(readWidgetBytes(baseDiffViewer, 'diff_viewer'), baseDiffViewerBefore);
+  assert.deepEqual(readWidgetBytes(path.join(mainCatalog, 'diff_viewer'), 'diff_viewer'), catalogDiffViewerBefore);
+  assert.deepEqual(readWidgetBytes(projectDiffViewer, 'diff_viewer'), catalogDiffViewerBefore);
+  checkpoint('project uninstall keeps source and disables only');
+
+  const coreToggle = await control(mainControlPath, 'widget.toggle', {id: 'agent_console', enabled: false});
+  assert.equal(coreToggle.enabled, false);
+  assert.equal(coreToggle.source, 'base');
+  assert.equal((await control(mainControlPath, 'shell.status')).widgets.agent_console.enabled, false);
+  await assert.rejects(() => control(mainControlPath, 'widget.uninstall', {id: 'agent_console'}), /Core widget/);
+  checkpoint('core widget may be disabled but not uninstalled');
+
+  const rollbackAppDir = copyFixture(rollbackWorkspace);
+  const {globalCatalog: rollbackCatalog} = seedProjectOverlay(rollbackWorkspace);
+  writeWidgetFixture(path.join(rollbackAppDir, 'lib', 'widgets'), 'registry_breaker', {name: 'Registry Breaker', description: 'Broken base widget that forces registry analyze failure', slot: 'center', broken: true});
+  writeWidgetFixture(rollbackCatalog, 'rollback_case', {name: 'Rollback Case (Catalog)', description: 'Catalog fixture used to verify stale state is cleared after failure', slot: 'right'});
+  writeWidgetFixture(path.join(rollbackWorkspace, 'pif_app', 'widgets'), 'agent_console', {name: 'Agent Console (Project Shadow)', description: 'Non-core project shadow fixture for core uninstall safety', slot: 'center'});
+  const rollbackPort = await reservePort();
+  rollbackPi = await startPi({workspace: rollbackWorkspace, port: rollbackPort, piBin: fakePi(rollbackWorkspace), appDir: rollbackAppDir, globalCatalog: rollbackCatalog});
+  const rollbackControlPath = path.join(rollbackWorkspace, '.pi', 'pif', 'control.sock');
+  const rollbackStatusBefore = await control(rollbackControlPath, 'shell.status');
+  assert.equal(rollbackStatusBefore.widgets.registry_breaker.source, 'base');
+  assert.equal(rollbackStatusBefore.widgets.registry_breaker.enabled, true);
+  assert.equal(rollbackStatusBefore.catalog.rollback_case.source, 'catalog');
+  const rollbackInstall = await control(rollbackControlPath, 'widget.install', {id: 'rollback_case'});
+  assert.equal(rollbackInstall.ok, false);
+  assert.equal(rollbackInstall.phase, 'registry_analyze');
+  assert.equal(rollbackInstall.source, 'project');
+  assert.ok(!fs.existsSync(path.join(rollbackWorkspace, 'pif_app', 'widgets', 'rollback_case')), 'failed catalog install removes the copied project directory');
+  const rollbackStatusAfter = await control(rollbackControlPath, 'shell.status');
+  assert.equal(rollbackStatusAfter.widgets.rollback_case, undefined);
+  assert.equal(rollbackStatusAfter.catalog.rollback_case.source, 'catalog');
+  const rollbackList = await control(rollbackControlPath, 'widget.list');
+  assert.equal(rollbackList.installed.rollback_case, undefined);
+  assert.equal(rollbackList.catalog.rollback_case.source, 'catalog');
+  checkpoint('registry rollback leaves no stale installed record');
+
+  const coreShadowList = await control(rollbackControlPath, 'widget.list');
+  assert.equal(coreShadowList.installed.agent_console.source, 'project');
+  assert.equal(coreShadowList.installed.agent_console.core, false);
+  const coreShadowToggle = await control(rollbackControlPath, 'widget.toggle', {id: 'agent_console', enabled: false});
+  assert.equal(coreShadowToggle.source, 'project');
+  assert.equal(coreShadowToggle.enabled, false);
+  await assert.rejects(() => control(rollbackControlPath, 'widget.uninstall', {id: 'agent_console'}), /Core widget/);
+  checkpoint('project-shadow core widget can be disabled but not uninstalled');
 });
 
 test('real Flutter supervisor boots the macOS shell and performs a machine-protocol reload', {timeout: 180_000}, async (t) => {

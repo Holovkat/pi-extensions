@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Remediation behavior regressions for the combined gate](./2026-08-31T04-28-00Z-pif-remediation-behavior-regressions.md) | 2026-08-31T04:28:00Z | pif, testing, remediation | #160 |
 | [Tracker request identity and dialog ownership (#216)](./2026-08-31T04-19-37Z-pif-tracker-request-id-correlation.md) | 2026-08-31T04:19:37Z | pif, tracker, request-correlation | #216 |
 | [Export entrypoint, pinned widgets and startup ownership (#211)](./2026-08-31T04-06-56Z-pif-export-entrypoint-adoption-race-guard.md) | 2026-08-31T04:06:56Z | pif, export, startup | #211 |
 | [Exported native Pi profile isolation (#201)](./2026-08-31T04-19-03Z-pif-exported-native-profile-isolation.md) | 2026-08-31T04:19:03Z | pif, export, native-profile | #201 |
