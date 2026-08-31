@@ -19,6 +19,9 @@ class EnvironmentIdentity {
   final String workspacePath;
   final String builderVersion;
   String get appDir => WorkspacePaths.child(workspacePath, 'pif');
+  bool get hasEditableSource =>
+      File('$appDir/pubspec.yaml').existsSync() &&
+      Directory('$appDir/macos').existsSync();
   String get kitDir => WorkspacePaths.child(workspacePath, '.pif/builder');
   String get stateDir => WorkspacePaths.child(workspacePath, '.pi/pif');
 

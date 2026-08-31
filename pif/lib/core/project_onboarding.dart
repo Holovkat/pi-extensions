@@ -4,8 +4,9 @@ import 'development_environment.dart';
 import 'github_connection.dart';
 import 'project_repository.dart';
 
-/// Returns an environment after an explicit repository decision. The caller
-/// launches a new workspace, or refreshes the current tracker without restart.
+/// Prepares a new or resumed project, preserving its saved repository choice.
+/// [repositoryOnly] instead edits the current repository connection without
+/// requiring builder setup. [chooseFolder] defaults to the native chooser.
 Future<EnvironmentIdentity?> showProjectOnboarding(
   BuildContext context, {
   required DevelopmentEnvironmentService environments,
@@ -13,6 +14,8 @@ Future<EnvironmentIdentity?> showProjectOnboarding(
   required Future<void> Function(EnvironmentIdentity) onEnvironmentSelected,
   required Future<void> Function() onOpenSettings,
   EnvironmentIdentity? environment,
+  bool repositoryOnly = false,
+  Future<String?> Function(String prompt)? chooseFolder,
 }) => showDialog<EnvironmentIdentity>(
   context: context,
   barrierDismissible: false,
@@ -22,6 +25,8 @@ Future<EnvironmentIdentity?> showProjectOnboarding(
     onEnvironmentSelected: onEnvironmentSelected,
     onOpenSettings: onOpenSettings,
     environment: environment,
+    repositoryOnly: repositoryOnly,
+    chooseFolder: chooseFolder,
   ),
 );
 
@@ -32,12 +37,16 @@ class _ProjectOnboarding extends StatefulWidget {
     required this.onEnvironmentSelected,
     required this.onOpenSettings,
     this.environment,
+    required this.repositoryOnly,
+    this.chooseFolder,
   });
   final DevelopmentEnvironmentService environments;
   final GithubConnectionService github;
   final Future<void> Function(EnvironmentIdentity) onEnvironmentSelected;
   final Future<void> Function() onOpenSettings;
   final EnvironmentIdentity? environment;
+  final bool repositoryOnly;
+  final Future<String?> Function(String prompt)? chooseFolder;
   @override
   State<_ProjectOnboarding> createState() => _ProjectOnboardingState();
 }
@@ -54,8 +63,9 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
   String? _notice;
   bool _private = true;
   bool _busy = false;
-  bool _createdHere = false;
-  bool _finished = false;
+  bool _showingSettings = false;
+  bool _repositorySaved = false;
+  bool _recovering = false;
   String _progress = '';
 
   @override
@@ -63,7 +73,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
     super.initState();
     widget.github.addListener(_connectionChanged);
     if (widget.environment != null) {
-      _mode = 'connect';
+      _mode = widget.repositoryOnly ? 'connect' : 'create';
       WidgetsBinding.instance.addPostFrameCallback(
         (_) => _run(() => _activate(widget.environment!)),
       );
@@ -81,10 +91,17 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
 
   void _connectionChanged() {
     if (!mounted) return;
-    if (_owner.text.isEmpty && widget.github.state.account != null)
+    if (_githubVerified && _owner.text.isEmpty)
       _owner.text = widget.github.state.account!;
     setState(() {});
   }
+
+  bool get _githubVerified =>
+      _identity != null &&
+      widget.github.environmentId == _identity!.id &&
+      widget.github.workspace == _identity!.workspacePath &&
+      widget.github.state.validated &&
+      widget.github.state.account != null;
 
   Future<void> _run(Future<void> Function() action) async {
     if (_busy) return;
@@ -95,13 +112,18 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
     try {
       await action();
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted) {
+        setState(
+          () => _error = error is StateError ? error.message : error.toString(),
+        );
+      }
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<String?> _folder(String prompt) async {
+    if (widget.chooseFolder != null) return widget.chooseFolder!(prompt);
     final result = await Process.run('/usr/bin/osascript', [
       '-e',
       'on run argv',
@@ -126,15 +148,23 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
       await widget.onEnvironmentSelected(identity);
     }
     final saved = _repositories.pending(identity);
-    if (saved?['mode'] == 'create' &&
-        ['requested', 'remote_created', 'denied'].contains(saved?['phase'])) {
-      _mode = 'create';
-      final target = (saved!['target'] as String).split('/');
-      _owner.text = target.first;
-      _repo.text = target.last;
-      _private = saved['private'] == true;
-      _notice =
-          'A saved creation request needs review. Retry checks the exact target before any further action.';
+    if (saved != null &&
+        (!widget.repositoryOnly ||
+            !['local', 'linked'].contains(saved['phase']))) {
+      _mode = saved['mode'] as String;
+      _repositorySaved = ['local', 'linked'].contains(saved['phase']);
+      _recovering = ['requested', 'remote_created'].contains(saved['phase']);
+      if (saved['target'] is String) {
+        final target = (saved['target'] as String).split('/');
+        _owner.text = target.first;
+        _repo.text = target.last;
+        _private = saved['private'] == true;
+      }
+      _notice = _repositorySaved
+          ? 'Your repository choice is saved. Continue preparing this project.'
+          : _recovering
+          ? 'A saved request needs verification. The exact repository will be checked before continuing.'
+          : 'The previous request was declined. Review the repository details before continuing.';
     } else {
       final origin = await _repositories.currentRepository(identity);
       if (origin != null) {
@@ -152,15 +182,9 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
   }
 
   Future<void> _selectLocation() => _run(() async {
-    final path = await _folder(
-      _mode == 'connect'
-          ? 'Select an existing local workspace'
-          : 'Choose the parent folder for the new project',
-    );
+    final path = await _folder('Choose the parent folder for the new project');
     if (path == null || path.isEmpty || !mounted) return;
     setState(() => _location = path);
-    if (_mode == 'connect')
-      await _activate(await EnvironmentIdentity.ensure(path));
   });
   Future<void> _allocate() => _run(() async {
     if (_location == null)
@@ -169,73 +193,120 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
       parentPath: _location!,
       name: _name.text.trim(),
     );
-    _createdHere = true;
     await _activate(identity);
   });
-  Future<void> _settings() => _run(() async {
-    if (_identity == null) return;
-    await widget.onOpenSettings();
-    _connectionChanged();
-  });
+  Future<void> _settings() async {
+    if (_busy || _showingSettings) return;
+    setState(() => _showingSettings = true);
+    try {
+      final identity = _identity;
+      if (identity != null &&
+          (widget.github.environmentId != identity.id ||
+              widget.github.workspace != identity.workspacePath)) {
+        await widget.onEnvironmentSelected(identity);
+      }
+      await widget.onOpenSettings();
+      _connectionChanged();
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally {
+      if (mounted) setState(() => _showingSettings = false);
+    }
+  }
+
   Future<void> _complete() => _run(() async {
     final identity = _identity!;
-    final target = '${_owner.text.trim()}/${_repo.text.trim()}';
-    setState(() => _progress = 'Saving the repository decision…');
-    switch (_mode) {
-      case 'local':
-        await _repositories.localOnly(identity);
-      case 'connect':
-        await _repositories.connect(identity, target);
-      case 'create':
-        await _repositories.create(identity, target, private: _private);
-    }
-    var ready = identity;
-    String? notice;
-    if (_createdHere) {
+    if (!_repositorySaved) {
+      final target = '${_owner.text.trim()}/${_repo.text.trim()}';
+      setState(() => _progress = 'Saving the repository decision…');
       try {
-        ready = await widget.environments.provision(
-          identity,
-          onProgress: (message) {
-            if (mounted) setState(() => _progress = message);
-          },
-          isCancelled: () => !mounted,
-        );
-      } catch (error) {
-        notice =
-            'The environment and repository decision are saved. Builder setup needs attention: $error';
+        switch (_mode) {
+          case 'local':
+            await _repositories.localOnly(identity);
+          case 'connect':
+            await _repositories.connect(identity, target);
+          case 'create':
+            await _repositories.create(identity, target, private: _private);
+        }
+      } catch (_) {
+        _recovering = [
+          'requested',
+          'remote_created',
+        ].contains(_repositories.pending(identity)?['phase']);
+        rethrow;
       }
-    }
-    try {
-      final status = await widget.environments.inspect(ready);
-      if (!status.canBuild)
-        notice =
-            '${notice == null ? '' : '$notice\n'}Build prerequisites need attention:\n${status.allIssues.join('\n')}';
-    } catch (error) {
-      notice =
-          'The environment is saved. Build readiness could not be checked: $error';
+      _repositorySaved = true;
+      _recovering = false;
     }
     if (!mounted) return;
-    _identity = ready;
-    if (notice == null) {
-      Navigator.pop(context, ready);
+    if (widget.repositoryOnly) {
+      Navigator.pop(context, identity);
       return;
     }
+
     setState(() {
-      _notice = '$notice\nYou can open the project and use Settings now.';
-      _finished = true;
+      _notice = 'Your project and repository choice are saved.';
+      _progress = 'Preparing the project…';
     });
+    var ready = identity;
+    if (!identity.hasEditableSource) {
+      ready = await widget.environments.provision(
+        identity,
+        onProgress: (message) {
+          if (mounted) setState(() => _progress = message);
+        },
+        isCancelled: () => !mounted,
+      );
+    }
+    _identity = ready;
+    final status = await widget.environments.inspect(ready);
+    if (!status.canBuild) {
+      throw StateError(
+        'Project setup needs attention:\n${status.allIssues.join('\n')}',
+      );
+    }
+    if (mounted) Navigator.pop(context, ready);
   });
 
   @override
   Widget build(BuildContext context) {
     final github = widget.github.state;
     final selected = _identity != null;
-    final canConfirm = selected && (_mode == 'local' || github.validated);
+    final verified = _githubVerified;
+    final needsConnection =
+        selected && !_repositorySaved && _mode != 'local' && !verified;
+    final primaryLabel = !selected
+        ? 'Continue'
+        : _repositorySaved
+        ? 'Continue setup'
+        : needsConnection
+        ? 'Connect GitHub'
+        : _recovering
+        ? 'Check repository setup'
+        : switch (_mode) {
+            'local' =>
+              widget.repositoryOnly ? 'Use local only' : 'Create project',
+            'connect' => 'Connect existing repository',
+            _ => 'Create on GitHub',
+          };
+    final canContinue =
+        selected || (_location != null && _name.text.trim().isNotEmpty);
     return PopScope(
       canPop: !_busy,
       child: AlertDialog(
-        title: Text(
-          widget.environment == null ? 'New Project' : 'Connect Repository',
+        title: Row(
+          children: [
+            Expanded(
+              child: Text(
+                widget.repositoryOnly ? 'Connect Repository' : 'New Project',
+              ),
+            ),
+            IconButton(
+              tooltip: 'Settings',
+              onPressed: _busy || _showingSettings ? null : _settings,
+              icon: const Icon(Icons.settings_outlined, size: 20),
+            ),
+          ],
         ),
         content: SizedBox(
           width: 540,
@@ -244,7 +315,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (!_finished)
+                if (selected && !_repositorySaved)
                   DropdownButtonFormField<String>(
                     initialValue: _mode,
                     isExpanded: true,
@@ -268,64 +339,55 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
                       DropdownMenuItem(
                         value: 'local',
                         child: Text(
-                          'Local only — tracker disconnected',
+                          'Local project',
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
-                    onChanged: _busy
+                    onChanged: _busy || _recovering
                         ? null
                         : (value) => setState(() {
                             _mode = value!;
                             _error = null;
-                            if (!selected) _location = null;
+                            _notice = null;
                           }),
                   ),
                 const SizedBox(height: 16),
                 if (!selected) ...[
-                  if (_mode != 'connect')
-                    TextField(
-                      controller: _name,
-                      enabled: !_busy,
-                      decoration: const InputDecoration(
-                        labelText: 'Local project name',
-                      ),
+                  TextField(
+                    controller: _name,
+                    enabled: !_busy,
+                    decoration: const InputDecoration(
+                      labelText: 'Project name',
                     ),
+                    onChanged: (_) => setState(() {}),
+                  ),
                   const SizedBox(height: 12),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : _selectLocation,
                     icon: const Icon(Icons.folder_open),
-                    label: Text(
-                      _location ??
-                          (_mode == 'connect'
-                              ? 'Select existing workspace'
-                              : 'Choose project location'),
-                    ),
+                    label: Text(_location ?? 'Choose project location'),
                   ),
-                  if (_mode != 'connect')
-                    FilledButton(
-                      onPressed: _busy ? null : _allocate,
-                      child: const Text('Create local environment'),
-                    ),
                   const SizedBox(height: 8),
                   const Text(
-                    'The local environment is created first. This step never creates a remote repository.',
+                    'Choose a name and location. You can connect GitHub in the next step.',
                   ),
                 ] else ...[
                   SelectableText(_identity!.workspacePath),
                   const SizedBox(height: 12),
-                  if (!_finished && _mode != 'local') ...[
+                  if (!_repositorySaved && _mode != 'local') ...[
                     Text(
-                      'Account: ${github.validated ? github.account : 'not verified for this environment'}',
+                      'Account: ${verified ? github.account : 'not connected for this project'}',
                     ),
-                    Text(github.message),
-                    TextButton(
-                      onPressed: _busy ? null : _settings,
-                      child: const Text('Open GitHub Settings'),
-                    ),
+                    if (needsConnection)
+                      const Text(
+                        'Connect this project’s GitHub token in Settings, or choose local only.',
+                      ),
+                  ],
+                  if (!_repositorySaved && _mode != 'local' && verified) ...[
                     TextField(
                       controller: _owner,
-                      enabled: !_busy,
+                      enabled: !_busy && !_recovering,
                       decoration: const InputDecoration(
                         labelText: 'GitHub owner or organization',
                       ),
@@ -333,7 +395,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
                     ),
                     TextField(
                       controller: _repo,
-                      enabled: !_busy,
+                      enabled: !_busy && !_recovering,
                       decoration: const InputDecoration(
                         labelText: 'Repository name',
                       ),
@@ -346,7 +408,7 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
                           _private ? 'Private repository' : 'Public repository',
                         ),
                         value: _private,
-                        onChanged: _busy
+                        onChanged: _busy || _recovering
                             ? null
                             : (value) => setState(() => _private = value),
                       ),
@@ -355,17 +417,11 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
                       'Review: ${github.account ?? 'unverified account'} → github.com/${_owner.text.trim()}/${_repo.text.trim()}${_mode == 'create' ? (_private ? ' (private)' : ' (public)') : ' (existing visibility preserved)'}.',
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     ),
-                    const Text(
-                      'Confirming may initialize Git in this folder and add a matching origin. Existing origins and history are preserved. No files are committed or pushed.',
-                    ),
-                    if (_mode == 'create')
-                      const Text(
-                        'Issues will be enabled. A random, non-secret recovery marker is stored in the repository description so an uncertain request can be reconciled safely.',
-                      ),
+                    const Text('No files are committed or pushed.'),
                   ],
-                  if (!_finished && _mode == 'local')
+                  if (!_repositorySaved && _mode == 'local')
                     const Text(
-                      'No GitHub account or remote is required. The tracker stays disconnected; connect this environment later in Settings.',
+                      'GitHub and the tracker can be connected later.',
                     ),
                 ],
                 if (_notice != null) ...[
@@ -395,22 +451,16 @@ class _ProjectOnboardingState extends State<_ProjectOnboarding> {
             onPressed: _busy ? null : () => Navigator.pop(context),
             child: const Text('Cancel'),
           ),
-          if (_finished)
-            FilledButton(
-              onPressed: () => Navigator.pop(context, _identity),
-              child: const Text('Open project'),
-            )
-          else if (selected)
-            FilledButton(
-              onPressed: !_busy && canConfirm ? _complete : null,
-              child: Text(
-                _mode == 'local'
-                    ? 'Use local only'
-                    : _mode == 'connect'
-                    ? 'Connect existing repository'
-                    : 'Create on GitHub',
-              ),
-            ),
+          FilledButton(
+            onPressed: _busy || _showingSettings || !canContinue
+                ? null
+                : !selected
+                ? _allocate
+                : needsConnection
+                ? _settings
+                : _complete,
+            child: Text(primaryLabel),
+          ),
         ],
       ),
     );

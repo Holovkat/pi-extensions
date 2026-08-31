@@ -4,7 +4,7 @@ title: Current Repo State
 description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-31T10:36:58Z
+timestamp: 2026-08-31T12:03:49Z
 status: active
 ---
 
@@ -60,6 +60,11 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 - [Current installed-builder report](../../docs/reviews/2026-08-31-installed-builder-verification.md) records this candidate, failure/repair history and subsequent evidence. The earlier passing dc45ff40 baseline does not prove added scope.
 - Latest owner simplification: #221 is token-only, stored in macOS Keychain per environment UUID; no browser/device/OAuth flow, global-login fallback or automatic credential sharing. #223 adds one central Settings tab with just Appearance (Light/Dark/System) and GitHub; it borrows Mercury’s grouping without advanced sliders or unrelated sections. Allocate local environment identity before token/GitHub setup.
 - GitHub is the ticket authority; local-only mode remains explicitly disconnected. Secrets stay in secure OS storage and out of projects/exports; created environments do not copy parent runtime state or tickets. Ordinary AOT exports and the deferred RFW lane remain distinct from editable environments. #190 runtime self-management remains related backlog.
+
+### New Project workflow correction (31 August 2026)
+- Owner follow-up simplifies setup to the relevant next step. Saved projects automatically finish local preparation; saved repository decisions and credentials are not recreated. Settings stays in the header. Routine SDK selection/retry/preview-bypass choices are removed; actual failures expose specific recovery.
+- Current installed `/Applications/pif.app` is signed and running as **PID69833**, builder `eba148290911035dff9d53479eb5abf0ccd0ae37b858ab71027bc5467fde84d2`. This supersedes the installed candidate above. Clean analysis, **142 Flutter tests** and **15 Node integration tests** pass.
+- Native saved-project setup/open passed for `pif-test-app-1` with unchanged identity/repository decision. New Project first-step/Settings return was observed; the separate native folder chooser was confirmed by the owner but is not addressable by Computer Use. Fresh-project GUI completion and wider #160 acceptance remain distinct from these results.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.

@@ -296,6 +296,13 @@ tracker authority, including native epic/task sub-issue relationships.
 A conflicting origin is preserved, repository creation is retry-safe, and
 commit/push of project content requires a separate explicit action.
 
+New Project follows the saved workflow state: name/location, relevant repository
+connection/review, automatic local preparation, then open. A completed local or
+linked repository decision must not be repeated when local preparation resumes.
+Settings is a stable header reference and returning from it preserves the current
+step and drafts. Routine setup never asks users to select SDK files or choose a
+preview bypass; only a detected prerequisite failure exposes relevant recovery.
+
 Authentication is token-only. The selected environment's UUID and github.com
 scope address a native secure-store entry; no token is persisted in project
 JSON, sent through the hub bus, inherited by child environments or bundled

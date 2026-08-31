@@ -88,3 +88,55 @@ manual dependency restoration was diagnostic and is not a clean pass.
 - No merge, hosted deployment or release acceptance is implied by local implementation or tests.
 
 Raw logs and bounded diagnostic artifacts are in `/tmp/pif-installed-builder-execution-2026-08-31/`. Failed attempts are retained alongside passing reruns.
+
+
+## Owner follow-up: New Project workflow simplified
+
+The owner found the saved-project recovery surface confusing. Live evidence
+showed `pif-test-app-1` already had a linked GitHub repository and saved local
+identity, but no editable source or private builder kit. The picker inspected
+that state without continuing preparation; the repository dialog also gated
+preparation on whether the identity was created in that particular dialog.
+
+The corrected flow is name/location → relevant repository connection/review →
+automatic workspace preparation → open. Saved local/linked decisions skip
+repeated repository operations. Settings is a quiet, stable header reference;
+returning preserves drafts and the active step. The normal picker no longer
+shows Retry setup, SDK selection or Open without preview. Only a detected
+failure exposes Review setup, and the Flutter locator appears only when
+Flutter discovery fails. Existing repository-only Settings operations remain
+available without requiring the authoring preparation gate.
+
+Validation for this follow-up:
+
+- Dart analysis is clean; the complete Flutter suite passes **142 tests**.
+  This includes **10 onboarding and six picker workflow regressions** for
+  staged fields, Settings return, saved decisions, partial setup, preservation,
+  relevant recovery and ready-project reopening.
+- The required Node hub integration suite passes **15/15**. No Node product
+  code changed in this follow-up. One analyzer style warning was corrected;
+  initial test-harness fake/real event-loop stalls were repaired without
+  weakening the behavior assertions.
+- Final stock build and strict deep signature pass. Installed at
+  `/Applications/pif.app`, launched as **PID 69833**. All four changed Dart
+  product files match the installed resources. Builder version:
+  `eba148290911035dff9d53479eb5abf0ccd0ae37b858ab71027bc5467fde84d2`
+  (**10,333 files**). This supersedes PID53246 for the installed candidate.
+- Computer Use verified the simplified landing page, name/location-first
+  dialog and preservation of the entered name after Settings. The native
+  chooser opened as a separate `osascript`-owned dialog outside the captured
+  PIF window, confirmed by the owner's screenshot. Computer Use could not
+  address that helper, so fresh-project folder selection/full creation was
+  not completed through GUI automation; widget tests cover that progression.
+- On the final installation, clicking the existing `pif-test-app-1` recent
+  entry automatically created the missing editable workspace and opened
+  the shell with **Hub connected**. Its UUID and repository-decision file
+  remained unchanged; the source and private kit now exist with the final
+  builder version. No token was read, re-entered or changed by the agent, and
+  no repository create/update/delete operation was requested by this check.
+
+Evidence is in `/tmp/pif-new-project-workflow/`, including before/after
+preservation checks, installed/build/test logs and native screenshots. The
+previous app is retained at `previous-pif.app` in that directory. PIF is left
+open on the owner's project. This scoped workflow repair does not close #160,
+replace live credential lifecycle verification or approve #206/#212.

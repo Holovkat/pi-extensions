@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T12:03:49Z - Simplified New Project and verified automatic saved-project preparation
+
+Indexed the New Project workflow synthesis and updated canonical requirements, support guidance, report and state. Recorded 142 Flutter/15 Node integration passes, final signed PID69833 and native saved-project open with preserved UUID/repository choice. Preserved the separate system-chooser automation limit and wider #160/sample acceptance gates.
+
 ## 2026-08-31T10:36:58Z - Recorded installed portability and fresh bootstrap repairs
 
 Updated the existing integration synthesis/report and state indexes with the copied-runtime startup, fresh host package restoration and canonical retained-kit fixes. Final signed stock is PID53246 with builder b0b9f4ff and 10,333 verified files. Fresh installed-resource provisioning/reopen, two-page export and a further independent environment from its exact retained kit pass without manual setup; native UI and live GitHub remain open gates under #160. Historical failed attempts and sample approval boundaries remain explicit.

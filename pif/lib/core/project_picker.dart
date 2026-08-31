@@ -14,18 +14,22 @@ class ProjectPicker extends StatefulWidget {
     this.onEnvironmentSelected,
     this.onOpenSettings,
     this.environments,
+    this.chooseFolder,
+    this.recentProjectsFile,
   });
 
   final Future<void> Function(String workspace) onLaunch;
 
   /// The central GitHub/local creation wizard can replace the local fallback.
-  final Future<void> Function()? onCreateProject;
+  final Future<EnvironmentIdentity?> Function()? onCreateProject;
   final Future<void> Function()? onOpenSettings;
 
   /// Runs immediately after identity allocation, before prerequisites or auth.
   final Future<void> Function(EnvironmentIdentity identity)?
   onEnvironmentSelected;
   final DevelopmentEnvironmentService? environments;
+  final Future<String?> Function(String prompt)? chooseFolder;
+  final File? recentProjectsFile;
 
   @override
   State<ProjectPicker> createState() => _ProjectPickerState();
@@ -54,9 +58,11 @@ class _ProjectPickerState extends State<ProjectPicker> {
     }
   }
 
-  File get _recentFile => File(
-    '${Platform.environment['HOME'] ?? '/'}/.pi/pif/recent_projects.json',
-  );
+  File get _recentFile =>
+      widget.recentProjectsFile ??
+      File(
+        '${Platform.environment['HOME'] ?? '/'}/.pi/pif/recent_projects.json',
+      );
 
   void _saveRecent(String path) {
     final updated = [
@@ -69,6 +75,7 @@ class _ProjectPickerState extends State<ProjectPicker> {
   }
 
   Future<String?> _chooseFolder(String prompt) async {
+    if (widget.chooseFolder != null) return widget.chooseFolder!(prompt);
     final result = await Process.run('/usr/bin/osascript', [
       '-e',
       'on run argv',
@@ -97,7 +104,7 @@ class _ProjectPickerState extends State<ProjectPicker> {
     try {
       await action();
     } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
+      if (mounted && !_cancelled) setState(() => _error = error.toString());
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -118,10 +125,19 @@ class _ProjectPickerState extends State<ProjectPicker> {
   });
 
   Future<void> _openReady(EnvironmentIdentity identity) async {
+    // A saved identity/repository is not yet an editable workspace. Continue
+    // that local step automatically without repeating account/repo setup.
+    if (!identity.hasEditableSource) {
+      await _prepare(identity);
+      return;
+    }
     final readiness = await _environments.inspect(identity);
     if (!mounted) return;
     setState(() => _readiness = readiness);
-    if (readiness.canBuild) await widget.onLaunch(identity.workspacePath);
+    if (readiness.canBuild) {
+      setState(() => _progress = 'Opening your project…');
+      await widget.onLaunch(identity.workspacePath);
+    }
   }
 
   Future<void> _openFolder() => _run(() async {
@@ -135,20 +151,22 @@ class _ProjectPickerState extends State<ProjectPicker> {
 
   Future<void> _createProject() async {
     if (widget.onCreateProject != null) {
-      return _run(widget.onCreateProject!, progress: 'Creating a project…');
+      return _run(() async {
+        final identity = await widget.onCreateProject!();
+        if (identity == null || !mounted) return;
+        await _openReady(await _select(identity.workspacePath));
+      }, progress: 'Creating your project…');
     }
     var draftName = '';
     final name = await showDialog<String>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        title: const Text('New local development environment'),
+        title: const Text('New Project'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              'Local only. No GitHub repository or account connection is created.',
-            ),
+            const Text('Create a workspace for your application.'),
             const SizedBox(height: 16),
             TextField(
               onChanged: (value) => draftName = value,
@@ -187,7 +205,12 @@ class _ProjectPickerState extends State<ProjectPicker> {
   }
 
   Future<void> _prepare(EnvironmentIdentity identity) async {
-    if (mounted) setState(() => _provisioning = true);
+    if (mounted)
+      setState(() {
+        _provisioning = true;
+        _readiness = null;
+        _progress = 'Preparing your workspace…';
+      });
     try {
       final prepared = await _environments.provision(
         identity,
@@ -200,8 +223,10 @@ class _ProjectPickerState extends State<ProjectPicker> {
       final readiness = await _environments.inspect(prepared);
       if (!mounted) return;
       setState(() => _readiness = readiness);
-      if (readiness.canBuild && !_cancelled)
+      if (readiness.canBuild && !_cancelled) {
+        setState(() => _progress = 'Opening your project…');
         await widget.onLaunch(prepared.workspacePath);
+      }
     } finally {
       if (mounted) setState(() => _provisioning = false);
     }
@@ -213,13 +238,78 @@ class _ProjectPickerState extends State<ProjectPicker> {
     final sdk = await _chooseFolder('Select the prepared Flutter SDK folder');
     if (sdk == null) return;
     await DevelopmentToolchain.selectFlutterSdk(identity.workspacePath, sdk);
-    final readiness = await _environments.inspect(identity);
-    if (mounted) setState(() => _readiness = readiness);
+    await _openReady(identity);
   }, progress: 'Checking the selected Flutter SDK…');
+
+  Future<void> _reviewSetup() async {
+    final readiness = _readiness;
+    final needsFlutter =
+        readiness != null &&
+        (readiness.tools.flutter == null ||
+            readiness.tools.dart == null ||
+            readiness.tools.issues.any(
+              (issue) => issue.startsWith('The saved Flutter SDK'),
+            ));
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Finish project setup'),
+        content: SizedBox(
+          width: 480,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Your project and saved connection are preserved.'),
+                const SizedBox(height: 16),
+                for (final issue in [
+                  ?_error,
+                  ...?readiness?.allIssues,
+                ])
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: SelectableText(issue),
+                  ),
+                if (needsFlutter)
+                  const Text(
+                    'PIF could not find a usable Flutter installation automatically. '
+                    'If it is installed elsewhere, choose the Flutter SDK folder containing '
+                    'bin/flutter. You do not need to select an individual file.',
+                  ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Back'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: Text(needsFlutter ? 'Locate Flutter SDK' : 'Check again'),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true || !mounted || _pending == null) return;
+    if (needsFlutter) {
+      await _selectSdk();
+    } else {
+      await _run(
+        () => _openReady(_pending!),
+        progress: 'Checking project setup…',
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
+    final needsAttention =
+        _pending != null && (_error != null || _readiness?.canBuild == false);
+    final projectName = _pending?.workspacePath.split('/').last;
     return Scaffold(
       body: Center(
         child: SingleChildScrollView(
@@ -230,13 +320,25 @@ class _ProjectPickerState extends State<ProjectPicker> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'pif',
-                  style: TextStyle(
-                    fontSize: 32,
-                    fontWeight: FontWeight.w300,
-                    letterSpacing: 1,
-                  ),
+                Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'pif',
+                        style: TextStyle(
+                          fontSize: 32,
+                          fontWeight: FontWeight.w300,
+                          letterSpacing: 1,
+                        ),
+                      ),
+                    ),
+                    if (widget.onOpenSettings != null)
+                      IconButton(
+                        tooltip: 'Settings',
+                        onPressed: _busy ? null : widget.onOpenSettings,
+                        icon: const Icon(Icons.settings_outlined),
+                      ),
+                  ],
                 ),
                 Text(
                   'PI-NATIVE AGENTIC IDE',
@@ -254,8 +356,36 @@ class _ProjectPickerState extends State<ProjectPicker> {
                   if (_provisioning)
                     TextButton(
                       onPressed: () => setState(() => _cancelled = true),
-                      child: const Text('Cancel setup'),
+                      child: const Text('Cancel'),
                     ),
+                ] else if (needsAttention) ...[
+                  Text(
+                    'Finish setting up $projectName',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    _readiness?.tools.ready == false
+                        ? 'A build tool needs attention before your project can open.'
+                        : 'PIF could not finish preparing this workspace.',
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Your project and saved connection are preserved.',
+                  ),
+                  const SizedBox(height: 20),
+                  FilledButton(
+                    onPressed: _reviewSetup,
+                    child: const Text('Review setup'),
+                  ),
+                  TextButton(
+                    onPressed: () => setState(() {
+                      _pending = null;
+                      _readiness = null;
+                      _error = null;
+                    }),
+                    child: const Text('Back to projects'),
+                  ),
                 ] else ...[
                   SizedBox(
                     width: double.infinity,
@@ -273,57 +403,9 @@ class _ProjectPickerState extends State<ProjectPicker> {
                     child: OutlinedButton.icon(
                       onPressed: _openFolder,
                       icon: const Icon(Icons.folder_open),
-                      label: const Text('Open Development Environment'),
+                      label: const Text('Open Project'),
                     ),
                   ),
-                  if (_pending != null &&
-                      (_error != null || _readiness != null)) ...[
-                    const SizedBox(height: 24),
-                    Text(
-                      'Environment saved',
-                      style: Theme.of(context).textTheme.titleSmall,
-                    ),
-                    SelectableText(
-                      _pending!.workspacePath,
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Your local identity and existing files are preserved. Build prerequisites do not block account setup.',
-                    ),
-                    for (final issue
-                        in _readiness?.allIssues ?? <String>[]) ...[
-                      const SizedBox(height: 8),
-                      Text(issue, style: TextStyle(color: colors.error)),
-                    ],
-                    Wrap(
-                      spacing: 8,
-                      children: [
-                        TextButton(
-                          onPressed: () => _run(
-                            () => _prepare(_pending!),
-                            progress: 'Checking workspace setup…',
-                          ),
-                          child: const Text('Retry setup'),
-                        ),
-                        TextButton(
-                          onPressed: _selectSdk,
-                          child: const Text('Select Flutter SDK'),
-                        ),
-                        TextButton(
-                          onPressed: () => _run(
-                            () => widget.onLaunch(_pending!.workspacePath),
-                          ),
-                          child: const Text('Open without preview'),
-                        ),
-                        if (widget.onOpenSettings != null)
-                          TextButton(
-                            onPressed: widget.onOpenSettings,
-                            child: const Text('Settings'),
-                          ),
-                      ],
-                    ),
-                  ],
                   if (_recent.isNotEmpty) ...[
                     const SizedBox(height: 28),
                     Text(
@@ -337,57 +419,34 @@ class _ProjectPickerState extends State<ProjectPicker> {
                     for (final path in _recent)
                       ListTile(
                         dense: true,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                        ),
                         leading: Icon(
                           Icons.folder_outlined,
                           size: 20,
                           color: colors.onSurfaceVariant,
                         ),
                         title: Text(
-                          path.split('/').last,
+                          path.split('/').where((part) => part.isNotEmpty).last,
                           style: const TextStyle(fontSize: 14),
                         ),
                         subtitle: Text(
                           path,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 11,
                             color: colors.onSurfaceVariant,
                           ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
                         ),
                         onTap: () => _launch(path),
                       ),
                   ],
-                ],
-                if (_error != null) ...[
-                  const SizedBox(height: 20),
-                  Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: colors.errorContainer,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Icon(
-                          Icons.error_outline,
-                          color: colors.onErrorContainer,
-                          size: 18,
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _error!,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: colors.onErrorContainer,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
+                  if (_error != null) ...[
+                    const SizedBox(height: 16),
+                    Text(_error!, style: TextStyle(color: colors.error)),
+                  ],
                 ],
               ],
             ),

@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [New Project follows saved setup state](./2026-08-31-pif-new-project-workflow.md) | 2026-08-31T11:54:40Z | pif, onboarding, workflow, settings | #160, #219, #222, #223 |
 | [Installed builder, environment GitHub and Settings integration](./2026-08-31T10-09-00Z-pif-installed-builder-integration.md) | 2026-08-31T10:09:00Z | pif, installed-builder, environments, verification | #160, #204, #218–#223 |
 | [Environment-bound asynchronous GitHub tracker (#222)](./2026-08-31T09-45-43Z-pif-environment-bound-async-tracker.md) | 2026-08-31T09:45:43Z | pif, implementation, verification | #160 |
 | [Environment-bound GitHub token broker prepared for integration](./2026-08-31T09-40-55Z-pif-environment-github-token-t1.md) | 2026-08-31T09:40:55Z | pif, implementation, verification | #160 |

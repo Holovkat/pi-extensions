@@ -407,21 +407,19 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
     );
   }
 
-  Future<void> _newProject() async {
-    if (_onboardingInFlight) return;
+  Future<EnvironmentIdentity?> _newProject() async {
+    if (_onboardingInFlight) return null;
     final context = _navigatorKey.currentContext;
-    if (context == null) return;
+    if (context == null) return null;
     _onboardingInFlight = true;
     try {
-      final identity = await showProjectOnboarding(
+      return await showProjectOnboarding(
         context,
         environments: _environments,
         github: _github,
         onEnvironmentSelected: _selectEnvironment,
         onOpenSettings: _openSettingsPage,
       );
-      if (identity != null && mounted)
-        await _launchProject(identity.workspacePath);
     } finally {
       _onboardingInFlight = false;
     }
@@ -439,6 +437,7 @@ class _PifAppState extends State<PifApp> with WidgetsBindingObserver {
       await showProjectOnboarding(
         context,
         environment: identity,
+        repositoryOnly: true,
         environments: _environments,
         github: _github,
         onEnvironmentSelected: _selectEnvironment,

@@ -959,6 +959,14 @@ editable preview, so it can create another independent environment. Existing
 files are preserved on reopen; a damaged or incompatible kit is reported
 instead of silently borrowing another checkout.
 
+New Project asks for a name/location first, then only the relevant repository
+connection and confirmation. PIF prepares the workspace automatically and opens
+it when ready. Opening a saved project completes any missing local preparation
+without repeating its saved GitHub/repository decision. Settings stays in the
+header; a normal setup does not offer SDK selection or a preview bypass. If a
+real prerequisite fails, **Review setup** explains that specific blocker, with
+SDK location offered only when Flutter could not be discovered.
+
 Authoring requires macOS arm64, Flutter 3.44.x/Dart 3.12.2 or newer within
 major version 3, full Xcode selected with its setup completed, CocoaPods
 1.15+, and Git 2+. The app checks installed tools in known locations and
