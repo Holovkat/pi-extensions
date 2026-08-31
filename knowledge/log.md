@@ -3,6 +3,10 @@
 <!-- Entries are added in reverse chronological order by the curation agent -->
 <!-- Format: ## <ISO timestamp> - <action> -->
 
+## 2026-08-31T05:17:19Z - Recorded final native pif verification without closing acceptance gates
+
+Aligned the current state and inbox indexes with tested code 3bc8e1fc, 27 native remediation children, actual stock/export UI evidence and unchanged signed bundles. Preserved both failed combined gates and the three owner decisions. Added the dated verification report and retained the original review. Restored index links for 35 pre-existing inbox files and corrected the inventory to 61 without changing their content or curating them. No product source or acceptance criteria were changed.
+
 ## 2026-08-31T03:38:50Z - Corrected pif handoff snapshot with live #215 and #205 review state
 
 Updated the current pif state snapshot again to remove the stale tracker precursor claim, carry forward the live #205 review status, add #215 to the live tracker surface, and call out the #214 evidence commit and 25-child parent count. Kept the active #158/#159/#160 contract surface anchored to the live issue pages and left all source and test files untouched.

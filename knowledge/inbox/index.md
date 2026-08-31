@@ -4,6 +4,7 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 
 | Title | Timestamp | Tags | Issues |
 |-------|-----------|------|--------|
+| [Final native pif UI verification and remaining acceptance gaps](./2026-08-31T05-17-19Z-pif-final-native-ui-verification.md) | 2026-08-31T05:17:19Z | pif, verification, computer-use, export | #160, #187, #201, #204, #205, #206, #212, #215, #217 |
 | [Remediation behavior regressions for the combined gate](./2026-08-31T04-28-00Z-pif-remediation-behavior-regressions.md) | 2026-08-31T04:28:00Z | pif, testing, remediation | #160 |
 | [Tracker request identity and dialog ownership (#216)](./2026-08-31T04-19-37Z-pif-tracker-request-id-correlation.md) | 2026-08-31T04:19:37Z | pif, tracker, request-correlation | #216 |
 | [Export entrypoint, pinned widgets and startup ownership (#211)](./2026-08-31T04-06-56Z-pif-export-entrypoint-adoption-race-guard.md) | 2026-08-31T04:06:56Z | pif, export, startup | #211 |
@@ -29,4 +30,39 @@ Session syntheses awaiting curation. Items here are written by the agent before 
 | [Mercury App Template and pif-app-designer Skill Authored (#178)](./2026-08-29T07-34-46Z-pif-mercury-template-and-app-designer-skill.md) | 2026-08-29T07:34:46Z | pif, templates, mercury, design-system, skills, extract-design | #178 |
 | [Pif stock and export bundles require a portable Node runtime](./2026-08-31T04-51-25Z-pif-portable-node-packaging.md) | 2026-08-31T04:51:25Z | pif, packaging, export, macos, node, remediation | #160, #217 |
 | [Pif queued input preserves the active streaming message](./2026-08-31T05-02-46Z-pif-queued-input-preserves-streaming-message.md) | 2026-08-31T05:02:46Z | pif, agent-console, transcript, steer, regression | #160, #215 |
+| [Session 2026-07-25 - Global Pi agent model routing](./2026-07-25T02-39-05Z-global-pi-agent-model-routing.md) | 2026-07-25T02:39:05Z | pi, subagents, models, factory, droid, planning | — |
+| [Session 2026-07-25 - Pi Product Design Adapter](./2026-07-25T02-53-28Z-pi-product-design-adapter.md) | 2026-07-25T02:53:28Z | pi, codex, product-design, skills, adapter, licensing | — |
+| [Session 2026-07-26 - GitHub README diagram assets](./2026-07-26T07-20-27Z-github-readme-diagram-assets.md) | 2026-07-26T07:20:27Z | pi-extensions, readme, mermaid, github, diagrams, compatibility | — |
+| [pif Flutter Agentic IDE Design](./2026-08-14T22-53-14Z-pif-flutter-agentic-ide-design.md) | 2026-08-14T22:53:14Z | pi-extensions, pif, flutter, ide, widgets, rpc, design, spec | — |
+| [pif Epic and Task Planning Published](./2026-08-14T23-10-00Z-pif-epic-and-task-planning.md) | 2026-08-14T23:10:00Z | pi-extensions, pif, flutter, planning, epic, github, issues | #120, #121, #122, #123, #124, #125, #126, #127, #128, #129 |
+| [pif Phase 1 Implementation Reached T2](./2026-08-15T00-42-00Z-pif-phase-1-implementation.md) | 2026-08-15T00:42:00Z | pi-extensions, pif, flutter, implementation, verification, github | #120, #121, #122, #123, #124, #125, #126, #127, #128, #129 |
+| [pif Dev UAT Fixes — Console Rendering, Model Selection, Hot Reload, Packaging](./2026-08-15T04-48-23Z-pif-dev-uat-fixes.md) | 2026-08-15T04:48:23Z | pi-extensions, pif, flutter, dev-uat, fixes, packaging | #120, #121, #130 |
+| [pif Standalone macOS App — Project Picker, Pi Launcher, Build Script](./2026-08-15T05-05-49Z-pif-standalone-macos-app.md) | 2026-08-15T05:05:49Z | pi-extensions, pif, flutter, macos, packaging, standalone | #130 |
+| [pif Model Manager — Provider Config UI and Model Dropdown](./2026-08-15T06-03-10Z-pif-model-manager.md) | 2026-08-15T06:03:10Z | pi-extensions, pif, flutter, models, model-manager, configuration | #130 |
+| [pif Remediation Wave — Security, Resilience, Layout Reset, Packaging](./2026-08-22T09-00-00Z-pif-remediation-wave.md) | 2026-08-22T09:00:00Z | pi-extensions, pif, security, flutter, packaging, okf | #131, #132, #133, #134, #135, #136, #137, #138 |
+| [pif UAT Iteration Wave — Docking UX, Console Polish, Standalone Resilience](./2026-08-23T10-30-00Z-pif-uat-iteration-wave.md) | 2026-08-23T10:30:00Z | pi-extensions, pif, flutter, uat, docking, resilience | #139, #140, #141, #142, #143, #144, #145, #146, #147, #148, #149 |
+| [pif App-Builder Epic Planned — Applications Built on the pif Foundation](./2026-08-23T11-00-00Z-pif-app-builder-epic-planning.md) | 2026-08-23T11:00:00Z | pi-extensions, pif, flutter, planning, epic, github, app-builder | #152, #153, #154, #155, #156, #157, #158, #159, #160, #163, #164, #165, #166 |
+| [pif Tracker and Session Console Changes Integrated](./2026-08-23T13-10-00Z-pif-tracker-session-merge.md) | 2026-08-23T13:10:00Z | pi-extensions, pif, tracker, kanban, sessions, merge | #152, #163, #168 |
+| [pif Agent Console Codex-style conversation and UAT delivery handback](./2026-08-23T13-49-56Z-pif-agent-console-uat-handoff.md) | 2026-08-23T13:49:56Z | pi-extensions, pif, flutter, agent-console, uat, deployment | — |
+| [pif Tracker Panel Sprint — Kanban Board Shipped to Branch, Awaiting Dev UAT](./2026-08-23T16-30-00Z-pif-tracker-panel-sprint.md) | 2026-08-23T16:30:00Z | pi-extensions, pif, flutter, tracker, kanban, github, sprint | #163, #164, #165, #166 |
+| [pif Tracker CRUD Iteration — Full Ticket Lifecycle, Resizable Sheet](./2026-08-23T18-00-00Z-pif-tracker-crud-iteration.md) | 2026-08-23T18:00:00Z | pi-extensions, pif, flutter, tracker, crud, github, sprint | #168 |
+| [pif App-Builder Model Settled in the Design Spec — QA Alignment Audit and Roadmap Realignment (#154)](./2026-08-29T00-00-00Z-pif-app-builder-model-settled.md) | 2026-08-29T00:00:00Z | pi-extensions, pif, flutter, app-builder, design-spec, qa-audit, roadmap, templates | #154, #130, #152, #155, #156, #157, #158, #159, #178 |
+| [pif Hub Layered Widget Sources — Base, Global Catalog, Per-Project Overlay (#155)](./2026-08-29T01-00-00Z-pif-layered-widget-sources.md) | 2026-08-29T01:00:00Z | pi-extensions, pif, hub, widgets, layered-sources, provenance, registry-codegen, okf | #155, #130, #152, #153, #154, #156, #157 |
+| [2026-08-29T09-30-00Z-pif-page-widgets-app-runtime-mode](./2026-08-29T09-30-00Z-pif-page-widgets-app-runtime-mode.md) | — |  | — |
+| [2026-08-30T00-00-00Z-pif-tracker-epic-drill-down](./2026-08-30T00-00-00Z-pif-tracker-epic-drill-down.md) | — |  | — |
+| [2026-08-30T01-00-00Z-pif-tracker-detail-sheet](./2026-08-30T01-00-00Z-pif-tracker-detail-sheet.md) | — |  | — |
+| [2026-08-30T02-00-00Z-pif-app-model](./2026-08-30T02-00-00Z-pif-app-model.md) | — |  | — |
+| [2026-08-30T03-00-00Z-pif-agentic-build-flow](./2026-08-30T03-00-00Z-pif-agentic-build-flow.md) | — |  | — |
+| [2026-08-30T04-00-00Z-pif-export-pipeline](./2026-08-30T04-00-00Z-pif-export-pipeline.md) | — |  | — |
+| [pif tracker label preservation on first edit (#191)](./2026-08-31T00-55-10Z-pif-tracker-label-preservation.md) | 2026-08-31T00:55:10Z | pi-extensions, pif, tracker, github, issues, labels, flutter, okf | #191 |
+| [pif app manifest parser preserves s-prefixed page ids on reload (#193)](./2026-08-31T00-58-57Z-pif-app-manifest-parser-preserves-s-pages.md) | 2026-08-31T00:58:57Z | pi-extensions, pif, hub, manifest, parser, app-yaml, issues, okf | #193 |
+| [pif app tools publish live manifest state after successful mutations (#194)](./2026-08-31T01-04-13Z-pif-app-live-manifest-publish.md) | 2026-08-31T01:04:13Z | pi-extensions, pif, hub, flutter, manifest, snapshot, app-mode, issues, okf | #194 |
+| [pif tracker view-mode save acknowledgement for #197](./2026-08-31T01-06-24Z-pif-tracker-view-mode-save-ack.md) | 2026-08-31T01:06:24Z | pi-extensions, pif, tracker, flutter, issues, save-ack, okf | #197 |
+| [pif docking shell single-page no-nav state for #198](./2026-08-31T01-11-50Z-pif-docking-shell-single-page-nav.md) | 2026-08-31T01:11:50Z | pi-extensions, pif, shell, app-mode, navigation, responsive, okf | #198 |
+| [pif widget store source badges from live snapshot state for #210](./2026-08-31T01-12-28Z-pif-widget-store-source-badges.md) | 2026-08-31T01:12:28Z | pi-extensions, pif, widget-store, provenance, catalog, okf | #210 |
+| [pif app snapshot publication follow-up for #194](./2026-08-31T01-13-22Z-pif-app-snapshot-publication-followup.md) | 2026-08-31T01:13:22Z | pi-extensions, pif, hub, app-mode, snapshot, manifest, okf | #194 |
+| [pif flutter test storage isolation for #160](./2026-08-31T01-22-34Z-pif-flutter-test-storage-isolation.md) | 2026-08-31T01:22:34Z | pi-extensions, pif, tests, storage, workspace, okf | #160 |
+| [pif app-builder runbook now uses scaffold-then-edit app flow (#200)](./2026-08-31T01-29-13Z-pif-app-builder-runbook-create-vs-edit.md) | 2026-08-31T01:29:13Z | pi-extensions, pif, skill, runbook, widgets, analyzer | #200 |
+| [Team Pulse fixture now uses a clean-checkout pif path (#203)](./2026-08-31T01-29-13Z-pif-fixture-clean-checkout-path.md) | 2026-08-31T01:29:13Z | pi-extensions, pif, fixture, pubspec, portability, flutter | #203 |
+| [PIF harness safety slice narrows test fixtures for #160](./2026-08-31T01-35-47Z-pif-harness-safety.md) | 2026-08-31T01:35:47Z | pi-extensions, pif, tests, node, harness, isolation | #160 |
 <!-- Rows added by session synthesis (agent-written), removed by curation agent -->

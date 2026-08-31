@@ -4,7 +4,7 @@ title: Current Repo State
 description: Current state of the pi-extensions repository — baseline extensions, blueprint, toolshed, council, pif hub/shell/SQLite persistence, and the live pif remediation candidate state as of 31 August 2026.
 resource: ./README.md
 tags: [pi-extensions, state, current, repo, status, roadmap, pif]
-timestamp: 2026-08-31T03:46:14Z
+timestamp: 2026-08-31T05:17:19Z
 status: active
 ---
 
@@ -41,17 +41,14 @@ Blueprint assets are committed in `agents/pi-blueprint/` and `skills/pi-blueprin
 - Epic #152 "pif app builder" is open and active: agentic applications composed on the pif foundation.
 - Tracker precursor sprint #163–#166 (repo-synced Kanban tracker panel v0.1: sprint, hub sync layer, board widget, verification) is historical shipped context and no longer the active planning surface for this snapshot.
 
-### pif App Builder Remediation Snapshot (#160 / #205 / #214 / #215)
-  - Implementation checkpoint: `codex/pif-app-builder-154` at `f4bfe769`; the knowledge snapshot was last updated in `c3aad65d` and corrected again in this docs pass.
-- Active contract references: GitHub issues `#158`, `#159`, and `#160` are the canonical issue bodies for the app-builder, export, and verification slices; this snapshot is aligned to those live issue pages rather than stale master-era planning text.
-- Review slices on branch: `#191`, `#192`, `#193`, `#194`, `#195`, `#196`, `#197`, `#198`, `#199`, `#200`, `#202`, `#203`, `#208`, `#210`, `#214`.
-- Supporting harness/evidence commits: `6891a1b3`, `a2172be8`, `a010db15`, `9f11e564`.
-- Current tracker snapshot: `#205` is review, `#214` is review, and `#215` is in progress; `#160` now shows 25 child issues, with the live set extending beyond the earlier 23-child snapshot.
-- `#160` remains the blocked final verification ticket; focused Flutter, Node, and native UI diagnostics exist, but `complete_gate_runs = 0` and the final `npm run test:pif`, install/launch, export/signature/provider, and clean-candidate acceptance evidence remain pending.
-- Owner-gated rows `#204`, `#206`, and `#212` remain blocked. Coordination items `#187` and `#211` are in progress; `#201`, `#207`, and `#209` are still todo.
-- The historical seven-task approvals (`#154`, `#155`, `#156`, `#157`, `#178`, `#188`, `#189`) remain preserved and are not treated as final candidate acceptance.
-- This section is a live snapshot of the remediation branch, not final candidate acceptance.
-- The live handoff records now point at the current review slice set in `knowledge/inbox/index.md` and the corrective log entry in `knowledge/log.md`.
+### pif App Builder Remediation Snapshot (#160, 31 August 2026)
+- Tested code candidate: `3bc8e1fc` on `codex/pif-app-builder-154`; the final documentation handoff does not change that built code revision.
+- Canonical requirements remain GitHub #158/#159/#160. There are 27 native remediation children: 24 implementation tasks in Review and owner-gated #204/#206/#212 blocked. #215 and #217 have final rebuilt UI evidence.
+- Both actual artifacts launch and obtain real answers using the existing native Pi profile. Installed stock passed valid New Session, Send, Steer, Abort/recovery, replay and widget toggles. Export passed Settings-home restart, a tool response, and widget toggles. Both signed bundles remained byte-for-byte unchanged after the checks.
+- Stock is installed at `/Applications/pif.app`, left at the clean project picker as PID 52706. Export `/tmp/pif160-ui-31x_h8mg/build/UI Workflow Check.app` was normally quit after testing. This technical fixture does not establish Mercury sample acceptance or clean-machine authentication provisioning.
+- Two combined gate attempts failed. Separate Node 63/63, clean analysis and Flutter 77/77 evidence exists on `4972a603`; final `3bc8e1fc` has eight passing focused transcript cases and live UI proof. No combined full gate has passed at tip.
+- #160 remains blocked on the export support-boundary decision, approved Mercury sample/appearance work and final combined acceptance. Historical seven-task owner approvals (#154/#155/#156/#157/#178/#188/#189) are preserved.
+- [Current report](../../docs/reviews/2026-08-31-remediation-verification.md) distinguishes final UI proof, earlier checks, operational incidents and remaining acceptance gaps. The dated baseline review is retained separately.
 
 ### pif Remediation Wave 2 (#170, In Flight)
 - Current sprint: crash handling, data integrity around persistence, auth containment on the bus, performance, and documentation.
