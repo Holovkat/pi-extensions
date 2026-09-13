@@ -1,0 +1,6 @@
+id: team_pulse_status
+name: Team Pulse Status
+slot: status
+version: 0.1.0
+core: false
+description: Widget Team Pulse Status for the project app
