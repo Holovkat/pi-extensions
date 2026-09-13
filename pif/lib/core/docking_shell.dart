@@ -7,6 +7,7 @@ import '../widget_registry.g.dart';
 import 'bus.dart';
 import 'panel_error_boundary.dart';
 import 'plugin.dart';
+import 'template_appearance.dart';
 
 class DockingShell extends StatefulWidget {
   const DockingShell({
@@ -602,7 +603,7 @@ class _DockingShellState extends State<DockingShell>
   Widget _appScaffold() {
     final statusWidgets = inSlot(PifSlot.status);
     final hasNavigation = _pageIds.length > 1;
-    return Scaffold(
+    final scaffold = Scaffold(
       body: Column(
         children: [
           _titleBar(),
@@ -649,6 +650,18 @@ class _DockingShellState extends State<DockingShell>
             ),
         ],
       ),
+    );
+    // Pinned template appearance (#212): a manifest template swaps the
+    // app-mode Material theme for its paired semantic tokens. The title
+    // bar, console chrome and IDE scaffold stay on the pif theme, and a
+    // missing or unknown template id keeps the stock appearance.
+    final template = templateAppearanceFor(
+      _appManifest?['template'] as String?,
+    );
+    if (template == null) return scaffold;
+    return Theme(
+      data: template.materialTheme(Theme.of(context).brightness),
+      child: scaffold,
     );
   }
 
